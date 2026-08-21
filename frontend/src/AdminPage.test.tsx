@@ -1,7 +1,7 @@
 import { cleanup, render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { AdminPage } from './AdminPage'
+import { AdminPage, DeviceViewport } from './AdminPage'
 
 function jsonResponse(body: unknown, status = 200) {
   return new Response(JSON.stringify(body), {
@@ -92,5 +92,16 @@ describe('AdminPage', () => {
 
     await waitFor(() => expect(FakeWebSocket.instance!.close).toHaveBeenCalled())
     expect(screen.getByRole('button', { name: '接管设备' })).toBeInTheDocument()
+  })
+
+  it('keeps the admin viewport offline when its configured WebSocket URL is invalid', async () => {
+    class InvalidWebSocket {
+      constructor(_url: string) { throw new SyntaxError('Invalid URL') }
+    }
+    vi.stubGlobal('WebSocket', InvalidWebSocket)
+
+    render(<DeviceViewport active locked streamUrl="not a websocket URL" />)
+
+    await waitFor(() => expect(screen.getByText('设备画面连接不可用，当前离线')).toBeInTheDocument())
   })
 })

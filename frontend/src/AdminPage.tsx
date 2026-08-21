@@ -24,8 +24,19 @@ export function DeviceViewport({ locked, active, streamUrl = import.meta.env.VIT
       setConnection(active ? 'UNCONFIGURED' : 'OFFLINE')
       return
     }
-    setConnection('CONNECTING')
-    const client = new WebSocket(streamUrl)
+    let client: WebSocket
+    try {
+      const url = new URL(streamUrl)
+      if (url.protocol !== 'ws:' && url.protocol !== 'wss:') throw new TypeError('Unsupported WebSocket protocol')
+      setConnection('CONNECTING')
+      client = new WebSocket(streamUrl)
+    } catch {
+      socket.current = null
+      setRunnerReady(false)
+      setRunnerLocked(false)
+      setConnection('OFFLINE')
+      return
+    }
     socket.current = client
     client.onopen = () => setConnection('ONLINE')
     client.onclose = () => {

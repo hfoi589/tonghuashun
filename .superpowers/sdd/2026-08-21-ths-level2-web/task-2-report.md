@@ -83,3 +83,22 @@ git diff --check passed
 ```
 
 The added tests exercise normalized public submission and job URL restoration, SSE behavior after a transient error, disabled queue placeholders, typed/locked device input, and closing the device stream after an administrator health failure.
+
+## Review fix round 2: malformed device stream URL
+
+### RED
+
+Added a focused viewport test that supplies a malformed configured WebSocket URL. Before the fix, `new WebSocket(streamUrl)` synchronously raised `SyntaxError: Invalid URL` from the React effect and crashed the test/page.
+
+### GREEN
+
+The viewport now validates that the configured URL uses `ws:` or `wss:` and wraps WebSocket construction in `try/catch`. A malformed URL clears readiness/lock state and renders the existing offline state instead of propagating the exception.
+
+Fresh verification:
+
+```text
+Focused AdminPage test: 4 passed
+Full frontend test suite: 3 files passed, 10 tests passed
+npm run build: passed
+git diff --check: passed
+```

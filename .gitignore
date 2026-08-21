@@ -1,0 +1,17 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+node_modules/
+dist/
+build/
+.env
+.env.*
+!.env.example
+data/
+artifacts/
+.superpowers/
+.DS_Store
+

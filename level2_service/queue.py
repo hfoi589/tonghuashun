@@ -24,6 +24,7 @@ class TaskStore(Protocol):
     def enqueue(self, task: TaskRecord) -> None: ...
     def get(self, task_id: str) -> TaskRecord | None: ...
     def next_queued(self) -> TaskRecord | None: ...
+    def requeue_waiting(self, task_id: str) -> TaskRecord: ...
     def transition(self, task_id: str, status: TaskStatus, *, error_code: str | None = None) -> TaskRecord: ...
     def complete_capture(self, task_id: str, kind: CaptureKind, path: str) -> TaskRecord: ...
     def events_after(self, task_id: str, event_index: int = 0) -> list[dict[str, str]]: ...
@@ -76,6 +77,16 @@ class InMemoryStreams:
 
     def get(self, task_id: str) -> TaskRecord | None:
         return self._tasks.get(task_id)
+
+    def requeue_waiting(self, task_id: str) -> TaskRecord:
+        task = self._tasks[task_id]
+        if task.status != TaskStatus.WAITING_ADMIN:
+            raise InvalidTransitionError(f"{task.status.value} cannot be requeued")
+        task.status = TaskStatus.QUEUED
+        task.error_code = None
+        task.updated_at = utc_now()
+        self._emit(task)
+        return task
 
     def set_capture_root(self, capture_root: Path) -> None:
         self.capture_root = capture_root.resolve()
@@ -150,7 +161,7 @@ class InMemoryStreams:
 class RedisStreamsStore:
     """Redis-backed TaskStore using a stream for events and Lua for FIFO claims."""
 
-    _REQUIRED_CLIENT_METHODS = ("delete", "eval", "get", "rpush", "sadd", "scard", "set", "smembers", "srem", "xadd", "xrange")
+    _REQUIRED_CLIENT_METHODS = ("delete", "eval", "get", "lpush", "rpush", "sadd", "scard", "set", "smembers", "srem", "xadd", "xrange")
     _CLAIM_SCRIPT = """
 local task_id = redis.call('LPOP', KEYS[1])
 while task_id do
@@ -215,6 +226,20 @@ return false
             utc_now().isoformat(),
         )
         return self._deserialize(payload) if payload else None
+
+    def requeue_waiting(self, task_id: str) -> TaskRecord:
+        task = self._required(task_id)
+        if task.status != TaskStatus.WAITING_ADMIN:
+            raise InvalidTransitionError(f"{task.status.value} cannot be requeued")
+        task.status = TaskStatus.QUEUED
+        task.error_code = None
+        task.updated_at = utc_now()
+        self._save(task)
+        # A previously claimed task resumes at its original FIFO position ahead
+        # of jobs submitted while an administrator handled the device gate.
+        self.client.lpush(self._queue_key, task.task_id)
+        self._emit(task)
+        return task
 
     def transition(self, task_id: str, status: TaskStatus, *, error_code: str | None = None) -> TaskRecord:
         task = self._required(task_id)

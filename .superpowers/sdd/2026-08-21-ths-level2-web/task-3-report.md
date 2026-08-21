@@ -64,3 +64,39 @@ completed with exit status 0
 - The ADB selector identifiers are recipe-bound placeholders for deployment UI
   mappings. Deployment validation must still confirm the actual installed app's
   identifiers and visual templates after an administrator manually signs in.
+
+## Review-fix evidence
+
+### Root causes
+
+- The original stream authenticated only when opening. Logout revoked the HTTP
+  session but did not revoke the `RunnerControl` lock or close an already-open
+  device stream.
+- ADB screens are PNG, while the stream allowed its optional OpenCV conversion
+  to be absent and silently omitted frames. There was no declared image codec
+  dependency.
+- A claimed `WAITING_ADMIN` task had no safe transition back into the queue;
+  input envelope sequence numbers were syntactically checked but not ordered;
+  and each accepted input iteration captured a screen.
+
+### RED/GREEN review cycles
+
+| Behaviour | RED evidence | GREEN evidence |
+| --- | --- | --- |
+| Session/log-out safety, JPEG frames, input sequencing and cadence | Expanded device-stream suite failed at collection because `FrameThrottle` was absent; after its first implementation the logout test exposed a duplicate WebSocket-close trace, pinpointing concurrent logout and loop closes | `pytest tests/test_device_websocket.py -q` → `7 passed` after registered active-socket disconnection, per-loop session revalidation, idempotent close, strict increasing sequence checks, the 250ms gate, and Pillow JPEG conversion |
+| Waiting task recovery | Runner recovery test failed because `TaskStore` had no `requeue_waiting` operation | focused backend runner/admin/Redis suite → `23 passed`; the store/API now move only `WAITING_ADMIN` tasks to `QUEUED`, preserving FIFO priority |
+| Admin recovery control | AdminPage test failed because there was no `等待任务 ID` control | `npm test -- --run src/AdminPage.test.tsx` → `5 passed` after CSRF-protected resume API wiring and the recovery form |
+
+### Review-fix final verification
+
+```text
+.venv/bin/python -m pytest -q
+44 passed
+
+frontend: npm test
+3 files passed, 12 tests passed
+```
+
+Pillow is now a declared runtime dependency (`Pillow>=10.0.0`). The JPEG test
+uses a valid generated 1x1 PNG and asserts that the emitted frame data begins
+with the JPEG signature; OpenCV remains lazy and confined to template matching.

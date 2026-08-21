@@ -77,6 +77,10 @@ export const api = {
     method: 'POST',
     headers: { 'X-CSRF-Token': csrfToken },
   }),
+  resumeWaitingJob: (publicId: string, csrfToken: string) => request<Job>(`/api/admin/jobs/${encodeURIComponent(publicId)}/resume`, {
+    method: 'POST',
+    headers: { 'X-CSRF-Token': csrfToken },
+  }),
   acquireLock: (csrfToken: string) => request<LockState>('/api/admin/lock/acquire', {
     method: 'POST',
     headers: { 'X-CSRF-Token': csrfToken },

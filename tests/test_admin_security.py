@@ -44,3 +44,21 @@ def test_logout_requires_csrf_and_revokes_the_server_side_session() -> None:
     csrf = client.cookies.get("ths_csrf")
     assert client.post("/api/admin/session/logout", headers={"X-CSRF-Token": csrf}).status_code == 204
     assert client.get("/api/admin/runner").status_code == 401
+
+
+def test_admin_can_resume_a_waiting_job_with_csrf() -> None:
+    """An administrator needs an explicit safe path to resume a cleared UI gate."""
+    from level2_service.models import TaskRecord, TaskStatus
+    from level2_service.queue import InMemoryStreams
+
+    store = InMemoryStreams()
+    task = TaskRecord(task_id="waiting-job", symbol="SZ.000001")
+    store.enqueue(task)
+    store.transition(task.task_id, TaskStatus.RUNNING)
+    store.transition(task.task_id, TaskStatus.WAITING_ADMIN, error_code="WAITING_ADMIN")
+    client = TestClient(create_app(store=store, admin_password_hash=PasswordHasher().hash("admin-secret")), base_url="https://testserver")
+    assert client.post("/api/admin/session", json={"password": "admin-secret"}).status_code == 204
+    assert client.post("/api/admin/jobs/waiting-job/resume").status_code == 403
+    response = client.post("/api/admin/jobs/waiting-job/resume", headers={"X-CSRF-Token": client.cookies.get("ths_csrf")})
+    assert response.status_code == 200
+    assert response.json()["status"] == "QUEUED"

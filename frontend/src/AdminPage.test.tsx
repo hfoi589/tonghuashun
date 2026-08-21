@@ -68,6 +68,28 @@ describe('AdminPage', () => {
     }))
   })
 
+  it('resumes a waiting task through the protected admin route', async () => {
+    vi.mocked(fetch)
+      .mockResolvedValueOnce(new Response(null, { status: 204 }))
+      .mockResolvedValueOnce(jsonResponse({ state: 'NEEDS_ADMIN', last_heartbeat: null, queue_paused: false }))
+      .mockResolvedValueOnce(jsonResponse({ locked: false }))
+      .mockResolvedValueOnce(jsonResponse({ paused: false }))
+      .mockResolvedValueOnce(jsonResponse({ public_id: 'waiting-job', symbol: 'SZ.000001', status: 'QUEUED', error_code: null, created_at: '2026-08-21T00:00:00+00:00', captures: [] }))
+
+    const user = userEvent.setup()
+    render(<AdminPage />)
+    await user.type(screen.getByLabelText('管理员密码'), 'never-display-this')
+    await user.click(screen.getByRole('button', { name: '登录管理台' }))
+    await user.type(screen.getByLabelText('等待任务 ID'), 'waiting-job')
+    await user.click(screen.getByRole('button', { name: '恢复等待任务' }))
+
+    await waitFor(() => expect(screen.getByText('任务已重新加入队列')).toBeInTheDocument())
+    expect(fetch).toHaveBeenLastCalledWith('/api/admin/jobs/waiting-job/resume', expect.objectContaining({
+      method: 'POST',
+      headers: expect.objectContaining({ 'X-CSRF-Token': 'test-csrf' }),
+    }))
+  })
+
   it('clears the local lock and closes the device stream when health refresh fails', async () => {
     class FakeWebSocket {
       static instance: FakeWebSocket | undefined

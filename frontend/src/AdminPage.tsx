@@ -107,6 +107,7 @@ export function AdminPage({ deviceStreamUrl }: { deviceStreamUrl?: string }) {
   const [health, setHealth] = useState<RunnerHealth | null>(null)
   const [queue, setQueue] = useState<QueueState | null>(null)
   const [locked, setLocked] = useState(false)
+  const [waitingTaskId, setWaitingTaskId] = useState('')
   const [message, setMessage] = useState('')
   const invalidateAdminControl = useCallback((reason: unknown) => {
     setHealth(null)
@@ -153,6 +154,17 @@ export function AdminPage({ deviceStreamUrl }: { deviceStreamUrl?: string }) {
       setMessage(result.paused ? '队列已暂停' : '队列已恢复')
     } catch (reason) { invalidateAdminControl(reason) }
   }
+  async function resumeWaitingJob(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    const publicId = waitingTaskId.trim()
+    if (!publicId) return
+    setMessage('')
+    try {
+      await api.resumeWaitingJob(publicId, readCsrfToken())
+      setWaitingTaskId('')
+      setMessage('任务已重新加入队列')
+    } catch (reason) { invalidateAdminControl(reason) }
+  }
   useEffect(() => {
     if (!authenticated) return
     const timer = window.setInterval(refreshHealth, 15_000)
@@ -166,7 +178,8 @@ export function AdminPage({ deviceStreamUrl }: { deviceStreamUrl?: string }) {
     <p className="notice"><span>密码仅用于本次请求，不会记录或展示。</span> 不要在此页面输入或粘贴同花顺账号凭据；本页面不会记录任何密码或按键内容。</p>
     <section className="admin-controls"><div><h2>人工接管</h2><p>{locked ? '当前会话正在控制设备。' : '设备未由当前会话接管。'}</p></div><div className="button-row">{locked ? <button className="secondary" onClick={() => changeLock('release')}>交还控制</button> : <button onClick={() => changeLock('acquire')}>接管设备</button>}<button className="secondary" onClick={refreshHealth}>刷新运行端状态</button></div></section>
     <section className="admin-controls"><div><h2>队列</h2><p>{queue?.paused ? '队列已暂停；已领取的任务会继续完成。' : '队列正在接收 Runner 的 FIFO 任务。'}</p></div><div className="button-row">{queue?.paused ? <button className="secondary" onClick={() => changeQueue('resume')}>恢复队列</button> : <button className="secondary" onClick={() => changeQueue('pause')} disabled={!queue}>暂停队列</button>}</div></section>
-    {message && <p className={message.includes('获得') || message.includes('交还') ? 'success-message' : 'error'} role="status">{message}</p>}
+    <section className="admin-controls"><div><h2>恢复等待任务</h2><p>完成设备登录、验证或权限处理后，输入任务 ID 重新排入 FIFO 队列。</p></div><form className="button-row" onSubmit={resumeWaitingJob}><label htmlFor="waiting-task">等待任务 ID</label><input id="waiting-task" value={waitingTaskId} onChange={(event) => setWaitingTaskId(event.target.value)} autoComplete="off" /><button className="secondary" type="submit" disabled={!waitingTaskId.trim()}>恢复等待任务</button></form></section>
+    {message && <p className={message.includes('获得') || message.includes('交还') || message.includes('重新') ? 'success-message' : 'error'} role="status">{message}</p>}
     <DeviceViewport locked={locked} active={health !== null} streamUrl={deviceStreamUrl} />
   </main>
 }

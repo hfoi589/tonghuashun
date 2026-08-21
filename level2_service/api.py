@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import re
 import secrets
-from asyncio import Event, TimeoutError, create_task, sleep, wait_for
+from asyncio import Event, TimeoutError, create_task, get_running_loop, sleep, wait_for
 from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
@@ -13,11 +13,12 @@ from typing import AsyncIterator, Optional
 
 from fastapi import Depends, FastAPI, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, StreamingResponse
+from starlette.websockets import WebSocketState
 from pydantic import BaseModel, Field, field_validator
 
 from .models import CaptureKind, CaptureStatus, TaskRecord, TaskStatus, utc_now
 from .queue import InMemoryStreams, QueueFullError, TaskStore
-from .runner import ADBDeviceBridge, DeviceBridge, RunnerControl, jpeg_base64
+from .runner import ADBDeviceBridge, DeviceBridge, FrameThrottle, RunnerControl, jpeg_base64
 from .security import AdminSessionManager
 
 
@@ -190,6 +191,7 @@ def create_app(
 
     @app.post("/api/admin/session/logout", status_code=204)
     def admin_logout(response: Response, session=Depends(require_csrf)) -> None:
+        app.state.runner_control.disconnect_session(session.session_id)
         app.state.admin_sessions.revoke(session.session_id)
         response.delete_cookie("ths_admin_session", httponly=True, samesite="strict", secure=True)
         response.delete_cookie("ths_csrf", httponly=False, samesite="strict", secure=True)
@@ -214,6 +216,17 @@ def create_app(
             raise HTTPException(status_code=409, detail="runner lock is not owned by this admin")
         return LockResponse(locked=False)
 
+    @app.post("/api/admin/jobs/{public_id}/resume", response_model=TaskResponse)
+    def resume_waiting_job(public_id: str, _session=Depends(require_csrf)) -> TaskResponse:
+        task = app.state.store.get(public_id)
+        if task is None:
+            raise HTTPException(status_code=404, detail="task not found")
+        try:
+            resumed = app.state.store.requeue_waiting(public_id)
+        except ValueError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from None
+        return TaskResponse.model_validate(resumed.as_public())
+
     @app.get("/api/admin/queue", response_model=QueueResponse)
     def queue_status(_session=Depends(require_admin)) -> QueueResponse:
         return QueueResponse(paused=app.state.runner_control.queue_paused)
@@ -237,31 +250,53 @@ def create_app(
         await websocket.accept()
         control = app.state.runner_control
         bridge = app.state.device_bridge
-        sequence = 0
+        loop = get_running_loop()
+        unregister_socket = control.register_socket(
+            session.session_id,
+            lambda: loop.call_soon_threadsafe(lambda: create_task(_close_device_socket(websocket, 1008))),
+        )
+        throttle = FrameThrottle()
+        last_input_sequence = 0
+        frame_sequence = 0
         await websocket.send_json(control.status(session.session_id))
+        throttle.mark_sent()
         try:
             while True:
+                if not control.session_connected(session.session_id) or app.state.admin_sessions.valid_session(session.session_id) is None:
+                    await _close_device_socket(websocket, 1008)
+                    return
                 try:
-                    raw = await wait_for(websocket.receive_json(), timeout=0.25)
+                    raw = await wait_for(websocket.receive_json(), timeout=throttle.wait_seconds())
                 except TimeoutError:
                     raw = None
                 if raw is not None:
-                    event = _validated_input(raw)
-                    if event is None:
-                        await websocket.close(code=1003)
+                    if not control.session_connected(session.session_id) or app.state.admin_sessions.valid_session(session.session_id) is None:
+                        await _close_device_socket(websocket, 1008)
                         return
+                    event = _validated_input(raw)
+                    input_sequence = raw.get("sequence") if isinstance(raw, dict) else None
+                    if event is None or not isinstance(input_sequence, int) or input_sequence <= last_input_sequence:
+                        await _close_device_socket(websocket, 1003)
+                        return
+                    last_input_sequence = input_sequence
                     if control.authorizes_input(session.session_id):
                         _forward_input(bridge, event)
+                    continue
                 try:
                     encoded = jpeg_base64(bridge.screenshot_png())
                 except Exception:
-                    encoded = None
-                if encoded is not None:
-                    sequence += 1
-                    await websocket.send_json({"type": "frame", "encoding": "jpeg", "sequence": sequence, "capturedAt": utc_now().isoformat(), "data": encoded})
+                    control.heartbeat("OFFLINE")
+                    await websocket.send_json(control.status(session.session_id))
+                    throttle.mark_sent()
+                    continue
+                throttle.mark_sent()
+                frame_sequence += 1
+                await websocket.send_json({"type": "frame", "encoding": "jpeg", "sequence": frame_sequence, "capturedAt": utc_now().isoformat(), "data": encoded})
                 await websocket.send_json(control.status(session.session_id))
         except WebSocketDisconnect:
             return
+        finally:
+            unregister_socket()
 
     return app
 
@@ -283,6 +318,16 @@ def _validated_input(value: object) -> dict | None:
     elif not isinstance(event.get("key"), str) or event.get("action") not in {"down", "up"}:
         return None
     return event
+
+
+async def _close_device_socket(websocket: WebSocket, code: int) -> None:
+    """Close once: logout and the loop may observe the same revocation."""
+    if websocket.application_state != WebSocketState.CONNECTED:
+        return
+    try:
+        await websocket.close(code=code)
+    except (RuntimeError, WebSocketDisconnect):
+        return
 
 
 def _normalised(value: object) -> bool:

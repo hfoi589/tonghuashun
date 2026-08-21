@@ -75,6 +75,19 @@ def test_runner_marks_login_requirement_waiting_for_admin(tmp_path: Path) -> Non
     assert task.error_code == "WAITING_ADMIN"
 
 
+def test_waiting_admin_task_can_be_requeued_and_run_after_intervention(tmp_path: Path) -> None:
+    """A human-cleared login gate must not strand the claimed FIFO task forever."""
+    store = InMemoryStreams()
+    store.enqueue(TaskRecord(task_id="recover-task", symbol="SZ.000001"))
+    blocked = Level2Runner(store, Level2Navigator(FakeDeviceBridge(symbol="SZ.000001", failures=[NeedsAdminError("login")])), tmp_path, RunnerControl()).run_once()
+
+    assert blocked is not None and blocked.status == TaskStatus.WAITING_ADMIN
+    assert store.requeue_waiting("recover-task").status == TaskStatus.QUEUED
+    recovered = Level2Runner(store, Level2Navigator(FakeDeviceBridge(symbol="SZ.000001")), tmp_path, RunnerControl()).run_once()
+
+    assert recovered is not None and recovered.status == TaskStatus.COMPLETED
+
+
 def test_runner_keeps_completed_tabs_when_a_later_tab_fails(tmp_path: Path) -> None:
     """Successful verified screens remain available when one later tab is unavailable."""
     store = InMemoryStreams()

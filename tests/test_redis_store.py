@@ -20,6 +20,7 @@ class FakeRedis:
     def get(self, key): return self.values.get(key)
     def delete(self, key): self.values.pop(key, None)
     def rpush(self, key, value): self.lists.setdefault(key, []).append(value)
+    def lpush(self, key, value): self.lists.setdefault(key, []).insert(0, value)
     def sadd(self, key, value): self.sets.setdefault(key, set()).add(value)
     def srem(self, key, value): self.sets.setdefault(key, set()).discard(value)
     def smembers(self, key): return self.sets.get(key, set())
@@ -50,7 +51,7 @@ def test_redis_store_exposes_the_full_task_store_contract() -> None:
     """A partial adapter cannot back production routes when Redis is configured."""
     store = RedisStreamsStore(FakeRedis())
 
-    for method in ("enqueue", "get", "transition", "complete_capture", "events_after", "cleanup", "next_queued"):
+    for method in ("enqueue", "get", "transition", "complete_capture", "events_after", "cleanup", "next_queued", "requeue_waiting"):
         assert callable(getattr(store, method, None))
 
 

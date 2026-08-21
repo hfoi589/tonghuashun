@@ -33,8 +33,8 @@ class TaskStore(Protocol):
 _ALLOWED_TRANSITIONS = {
     TaskStatus.QUEUED: {TaskStatus.RUNNING, TaskStatus.FAILED},
     TaskStatus.RUNNING: {TaskStatus.WAITING_ADMIN, TaskStatus.PARTIAL, TaskStatus.COMPLETED, TaskStatus.FAILED},
-    TaskStatus.WAITING_ADMIN: {TaskStatus.RUNNING, TaskStatus.FAILED},
-    TaskStatus.PARTIAL: {TaskStatus.RUNNING, TaskStatus.COMPLETED, TaskStatus.FAILED},
+    TaskStatus.WAITING_ADMIN: {TaskStatus.RUNNING, TaskStatus.PARTIAL, TaskStatus.FAILED},
+    TaskStatus.PARTIAL: {TaskStatus.RUNNING, TaskStatus.WAITING_ADMIN, TaskStatus.COMPLETED, TaskStatus.FAILED},
     TaskStatus.COMPLETED: set(),
     TaskStatus.FAILED: set(),
     TaskStatus.EXPIRED: set(),

@@ -27,6 +27,7 @@ describe('AdminPage', () => {
       .mockResolvedValueOnce(new Response(null, { status: 204 }))
       .mockResolvedValueOnce(jsonResponse({ state: 'OFFLINE', last_heartbeat: null }))
       .mockResolvedValueOnce(jsonResponse({ locked: false }))
+      .mockResolvedValueOnce(jsonResponse({ paused: false }))
       .mockResolvedValueOnce(jsonResponse({ locked: true }))
 
     const user = userEvent.setup()
@@ -45,20 +46,26 @@ describe('AdminPage', () => {
     expect(screen.getByText('密码仅用于本次请求，不会记录或展示。')).toBeInTheDocument()
   })
 
-  it('keeps unavailable queue controls disabled until Runner endpoints exist', async () => {
+  it('pauses the queue through the protected Runner endpoint', async () => {
     vi.mocked(fetch)
       .mockResolvedValueOnce(new Response(null, { status: 204 }))
       .mockResolvedValueOnce(jsonResponse({ state: 'OFFLINE', last_heartbeat: null }))
       .mockResolvedValueOnce(jsonResponse({ locked: false }))
+      .mockResolvedValueOnce(jsonResponse({ paused: false }))
+      .mockResolvedValueOnce(jsonResponse({ paused: true }))
 
     const user = userEvent.setup()
     render(<AdminPage />)
     await user.type(screen.getByLabelText('管理员密码'), 'never-display-this')
     await user.click(screen.getByRole('button', { name: '登录管理台' }))
 
-    await waitFor(() => expect(screen.getByRole('button', { name: '暂停队列' })).toBeDisabled())
-    expect(screen.getByRole('button', { name: '恢复队列' })).toBeDisabled()
-    expect(screen.getByText('队列控制不可用，等待 Runner 端点接入。')).toBeInTheDocument()
+    await waitFor(() => expect(screen.getByRole('button', { name: '暂停队列' })).toBeEnabled())
+    await user.click(screen.getByRole('button', { name: '暂停队列' }))
+    await waitFor(() => expect(screen.getByText('队列已暂停')).toBeInTheDocument())
+    expect(fetch).toHaveBeenLastCalledWith('/api/admin/queue/pause', expect.objectContaining({
+      method: 'POST',
+      headers: expect.objectContaining({ 'X-CSRF-Token': 'test-csrf' }),
+    }))
   })
 
   it('clears the local lock and closes the device stream when health refresh fails', async () => {
@@ -79,6 +86,7 @@ describe('AdminPage', () => {
       .mockResolvedValueOnce(new Response(null, { status: 204 }))
       .mockResolvedValueOnce(jsonResponse({ state: 'ONLINE', last_heartbeat: null }))
       .mockResolvedValueOnce(jsonResponse({ locked: false }))
+      .mockResolvedValueOnce(jsonResponse({ paused: false }))
       .mockResolvedValueOnce(jsonResponse({ locked: true }))
       .mockRejectedValueOnce(new Error('admin authentication required'))
 

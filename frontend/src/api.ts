@@ -22,10 +22,15 @@ export interface Job {
 export interface RunnerHealth {
   state: string
   last_heartbeat: string | null
+  queue_paused: boolean
 }
 
 export interface LockState {
   locked: boolean
+}
+
+export interface QueueState {
+  paused: boolean
 }
 
 export class ApiError extends Error {
@@ -63,6 +68,15 @@ export const api = {
   }),
   runner: () => request<RunnerHealth>('/api/admin/runner'),
   lock: () => request<LockState>('/api/admin/lock'),
+  queue: () => request<QueueState>('/api/admin/queue'),
+  pauseQueue: (csrfToken: string) => request<QueueState>('/api/admin/queue/pause', {
+    method: 'POST',
+    headers: { 'X-CSRF-Token': csrfToken },
+  }),
+  resumeQueue: (csrfToken: string) => request<QueueState>('/api/admin/queue/resume', {
+    method: 'POST',
+    headers: { 'X-CSRF-Token': csrfToken },
+  }),
   acquireLock: (csrfToken: string) => request<LockState>('/api/admin/lock/acquire', {
     method: 'POST',
     headers: { 'X-CSRF-Token': csrfToken },

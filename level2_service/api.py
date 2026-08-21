@@ -11,13 +11,13 @@ from datetime import datetime
 from pathlib import Path
 from typing import AsyncIterator, Optional
 
-from fastapi import Depends, FastAPI, HTTPException, Request, Response
+from fastapi import Depends, FastAPI, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field, field_validator
 
 from .models import CaptureKind, CaptureStatus, TaskRecord, TaskStatus, utc_now
 from .queue import InMemoryStreams, QueueFullError, TaskStore
-from .runner import RunnerControl
+from .runner import ADBDeviceBridge, DeviceBridge, RunnerControl, jpeg_base64
 from .security import AdminSessionManager
 
 
@@ -56,10 +56,15 @@ class TaskResponse(BaseModel):
 class RunnerHealthResponse(BaseModel):
     state: str
     last_heartbeat: Optional[datetime]
+    queue_paused: bool
 
 
 class LockResponse(BaseModel):
     locked: bool
+
+
+class QueueResponse(BaseModel):
+    paused: bool
 
 
 def create_app(
@@ -68,6 +73,7 @@ def create_app(
     admin_password_hash: str | None = None,
     capture_root: Path | None = None,
     cleanup_interval_seconds: float = 60.0,
+    device_bridge: DeviceBridge | None = None,
 ) -> FastAPI:
     """Build an isolated application instance for one service process."""
     if cleanup_interval_seconds <= 0:
@@ -97,6 +103,7 @@ def create_app(
     app.state.store = store or InMemoryStreams()
     app.state.admin_sessions = AdminSessionManager(admin_password_hash)
     app.state.runner_control = RunnerControl()
+    app.state.device_bridge = device_bridge or ADBDeviceBridge()
     app.state.capture_root = (capture_root or Path("captures")).resolve()
     set_capture_root = getattr(app.state.store, "set_capture_root", None)
     if callable(set_capture_root):
@@ -207,4 +214,86 @@ def create_app(
             raise HTTPException(status_code=409, detail="runner lock is not owned by this admin")
         return LockResponse(locked=False)
 
+    @app.get("/api/admin/queue", response_model=QueueResponse)
+    def queue_status(_session=Depends(require_admin)) -> QueueResponse:
+        return QueueResponse(paused=app.state.runner_control.queue_paused)
+
+    @app.post("/api/admin/queue/pause", response_model=QueueResponse)
+    def pause_queue(_session=Depends(require_csrf)) -> QueueResponse:
+        app.state.runner_control.pause_queue()
+        return QueueResponse(paused=True)
+
+    @app.post("/api/admin/queue/resume", response_model=QueueResponse)
+    def resume_queue(_session=Depends(require_csrf)) -> QueueResponse:
+        app.state.runner_control.resume_queue()
+        return QueueResponse(paused=False)
+
+    @app.websocket("/api/admin/device")
+    async def device_stream(websocket: WebSocket) -> None:
+        session = app.state.admin_sessions.valid_session(websocket.cookies.get("ths_admin_session"))
+        if session is None:
+            await websocket.close(code=1008)
+            return
+        await websocket.accept()
+        control = app.state.runner_control
+        bridge = app.state.device_bridge
+        sequence = 0
+        await websocket.send_json(control.status(session.session_id))
+        try:
+            while True:
+                try:
+                    raw = await wait_for(websocket.receive_json(), timeout=0.25)
+                except TimeoutError:
+                    raw = None
+                if raw is not None:
+                    event = _validated_input(raw)
+                    if event is None:
+                        await websocket.close(code=1003)
+                        return
+                    if control.authorizes_input(session.session_id):
+                        _forward_input(bridge, event)
+                try:
+                    encoded = jpeg_base64(bridge.screenshot_png())
+                except Exception:
+                    encoded = None
+                if encoded is not None:
+                    sequence += 1
+                    await websocket.send_json({"type": "frame", "encoding": "jpeg", "sequence": sequence, "capturedAt": utc_now().isoformat(), "data": encoded})
+                await websocket.send_json(control.status(session.session_id))
+        except WebSocketDisconnect:
+            return
+
     return app
+
+
+def _validated_input(value: object) -> dict | None:
+    """Validate the documented input envelope without retaining key values."""
+    if not isinstance(value, dict) or value.get("type") != "input" or not isinstance(value.get("sequence"), int):
+        return None
+    event = value.get("event")
+    if not isinstance(event, dict) or event.get("kind") not in {"tap", "swipe", "key"}:
+        return None
+    kind = event["kind"]
+    if kind == "tap":
+        if not _normalised(event.get("x")) or not _normalised(event.get("y")):
+            return None
+    elif kind == "swipe":
+        if not all(_normalised(event.get(field)) for field in ("startX", "startY", "endX", "endY")):
+            return None
+    elif not isinstance(event.get("key"), str) or event.get("action") not in {"down", "up"}:
+        return None
+    return event
+
+
+def _normalised(value: object) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and 0 <= value <= 1
+
+
+def _forward_input(bridge: DeviceBridge, event: dict) -> None:
+    """Dispatch only normalised events; deliberately do not log keyboard payloads."""
+    if event["kind"] == "tap":
+        bridge.tap(float(event["x"]), float(event["y"]))
+    elif event["kind"] == "swipe":
+        bridge.swipe(float(event["startX"]), float(event["startY"]), float(event["endX"]), float(event["endY"]))
+    else:
+        bridge.key(event["key"], event["action"])

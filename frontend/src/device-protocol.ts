@@ -12,10 +12,13 @@ export interface DeviceFrame {
 
 export interface RunnerStatus {
   type: 'runner_status'
-  state: string
+  state: RunnerState
   locked: boolean
   sequence?: number
 }
+
+export type RunnerState = 'BOOTING' | 'READY' | 'ADMIN_CONTROL' | 'NEEDS_ADMIN' | 'OFFLINE'
+const runnerStates: ReadonlySet<string> = new Set(['BOOTING', 'READY', 'ADMIN_CONTROL', 'NEEDS_ADMIN', 'OFFLINE'])
 
 export type DeviceInputEvent =
   | { kind: 'tap'; x: number; y: number }
@@ -37,8 +40,9 @@ export function parseDeviceServerMessage(value: unknown): DeviceServerMessage | 
   if (message.type === 'frame' && message.encoding === 'jpeg' && typeof sequence === 'number' && typeof message.capturedAt === 'string' && typeof message.data === 'string') {
     return { type: 'frame', encoding: 'jpeg', sequence, capturedAt: message.capturedAt, data: message.data }
   }
-  if (message.type === 'runner_status' && typeof message.state === 'string' && typeof message.locked === 'boolean' && (sequence === undefined || typeof sequence === 'number')) {
-    return sequence === undefined ? { type: 'runner_status', state: message.state, locked: message.locked } : { type: 'runner_status', state: message.state, locked: message.locked, sequence }
+  if (message.type === 'runner_status' && typeof message.state === 'string' && runnerStates.has(message.state) && typeof message.locked === 'boolean' && (sequence === undefined || typeof sequence === 'number')) {
+    const state = message.state as RunnerState
+    return sequence === undefined ? { type: 'runner_status', state, locked: message.locked } : { type: 'runner_status', state, locked: message.locked, sequence }
   }
   return undefined
 }

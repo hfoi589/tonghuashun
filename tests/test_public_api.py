@@ -18,11 +18,34 @@ def test_public_submission_accepts_a_six_digit_a_share_symbol() -> None:
     assert body["captures"][0]["expires_at"] is None
 
 
-def test_public_submission_rejects_non_a_share_symbols() -> None:
-    """Relaxing symbol validation would send ambiguous input to the Android runner."""
+def test_public_submission_normalizes_app_searchable_symbols_before_queueing() -> None:
+    """Passing raw user spelling to the runner would make an exact app search unsafe."""
+    store = InMemoryStreams()
+    client = TestClient(create_app(store=store))
+
+    response = client.post("/api/v1/jobs", json={"symbol": "  aapl.us  "})
+
+    assert response.status_code == 202
+    public_id = response.json()["public_id"]
+    assert response.json()["symbol"] == "AAPL.US"
+    assert store.get(public_id).symbol == "AAPL.US"
+
+
+def test_symbol_length_is_checked_after_trimming() -> None:
+    """Applying the length bound to raw padding would reject a valid exact search code."""
     client = TestClient(create_app())
 
-    response = client.post("/api/v1/jobs", json={"symbol": "ABC123"})
+    response = client.post("/api/v1/jobs", json={"symbol": f"{' ' * 20}brk.b{' ' * 20}"})
+
+    assert response.status_code == 202
+    assert response.json()["symbol"] == "BRK.B"
+
+
+def test_public_submission_rejects_symbols_outside_the_app_search_alphabet() -> None:
+    """Accepting separators outside the approved alphabet could alter an exact app search."""
+    client = TestClient(create_app())
+
+    response = client.post("/api/v1/jobs", json={"symbol": "AAPL/US"})
 
     assert response.status_code == 422
 

@@ -5,8 +5,9 @@
 - FastAPI public API: `POST /api/v1/jobs`, `GET /api/v1/jobs/{public_id}`, SSE at
   `GET /api/v1/jobs/{public_id}/events` (including reconnect cursor), and capture delivery at
   `GET /api/v1/jobs/{public_id}/captures/{kind}`.
-- Opaque `secrets.token_urlsafe(24)` public IDs; six-digit A-share validation
-  (`0`, `3`, or `6` prefix); typed Pydantic request/response models.
+- Opaque `secrets.token_urlsafe(24)` public IDs; normalized App-searchable
+  symbols (trimmed, uppercased, 1–16 characters from `A-Z`, `0-9`, `.`, `_`,
+  and `-`); typed Pydantic request/response models.
 - Domain enums: `LARGE_ORDER_NET`, `LARGE_ORDER_AMOUNT`, `RETAIL_COUNT`, and
   `QUEUED`, `RUNNING`, `WAITING_ADMIN`, `COMPLETED`, `PARTIAL`, `FAILED`, `EXPIRED`.
 - A `TaskStore` interface, deterministic `InMemoryStreams` fake, and a complete
@@ -47,7 +48,7 @@ Run from the project virtual environment:
 
 ```text
 .venv/bin/python -m pytest -q
-26 passed
+28 passed
 
 .venv/bin/python -m compileall -q level2_service
 git diff --check
@@ -93,3 +94,16 @@ The emitted task statuses are exactly `QUEUED`, `RUNNING`, `WAITING_ADMIN`,
 `COMPLETED`, `PARTIAL`, `FAILED`, and `EXPIRED`. Capture expiry is calculated
 as `captured_at + 24 hours`; after a capture expires the task is marked
 `EXPIRED` until its metadata is removed at the seven-day limit.
+
+## Approved symbol-contract update (2026-08-21)
+
+The public request validator was changed from six-digit A-share-only input to
+the approved App-searchable form. It trims and uppercases input, then requires
+an exact 1–16-character match against `[A-Z0-9._-]`. The normalized value is
+the only value stored in `TaskRecord` and handed to the future runner; no fuzzy
+matching, tokenization, or runner behavior was added.
+
+| Cycle | RED evidence | GREEN evidence |
+|---|---|---|
+| Normalized public symbol | `pytest tests/test_public_api.py -q` → expected 202 for `  aapl.us  `, got 422 | same focused suite → 5 passed; API and queued record both contain exact `AAPL.US` |
+| Trim-before-length rule | focused suite → padded `brk.b` was rejected with 422 because the raw-length Field bound ran first | focused suite → 6 passed after moving the 1–16 bound to the normalized validator |

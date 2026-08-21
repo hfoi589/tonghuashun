@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import secrets
 from asyncio import Event, TimeoutError, create_task, sleep, wait_for
 from contextlib import asynccontextmanager
@@ -12,7 +13,7 @@ from typing import AsyncIterator, Optional
 
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.responses import FileResponse, StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from .models import CaptureKind, CaptureStatus, TaskRecord, TaskStatus, utc_now
 from .queue import InMemoryStreams, QueueFullError, TaskStore
@@ -21,7 +22,15 @@ from .security import AdminSessionManager
 
 
 class SubmitTask(BaseModel):
-    symbol: str = Field(pattern=r"^(?:0|3|6)\d{5}$")
+    symbol: str
+
+    @field_validator("symbol")
+    @classmethod
+    def normalize_app_search_symbol(cls, value: str) -> str:
+        normalized = value.strip().upper()
+        if not re.fullmatch(r"[A-Z0-9._-]{1,16}", normalized):
+            raise ValueError("symbol must be 1-16 App-searchable characters")
+        return normalized
 
 
 class LoginRequest(BaseModel):

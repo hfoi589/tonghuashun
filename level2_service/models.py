@@ -29,9 +29,10 @@ class TaskStatus(str, Enum):
     QUEUED = "QUEUED"
     RUNNING = "RUNNING"
     WAITING_ADMIN = "WAITING_ADMIN"
+    COMPLETED = "COMPLETED"
     PARTIAL = "PARTIAL"
-    SUCCEEDED = "SUCCEEDED"
     FAILED = "FAILED"
+    EXPIRED = "EXPIRED"
 
 
 @dataclass
@@ -40,6 +41,10 @@ class CaptureRecord:
     status: CaptureStatus = CaptureStatus.PENDING
     path: Path | None = None
     captured_at: datetime | None = None
+
+    @property
+    def expires_at(self) -> datetime | None:
+        return self.captured_at + timedelta(hours=24) if self.captured_at else None
 
 
 @dataclass
@@ -56,28 +61,28 @@ class TaskRecord:
     )
 
     @property
-    def capture_expires_at(self) -> datetime:
-        return self.created_at + timedelta(hours=24)
-
-    @property
     def metadata_expires_at(self) -> datetime:
         return self.created_at + timedelta(days=7)
 
     def as_public(self) -> dict[str, Any]:
         return {
-            "task_id": self.task_id,
+            "public_id": self.task_id,
             "symbol": self.symbol,
             "status": self.status.value,
             "error_code": self.error_code,
             "created_at": self.created_at.isoformat(),
-            "capture_expires_at": self.capture_expires_at.isoformat(),
             "captures": [
                 {
                     "kind": kind.value,
                     "status": self.captures[kind].status.value,
                     "url": (
-                        f"/api/tasks/{self.task_id}/captures/{kind.value}"
+                        f"/api/v1/jobs/{self.task_id}/captures/{kind.value}"
                         if self.captures[kind].status == CaptureStatus.READY
+                        else None
+                    ),
+                    "expires_at": (
+                        self.captures[kind].expires_at.isoformat()
+                        if self.captures[kind].expires_at
                         else None
                     ),
                 }

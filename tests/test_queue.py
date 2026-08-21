@@ -16,14 +16,14 @@ def test_queue_returns_oldest_queued_task_first() -> None:
 
 
 def test_queue_rejects_invalid_state_transition() -> None:
-    """Allowing QUEUED directly to SUCCEEDED would publish unverified results."""
+    """Allowing QUEUED directly to COMPLETED would publish unverified results."""
     store = InMemoryStreams()
     store.enqueue(TaskRecord(task_id="task", symbol="600938"))
 
     try:
-        store.transition("task", TaskStatus.SUCCEEDED)
+        store.transition("task", TaskStatus.COMPLETED)
     except ValueError as error:
-        assert str(error) == "QUEUED cannot transition to SUCCEEDED"
+        assert str(error) == "QUEUED cannot transition to COMPLETED"
     else:
         raise AssertionError("invalid transition was accepted")
 
@@ -42,7 +42,7 @@ def test_one_finished_capture_makes_task_partial_until_all_three_are_ready() -> 
 
     store.complete_capture("task", CaptureKind.LARGE_ORDER_AMOUNT, "/tmp/amount.png")
     complete = store.complete_capture("task", CaptureKind.RETAIL_COUNT, "/tmp/retail.png")
-    assert complete.status == TaskStatus.SUCCEEDED
+    assert complete.status.value == "COMPLETED"
 
 
 def test_retention_expires_captures_after_24_hours_then_removes_metadata_after_7_days() -> None:
@@ -53,8 +53,13 @@ def test_retention_expires_captures_after_24_hours_then_removes_metadata_after_7
     store.transition("task", TaskStatus.RUNNING)
     store.complete_capture("task", CaptureKind.LARGE_ORDER_NET, "/tmp/net.png")
 
-    assert store.cleanup(task.created_at + timedelta(hours=24, seconds=1)) == []
+    task.captures[CaptureKind.LARGE_ORDER_NET].captured_at = task.created_at + timedelta(hours=23)
+    assert store.cleanup(task.created_at + timedelta(hours=25, seconds=1)) == []
+    assert task.captures[CaptureKind.LARGE_ORDER_NET].status == CaptureStatus.READY
+    assert task.status.value != "EXPIRED"
+    assert store.cleanup(task.created_at + timedelta(hours=47, seconds=1)) == []
     assert task.captures[CaptureKind.LARGE_ORDER_NET].status == CaptureStatus.EXPIRED
+    assert task.status.value == "EXPIRED"
     assert store.cleanup(task.created_at + timedelta(days=7, seconds=1)) == [task]
     assert store.get("task") is None
 
@@ -75,3 +80,17 @@ def test_capture_completion_requires_the_runner_to_claim_the_task() -> None:
 
     with pytest.raises(ValueError, match="QUEUED cannot accept a capture"):
         store.complete_capture("task", CaptureKind.LARGE_ORDER_NET, "/tmp/net.png")
+
+
+def test_next_queued_atomically_claims_the_oldest_job() -> None:
+    """Returning a queued job twice lets concurrent runners capture the same request."""
+    store = InMemoryStreams()
+    store.enqueue(TaskRecord(task_id="first", symbol="600938"))
+    store.enqueue(TaskRecord(task_id="second", symbol="000001"))
+
+    first = store.next_queued()
+    second = store.next_queued()
+
+    assert first.task_id == "first"
+    assert first.status == TaskStatus.RUNNING
+    assert second.task_id == "second"

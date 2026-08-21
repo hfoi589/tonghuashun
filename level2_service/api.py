@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import json
 import secrets
-from asyncio import sleep
+from asyncio import Event, TimeoutError, create_task, sleep, wait_for
+from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import AsyncIterator, Optional
@@ -13,7 +14,7 @@ from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
-from .models import CaptureKind, CaptureStatus, TaskRecord, TaskStatus
+from .models import CaptureKind, CaptureStatus, TaskRecord, TaskStatus, utc_now
 from .queue import InMemoryStreams, QueueFullError, TaskStore
 from .runner import RunnerControl
 from .security import AdminSessionManager
@@ -31,15 +32,15 @@ class CaptureResponse(BaseModel):
     kind: CaptureKind
     status: CaptureStatus
     url: Optional[str]
+    expires_at: Optional[datetime]
 
 
 class TaskResponse(BaseModel):
-    task_id: str
+    public_id: str
     symbol: str
     status: TaskStatus
     error_code: Optional[str]
     created_at: datetime
-    capture_expires_at: datetime
     captures: list[CaptureResponse]
 
 
@@ -57,15 +58,40 @@ def create_app(
     store: TaskStore | None = None,
     admin_password_hash: str | None = None,
     capture_root: Path | None = None,
+    cleanup_interval_seconds: float = 60.0,
 ) -> FastAPI:
     """Build an isolated application instance for one service process."""
-    app = FastAPI(title="THS Level2 Capture Service")
+    if cleanup_interval_seconds <= 0:
+        raise ValueError("cleanup_interval_seconds must be positive")
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+        stop = Event()
+
+        async def retention_loop() -> None:
+            while not stop.is_set():
+                app.state.store.cleanup(utc_now())
+                try:
+                    await wait_for(stop.wait(), timeout=cleanup_interval_seconds)
+                except TimeoutError:
+                    continue
+
+        app.state.cleanup_stop = stop
+        app.state.cleanup_task = create_task(retention_loop())
+        try:
+            yield
+        finally:
+            stop.set()
+            await app.state.cleanup_task
+
+    app = FastAPI(title="THS Level2 Capture Service", lifespan=lifespan)
     app.state.store = store or InMemoryStreams()
     app.state.admin_sessions = AdminSessionManager(admin_password_hash)
     app.state.runner_control = RunnerControl()
     app.state.capture_root = (capture_root or Path("captures")).resolve()
-    if isinstance(app.state.store, InMemoryStreams):
-        app.state.store.set_capture_root(app.state.capture_root)
+    set_capture_root = getattr(app.state.store, "set_capture_root", None)
+    if callable(set_capture_root):
+        set_capture_root(app.state.capture_root)
 
     def require_admin(request: Request):
         session = app.state.admin_sessions.valid_session(request.cookies.get("ths_admin_session"))
@@ -78,7 +104,7 @@ def create_app(
             raise HTTPException(status_code=403, detail="CSRF token required")
         return session
 
-    @app.post("/api/tasks", status_code=202, response_model=TaskResponse)
+    @app.post("/api/v1/jobs", status_code=202, response_model=TaskResponse)
     def submit_task(payload: SubmitTask) -> TaskResponse:
         task = TaskRecord(task_id=secrets.token_urlsafe(24), symbol=payload.symbol)
         try:
@@ -87,16 +113,16 @@ def create_app(
             raise HTTPException(status_code=429, detail="queue is full") from None
         return TaskResponse.model_validate(task.as_public())
 
-    @app.get("/api/tasks/{task_id}", response_model=TaskResponse)
-    def get_task(task_id: str) -> TaskResponse:
-        task = app.state.store.get(task_id)
+    @app.get("/api/v1/jobs/{public_id}", response_model=TaskResponse)
+    def get_task(public_id: str) -> TaskResponse:
+        task = app.state.store.get(public_id)
         if task is None:
             raise HTTPException(status_code=404, detail="task not found")
         return TaskResponse.model_validate(task.as_public())
 
-    @app.get("/api/tasks/{task_id}/captures/{kind}")
-    def get_capture(task_id: str, kind: CaptureKind):
-        task = app.state.store.get(task_id)
+    @app.get("/api/v1/jobs/{public_id}/captures/{kind}")
+    def get_capture(public_id: str, kind: CaptureKind):
+        task = app.state.store.get(public_id)
         if task is None:
             raise HTTPException(status_code=404, detail="task not found")
         capture = task.captures[kind]
@@ -113,18 +139,18 @@ def create_app(
             raise HTTPException(status_code=404, detail="capture is not available")
         return FileResponse(path, media_type="image/png")
 
-    @app.get("/api/tasks/{task_id}/events")
-    async def task_events(task_id: str, request: Request, after: int = 0, once: bool = False):
-        task = app.state.store.get(task_id)
+    @app.get("/api/v1/jobs/{public_id}/events")
+    async def task_events(public_id: str, request: Request, after: int = 0, once: bool = False):
+        task = app.state.store.get(public_id)
         if task is None:
             raise HTTPException(status_code=404, detail="task not found")
 
         async def event_stream() -> AsyncIterator[str]:
             event_index = after
             while not await request.is_disconnected():
-                events = app.state.store.events_after(task_id, event_index)
+                events = app.state.store.events_after(public_id, event_index)
                 for event in events:
-                    payload = json.dumps({"task_id": task_id, "status": event["data"]})
+                    payload = json.dumps({"public_id": public_id, "status": event["data"]})
                     yield f"event: {event['event']}\ndata: {payload}\n\n"
                 event_index += len(events)
                 if once:

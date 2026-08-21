@@ -2,16 +2,16 @@
 
 ## Delivered
 
-- FastAPI public API: `POST /api/tasks`, `GET /api/tasks/{task_id}`, SSE at
-  `GET /api/tasks/{task_id}/events` (including reconnect cursor), and capture delivery at
-  `GET /api/tasks/{task_id}/captures/{kind}`.
-- Opaque `secrets.token_urlsafe(24)` task IDs; six-digit A-share validation
+- FastAPI public API: `POST /api/v1/jobs`, `GET /api/v1/jobs/{public_id}`, SSE at
+  `GET /api/v1/jobs/{public_id}/events` (including reconnect cursor), and capture delivery at
+  `GET /api/v1/jobs/{public_id}/captures/{kind}`.
+- Opaque `secrets.token_urlsafe(24)` public IDs; six-digit A-share validation
   (`0`, `3`, or `6` prefix); typed Pydantic request/response models.
 - Domain enums: `LARGE_ORDER_NET`, `LARGE_ORDER_AMOUNT`, `RETAIL_COUNT`, and
-  `QUEUED`, `RUNNING`, `WAITING_ADMIN`, `PARTIAL`, `SUCCEEDED`, `FAILED`.
-- A `TaskStore` interface, deterministic `InMemoryStreams` fake, and a small
-  `RedisStreamsStore` adapter boundary that appends production job events to a
-  Redis Stream. The fake has FIFO selection, a global pending cap (default
+  `QUEUED`, `RUNNING`, `WAITING_ADMIN`, `COMPLETED`, `PARTIAL`, `FAILED`, `EXPIRED`.
+- A `TaskStore` interface, deterministic `InMemoryStreams` fake, and a complete
+  `RedisStreamsStore` adapter that serializes task state, emits Redis Stream
+  events, and atomically claims FIFO work with Lua. The fake has FIFO selection, a global pending cap (default
   200), event records, transition enforcement, and partial-to-complete capture
   state handling.
 - Admin login only accepts a supplied Argon2id password hash; it creates random
@@ -47,7 +47,7 @@ Run from the project virtual environment:
 
 ```text
 .venv/bin/python -m pytest -q
-20 passed
+26 passed
 
 .venv/bin/python -m compileall -q level2_service
 git diff --check
@@ -64,3 +64,32 @@ The latter two commands completed with exit status 0.
 - The local host exposes Python 3.9; the project metadata retains the planned
   Python 3.12 minimum. Tests ran in `.venv` successfully under the local
   interpreter, using compatible syntax in FastAPI route annotations.
+
+## Review-fix evidence (2026-08-21)
+
+The review identified contract and concurrency defects in the first Task 1
+commit. Their common causes were an internal-name-first API, an in-memory-only
+queue implementation, and retention invoked only by callers. The following
+test-first corrections were made.
+
+| Fix | RED evidence | GREEN evidence |
+|---|---|---|
+| Public contract | `pytest tests/test_public_api.py -q` → 4 failures: `/api/v1/jobs` returned 404 | same command → 4 passed after `public_id` and `/api/v1/jobs` routes |
+| Capture/SSE contract | `pytest tests/test_results_delivery.py -q` → 4 failures: new capture/event routes returned 404 | capture/results suite → 9 passed after public-ID routes |
+| Exact terminal state, per-capture expiry, atomic fake claim | `pytest tests/test_queue.py -q` → 3 failures: emitted `SUCCEEDED`, expiry used task creation, and a claim stayed `QUEUED` | queue suite → 7 passed after `COMPLETED`/`EXPIRED`, capture timestamp retention, and lock-protected claim |
+| Redis adapter contract | `pytest tests/test_redis_store.py -q` → adapter lacked `enqueue` and the remaining TaskStore methods | Redis fake integration suite → 3 passed with serialization, Stream event replay, Lua `LPOP`/state-update claim, and public-route injection |
+| App-owned retention | `pytest tests/test_retention_lifecycle.py -q` → `create_app` rejected the cleanup interval and no lifecycle worker existed | lifecycle suite → 1 passed; task expires the capture and stops cleanly with `TestClient` shutdown |
+
+The public API is now exclusively:
+
+```text
+POST /api/v1/jobs
+GET  /api/v1/jobs/{public_id}
+GET  /api/v1/jobs/{public_id}/events
+GET  /api/v1/jobs/{public_id}/captures/{kind}
+```
+
+The emitted task statuses are exactly `QUEUED`, `RUNNING`, `WAITING_ADMIN`,
+`COMPLETED`, `PARTIAL`, `FAILED`, and `EXPIRED`. Capture expiry is calculated
+as `captured_at + 24 hours`; after a capture expires the task is marked
+`EXPIRED` until its metadata is removed at the seven-day limit.

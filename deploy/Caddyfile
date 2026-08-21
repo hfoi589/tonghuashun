@@ -1,0 +1,9 @@
+{$CADDY_SITE_ADDRESS::80} {
+    encode zstd gzip
+
+    @api path /api/*
+    reverse_proxy @api api:8000
+
+    try_files {path} /index.html
+    file_server
+}

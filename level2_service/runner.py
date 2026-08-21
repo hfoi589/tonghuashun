@@ -7,6 +7,7 @@ knows, records, or sends application credentials or private THS protocol data.
 from __future__ import annotations
 
 import base64
+import os
 import subprocess
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -85,17 +86,30 @@ class OpenCVTemplateFallback:
 class ADBDeviceBridge:
     """Lazy ADB bridge; importing this module never requires ADB or uiautomator2."""
 
-    def __init__(self, adb: str = "adb", serial: str | None = None, uiautomator_adapter: object | None = None) -> None:
+    def __init__(
+        self,
+        adb: str = "adb",
+        serial: str | None = None,
+        uiautomator_adapter: object | None = None,
+        environment: dict[str, str] | None = None,
+    ) -> None:
         self.adb = adb
         self.serial = serial
         self._uiautomator_adapter = uiautomator_adapter
+        self.environment = environment
 
     def _run(self, *args: str) -> bytes:
         command = [self.adb]
         if self.serial:
             command.extend(["-s", self.serial])
         command.extend(args)
-        return subprocess.run(command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE).stdout
+        return subprocess.run(
+            command,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=self.environment or os.environ.copy(),
+        ).stdout
 
     def _shell(self, *args: str) -> bytes:
         return self._run("shell", *args)

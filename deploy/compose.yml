@@ -1,0 +1,102 @@
+name: ths-level2
+
+services:
+  api:
+    build:
+      context: ..
+      target: api
+    image: ths-level2-api:local
+    restart: unless-stopped
+    env_file:
+      - path: ../.env
+        required: false
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      CAPTURE_ROOT: /data/captures
+      ADB_PATH: adb
+      ADB_SERIAL: ${ADB_SERIAL:-redroid:5555}
+      ADB_SERVER_SOCKET: ${ADB_SERVER_SOCKET:-}
+      ADB_CONNECT: ${ADB_CONNECT:-1}
+      RUNNER_POLL_INTERVAL_SECONDS: ${RUNNER_POLL_INTERVAL_SECONDS:-1}
+    depends_on:
+      redis:
+        condition: service_started
+    expose:
+      - "8000"
+    volumes:
+      - capture-data:/data/captures
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/openapi.json', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  redis:
+    image: redis:7.4-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    expose:
+      - "6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  caddy:
+    build:
+      context: ..
+      target: caddy
+    image: ths-level2-caddy:local
+    restart: unless-stopped
+    environment:
+      CADDY_SITE_ADDRESS: ${CADDY_SITE_ADDRESS:-:80}
+    depends_on:
+      api:
+        condition: service_healthy
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - caddy-data:/data
+      - caddy-config:/config
+
+  android:
+    image: redroid/redroid:13.0.0_64only-latest
+    platform: linux/amd64
+    profiles: ["linux-redroid"]
+    privileged: true
+    restart: unless-stopped
+    security_opt:
+      - apparmor=unconfined
+    devices:
+      - /dev/binder:/dev/binder
+      - /dev/hwbinder:/dev/hwbinder
+      - /dev/vndbinder:/dev/vndbinder
+    expose:
+      - "5555"
+    command:
+      - androidboot.use_memfd=1
+      - androidboot.redroid_gpu_mode=guest
+      - androidboot.redroid_width=1080
+      - androidboot.redroid_height=1920
+      - androidboot.redroid_dpi=480
+      - androidboot.redroid_fps=60
+    volumes:
+      - redroid-data:/data
+      - type: bind
+        source: /dev/binderfs
+        target: /dev/binderfs
+        bind:
+          create_host_path: false
+
+volumes:
+  capture-data:
+  redis-data:
+  redroid-data:
+  caddy-data:
+  caddy-config:

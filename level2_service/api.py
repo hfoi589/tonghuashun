@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import re
 import secrets
-from asyncio import FIRST_COMPLETED, CancelledError, Event, TimeoutError, create_task, gather, get_running_loop, sleep, wait, wait_for
+from asyncio import FIRST_COMPLETED, CancelledError, Event, TimeoutError, create_task, gather, get_running_loop, sleep, to_thread, wait, wait_for
 from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
@@ -18,7 +18,7 @@ from pydantic import BaseModel, Field, field_validator
 
 from .models import CaptureKind, CaptureStatus, TaskRecord, TaskStatus, utc_now
 from .queue import InMemoryStreams, QueueFullError, TaskStore
-from .runner import ADBDeviceBridge, DeviceBridge, RunnerControl, jpeg_base64
+from .runner import ADBDeviceBridge, DeviceBridge, Level2Runner, RunnerControl, jpeg_base64
 from .security import AdminSessionManager
 
 
@@ -75,10 +75,16 @@ def create_app(
     capture_root: Path | None = None,
     cleanup_interval_seconds: float = 60.0,
     device_bridge: DeviceBridge | None = None,
+    runner_control: RunnerControl | None = None,
+    runner: Level2Runner | None = None,
+    runner_poll_interval_seconds: float = 1.0,
+    admin_session_secret: str | None = None,
 ) -> FastAPI:
     """Build an isolated application instance for one service process."""
     if cleanup_interval_seconds <= 0:
         raise ValueError("cleanup_interval_seconds must be positive")
+    if runner_poll_interval_seconds <= 0:
+        raise ValueError("runner_poll_interval_seconds must be positive")
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
@@ -92,18 +98,35 @@ def create_app(
                 except TimeoutError:
                     continue
 
+        async def runner_loop() -> None:
+            """Run the blocking ADB worker off the API event loop until shutdown."""
+            assert runner is not None
+            while not stop.is_set():
+                try:
+                    await to_thread(runner.run_once)
+                except Exception:
+                    # Device failures are surfaced through the authenticated health API.
+                    app.state.runner_control.heartbeat("OFFLINE")
+                try:
+                    await wait_for(stop.wait(), timeout=runner_poll_interval_seconds)
+                except TimeoutError:
+                    continue
+
         app.state.cleanup_stop = stop
         app.state.cleanup_task = create_task(retention_loop())
+        app.state.runner_task = create_task(runner_loop()) if runner is not None else None
         try:
             yield
         finally:
             stop.set()
             await app.state.cleanup_task
+            if app.state.runner_task is not None:
+                await app.state.runner_task
 
     app = FastAPI(title="THS Level2 Capture Service", lifespan=lifespan)
     app.state.store = store or InMemoryStreams()
-    app.state.admin_sessions = AdminSessionManager(admin_password_hash)
-    app.state.runner_control = RunnerControl()
+    app.state.admin_sessions = AdminSessionManager(admin_password_hash, session_secret=admin_session_secret)
+    app.state.runner_control = runner_control or RunnerControl()
     app.state.device_bridge = device_bridge or ADBDeviceBridge()
     app.state.capture_root = (capture_root or Path("captures")).resolve()
     set_capture_root = getattr(app.state.store, "set_capture_root", None)

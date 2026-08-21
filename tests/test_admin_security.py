@@ -62,3 +62,22 @@ def test_admin_can_resume_a_waiting_job_with_csrf() -> None:
     response = client.post("/api/admin/jobs/waiting-job/resume", headers={"X-CSRF-Token": client.cookies.get("ths_csrf")})
     assert response.status_code == 200
     assert response.json()["status"] == "QUEUED"
+
+
+def test_logout_revokes_session_before_runner_disconnects_it() -> None:
+    """The old stream must become unauthorised before its lock-close callback runs."""
+    app = create_app(admin_password_hash=PasswordHasher().hash("admin-secret"))
+    client = TestClient(app, base_url="https://testserver")
+    assert client.post("/api/admin/session", json={"password": "admin-secret"}).status_code == 204
+    session_id = client.cookies.get("ths_admin_session")
+    observed: list[bool] = []
+    original = app.state.runner_control.disconnect_session
+
+    def checked_disconnect(value: str) -> None:
+        observed.append(app.state.admin_sessions.valid_session(value) is None)
+        original(value)
+
+    app.state.runner_control.disconnect_session = checked_disconnect
+    assert client.post("/api/admin/session/logout", headers={"X-CSRF-Token": client.cookies.get("ths_csrf")}).status_code == 204
+    assert observed == [True]
+    assert app.state.admin_sessions.valid_session(session_id) is None

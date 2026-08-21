@@ -30,7 +30,25 @@ class FakeRedis:
         entries.append((str(len(entries) + 1), fields))
         return entries[-1][0]
     def xrange(self, key, _start, _end): return self.streams.get(key, [])
-    def eval(self, _script, _keys, queue_key, prefix, event_stream, timestamp):
+    def eval(self, script, _keys, queue_key, prefix, event_stream, *args):
+        if "WAITING_ADMIN" in script:
+            task_id, timestamp = args
+            key = prefix + task_id
+            payload = self.values.get(key)
+            if not payload:
+                return False
+            task = json.loads(payload)
+            if task["status"] != "WAITING_ADMIN":
+                return False
+            task["status"] = "QUEUED"
+            task["error_code"] = None
+            task["updated_at"] = timestamp
+            updated = json.dumps(task)
+            self.values[key] = updated
+            self.lpush(queue_key, task_id)
+            self.xadd(event_stream, {"event": "status", "task_id": task_id, "data": "QUEUED"})
+            return updated
+        (timestamp,) = args
         while self.lists.get(queue_key):
             task_id = self.lists[queue_key].pop(0)
             key = prefix + task_id
@@ -77,6 +95,22 @@ def test_redis_store_persists_state_and_claims_fifo_jobs_once() -> None:
     assert second.task_id == "second"
     assert store.get("first").status == TaskStatus.PARTIAL
     assert [event["data"] for event in store.events_after("first")] == ["QUEUED", "RUNNING", "PARTIAL"]
+
+
+def test_redis_requeue_waiting_is_atomic_and_idempotent() -> None:
+    """Concurrent resume clicks must yield one pending entry and one QUEUED event."""
+    redis = FakeRedis()
+    first = RedisStreamsStore(redis)
+    second = RedisStreamsStore(redis)
+    first.enqueue(TaskRecord(task_id="waiting", symbol="SZ.000001"))
+    first.next_queued()
+    first.transition("waiting", TaskStatus.WAITING_ADMIN, error_code="WAITING_ADMIN")
+
+    assert first.requeue_waiting("waiting").status == TaskStatus.QUEUED
+    assert second.requeue_waiting("waiting").status == TaskStatus.QUEUED
+
+    assert redis.lists["ths:jobs:pending"] == ["waiting"]
+    assert [event["data"] for event in first.events_after("waiting")] == ["QUEUED", "RUNNING", "WAITING_ADMIN", "QUEUED"]
 
 
 def test_public_routes_work_when_the_redis_adapter_is_configured() -> None:

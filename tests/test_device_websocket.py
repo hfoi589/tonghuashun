@@ -3,9 +3,11 @@ from argon2 import PasswordHasher
 from base64 import b64decode
 from io import BytesIO
 from PIL import Image
+from threading import Event, Thread
+from time import monotonic, sleep
 
 from level2_service.api import create_app
-from level2_service.runner import FakeDeviceBridge, FrameThrottle, RunnerControl
+from level2_service.runner import FakeDeviceBridge, RunnerControl
 
 
 _tiny_png = BytesIO()
@@ -125,15 +127,34 @@ def test_device_websocket_rejects_duplicate_or_older_input_sequences() -> None:
     assert client.app.state.device_bridge.inputs == [("tap", 0.1, 0.2)]
 
 
-def test_frame_throttle_allows_only_one_frame_per_250ms_under_input_load() -> None:
-    """Input arrivals must not cause the screen-capture rate to exceed 4 FPS."""
-    now = [10.0]
-    throttle = FrameThrottle(interval_seconds=0.25, clock=lambda: now[0])
+def test_device_stream_keeps_four_fps_ticker_running_during_continuous_input() -> None:
+    """A busy input receiver cannot starve the independent 250ms frame ticker."""
+    bridge = FakeDeviceBridge(symbol="SZ.000001", screenshot=b"\xff\xd8jpg\xff\xd9")
+    client = TestClient(create_app(admin_password_hash=PasswordHasher().hash("admin-secret"), device_bridge=bridge), base_url="https://testserver")
+    assert client.post("/api/admin/session", json={"password": "admin-secret"}).status_code == 204
+    assert client.post("/api/admin/lock/acquire", headers={"X-CSRF-Token": client.cookies.get("ths_csrf")}).status_code == 200
+    with client.websocket_connect("wss://testserver/api/admin/device") as socket:
+        socket.receive_json()
+        stop = Event()
 
-    assert throttle.due() is True
-    throttle.mark_sent()
-    assert throttle.due() is False
-    now[0] += 0.249
-    assert throttle.due() is False
-    now[0] += 0.001
-    assert throttle.due() is True
+        def feed() -> None:
+            sequence = 1
+            while not stop.is_set():
+                socket.send_json({"type": "input", "sequence": sequence, "event": {"kind": "tap", "x": 0.1, "y": 0.2}})
+                sequence += 1
+                sleep(0.002)
+
+        sender = Thread(target=feed)
+        sender.start()
+        started = monotonic()
+        frames = []
+        while len(frames) < 2:
+            message = socket.receive_json()
+            if message.get("type") == "frame":
+                frames.append(message)
+        stop.set()
+        sender.join(timeout=1)
+
+    assert monotonic() - started < 0.9
+    assert len(frames) == 2
+    assert bridge.capture_attempts == 2

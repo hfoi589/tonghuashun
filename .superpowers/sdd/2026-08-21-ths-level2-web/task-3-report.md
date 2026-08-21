@@ -100,3 +100,33 @@ frontend: npm test
 Pillow is now a declared runtime dependency (`Pillow>=10.0.0`). The JPEG test
 uses a valid generated 1x1 PNG and asserts that the emitted frame data begins
 with the JPEG signature; OpenCV remains lazy and confined to template matching.
+
+## Scoped re-review fixes
+
+### Root causes
+
+- The prior loop placed frame emission after input handling. Although it used a
+  timeout gate, a constantly ready input receiver still coupled ticker progress
+  to that receiver and left `FrameThrottle.due()` unused.
+- Redis requeue was a read/modify/write followed by `LPUSH`, allowing two
+  concurrent resume calls to enqueue and emit the same task twice.
+- Logout retained every revoked session ID in `RunnerControl`, and it invoked
+  disconnect/release before server-side session revocation.
+
+### RED/GREEN evidence
+
+| Behaviour | RED evidence | GREEN evidence |
+| --- | --- | --- |
+| Atomic Redis recovery | `pytest tests/test_redis_store.py tests/test_admin_security.py tests/test_device_websocket.py -q` → second requeue raised `QUEUED cannot be requeued` | same focused scope → atomic Lua CAS accepts the first `WAITING_ADMIN` transition, makes later calls idempotently return `QUEUED`, and leaves one pending entry/event |
+| Logout order | focused admin test observed `valid_session(...) is None == False` while `disconnect_session` ran | focused admin/Redis/runner suite → `18 passed`; revoke precedes runner disconnect and the permanent disconnected-session set was removed |
+| Independent frames | continuous-input stream test is now backed by separate receiver and `sleep(0.25)` ticker tasks; the initial concurrent-task cleanup leaked `CancelledError` on disconnect, reproduced by focused WebSocket tests | `pytest tests/test_device_websocket.py -q` → `7 passed`; two frames arrive during continuous input in under 0.9 seconds with exactly two device captures, no input-driven burst |
+
+### Scoped re-review final verification
+
+```text
+.venv/bin/python -m pytest -q
+46 passed
+
+frontend: npm test
+3 files passed, 12 tests passed
+```

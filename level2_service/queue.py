@@ -182,6 +182,20 @@ while task_id do
 end
 return false
 """
+    _REQUEUE_WAITING_SCRIPT = """
+local payload = redis.call('GET', KEYS[2] .. ARGV[1])
+if not payload then return false end
+local task = cjson.decode(payload)
+if task.status ~= 'WAITING_ADMIN' then return false end
+task.status = 'QUEUED'
+task.error_code = cjson.null
+task.updated_at = ARGV[2]
+local updated = cjson.encode(task)
+redis.call('SET', KEYS[2] .. ARGV[1], updated)
+redis.call('LPUSH', KEYS[1], ARGV[1])
+redis.call('XADD', KEYS[3], '*', 'event', 'status', 'task_id', ARGV[1], 'data', 'QUEUED')
+return updated
+"""
 
     def __init__(self, client: object, stream: str = "ths:jobs", pending_cap: int = 200, capture_root: Path | None = None) -> None:
         missing = [name for name in self._REQUIRED_CLIENT_METHODS if not callable(getattr(client, name, None))]
@@ -228,18 +242,21 @@ return false
         return self._deserialize(payload) if payload else None
 
     def requeue_waiting(self, task_id: str) -> TaskRecord:
+        payload = self.client.eval(
+            self._REQUEUE_WAITING_SCRIPT,
+            3,
+            self._queue_key,
+            self._prefix,
+            self._event_stream,
+            task_id,
+            utc_now().isoformat(),
+        )
+        if payload:
+            return self._deserialize(payload)
         task = self._required(task_id)
-        if task.status != TaskStatus.WAITING_ADMIN:
-            raise InvalidTransitionError(f"{task.status.value} cannot be requeued")
-        task.status = TaskStatus.QUEUED
-        task.error_code = None
-        task.updated_at = utc_now()
-        self._save(task)
-        # A previously claimed task resumes at its original FIFO position ahead
-        # of jobs submitted while an administrator handled the device gate.
-        self.client.lpush(self._queue_key, task.task_id)
-        self._emit(task)
-        return task
+        if task.status == TaskStatus.QUEUED:
+            return task
+        raise InvalidTransitionError(f"{task.status.value} cannot be requeued")
 
     def transition(self, task_id: str, status: TaskStatus, *, error_code: str | None = None) -> TaskRecord:
         task = self._required(task_id)

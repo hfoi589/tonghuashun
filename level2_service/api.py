@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import re
 import secrets
-from asyncio import Event, TimeoutError, create_task, get_running_loop, sleep, wait_for
+from asyncio import FIRST_COMPLETED, CancelledError, Event, TimeoutError, create_task, gather, get_running_loop, sleep, wait, wait_for
 from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
@@ -18,7 +18,7 @@ from pydantic import BaseModel, Field, field_validator
 
 from .models import CaptureKind, CaptureStatus, TaskRecord, TaskStatus, utc_now
 from .queue import InMemoryStreams, QueueFullError, TaskStore
-from .runner import ADBDeviceBridge, DeviceBridge, FrameThrottle, RunnerControl, jpeg_base64
+from .runner import ADBDeviceBridge, DeviceBridge, RunnerControl, jpeg_base64
 from .security import AdminSessionManager
 
 
@@ -191,8 +191,8 @@ def create_app(
 
     @app.post("/api/admin/session/logout", status_code=204)
     def admin_logout(response: Response, session=Depends(require_csrf)) -> None:
-        app.state.runner_control.disconnect_session(session.session_id)
         app.state.admin_sessions.revoke(session.session_id)
+        app.state.runner_control.disconnect_session(session.session_id)
         response.delete_cookie("ths_admin_session", httponly=True, samesite="strict", secure=True)
         response.delete_cookie("ths_csrf", httponly=False, samesite="strict", secure=True)
 
@@ -255,47 +255,64 @@ def create_app(
             session.session_id,
             lambda: loop.call_soon_threadsafe(lambda: create_task(_close_device_socket(websocket, 1008))),
         )
-        throttle = FrameThrottle()
-        last_input_sequence = 0
-        frame_sequence = 0
         await websocket.send_json(control.status(session.session_id))
-        throttle.mark_sent()
-        try:
+
+        def session_is_valid() -> bool:
+            return app.state.admin_sessions.valid_session(session.session_id) is not None
+
+        async def receive_input() -> None:
+            last_input_sequence = 0
             while True:
-                if not control.session_connected(session.session_id) or app.state.admin_sessions.valid_session(session.session_id) is None:
+                if not session_is_valid():
                     await _close_device_socket(websocket, 1008)
                     return
                 try:
-                    raw = await wait_for(websocket.receive_json(), timeout=throttle.wait_seconds())
-                except TimeoutError:
-                    raw = None
-                if raw is not None:
-                    if not control.session_connected(session.session_id) or app.state.admin_sessions.valid_session(session.session_id) is None:
-                        await _close_device_socket(websocket, 1008)
-                        return
-                    event = _validated_input(raw)
-                    input_sequence = raw.get("sequence") if isinstance(raw, dict) else None
-                    if event is None or not isinstance(input_sequence, int) or input_sequence <= last_input_sequence:
-                        await _close_device_socket(websocket, 1003)
-                        return
-                    last_input_sequence = input_sequence
-                    if control.authorizes_input(session.session_id):
-                        _forward_input(bridge, event)
-                    continue
+                    raw = await websocket.receive_json()
+                except WebSocketDisconnect:
+                    return
+                if not session_is_valid():
+                    await _close_device_socket(websocket, 1008)
+                    return
+                event = _validated_input(raw)
+                input_sequence = raw.get("sequence") if isinstance(raw, dict) else None
+                if event is None or not isinstance(input_sequence, int) or input_sequence <= last_input_sequence:
+                    await _close_device_socket(websocket, 1003)
+                    return
+                last_input_sequence = input_sequence
+                if control.authorizes_input(session.session_id):
+                    _forward_input(bridge, event)
+
+        async def emit_frames() -> None:
+            frame_sequence = 0
+            while True:
+                await sleep(0.25)
+                if not session_is_valid():
+                    await _close_device_socket(websocket, 1008)
+                    return
                 try:
                     encoded = jpeg_base64(bridge.screenshot_png())
                 except Exception:
                     control.heartbeat("OFFLINE")
                     await websocket.send_json(control.status(session.session_id))
-                    throttle.mark_sent()
                     continue
-                throttle.mark_sent()
                 frame_sequence += 1
                 await websocket.send_json({"type": "frame", "encoding": "jpeg", "sequence": frame_sequence, "capturedAt": utc_now().isoformat(), "data": encoded})
                 await websocket.send_json(control.status(session.session_id))
-        except WebSocketDisconnect:
+
+        receiver = create_task(receive_input())
+        ticker = create_task(emit_frames())
+        try:
+            _done, pending = await wait({receiver, ticker}, return_when=FIRST_COMPLETED)
+            for task in pending:
+                task.cancel()
+            await gather(receiver, ticker, return_exceptions=True)
+        except (WebSocketDisconnect, CancelledError):
             return
         finally:
+            for task in (receiver, ticker):
+                if not task.done():
+                    task.cancel()
+            await gather(receiver, ticker, return_exceptions=True)
             unregister_socket()
 
     return app

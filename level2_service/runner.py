@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import base64
 import subprocess
-import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -291,7 +290,6 @@ class RunnerControl:
     _lock_owner: str | None = None
     _sequence: int = 0
     _listeners: list[Callable[[dict], None]] = field(default_factory=list)
-    _disconnected_sessions: set[str] = field(default_factory=set)
     _socket_disconnectors: dict[str, list[Callable[[], None]]] = field(default_factory=dict)
 
     def heartbeat(self, state: str = "READY") -> None:
@@ -322,19 +320,15 @@ class RunnerControl:
         return {"locked": self._lock_owner == session_id}
 
     def authorizes_input(self, session_id: str) -> bool:
-        return session_id not in self._disconnected_sessions and self._lock_owner == session_id
+        return self._lock_owner == session_id
 
     def disconnect_session(self, session_id: str) -> None:
         """Invalidate a disconnected admin's lock and active device streams."""
-        self._disconnected_sessions.add(session_id)
         if self._lock_owner == session_id:
             self._lock_owner = None
         for disconnect in tuple(self._socket_disconnectors.get(session_id, ())):
             disconnect()
         self._publish()
-
-    def session_connected(self, session_id: str) -> bool:
-        return session_id not in self._disconnected_sessions
 
     def register_socket(self, session_id: str, disconnect: Callable[[], None]) -> Callable[[], None]:
         self._socket_disconnectors.setdefault(session_id, []).append(disconnect)
@@ -432,24 +426,6 @@ class Level2Runner:
             except NavigationError as error:
                 last_error = error
         raise last_error or NavigationError("navigation failed")
-
-
-@dataclass
-class FrameThrottle:
-    """Monotonic frame gate that keeps screen capture independent from input rate."""
-
-    interval_seconds: float = 0.25
-    clock: Callable[[], float] = time.monotonic
-    _next_frame_at: float = field(default=float("-inf"), init=False)
-
-    def due(self) -> bool:
-        return self.clock() >= self._next_frame_at
-
-    def mark_sent(self) -> None:
-        self._next_frame_at = self.clock() + self.interval_seconds
-
-    def wait_seconds(self) -> float:
-        return max(0.0, self._next_frame_at - self.clock())
 
 
 def jpeg_base64(png_or_jpeg: bytes) -> str:

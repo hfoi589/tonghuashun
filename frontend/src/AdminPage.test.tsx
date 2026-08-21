@@ -44,4 +44,53 @@ describe('AdminPage', () => {
     }))
     expect(screen.getByText('密码仅用于本次请求，不会记录或展示。')).toBeInTheDocument()
   })
+
+  it('keeps unavailable queue controls disabled until Runner endpoints exist', async () => {
+    vi.mocked(fetch)
+      .mockResolvedValueOnce(new Response(null, { status: 204 }))
+      .mockResolvedValueOnce(jsonResponse({ state: 'OFFLINE', last_heartbeat: null }))
+      .mockResolvedValueOnce(jsonResponse({ locked: false }))
+
+    const user = userEvent.setup()
+    render(<AdminPage />)
+    await user.type(screen.getByLabelText('管理员密码'), 'never-display-this')
+    await user.click(screen.getByRole('button', { name: '登录管理台' }))
+
+    await waitFor(() => expect(screen.getByRole('button', { name: '暂停队列' })).toBeDisabled())
+    expect(screen.getByRole('button', { name: '恢复队列' })).toBeDisabled()
+    expect(screen.getByText('队列控制不可用，等待 Runner 端点接入。')).toBeInTheDocument()
+  })
+
+  it('clears the local lock and closes the device stream when health refresh fails', async () => {
+    class FakeWebSocket {
+      static instance: FakeWebSocket | undefined
+      static OPEN = 1
+      readyState = FakeWebSocket.OPEN
+      close = vi.fn()
+      send = vi.fn()
+      onopen: (() => void) | null = null
+      onclose: (() => void) | null = null
+      onerror: (() => void) | null = null
+      onmessage: ((event: MessageEvent) => void) | null = null
+      constructor(_url: string) { FakeWebSocket.instance = this }
+    }
+    vi.stubGlobal('WebSocket', FakeWebSocket)
+    vi.mocked(fetch)
+      .mockResolvedValueOnce(new Response(null, { status: 204 }))
+      .mockResolvedValueOnce(jsonResponse({ state: 'ONLINE', last_heartbeat: null }))
+      .mockResolvedValueOnce(jsonResponse({ locked: false }))
+      .mockResolvedValueOnce(jsonResponse({ locked: true }))
+      .mockRejectedValueOnce(new Error('admin authentication required'))
+
+    const user = userEvent.setup()
+    render(<AdminPage deviceStreamUrl="ws://runner.example/stream" />)
+    await user.type(screen.getByLabelText('管理员密码'), 'never-display-this')
+    await user.click(screen.getByRole('button', { name: '登录管理台' }))
+    await waitFor(() => expect(FakeWebSocket.instance).toBeDefined())
+    await user.click(screen.getByRole('button', { name: '接管设备' }))
+    await user.click(screen.getByRole('button', { name: '刷新运行端状态' }))
+
+    await waitFor(() => expect(FakeWebSocket.instance!.close).toHaveBeenCalled())
+    expect(screen.getByRole('button', { name: '接管设备' })).toBeInTheDocument()
+  })
 })

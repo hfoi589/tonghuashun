@@ -73,11 +73,14 @@ export const api = {
   }),
 }
 
-export function subscribeToJob(publicId: string, onChange: () => void): () => void {
+export type JobStreamState = 'CONNECTED' | 'RECONNECTING' | 'UNAVAILABLE'
+
+export function subscribeToJob(publicId: string, onChange: () => void, onStateChange?: (state: JobStreamState) => void): () => void {
   if (typeof EventSource === 'undefined') return () => undefined
   const stream = new EventSource(`/api/v1/jobs/${encodeURIComponent(publicId)}/events`)
   stream.addEventListener('status', onChange)
-  stream.onerror = () => stream.close()
+  stream.onopen = () => onStateChange?.('CONNECTED')
+  stream.onerror = () => onStateChange?.('RECONNECTING')
   return () => stream.close()
 }
 

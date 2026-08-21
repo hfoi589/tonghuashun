@@ -43,3 +43,43 @@ The production bundle contains `dist/index.html`, one CSS asset, and one JavaScr
 ## Remaining integration boundary
 
 The UI correctly consumes every Task 1 route available today. Task 3 must publish a concrete device WebSocket URL/protocol and queue pause/resume endpoints before the visual stream and placeholder controls can drive an actual runner. Until then, the admin page remains safely explicit about the offline state and does not invent backend behavior.
+
+## Review fix round 1
+
+### Changes
+
+- Replaced the six-digit A-share-only public input check with the planned App-searchable contract: trim, uppercase, then accept 1–16 characters from `A-Z`, `0-9`, `.`, `_`, and `-`.
+- A submitted public task now writes `?job=<public_id>` to the URL. On a refresh the public page loads that job and resumes its SSE subscription.
+- A transient EventSource error now updates the visible connection state to “正在自动重连” but does not call `close()`, preserving browser-native SSE reconnect behavior.
+- Added the documented, typed Task 3 WebSocket envelope contract in `frontend/src/device-protocol.ts`:
+  - frame: `{type:'frame', encoding:'jpeg', sequence, capturedAt, data}`
+  - runner status: `{type:'runner_status', state, locked, sequence?}`
+  - input: `{type:'input', sequence, event}` for `tap`, `swipe`, and `key`
+- Device input is sequenced and rejected unless the WebSocket is open, the Runner reports ready and locked, and the current admin session holds its API lock.
+- Any runner-health or admin lock operation failure clears the local lock and makes the device viewport close its socket, preventing stale input. A manual health refresh makes this state visible and testable.
+- Queue pause/resume controls are disabled and explicitly unavailable until Task 3 provides real endpoints.
+
+### RED
+
+The review test run failed in the expected places before implementation:
+
+```text
+App-searchable input was capped at six characters and rejected SZ.000001.
+?job=public-job-1 was not restored after refresh.
+EventSource.onerror closed the stream, preventing native reconnect.
+Queue pause/resume controls were enabled.
+device-stream.ts did not yet exist for the input-envelope test.
+```
+
+### GREEN
+
+After implementation, a fresh focused and full test run passed:
+
+```text
+Test Files  3 passed (3)
+Tests  9 passed (9)
+npm run build   TypeScript check and Vite production build passed
+git diff --check passed
+```
+
+The added tests exercise normalized public submission and job URL restoration, SSE behavior after a transient error, disabled queue placeholders, typed/locked device input, and closing the device stream after an administrator health failure.

@@ -1,0 +1,77 @@
+from datetime import timedelta
+
+import pytest
+
+from level2_service.models import CaptureKind, CaptureStatus, TaskRecord, TaskStatus
+from level2_service.queue import InMemoryStreams, QueueFullError
+
+
+def test_queue_returns_oldest_queued_task_first() -> None:
+    """Iterating newest-first would starve older public requests."""
+    store = InMemoryStreams()
+    store.enqueue(TaskRecord(task_id="first", symbol="600938"))
+    store.enqueue(TaskRecord(task_id="second", symbol="000001"))
+
+    assert store.next_queued().task_id == "first"
+
+
+def test_queue_rejects_invalid_state_transition() -> None:
+    """Allowing QUEUED directly to SUCCEEDED would publish unverified results."""
+    store = InMemoryStreams()
+    store.enqueue(TaskRecord(task_id="task", symbol="600938"))
+
+    try:
+        store.transition("task", TaskStatus.SUCCEEDED)
+    except ValueError as error:
+        assert str(error) == "QUEUED cannot transition to SUCCEEDED"
+    else:
+        raise AssertionError("invalid transition was accepted")
+
+
+def test_one_finished_capture_makes_task_partial_until_all_three_are_ready() -> None:
+    """Marking a task successful after one screenshot would hide missing Level2 views."""
+    store = InMemoryStreams()
+    task = TaskRecord(task_id="task", symbol="600938")
+    store.enqueue(task)
+    store.transition("task", TaskStatus.RUNNING)
+
+    partial = store.complete_capture("task", CaptureKind.LARGE_ORDER_NET, "/tmp/net.png")
+    assert partial.status == TaskStatus.PARTIAL
+    assert partial.captures[CaptureKind.LARGE_ORDER_NET].status == CaptureStatus.READY
+    assert partial.captures[CaptureKind.RETAIL_COUNT].status == CaptureStatus.PENDING
+
+    store.complete_capture("task", CaptureKind.LARGE_ORDER_AMOUNT, "/tmp/amount.png")
+    complete = store.complete_capture("task", CaptureKind.RETAIL_COUNT, "/tmp/retail.png")
+    assert complete.status == TaskStatus.SUCCEEDED
+
+
+def test_retention_expires_captures_after_24_hours_then_removes_metadata_after_7_days() -> None:
+    """Leaking a capture beyond its retention window exposes market screenshots too long."""
+    store = InMemoryStreams()
+    task = TaskRecord(task_id="task", symbol="600938")
+    store.enqueue(task)
+    store.transition("task", TaskStatus.RUNNING)
+    store.complete_capture("task", CaptureKind.LARGE_ORDER_NET, "/tmp/net.png")
+
+    assert store.cleanup(task.created_at + timedelta(hours=24, seconds=1)) == []
+    assert task.captures[CaptureKind.LARGE_ORDER_NET].status == CaptureStatus.EXPIRED
+    assert store.cleanup(task.created_at + timedelta(days=7, seconds=1)) == [task]
+    assert store.get("task") is None
+
+
+def test_queue_cap_rejects_a_new_pending_task() -> None:
+    """Ignoring the global cap would allow unbounded single-runner backlog growth."""
+    store = InMemoryStreams(pending_cap=1)
+    store.enqueue(TaskRecord(task_id="first", symbol="600938"))
+
+    with pytest.raises(QueueFullError, match="global pending queue cap reached"):
+        store.enqueue(TaskRecord(task_id="second", symbol="000001"))
+
+
+def test_capture_completion_requires_the_runner_to_claim_the_task() -> None:
+    """Completing a QUEUED task would let a stale worker bypass the FIFO claim."""
+    store = InMemoryStreams()
+    store.enqueue(TaskRecord(task_id="task", symbol="600938"))
+
+    with pytest.raises(ValueError, match="QUEUED cannot accept a capture"):
+        store.complete_capture("task", CaptureKind.LARGE_ORDER_NET, "/tmp/net.png")

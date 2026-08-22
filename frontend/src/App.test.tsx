@@ -71,7 +71,8 @@ describe('Level2 web UI', () => {
     render(<App />)
     await user.type(screen.getByLabelText('股票代码'), '600938')
     await screen.findByText('中国海油（600938）')
-    expect(screen.getByRole('checkbox', { name: '生成整页长截图' })).toBeChecked()
+    expect(screen.getByRole('heading', { name: '同花顺数据采集' })).toBeInTheDocument()
+    expect(screen.getByRole('checkbox', { name: '生成整页长截图' })).not.toBeChecked()
     await user.click(screen.getByRole('button', { name: '提交采集任务' }))
 
     await waitFor(() => expect(screen.getByText('已进入队列')).toBeInTheDocument())
@@ -80,16 +81,15 @@ describe('Level2 web UI', () => {
     }))
     expect(fetch).toHaveBeenNthCalledWith(2, '/api/v1/jobs', expect.objectContaining({
       method: 'POST',
-      body: JSON.stringify({ symbol: '600938', include_long_capture: true }),
+      body: JSON.stringify({ symbol: '600938', include_long_capture: false }),
     }))
     expect(window.location.href).toBe(currentUrl)
   })
 
-  it('submits a data-only task when the long capture switch is turned off', async () => {
+  it('submits a long-capture task when the switch is turned on', async () => {
     const dataOnlyTask: Job = {
       ...task,
-      include_long_capture: false,
-      long_capture: { status: 'SKIPPED', url: null, expires_at: null },
+      include_long_capture: true,
     }
     vi.mocked(fetch)
       .mockResolvedValueOnce(jsonResponse(symbolLookup('601872', '招商轮船')))
@@ -105,8 +105,19 @@ describe('Level2 web UI', () => {
     await waitFor(() => expect(screen.getByText('已进入队列')).toBeInTheDocument())
     expect(fetch).toHaveBeenCalledWith('/api/v1/jobs', expect.objectContaining({
       method: 'POST',
-      body: JSON.stringify({ symbol: '601872', include_long_capture: false }),
+      body: JSON.stringify({ symbol: '601872', include_long_capture: true }),
     }))
+  })
+
+  it('removes the retired collection copy from the page', () => {
+    render(<App />)
+
+    expect(screen.getByRole('heading', { name: '同花顺数据采集' })).toBeInTheDocument()
+    expect(screen.queryByText('采集 Level2 数据，结果逐条保留')).not.toBeInTheDocument()
+    expect(screen.queryByText('新建采集')).not.toBeInTheDocument()
+    expect(screen.queryByText('提交新的采集任务')).not.toBeInTheDocument()
+    expect(screen.queryByText('输入 6 位股票代码，查询到股票名称后才可提交。')).not.toBeInTheDocument()
+    expect(screen.queryByText('关闭后由 App 在后台请求并回传数据，不打开搜索框、不切换股票页面。')).not.toBeInTheDocument()
   })
 
   it('does not query or enable submit before all six digits are entered', async () => {
@@ -306,7 +317,9 @@ describe('Level2 web UI', () => {
     expect(screen.getByText('长截图已生成，部分数据未读取')).toBeInTheDocument()
     expect(screen.getByText('-0.02')).toBeInTheDocument()
     expect(screen.getByText('+21.23')).toBeInTheDocument()
-    expect(screen.getAllByText('招商轮船')).toHaveLength(2)
+    expect(screen.getByText('招商轮船（600938）')).toBeInTheDocument()
+    expect(screen.queryByText('招商轮船', { selector: 'h3' })).not.toBeInTheDocument()
+    expect(screen.queryByText('600938', { selector: '.job-symbol' })).not.toBeInTheDocument()
     expect(screen.getByText('19.78')).toBeInTheDocument()
     expect(screen.getByText('+7.15%')).toBeInTheDocument()
     expect(screen.getByText('2.40%')).toBeInTheDocument()
@@ -364,15 +377,15 @@ describe('Level2 web UI', () => {
     await user.type(input, '600938')
     await screen.findByText('中国海油（600938）')
     await user.click(screen.getByRole('button', { name: '提交采集任务' }))
-    await waitFor(() => expect(screen.getByRole('heading', { name: '600938' })).toBeInTheDocument())
+    await waitFor(() => expect(screen.getByText('任务 public-job-1')).toBeInTheDocument())
 
     await user.clear(input)
     await user.type(input, '000001')
     await screen.findByText('平安银行（000001）')
     await user.click(screen.getByRole('button', { name: '提交采集任务' }))
 
-    await waitFor(() => expect(screen.getByRole('heading', { name: '000001' })).toBeInTheDocument())
-    expect(screen.getByRole('heading', { name: '600938' })).toBeInTheDocument()
+    await waitFor(() => expect(screen.getByText('任务 public-job-2')).toBeInTheDocument())
+    expect(screen.getByText('任务 public-job-1')).toBeInTheDocument()
     expect(screen.getByText('采集历史')).toBeInTheDocument()
   })
 
@@ -386,8 +399,8 @@ describe('Level2 web UI', () => {
 
     render(<App />)
 
-    await waitFor(() => expect(screen.getByRole('heading', { name: '000001' })).toBeInTheDocument())
-    expect(screen.getByRole('heading', { name: '600938' })).toBeInTheDocument()
+    await waitFor(() => expect(screen.getByText('任务 public-job-2')).toBeInTheDocument())
+    expect(screen.getByText('任务 public-job-1')).toBeInTheDocument()
   })
 
   it('clears only the collection history stored in this browser', async () => {
@@ -397,10 +410,10 @@ describe('Level2 web UI', () => {
     const user = userEvent.setup()
 
     render(<App />)
-    await waitFor(() => expect(screen.getByRole('heading', { name: '600938' })).toBeInTheDocument())
+    await waitFor(() => expect(screen.getByText('任务 public-job-1')).toBeInTheDocument())
     await user.click(screen.getByRole('button', { name: '清空本机记录' }))
 
-    expect(screen.queryByRole('heading', { name: '600938' })).not.toBeInTheDocument()
+    expect(screen.queryByText('任务 public-job-1')).not.toBeInTheDocument()
     expect(window.localStorage.getItem('ths_level2_job_history')).toBeNull()
     expect(screen.getByText('还没有采集记录')).toBeInTheDocument()
   })

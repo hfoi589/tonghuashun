@@ -19,13 +19,15 @@
 
 ### 当前交接风险
 
-截至本文档编写时：
+当前可交接基线为 `main` 分支上的 `26135be` 提交。仓库没有配置可直接依赖的
+Git 远程地址，因此迁移时不能假设新 Mac 能够直接克隆本项目。迁移前仍应
+执行 `git status --short`，确认工作区干净，或者明确把当前工作区的全部内容
+一起复制到迁移包中。
 
-- 当前分支是 `feature/ths-level2-web`。
-- 工作区存在大量尚未提交的修改和新增文件。
-- 当前仓库没有配置可直接依赖的 Git 远程地址。
-
-因此，迁移时不能只在新 Mac 上克隆某个旧提交。必须先将当前工作区提交到可信的私有仓库，或者完整复制当前项目目录。迁移前应再次执行 `git status --short`，确认真正需要交接的文件都已包含在迁移包中。
+项目目录本身不包含 Docker Desktop 的镜像和命名卷。只复制项目目录还不够，
+新 Mac 必须重新构建/加载镜像、重新创建 Android AVD，并重新启动 Frida
+Server；如果要保留任务、截图、模板或管理员状态，还必须另外迁移 Docker
+数据卷备份。
 
 ## 2. 迁移到另一台 Mac
 
@@ -62,7 +64,7 @@ command -v adb emulator sdkmanager avdmanager
 
 | 内容 | 作用 | 注意事项 |
 | --- | --- | --- |
-| 当前完整项目目录 | 包含尚未提交的实际源码和部署文件 | 不要只复制旧 Git 提交 |
+| 当前完整项目目录 | 包含 `main` 基线源码、部署文件和 Git 提交 | 不要只复制旧 Git 提交；被忽略的配置需另行传输 |
 | `.env` | 管理员密码 Argon2id 哈希和会话密钥 | 属于敏感文件，权限应保持为 `0600` |
 | `deploy/macos.env` | Mac 的 ADB、Frida、端口配置 | 文件被 Git 忽略，不会随普通克隆出现 |
 | 指定版本的同花顺 APK | 创建 AVD、安装应用 | SHA-256 必须完全匹配项目预检值 |
@@ -92,7 +94,58 @@ command -v adb emulator sdkmanager avdmanager
 
 如果恢复 `admin-data`，其中的 `/data/admin/password.hash` 会优先于 `.env` 中的初始密码哈希。若希望在新 Mac 使用新管理员密码，不要恢复旧 `admin-data`，而应重新生成 `.env`。
 
-### 2.4 旧 Mac 上的停机和备份
+### 2.4 Docker 镜像在哪里
+
+Docker 镜像不在项目文件夹中。项目文件夹只包含 `Dockerfile`、Compose 文件和
+源码；镜像实际保存在 Docker Desktop 管理的本地镜像存储中。复制项目目录到
+另一台 Mac 不会自动带走这些镜像。
+
+当前 macOS Compose 使用的镜像如下：
+
+| 镜像 | 来源和用途 |
+| --- | --- |
+| `ths-level2-api:local` | 根据项目根目录的 `Dockerfile` 本地构建；包含 FastAPI、Runner、Frida Python 客户端和已编译的 React 前端 |
+| `redis:7.4-alpine` | Docker Registry 拉取的 Redis 运行时镜像 |
+| `redroid/redroid:13.0.0_64only-latest` | 仅 Linux `linux-redroid` profile 使用；macOS 原生 AVD 不使用此 Android 镜像 |
+
+在当前项目目录查看镜像：
+
+```sh
+docker image ls ths-level2-api
+docker image inspect ths-level2-api:local
+docker compose --env-file deploy/macos.env -f deploy/compose.yml config --images
+```
+
+新 Mac 从项目重新构建 API 镜像：
+
+```sh
+docker compose --env-file deploy/macos.env -f deploy/compose.yml build api
+```
+
+这会使用项目根目录作为构建上下文，执行 `Dockerfile` 的 `frontend-build` 阶段，
+再把 `frontend/dist` 复制进 `ths-level2-api:local`。也可以在启动时使用
+`up -d --build` 自动构建。镜像构建完成后，容器通过 Compose 使用该本地标签。
+
+如果新 Mac 无法联网、或希望直接搬运已经构建好的 API 镜像，可在旧 Mac 导出：
+
+```sh
+docker save ths-level2-api:local redis:7.4-alpine \
+  -o migration-backup/ths-level2-images.tar
+shasum -a 256 migration-backup/ths-level2-images.tar
+```
+
+在新 Mac 导入：
+
+```sh
+docker load -i migration-backup/ths-level2-images.tar
+docker image ls ths-level2-api redis
+```
+
+镜像导入只能恢复镜像本身，不能恢复 Redis 数据、截图、模板或管理员状态；
+这些内容仍需按上一节备份和恢复 Docker 卷。若项目源码已经变化，优先在新 Mac
+重新执行 `docker compose ... build api`，避免运行旧镜像中的代码。
+
+### 2.5 旧 Mac 上的停机和备份
 
 1. 在管理页面暂停队列，等待正在执行的任务结束。
 2. 记录旧 Mac 的端口、模拟器序列号和 AVD 名称。
@@ -132,7 +185,7 @@ shasum -a 256 migration-backup/volumes/*.tgz
 
 不要执行 `docker compose down -v`，否则会删除上述数据卷。
 
-### 2.5 Android 模拟器和登录状态怎么处理
+### 2.6 Android 模拟器和登录状态怎么处理
 
 推荐方案是在新 Mac 重新创建 AVD、重新安装 APK，并由管理员手工登录同花顺。这样最稳定，也能避免旧 AVD 中的绝对路径、快照、设备标识和 Android SDK 路径在新机器上失效。
 
@@ -142,7 +195,7 @@ shasum -a 256 migration-backup/volumes/*.tgz
 - `google_apis`
 - `arm64-v8a`
 - 默认设备序列号通常为 `emulator-5554`
-- 1080×1920 截图尺寸是长截图拼接和 OCR 的前提
+- 1080×1920 截图尺寸是长截图拼接和结构校验的前提
 
 如果业务上必须尝试保留同花顺登录状态，可以在完全关闭模拟器后备份：
 
@@ -151,7 +204,135 @@ shasum -a 256 migration-backup/volumes/*.tgz
 
 但直接复制 AVD 属于尽力迁移，不是当前项目保证支持的路径。即使复制成功，同花顺仍可能因为设备环境变化要求重新验证或重新登录。
 
-### 2.6 新 Mac 上的恢复步骤
+### 2.7 只复制项目文件夹时从零部署
+
+本节适用于只把当前项目文件夹复制到新 Mac、不恢复旧 Docker 数据卷的情况。
+这是推荐的全新部署路径；旧任务、旧截图和旧管理员状态不会被带过来。
+
+#### 第一步：安装新 Mac 的基础环境
+
+新 Mac 必须是 Apple Silicon，并安装 Docker Desktop、Android SDK Command-line
+Tools、Java/JDK 和 Python 3。确认以下命令可用：
+
+```sh
+uname -m
+docker --version
+docker compose version
+python3 --version
+command -v adb emulator sdkmanager avdmanager
+```
+
+`uname -m` 必须返回 `arm64`。Docker Desktop 必须已经启动。
+
+#### 第二步：复制项目文件夹并创建本机配置
+
+进入复制后的项目根目录。项目部署不要求新 Mac 预先安装 Node.js；API 镜像的
+`Dockerfile` 会在构建阶段使用 Node 镜像编译 React 前端。
+
+```sh
+cd /绝对路径/tonghuashun
+git status --short
+
+./scripts/setup-admin.sh .env
+chmod 600 .env
+
+cp deploy/macos.env.example deploy/macos.env
+chmod 600 deploy/macos.env
+```
+
+`setup-admin.sh` 会交互式创建管理员密码哈希和随机会话密钥。不要把 `.env`
+或 `deploy/macos.env` 提交到 Git；前者包含敏感凭据，后者会被 `.gitignore`
+忽略。
+
+确认 `deploy/macos.env` 使用本机 AVD 配置：
+
+```dotenv
+ADB_SERIAL=emulator-5554
+ADB_SERVER_SOCKET=tcp:host.docker.internal:5037
+ADB_CONNECT=0
+ADMIN_PASSWORD_FILE=/data/admin/password.hash
+APP_PORT=8000
+ADMIN_COOKIE_SECURE=0
+FRIDA_SERVER_ENDPOINT=host.docker.internal:27042
+```
+
+如果 AVD 使用了其他序列号，必须同步修改 `ADB_SERIAL` 和后续 `adb -s` 命令。
+
+#### 第三步：准备 APK、创建 AVD 并人工登录
+
+APK 和 Frida Server 应放在项目目录之外，并先验证 APK：
+
+```sh
+python3 scripts/preflight.py --apk-only --apk /绝对路径/ths.apk
+./scripts/bootstrap-macos-avd.sh /绝对路径/ths.apk
+python3 scripts/preflight.py --profile macos-avd --apk /绝对路径/ths.apk
+```
+
+预检必须输出 `PREFLIGHT OK`。进入模拟器后，由管理员正常完成同花顺登录、
+验证码、设备验证和 Level2 权限确认；项目不会绕过这些步骤。
+
+至少确认 App 能稳定运行、能打开测试股票、能看到相关 Level2 页面，并且页面
+可以滚动到底部图表。
+
+#### 第四步：启动 Frida Server
+
+```sh
+adb -s emulator-5554 root
+adb -s emulator-5554 push /绝对路径/frida-server-16.7.19-android-arm64 /data/local/tmp/ths-frida-server
+adb -s emulator-5554 shell chmod 0755 /data/local/tmp/ths-frida-server
+adb -s emulator-5554 shell '/data/local/tmp/ths-frida-server >/dev/null 2>&1 &'
+adb -s emulator-5554 forward tcp:27042 tcp:27042
+```
+
+Frida Server 版本必须是 `16.7.19`。模拟器重启后，通常需要重新启动 Server
+并重新执行端口转发。
+
+#### 第五步：验证 Compose、构建 API 镜像并启动
+
+首次部署不需要手动创建卷，Compose 会自动创建新的：
+`ths-level2_redis-data`、`ths-level2_capture-data`、
+`ths-level2_template-data` 和 `ths-level2_admin-data`。
+
+```sh
+docker compose --env-file deploy/macos.env -f deploy/compose.yml config --quiet
+docker compose --env-file deploy/macos.env -f deploy/compose.yml build api
+docker compose --env-file deploy/macos.env -f deploy/compose.yml up -d api redis
+```
+
+构建过程中会：
+
+1. 用 Node 22 构建 React 前端。
+2. 用 Python 3.12 构建 API 镜像。
+3. 安装 ADB、Tesseract 和 Python 依赖。
+4. 把前端构建结果复制到 API 镜像的 `/app/frontend`。
+
+`api` 服务使用本地镜像标签 `ths-level2-api:local`；Redis 使用
+`redis:7.4-alpine`。如果要同时启动并在需要时自动构建，也可以使用：
+
+```sh
+docker compose --env-file deploy/macos.env -f deploy/compose.yml up -d --build api redis
+```
+
+#### 第六步：基础验收和首次任务
+
+```sh
+adb devices -l
+adb -s emulator-5554 shell pidof com.hexin.plat.android
+adb -s emulator-5554 forward --list
+docker compose --env-file deploy/macos.env -f deploy/compose.yml ps
+docker compose --env-file deploy/macos.env -f deploy/compose.yml logs --tail=100 api redis
+curl -fsS http://127.0.0.1:8000/
+curl -fsS http://127.0.0.1:8000/openapi.json >/dev/null
+```
+
+然后打开 `http://127.0.0.1:8000/#admin` 登录管理页面。先提交一个关闭长截图
+的纯数据任务，确认指标来自 App 内部接口且任务能完成；再提交一个带长截图的
+任务，确认长截图覆盖股票页顶部到底部图表。
+
+全新部署不需要恢复旧 Docker 卷。若后续发现需要旧任务或截图，停止服务后按
+“2.8 新 Mac 上恢复旧配置和 Docker 数据卷”执行恢复，不要把旧卷和新卷混用。
+
+### 2.8 新 Mac 上恢复旧配置和 Docker 数据卷
 
 以下命令都应在新 Mac 的项目根目录执行。
 
@@ -191,7 +372,7 @@ python3 scripts/preflight.py --profile macos-avd --apk /绝对路径/ths.apk
 
 `bootstrap-macos-avd.sh` 会安装/检查 Android 33 ARM64 系统镜像、创建 AVD、启动模拟器并安装 APK。预检必须出现 `PREFLIGHT OK`。
 
-采集和 OCR 坐标按 1080×1920 屏幕校准。创建 AVD 后必须检查实际输出：
+长截图拼接和结构校验坐标按 1080×1920 屏幕校准。创建 AVD 后必须检查实际输出：
 
 ```sh
 adb -s emulator-5554 shell wm size
@@ -250,7 +431,7 @@ docker compose --env-file deploy/macos.env -f deploy/compose.yml up -d --build
 
 Mac 上必须使用 `deploy/macos.env`。如果直接使用默认 Compose 配置，API 会错误地等待 Linux 环境中的 `redroid:5555`。
 
-### 2.7 迁移后的验收
+### 2.9 迁移后的验收
 
 先检查基础状态：
 
@@ -284,7 +465,7 @@ curl -sS http://127.0.0.1:8000/api/v1/jobs \
 
 确认纯数据模式后，再在网页提交一次勾选“生成整页长截图”的任务。长截图真实验收不能只看 HTTP 200，必须打开图片，确认从股票页顶部覆盖到底部图表，并且包含“大单净量”区域。
 
-### 2.8 浏览器历史不会随 Docker 卷自动迁移
+### 2.10 浏览器历史不会随 Docker 卷自动迁移
 
 前端只在当前浏览器、当前 Origin 的 `localStorage` 中保存最多 50 个任务 ID，键名为：
 
@@ -319,7 +500,7 @@ Redis 保存任务并加入 FIFO 队列
         ↓
 根据 include_long_capture 选择采集路径
         ├─ false：Frida 直接调用 App 内部数据管理器
-        └─ true ：ADB/uiautomator2 操作页面 + Frida 读值 + 必要时 OCR
+        └─ true ：ADB/uiautomator2 操作页面 + Frida `read_direct()` 读值 + OCR 仅结构校验
         ↓
 结果和状态写回 Redis，长截图写入 capture-data
         ↓
@@ -342,9 +523,9 @@ Content-Type: application/json
 
 规则如下：
 
-- `symbol` 会去除首尾空格并转为大写。
-- 允许 1～16 位字母、数字、`.`、`_`、`-`。
-- 纯数据模式要求传入可确认市场的六位 A 股代码。
+- `symbol` 必须是六位数字，并且要先通过 App 内部精确名称查询。
+- 不接受股票名称、模糊搜索文本、交易所后缀或未知市场前缀。
+- 任务指标只能由 `FridaParsedValueSource.read_direct()` 获取。
 - 每个任务生成随机公开 ID，初始状态为 `QUEUED`。
 - Redis 以 FIFO 顺序保存待处理任务，最多允许 200 个处于 `QUEUED`、`RUNNING` 或 `WAITING_ADMIN` 的任务；超过后 API 返回 429。
 - Runner 只有一个，通过 Redis Lua 脚本原子领取任务，领取后状态变为 `RUNNING`。
@@ -436,9 +617,13 @@ Runner 每次处理任务前，会查看 `/data/admin/daily-check.json`。如果
 
 对应宿主数据位于 `ths-level2_capture-data` 卷。
 
-#### 数值读取和 OCR 降级
+#### 数值读取和长截图结构校验
 
-长截图生成后，系统优先使用 Frida 扫描当前 App 已解析的对象，读取与任务股票代码匹配的数据：
+无论是否生成长截图，任务指标都通过 `FridaParsedValueSource.read_direct()`
+向 App 内部请求桥接发送股票代码和已确认的市场代码。长截图模式只额外执行
+页面导航、滚动、截图和拼接；它不能改变指标查询方式。
+
+系统读取与任务股票代码匹配的数据：
 
 | 返回字段 | App 数据来源/映射 |
 | --- | --- |
@@ -451,13 +636,10 @@ Runner 每次处理任务前，会查看 `/data/admin/daily-check.json`。如果
 | 散户数量 | `techid 7034`，数据字段 `216` |
 | MACDFS | `techid 7051`，数据字段 `36883`，读取最新点 |
 
-OCR 不是主数据源。只有 Frida 缺少以下某个图表指标时，才会从已截取的图表帧中裁剪对应区域并用 Tesseract 补值：
-
-- 大单净量
-- 大单金额
-- 散户数量
-
-股票名称、股价、涨跌幅、换手率和 MACDFS 没有 OCR 兜底。只要八个字段中有任意字段为空，任务会标记为 `PARTIAL`，错误码为 `VALUE_RECOGNITION_FAILED`；长截图仍然可以是可用状态。
+如果 App 内部接口只返回部分字段，缺失字段保持为空，任务标记为 `PARTIAL`，
+错误码为 `VALUE_RECOGNITION_FAILED`；不得从截图、UI 文本或 OCR 中补值。
+OCR 只能在长截图生成后用于非数据结构校验，例如确认图片包含“大单净量”
+图表标题。校验失败时可以重新导航和拼接，但不能用 OCR 生成任何 `values` 字段。
 
 ### 3.6 结果状态和常见错误码
 
@@ -467,7 +649,7 @@ OCR 不是主数据源。只有 Frida 缺少以下某个图表指标时，才会
 | `RUNNING` | 正在采集 | 不要同时人工控制设备 |
 | `WAITING_ADMIN` | 登录、验证或权限需要人工处理 | 管理页面接管设备，处理后恢复任务和队列 |
 | `COMPLETED` | 八个字段完整；如果请求截图，截图也已生成 | 正常完成 |
-| `PARTIAL` / `VALUE_RECOGNITION_FAILED` | 截图可能已生成，但部分字段缺失 | 检查 Frida、App 页面和 OCR 校准 |
+| `PARTIAL` / `VALUE_RECOGNITION_FAILED` | 截图可能已生成，但部分字段缺失 | 检查 App 内部接口、回调字段和原始错误码 |
 | `UNSUPPORTED_MARKET` | 纯数据任务的市场前缀未确认 | 使用支持的六位 A 股代码 |
 | `DIRECT_APP_OFFLINE` | 同花顺进程未运行 | 启动 App 并保持登录 |
 | `DIRECT_REQUEST_TIMEOUT` | App 内部数据请求超时 | 检查网络、App 状态和 Frida |

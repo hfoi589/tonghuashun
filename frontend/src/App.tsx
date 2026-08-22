@@ -92,6 +92,7 @@ export function JobResult({ task, isLatest = false }: { task: Job, isLatest?: bo
   const finished = task.status === 'COMPLETED' || task.status === 'PARTIAL'
   const captureReady = task.long_capture.status === 'READY' && Boolean(task.long_capture.url)
   const captureId = `long-capture-${task.public_id}`
+  const stockDisplayName = task.values.stock_name ? `${task.values.stock_name}（${task.symbol}）` : null
 
   return <article className={`job-result${isLatest ? ' latest-job' : ''}`} aria-live="polite">
     <div className="job-heading">
@@ -100,8 +101,6 @@ export function JobResult({ task, isLatest = false }: { task: Job, isLatest?: bo
           {isLatest && <span className="latest-badge">最新</span>}
           <span>任务 {task.public_id.slice(0, 12)}</span>
         </div>
-        <h3>{task.values.stock_name ?? task.symbol}</h3>
-        {task.values.stock_name && <p className="job-symbol">{task.symbol}</p>}
         <p className="job-time">提交时间 {new Date(task.created_at).toLocaleString('zh-CN')}</p>
         {task.collected_at && <p className="job-time">采集时间 {new Date(task.collected_at).toLocaleString('zh-CN')}</p>}
       </div>
@@ -114,7 +113,7 @@ export function JobResult({ task, isLatest = false }: { task: Job, isLatest?: bo
     {task.status === 'EXPIRED' && <p className="expired">截图仅保留 24 小时；此任务的下载链接已失效。</p>}
 
     {task.status !== 'EXPIRED' && <div className="value-grid">
-      <ValueCard name="股票名称" value={task.values.stock_name} source={task.value_sources?.stock_name} finished={finished} />
+      <ValueCard name="股票名称" value={stockDisplayName} source={task.value_sources?.stock_name} finished={finished} />
       <ValueCard name="当前股价" value={task.values.current_price} source={task.value_sources?.current_price} finished={finished} />
       <ValueCard name="当前涨跌幅" value={task.values.change_percent} source={task.value_sources?.change_percent} finished={finished} directional />
       <ValueCard name="换手率" value={task.values.turnover_rate} source={task.value_sources?.turnover_rate} finished={finished} />
@@ -158,7 +157,7 @@ export default function App({ initialTask }: { initialTask?: Job }) {
   const isAdmin = window.location.hash === '#admin'
   const [symbol, setSymbol] = useState('')
   const [symbolLookup, setSymbolLookup] = useState<SymbolLookupState>({ status: 'idle' })
-  const [includeLongCapture, setIncludeLongCapture] = useState(true)
+  const [includeLongCapture, setIncludeLongCapture] = useState(false)
   const [tasks, setTasks] = useState<Job[]>(initialTask ? [initialTask] : [])
   const [error, setError] = useState('')
   const [submitting, setSubmitting] = useState(false)
@@ -297,16 +296,10 @@ export default function App({ initialTask }: { initialTask?: Job }) {
   return <main className="page-shell">
     <header className="hero">
       <p className="eyebrow">THS LEVEL2</p>
-      <h1>采集 Level2 数据，结果逐条保留</h1>
-      <p>输入股票代码后进入单设备队列。每次采集都会追加到当前浏览器的历史记录，不再覆盖上一条结果。</p>
+      <h1>同花顺数据采集</h1>
     </header>
 
-    <section className="panel submit-panel" aria-labelledby="submit-title">
-      <div className="submit-copy">
-        <p className="eyebrow">新建采集</p>
-        <h2 id="submit-title">提交新的采集任务</h2>
-        <p>输入 6 位股票代码，查询到股票名称后才可提交。</p>
-      </div>
+    <section className="panel submit-panel" aria-label="提交采集任务">
       <form onSubmit={submit}>
         <label className="sr-only" htmlFor="symbol">股票代码</label>
         <div className="form-row">
@@ -325,6 +318,15 @@ export default function App({ initialTask }: { initialTask?: Job }) {
             maxLength={6}
           />
           <button type="submit" disabled={submitting || !verifiedSymbol}>{submitting ? '正在提交…' : '提交采集任务'}</button>
+          <label className="capture-option">
+            <input
+              type="checkbox"
+              aria-label="生成整页长截图"
+              checked={includeLongCapture}
+              onChange={(event) => setIncludeLongCapture(event.target.checked)}
+            />
+            <span><strong>生成整页长截图</strong></span>
+          </label>
         </div>
         <div
           id="symbol-lookup-status"
@@ -336,7 +338,7 @@ export default function App({ initialTask }: { initialTask?: Job }) {
           {symbolLookup.status === 'invalid' && <span>未找到该股票</span>}
           {symbolLookup.status === 'unavailable' && <span>股票查询暂时不可用</span>}
           {symbolLookup.status === 'valid' && <>
-            <strong>{symbolLookup.result.name}（{symbolLookup.result.symbol}）</strong>
+            <strong className="symbol-lookup-value">{symbolLookup.result.name}（{symbolLookup.result.symbol}）</strong>
             <button
               type="button"
               className="symbol-edit"
@@ -347,18 +349,6 @@ export default function App({ initialTask }: { initialTask?: Job }) {
             >修改代码</button>
           </>}
         </div>
-        <label className="capture-option">
-          <input
-            type="checkbox"
-            aria-label="生成整页长截图"
-            checked={includeLongCapture}
-            onChange={(event) => setIncludeLongCapture(event.target.checked)}
-          />
-          <span>
-            <strong>生成整页长截图</strong>
-            <small>关闭后由 App 在后台请求并回传数据，不打开搜索框、不切换股票页面。</small>
-          </span>
-        </label>
       </form>
       {error && <p className="error form-error" role="alert">{error}</p>}
     </section>

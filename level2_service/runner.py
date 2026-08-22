@@ -22,7 +22,7 @@ from typing import Callable, Protocol
 from zoneinfo import ZoneInfo
 
 from .models import CaptureKind, MetricKind, TaskRecord, TaskStatus, utc_now
-from .parsed_values import DirectRequestError, ParsedValueSource, UnsupportedMarketError
+from .parsed_values import DirectRequestError, ParsedValueSource, UnsupportedMarketError, market_code_for_symbol
 from .queue import TaskStore
 
 
@@ -52,6 +52,13 @@ SEARCH_RESULT_CODE_SELECTOR = "com.hexin.plat.android:id/stock_code"
 STOCK_TITLE_SELECTOR = "com.hexin.plat.android:id/navi_title_text"
 MAX_HOME_BACK_PRESSES = 8
 ADMIN_BLOCKING_TEXTS = frozenset({"登录", "验证码", "设备验证", "人机验证", "暂无权限", "开通"})
+MARKET_LABELS = {
+    "17": "沪A",
+    "20": "沪基",
+    "33": "深A",
+    "36": "深基",
+    "151": "京A",
+}
 BEIJING_TIMEZONE = ZoneInfo("Asia/Shanghai")
 ANDROID_KEY_NAMES = {
     "Enter": "KEYCODE_ENTER",
@@ -296,7 +303,11 @@ def long_capture_has_net_heading(
 
         ocr = recognize
     try:
-        return "净量" in ocr(ocr_input)
+        recognized = ocr(ocr_input)
+        # Fund pages use a different Level-2 heading from ordinary stock
+        # pages.  This is still only a structural check; all task values are
+        # read from the App-internal direct interface.
+        return "净量" in recognized or "大单占比" in recognized
     except Exception:
         return False
 
@@ -681,14 +692,14 @@ class ADBDeviceBridge:
         return bool(adapter and adapter(resourceId=selector).exists)
 
     def click_selector(self, selector: str) -> bool:
-        adapter = self._uiautomator()
-        if adapter is None:
-            return False
-        target = adapter(resourceId=selector)
-        if not target.exists:
-            return False
-        target.click()
-        return True
+        def click(adapter: object) -> bool:
+            target = adapter(resourceId=selector)
+            if not target.exists:
+                return False
+            target.click()
+            return True
+
+        return bool(self._run_uiautomator_action(click))
 
     def wait_for_selector(self, selector: str, timeout: float) -> bool:
         adapter = self._uiautomator()
@@ -721,14 +732,57 @@ class ADBDeviceBridge:
         return 1 if target.exists else 0
 
     def click_selector_text(self, selector: str, text: str) -> bool:
+        def click(adapter: object) -> bool:
+            target = adapter(resourceId=selector, text=text)
+            if not target.exists:
+                return False
+            target.click()
+            return True
+
+        return bool(self._run_uiautomator_action(click))
+
+    def click_search_result(self, selector: str, text: str, market_label: str) -> bool:
+        """Tap the exact-code result whose card carries the expected market label."""
         adapter = self._uiautomator()
         if adapter is None:
             return False
-        target = adapter(resourceId=selector, text=text)
-        if not target.exists:
+        try:
+            raw = adapter.dump_hierarchy(compressed=True)
+            root = ElementTree.fromstring(raw)
+        except (ElementTree.ParseError, TypeError, ValueError, AttributeError):
             return False
-        target.click()
-        return True
+
+        parent_map: dict[int, list[ElementTree.Element]] = {}
+
+        def collect(node: ElementTree.Element, ancestors: list[ElementTree.Element]) -> None:
+            parent_map[id(node)] = ancestors
+            for child in node:
+                collect(child, [*ancestors, node])
+
+        collect(root, [])
+        bounds_pattern = re.compile(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]")
+        for candidate in root.iter():
+            if candidate.attrib.get("resource-id") != selector or candidate.attrib.get("text") != text:
+                continue
+            label_container = next(
+                (
+                    ancestor
+                    for ancestor in reversed(parent_map.get(id(candidate), []))
+                    if ancestor.attrib.get("resource-id", "").endswith("stock_code_label")
+                ),
+                None,
+            )
+            if label_container is None:
+                continue
+            if not any(node.attrib.get("text") == market_label for node in label_container.iter()):
+                continue
+            match = bounds_pattern.fullmatch(label_container.attrib.get("bounds", ""))
+            if match is None:
+                continue
+            left, top, right, bottom = (int(value) for value in match.groups())
+            self.tap((left + right) / 2 / SCREEN_SIZE[0], (top + bottom) / 2 / SCREEN_SIZE[1])
+            return True
+        return False
 
     def is_selected(self, selector: str) -> bool:
         adapter = self._uiautomator()
@@ -759,6 +813,22 @@ class ADBDeviceBridge:
         self._configure_uiautomator_adb()
         self._uiautomator_adapter = u2.connect(self.serial) if self.serial else u2.connect()
         return self._uiautomator_adapter
+
+    def _run_uiautomator_action(self, action: Callable[[object], object]) -> object | None:
+        for attempt in range(2):
+            try:
+                adapter = self._uiautomator()
+                return action(adapter) if adapter is not None else None
+            except Exception as error:
+                if attempt == 0 and self._is_stale_uiautomator_error(error):
+                    self._uiautomator_adapter = None
+                    continue
+                raise
+        return None
+
+    @staticmethod
+    def _is_stale_uiautomator_error(error: Exception) -> bool:
+        return "StaleObjectException" in f"{type(error).__name__}: {error}"
 
     def _configure_uiautomator_adb(self) -> None:
         """Make adbutils use the same remote ADB server as the adb CLI."""
@@ -933,6 +1003,11 @@ class Level2Navigator:
     def open_stock(self, symbol: str) -> None:
         normalized = symbol.strip().upper()
         self.bridge.launch_app(APP_PACKAGE, APP_ACTIVITY)
+        # am start returns before the App has rebuilt its home hierarchy.  Do
+        # not send back presses into that transition; on the real APK this
+        # can leave the activity outside the home screen and make all three
+        # navigation attempts fail.
+        self.bridge.wait_for_selector(HOME_MARKER_SELECTOR, 5)
         self._return_to_home()
         if not self.bridge.click_selector(HOME_SEARCH_SELECTOR) and not self.bridge.click_text("搜索") and not self.visual_fallback.tap_template("search", self.bridge):
             raise NavigationError("symbol search selector unavailable")
@@ -942,11 +1017,25 @@ class Level2Navigator:
             raise NavigationError("symbol search input unavailable")
         if not self.bridge.wait_for_selector_text(SEARCH_RESULT_CODE_SELECTOR, normalized, 10):
             raise NavigationError("exact symbol result unavailable")
-        if self.bridge.exact_selector_text_count(SEARCH_RESULT_CODE_SELECTOR, normalized) != 1:
-            raise NavigationError("exact symbol is not unique")
-        if not self.bridge.click_selector_text(SEARCH_RESULT_CODE_SELECTOR, normalized):
+        exact_count = self.bridge.exact_selector_text_count(SEARCH_RESULT_CODE_SELECTOR, normalized)
+        market_label = None
+        if normalized.isdigit() and len(normalized) == 6:
+            try:
+                market_label = MARKET_LABELS.get(market_code_for_symbol(normalized))
+            except UnsupportedMarketError:
+                market_label = None
+        if exact_count > 1 and market_label is not None:
+            click_market_result = getattr(self.bridge, "click_search_result", None)
+            clicked = callable(click_market_result) and bool(
+                click_market_result(SEARCH_RESULT_CODE_SELECTOR, normalized, market_label)
+            )
+        else:
+            if exact_count != 1:
+                raise NavigationError("exact symbol is not unique")
+            clicked = self.bridge.click_selector_text(SEARCH_RESULT_CODE_SELECTOR, normalized)
+        if not clicked:
             raise NavigationError("exact symbol result unavailable")
-        if not self.bridge.wait_for_selector(STOCK_TITLE_SELECTOR, 10):
+        if not self.bridge.wait_for_selector(STOCK_TITLE_SELECTOR, 20):
             raise NavigationError("stock page did not open")
 
     def admin_blocking_texts(self) -> frozenset[str]:

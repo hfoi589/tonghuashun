@@ -20,6 +20,7 @@ from level2_service.runner import (
     NavigationError,
     NeedsAdminError,
     RunnerControl,
+    SEARCH_RESULT_CODE_SELECTOR,
     long_capture_has_net_heading,
 )
 
@@ -167,6 +168,86 @@ def test_uiautomator_uses_configured_adb_server_socket(monkeypatch) -> None:
     assert calls["serial"] == "emulator-5554"
 
 
+def test_adb_click_selector_reconnects_after_a_stale_uiautomator_object() -> None:
+    class StaleObjectException(Exception):
+        pass
+
+    class Target:
+        exists = True
+
+        def __init__(self, stale: bool) -> None:
+            self.stale = stale
+            self.clicked = False
+
+        def click(self) -> None:
+            if self.stale:
+                raise StaleObjectException("StaleObjectException")
+            self.clicked = True
+
+    class Adapter:
+        def __init__(self, target: Target) -> None:
+            self.target = target
+
+        def __call__(self, **_selector):
+            return self.target
+
+    class RetryingBridge(ADBDeviceBridge):
+        def __init__(self) -> None:
+            super().__init__()
+            self.adapters = iter((Adapter(Target(True)), Adapter(Target(False))))
+
+        def _uiautomator(self):
+            return next(self.adapters)
+
+    assert RetryingBridge().click_selector("search") is True
+
+
+def test_adb_clicks_the_fund_search_result_with_the_expected_market_label() -> None:
+    class Adapter:
+        def dump_hierarchy(self, **_kwargs) -> str:
+            return (
+                '<hierarchy>'
+                '<node class="android.widget.LinearLayout" resource-id="com.hexin.plat.android:id/stock_code_label" bounds="[48,304][252,353]">'
+                '<node resource-id="com.hexin.plat.android:id/label" text="深基" />'
+                '<node resource-id="com.hexin.plat.android:id/stock_code" text="160723" bounds="[132,304][252,353]" />'
+                '</node>'
+                '<node class="android.widget.LinearLayout" resource-id="com.hexin.plat.android:id/stock_code_label" bounds="[48,791][378,844]">'
+                '<node resource-id="com.hexin.plat.android:id/label" text="基金" />'
+                '<node resource-id="com.hexin.plat.android:id/stock_code" text="160723" bounds="[132,794][252,843]" />'
+                '</node>'
+                '</hierarchy>'
+            )
+
+    bridge = ADBDeviceBridge(uiautomator_adapter=Adapter())
+    taps: list[tuple[float, float]] = []
+    bridge.tap = lambda x, y: taps.append((x, y))  # type: ignore[method-assign]
+
+    assert bridge.click_search_result(SEARCH_RESULT_CODE_SELECTOR, "160723", "深基") is True
+    assert taps == [(150 / 1080, 328.5 / 1920)]
+
+
+def test_navigator_filters_a_bond_collision_by_the_expected_stock_market_label() -> None:
+    class MarketAwareBridge(FakeDeviceBridge):
+        market_clicks: list[tuple[str, str, str]]
+
+        def __init__(self) -> None:
+            super().__init__(symbol="002412", exact_symbol_matches=2)
+            self.market_clicks = []
+
+        def click_search_result(self, selector: str, text: str, market_label: str) -> bool:
+            self.market_clicks.append((selector, text, market_label))
+            if market_label != "深A":
+                return False
+            self.stock_open = True
+            return True
+
+    bridge = MarketAwareBridge()
+
+    Level2Navigator(bridge).open_stock("002412")
+
+    assert bridge.market_clicks == [(SEARCH_RESULT_CODE_SELECTOR, "002412", "深A")]
+
+
 def test_lock_can_take_over_when_previous_owner_has_no_active_socket() -> None:
     control = RunnerControl()
 
@@ -188,6 +269,39 @@ def test_navigator_uses_visual_fallback_when_selector_is_missing() -> None:
 
     assert image.startswith(b"\x89PNG")
     assert bridge.visual_actions == ["search"]
+
+
+def test_navigator_waits_for_home_after_launch_before_pressing_back() -> None:
+    """A slow App launch must not receive back presses during its transition."""
+    class DelayedHomeBridge(FakeDeviceBridge):
+        def launch_app(self, package: str, activity: str) -> None:
+            super().launch_app(package, activity)
+            self.home_ready = False
+
+        def wait_for_selector(self, selector: str, timeout: float) -> bool:
+            if selector == "com.hexin.plat.android:id/firstpagenavi":
+                self.home_ready = True
+            return super().wait_for_selector(selector, timeout)
+
+        def press_back(self) -> None:
+            raise AssertionError("back pressed before the App home page was ready")
+
+    bridge = DelayedHomeBridge(symbol="SZ.000001")
+
+    Level2Navigator(bridge).open_stock("SZ.000001")
+
+
+def test_navigator_allows_slow_stock_page_to_finish_loading() -> None:
+    """A cold stock page may need more than the initial ten-second wait."""
+    class SlowStockPageBridge(FakeDeviceBridge):
+        def wait_for_selector(self, selector: str, timeout: float) -> bool:
+            if selector == "com.hexin.plat.android:id/navi_title_text" and timeout < 20:
+                return False
+            return super().wait_for_selector(selector, timeout)
+
+    bridge = SlowStockPageBridge(symbol="SZ.000001")
+
+    Level2Navigator(bridge).open_stock("SZ.000001")
 
 
 def test_navigator_uses_search_text_before_visual_fallback() -> None:
@@ -360,6 +474,12 @@ def test_long_capture_net_heading_validation_rejects_the_reported_missing_title(
     recognize = lambda _image: "散户数量 MACDFS 大单金额 金额:9091.9万 买卖队列"
 
     assert long_capture_has_net_heading(b"problem-image", ocr=recognize) is False
+
+
+def test_long_capture_net_heading_validation_accepts_the_fund_level2_title() -> None:
+    recognize = lambda _image: "分时量 大单占比(手)"
+
+    assert long_capture_has_net_heading(b"fund-image", ocr=recognize) is True
 
 
 def test_long_capture_net_heading_validation_accepts_the_visible_net_value_row() -> None:

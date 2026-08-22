@@ -1,26 +1,657 @@
-from pathlib import Path
+from __future__ import annotations
 
-from level2_service.models import CaptureKind, TaskRecord, TaskStatus
+from io import BytesIO
+from random import Random
+import sys
+import types
+from pathlib import Path
+from time import monotonic
+
+from PIL import Image
+import pytest
+
+from level2_service.models import CaptureKind, CaptureStatus, MetricKind, TaskRecord, TaskStatus
 from level2_service.queue import InMemoryStreams
 from level2_service.runner import (
+    ADBDeviceBridge,
     FakeDeviceBridge,
     Level2Navigator,
     Level2Runner,
     NavigationError,
     NeedsAdminError,
     RunnerControl,
+    long_capture_has_net_heading,
 )
+
+
+TEST_VALUES = {
+    CaptureKind.LARGE_ORDER_NET: "-0.02",
+    CaptureKind.LARGE_ORDER_AMOUNT: "-2802.6万",
+    CaptureKind.RETAIL_COUNT: "21.23",
+}
+
+PARSED_VALUES = {
+    MetricKind.STOCK_NAME: "招商轮船",
+    MetricKind.CURRENT_PRICE: "19.78",
+    MetricKind.CHANGE_PERCENT: "7.15%",
+    MetricKind.TURNOVER_RATE: "2.40%",
+    MetricKind.RETAIL_COUNT: "21.23",
+    MetricKind.LARGE_ORDER_NET: "-0.02",
+    MetricKind.LARGE_ORDER_AMOUNT: "-2802.6万",
+    MetricKind.MACDFS: "+0.012",
+}
+
+
+def _successful_runner(store, navigator, capture_root: Path, control: RunnerControl | None = None) -> Level2Runner:
+    viewport_height = 1920 - 215 - 154
+    random = Random(33007)
+    row_strip = Image.frombytes("RGB", (1, viewport_height + 450), random.randbytes((viewport_height + 450) * 3))
+    document = row_strip.resize((1080, viewport_height + 450))
+
+    def screen(offset: int) -> bytes:
+        image = Image.new("RGB", (1080, 1920), "white")
+        image.paste(document.crop((0, offset, 1080, offset + viewport_height)), (0, 215))
+        output = BytesIO()
+        image.save(output, format="PNG")
+        return output.getvalue()
+
+    frames = iter((screen(0), screen(450), screen(450)))
+
+    def screenshot_png() -> bytes:
+        navigator.bridge.capture_attempts += 1
+        return next(frames)
+
+    navigator.bridge.screenshot_png = screenshot_png  # type: ignore[method-assign]
+    return Level2Runner(
+        store,
+        navigator,
+        capture_root,
+        control or RunnerControl(),
+        value_reader=types.SimpleNamespace(read=lambda _frames, _kinds=None: TEST_VALUES),
+        parsed_value_source=types.SimpleNamespace(
+            read=lambda _symbol: dict(PARSED_VALUES),
+            read_direct=lambda _symbol: dict(PARSED_VALUES),
+        ),
+        stitcher=lambda frames: b"\x89PNG\r\n\x1a\nlong:" + b"|".join(frames),
+    )
+
+
+def test_adb_exact_text_count_rejects_unparseable_ui_dump() -> None:
+    """A malformed dump is not evidence of one exact symbol match."""
+    bridge = ADBDeviceBridge()
+    bridge._shell = lambda *_args: b"UI dump failed: SZ.000001"  # type: ignore[method-assign]
+
+    assert bridge.exact_text_count("SZ.000001") == 0
+
+
+def test_adb_exact_text_count_parses_ui_dump_with_diagnostic_prefix_and_suffix() -> None:
+    bridge = ADBDeviceBridge()
+    bridge._uiautomator = lambda: None  # type: ignore[method-assign]
+    bridge._shell = lambda *_args: (
+        b"UI dump requested\n"
+        b"<hierarchy><node text=\"SZ.000001\" /></hierarchy>\n"
+        b"UI dump complete\n"
+    )  # type: ignore[method-assign]
+
+    assert bridge.exact_text_count("SZ.000001") == 1
+
+
+def test_adb_visible_texts_uses_one_hierarchy_dump_for_all_admin_markers() -> None:
+    """Six separate selector queries would restore the avoidable daily delay."""
+    class HierarchyAdapter:
+        def __init__(self) -> None:
+            self.dumps = 0
+
+        def dump_hierarchy(self, **_kwargs) -> str:
+            self.dumps += 1
+            return (
+                '<hierarchy><node text="登录" />'
+                '<node text="验证码" /><node text="普通行情" /></hierarchy>'
+            )
+
+    adapter = HierarchyAdapter()
+    bridge = ADBDeviceBridge(uiautomator_adapter=adapter)
+
+    assert bridge.visible_texts() == frozenset({"登录", "验证码", "普通行情"})
+    assert adapter.dumps == 1
+
+
+def test_adb_command_timeout_prevents_a_capture_from_hanging_the_worker() -> None:
+    """A wedged host ADB connection must return control to the task state machine."""
+    bridge = ADBDeviceBridge(adb=sys.executable, command_timeout_seconds=0.05)
+    started = monotonic()
+
+    with pytest.raises(NavigationError, match="ADB command timed out"):
+        bridge._run("-c", "import time; time.sleep(2)")
+
+    assert monotonic() - started < 0.5
+
+
+def test_adb_key_maps_browser_key_names_to_android_keycodes() -> None:
+    bridge = ADBDeviceBridge()
+    calls: list[tuple[str, ...]] = []
+    bridge._shell = lambda *args: calls.append(args)  # type: ignore[method-assign]
+
+    bridge.key("a", "down")
+    bridge.key("Enter", "down")
+    bridge.key("a", "up")
+
+    assert calls == [
+        ("input", "keyevent", "KEYCODE_A"),
+        ("input", "keyevent", "KEYCODE_ENTER"),
+    ]
+
+
+def test_uiautomator_uses_configured_adb_server_socket(monkeypatch) -> None:
+    calls: dict[str, object] = {}
+
+    class FakeAdbClient:
+        def __init__(self, **kwargs) -> None:
+            calls["adb_client"] = kwargs
+
+    fake_adbutils = types.SimpleNamespace(AdbClient=FakeAdbClient)
+    fake_uiautomator2 = types.SimpleNamespace(
+        connect=lambda serial: calls.setdefault("serial", serial) or object()
+    )
+    monkeypatch.setitem(sys.modules, "adbutils", fake_adbutils)
+    monkeypatch.setitem(sys.modules, "uiautomator2", fake_uiautomator2)
+
+    bridge = ADBDeviceBridge(
+        serial="emulator-5554",
+        environment={"ADB_SERVER_SOCKET": "tcp:host.docker.internal:5037"},
+    )
+
+    bridge._uiautomator()
+
+    assert calls["adb_client"] == {"host": "host.docker.internal", "port": 5037}
+    assert calls["serial"] == "emulator-5554"
+
+
+def test_lock_can_take_over_when_previous_owner_has_no_active_socket() -> None:
+    control = RunnerControl()
+
+    assert control.lock("old-session") is True
+    assert control.lock("new-session") is True
+    assert control.lock_state("new-session") == {"locked": True}
 
 
 def test_navigator_uses_visual_fallback_when_selector_is_missing() -> None:
     """A skin change must not make a verified Level2 tab unreachable."""
-    bridge = FakeDeviceBridge(symbol="SZ.000001", selector_available=False)
+    class NoTextBridge(FakeDeviceBridge):
+        def click_text(self, text: str) -> bool:
+            return False if text == "搜索" else super().click_text(text)
+
+    bridge = NoTextBridge(symbol="SZ.000001", selector_available=False)
     navigator = Level2Navigator(bridge)
 
     image = navigator.capture("SZ.000001", CaptureKind.LARGE_ORDER_NET)
 
     assert image.startswith(b"\x89PNG")
     assert bridge.visual_actions == ["search"]
+
+
+def test_navigator_uses_search_text_before_visual_fallback() -> None:
+    class NoVisualFallback:
+        def tap_template(self, _name: str, _bridge: FakeDeviceBridge) -> bool:
+            return False
+
+    class TextSearchBridge(FakeDeviceBridge):
+        text_actions: list[str]
+
+        def click_text(self, text: str) -> bool:
+            self.text_actions.append(text)
+            return super().click_text(text)
+
+    bridge = TextSearchBridge(symbol="SZ.000001", selector_available=False)
+    bridge.text_actions = []
+
+    image = Level2Navigator(bridge, NoVisualFallback()).capture("SZ.000001", CaptureKind.LARGE_ORDER_NET)
+
+    assert image.startswith(b"\x89PNG")
+    assert bridge.text_actions[0] == "搜索"
+
+
+def test_navigator_returns_home_and_opens_the_unique_first_stock_result() -> None:
+    home_marker = "com.hexin.plat.android:id/firstpagenavi"
+    home_search = "com.hexin.plat.android:id/first_page_search_layout_container"
+    search_input = "com.hexin.plat.android:id/search_input"
+    stock_code = "com.hexin.plat.android:id/stock_code"
+    stock_title = "com.hexin.plat.android:id/navi_title_text"
+
+    class SearchFlowBridge(FakeDeviceBridge):
+        def __init__(self) -> None:
+            super().__init__(symbol="OLD")
+            self.back_steps_remaining = 2
+            self.search_open = False
+            self.stock_open = False
+            self.actions: list[tuple] = []
+
+        def has_selector(self, selector: str) -> bool:
+            if selector == home_marker:
+                return self.back_steps_remaining == 0
+            if selector == search_input:
+                return self.search_open
+            if selector == stock_title:
+                return self.stock_open
+            return super().has_selector(selector)
+
+        def press_back(self) -> None:
+            self.actions.append(("back",))
+            self.back_steps_remaining = max(0, self.back_steps_remaining - 1)
+
+        def wait_for_selector(self, selector: str, _timeout: float) -> bool:
+            self.actions.append(("wait_selector", selector))
+            return self.has_selector(selector)
+
+        def click_selector(self, selector: str) -> bool:
+            self.actions.append(("click_selector", selector))
+            if selector == home_search and self.back_steps_remaining == 0:
+                self.search_open = True
+                return True
+            return super().click_selector(selector)
+
+        def replace_text(self, selector: str, value: str) -> bool:
+            self.actions.append(("replace_text", selector, value))
+            if selector != search_input or not self.search_open:
+                return False
+            self.symbol = value
+            return True
+
+        def wait_for_selector_text(self, selector: str, text: str, _timeout: float) -> bool:
+            self.actions.append(("wait_selector_text", selector, text))
+            return selector == stock_code and text == self.symbol
+
+        def exact_selector_text_count(self, selector: str, text: str) -> int:
+            self.actions.append(("count_selector_text", selector, text))
+            return self.exact_symbol_matches if selector == stock_code and text == self.symbol else 0
+
+        def click_selector_text(self, selector: str, text: str) -> bool:
+            self.actions.append(("click_selector_text", selector, text))
+            if selector != stock_code or text != self.symbol:
+                return False
+            self.stock_open = True
+            return True
+
+    bridge = SearchFlowBridge()
+
+    image = Level2Navigator(bridge).capture("601872", CaptureKind.LARGE_ORDER_NET)
+
+    assert image.startswith(b"\x89PNG")
+    assert bridge.back_steps_remaining == 0
+    assert bridge.stock_open is True
+    assert ("replace_text", search_input, "601872") in bridge.actions
+    assert ("click_selector_text", stock_code, "601872") in bridge.actions
+    assert bridge.actions.index(("back",)) < bridge.actions.index(("replace_text", search_input, "601872"))
+
+
+def test_runner_ignores_early_level2_marker_and_scrolls_until_page_stops(tmp_path: Path) -> None:
+    """The Level-2 section begins one screen before the real page bottom."""
+    viewport_height = 1920 - 215 - 154
+    offsets = (0, 450, 900, 1350, 1350)
+    document_height = viewport_height + offsets[-1]
+    random = Random(601975)
+    row_strip = Image.frombytes("RGB", (1, document_height), random.randbytes(document_height * 3))
+    document = row_strip.resize((1080, document_height))
+
+    def screen(offset: int) -> bytes:
+        image = Image.new("RGB", (1080, 1920), "white")
+        image.paste(document.crop((0, offset, 1080, offset + viewport_height)), (0, 215))
+        output = BytesIO()
+        image.save(output, format="PNG")
+        return output.getvalue()
+
+    source_frames = tuple(screen(offset) for offset in offsets)
+
+    class RecordingChartBridge(FakeDeviceBridge):
+        def __init__(self) -> None:
+            super().__init__(symbol="OLD")
+            self.search_values: list[str] = []
+            self.settle_waits: list[float] = []
+            self.frames = iter(source_frames)
+
+        def replace_text(self, selector: str, value: str) -> bool:
+            self.search_values.append(value)
+            return super().replace_text(selector, value)
+
+        def screenshot_png(self) -> bytes:
+            self.capture_attempts += 1
+            return next(self.frames)
+
+        def has_text(self, text: str) -> bool:
+            if text == "买卖队列":
+                return len([action for action in self.inputs if action[0] == "swipe"]) >= 2
+            return super().has_text(text)
+
+        def wait_for_scroll_settle(self, timeout: float) -> None:
+            self.settle_waits.append(timeout)
+
+    store = InMemoryStreams()
+    store.enqueue(TaskRecord(task_id="one-search-task", symbol="601872"))
+    bridge = RecordingChartBridge()
+    values = PARSED_VALUES
+    reader = types.SimpleNamespace(read=lambda _frames, _kinds=None: TEST_VALUES)
+    runner = Level2Runner(
+        store,
+        Level2Navigator(bridge),
+        tmp_path,
+        RunnerControl(),
+        value_reader=reader,
+        parsed_value_source=types.SimpleNamespace(
+            read=lambda _symbol: dict(PARSED_VALUES),
+            read_direct=lambda _symbol: dict(PARSED_VALUES),
+        ),
+        stitcher=lambda frames: b"\x89PNG\r\n\x1a\nlong:" + b"|".join(frames),
+    )
+
+    task = runner.run_once()
+
+    assert task is not None and task.status == TaskStatus.COMPLETED
+    assert bridge.search_values == ["601872"]
+    assert bridge.inputs == [("swipe", 0.5, 0.85, 0.5, 0.47)] * 4
+    assert len(bridge.settle_waits) == 4
+    assert (tmp_path / "one-search-task" / "LONG.png").read_bytes() == (
+        b"\x89PNG\r\n\x1a\nlong:" + b"|".join(source_frames[:-1])
+    )
+    assert list((tmp_path / "one-search-task").iterdir()) == [tmp_path / "one-search-task" / "LONG.png"]
+    assert task.values == values
+
+
+def test_long_capture_net_heading_validation_rejects_the_reported_missing_title() -> None:
+    recognize = lambda _image: "散户数量 MACDFS 大单金额 金额:9091.9万 买卖队列"
+
+    assert long_capture_has_net_heading(b"problem-image", ocr=recognize) is False
+
+
+def test_long_capture_net_heading_validation_accepts_the_visible_net_value_row() -> None:
+    recognize = lambda _image: "散户数量 MACDFS 净量:0.49 大单金额 买卖队列"
+
+    assert long_capture_has_net_heading(b"complete-image", ocr=recognize) is True
+
+
+def test_long_capture_net_heading_default_ocr_isolates_the_left_neutral_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = Image.new("RGB", (1080, 1920), "white")
+    source.putpixel((100, 100), (70, 75, 80))
+    source.putpixel((120, 100), (170, 20, 20))
+    source.putpixel((400, 100), (50, 50, 50))
+    encoded = BytesIO()
+    source.save(encoded, format="PNG")
+    invocation: dict[str, object] = {}
+
+    def run_tesseract(command, *, input, stdout, stderr, check):  # noqa: ANN001
+        invocation.update(
+            command=command,
+            input=input,
+            stdout=stdout,
+            stderr=stderr,
+            check=check,
+        )
+        return types.SimpleNamespace(stdout="大单净量".encode(), stderr=b"")
+
+    monkeypatch.setattr("level2_service.runner.subprocess.run", run_tesseract)
+
+    assert long_capture_has_net_heading(encoded.getvalue()) is True
+
+    command = invocation["command"]
+    assert command[-2:] == ["--psm", "6"]
+    with Image.open(BytesIO(invocation["input"])) as prepared:  # type: ignore[arg-type]
+        prepared = prepared.convert("RGB")
+        assert prepared.size == (840, 5760)
+        assert prepared.getpixel((301, 301)) == (70, 75, 80)
+        assert prepared.getpixel((361, 301)) == (255, 255, 255)
+
+
+def test_runner_recaptures_instead_of_publishing_a_long_image_without_net_heading(tmp_path: Path) -> None:
+    class RetryingNavigator:
+        def __init__(self) -> None:
+            self.open_attempts = 0
+            self.capture_attempts = 0
+
+        def open_stock(self, _symbol: str) -> None:
+            self.open_attempts += 1
+
+        def capture_chart_frames(self) -> tuple[bytes, ...]:
+            self.capture_attempts += 1
+            return (f"frames-{self.capture_attempts}".encode(),)
+
+        def device_online(self) -> bool:
+            return True
+
+    store = InMemoryStreams()
+    store.enqueue(TaskRecord(task_id="heading-retry-task", symbol="601975"))
+    navigator = RetryingNavigator()
+    runner = Level2Runner(
+        store,
+        navigator,  # type: ignore[arg-type]
+        tmp_path,
+        RunnerControl(),
+        value_reader=types.SimpleNamespace(read=lambda _frames, _kinds=None: TEST_VALUES),
+        parsed_value_source=types.SimpleNamespace(
+            read=lambda _symbol: dict(PARSED_VALUES),
+            read_direct=lambda _symbol: dict(PARSED_VALUES),
+        ),
+        stitcher=lambda frames: b"missing-net" if frames[0] == b"frames-1" else b"complete-long-image",
+        long_capture_validator=lambda image: image == b"complete-long-image",
+    )
+
+    task = runner.run_once()
+
+    assert task is not None and task.status == TaskStatus.COMPLETED
+    assert navigator.open_attempts == 2
+    assert navigator.capture_attempts == 2
+    assert (tmp_path / "heading-retry-task" / "LONG.png").read_bytes() == b"complete-long-image"
+
+
+def test_long_capture_runner_uses_only_interface_values_and_leaves_missing_values_unfilled(tmp_path: Path) -> None:
+    """A long screenshot must never authorize OCR to replace missing interface data."""
+    store = InMemoryStreams()
+    store.enqueue(TaskRecord(task_id="background-first", symbol="601872"))
+    runner = _successful_runner(store, Level2Navigator(FakeDeviceBridge(symbol="601872")), tmp_path)
+    background = dict(PARSED_VALUES)
+    background[MetricKind.RETAIL_COUNT] = None
+
+    def forbid_runtime_snapshot(_symbol: str):
+        raise AssertionError("task values must use the direct App interface")
+
+    runner.parsed_value_source = types.SimpleNamespace(
+        read=forbid_runtime_snapshot,
+        read_direct=lambda _symbol: background,
+    )
+    runner.value_reader = types.SimpleNamespace(
+        read=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("task values must never run OCR")
+        )
+    )
+
+    task = runner.run_once()
+
+    assert task is not None and task.status == TaskStatus.PARTIAL
+    assert task.error_code == "VALUE_RECOGNITION_FAILED"
+    assert task.values == background
+    assert task.value_sources[MetricKind.RETAIL_COUNT] is None
+    assert all(
+        task.value_sources[kind].value == "INTERFACE"
+        for kind in MetricKind
+        if kind != MetricKind.RETAIL_COUNT
+    )
+    assert task.long_capture.status == CaptureStatus.READY
+
+
+def test_data_only_runner_reads_parsed_values_without_capturing_or_running_ocr(tmp_path: Path) -> None:
+    """Disabling the long image must skip every screenshot, stitch and OCR operation."""
+    class DataOnlyNavigator:
+        def __init__(self) -> None:
+            self.opened: list[str] = []
+
+        def open_stock(self, symbol: str) -> None:
+            self.opened.append(symbol)
+            raise AssertionError("data-only tasks must not open or switch the stock page")
+
+        def admin_blocking_texts(self) -> frozenset[str]:
+            return frozenset()
+
+        def capture_chart_frames(self) -> tuple[bytes, ...]:
+            raise AssertionError("data-only tasks must not capture frames")
+
+        def device_online(self) -> bool:
+            return True
+
+    class ForbiddenReader:
+        def read(self, *_args, **_kwargs):
+            raise AssertionError("data-only tasks must not run OCR")
+
+    store = InMemoryStreams()
+    store.enqueue(TaskRecord(
+        task_id="data-only-task",
+        symbol="601872",
+        include_long_capture=False,
+    ))
+    navigator = DataOnlyNavigator()
+    runner = Level2Runner(
+        store,
+        navigator,  # type: ignore[arg-type]
+        tmp_path,
+        RunnerControl(),
+        value_reader=ForbiddenReader(),  # type: ignore[arg-type]
+        parsed_value_source=types.SimpleNamespace(read_direct=lambda _symbol: dict(PARSED_VALUES)),
+        stitcher=lambda _frames: (_ for _ in ()).throw(AssertionError("must not stitch")),
+        long_capture_validator=lambda _image: (_ for _ in ()).throw(AssertionError("must not validate")),
+    )
+
+    task = runner.run_once()
+
+    assert task is not None and task.status == TaskStatus.COMPLETED
+    assert navigator.opened == []
+    assert task.values == PARSED_VALUES
+    assert task.long_capture.status == CaptureStatus.SKIPPED
+    assert task.long_capture.path is None
+    assert not (tmp_path / "data-only-task").exists()
+
+
+def test_data_only_runner_never_uses_ocr_for_missing_interface_values(tmp_path: Path) -> None:
+    """A partial interface response must stay partial without opening the App UI."""
+    store = InMemoryStreams()
+    store.enqueue(TaskRecord(
+        task_id="partial-data-only-task",
+        symbol="601872",
+        include_long_capture=False,
+    ))
+    values = dict(PARSED_VALUES)
+    values[MetricKind.LARGE_ORDER_NET] = None
+    bridge = FakeDeviceBridge(symbol="601872")
+    runner = _successful_runner(
+        store,
+        Level2Navigator(bridge),
+        tmp_path,
+    )
+    runner.parsed_value_source = types.SimpleNamespace(read_direct=lambda _symbol: values)
+    runner.value_reader = types.SimpleNamespace(
+        read=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("task values must never run OCR")
+        )
+    )
+    runner.stitcher = lambda _frames: (_ for _ in ()).throw(AssertionError("must not stitch"))
+    runner.long_capture_validator = lambda _image: (_ for _ in ()).throw(AssertionError("must not validate"))
+
+    task = runner.run_once()
+
+    assert task is not None and task.status == TaskStatus.PARTIAL
+    assert task.error_code == "VALUE_RECOGNITION_FAILED"
+    assert task.values == values
+    assert task.value_sources[MetricKind.LARGE_ORDER_NET] is None
+    assert all(
+        task.value_sources[kind].value == "INTERFACE"
+        for kind in MetricKind
+        if kind != MetricKind.LARGE_ORDER_NET
+    )
+    assert bridge.inputs == []
+    assert task.long_capture.status == CaptureStatus.SKIPPED
+    assert task.long_capture.path is None
+    assert not (tmp_path / "partial-data-only-task").exists()
+
+
+def test_data_only_runner_preserves_interface_error_without_ocr_fallback(tmp_path: Path) -> None:
+    store = InMemoryStreams()
+    store.enqueue(TaskRecord(
+        task_id="failed-interface-data-only-task",
+        symbol="601872",
+        include_long_capture=False,
+    ))
+    bridge = FakeDeviceBridge(symbol="601872")
+    runner = _successful_runner(
+        store,
+        Level2Navigator(bridge),
+        tmp_path,
+    )
+
+    def fail_direct(_symbol: str):
+        from level2_service.parsed_values import DirectRequestError
+
+        raise DirectRequestError("DIRECT_MANAGER_UNAVAILABLE")
+
+    runner.parsed_value_source = types.SimpleNamespace(read_direct=fail_direct)
+    runner.value_reader = types.SimpleNamespace(
+        read=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("task values must never run OCR")
+        )
+    )
+    runner.stitcher = lambda _frames: (_ for _ in ()).throw(AssertionError("must not stitch"))
+
+    task = runner.run_once()
+
+    assert task is not None and task.status == TaskStatus.FAILED
+    assert task.error_code == "DIRECT_MANAGER_UNAVAILABLE"
+    assert all(value is None for value in task.values.values())
+    assert all(source is None for source in task.value_sources.values())
+    assert bridge.inputs == []
+    assert task.long_capture.status == CaptureStatus.SKIPPED
+    assert not (tmp_path / "failed-interface-data-only-task").exists()
+
+
+def test_online_ui_failure_is_not_reported_as_device_offline(tmp_path: Path) -> None:
+    """A uiautomator/UI exception while adb is healthy must not poison runner health."""
+    store = InMemoryStreams()
+    store.enqueue(TaskRecord(task_id="ui-failure-task", symbol="601872"))
+    bridge = FakeDeviceBridge(symbol="601872", failures=[RuntimeError("uiautomator rpc failed")])
+    bridge.online = True
+    control = RunnerControl()
+
+    task = Level2Runner(
+        store,
+        Level2Navigator(bridge),
+        tmp_path,
+        control,
+        parsed_value_source=types.SimpleNamespace(
+            read_direct=lambda _symbol: dict(PARSED_VALUES)
+        ),
+    ).run_once()
+
+    assert task is not None and task.status == TaskStatus.FAILED
+    assert task.error_code == "NAVIGATION_FAILED"
+    assert control.state == "READY"
+
+
+def test_device_transport_failure_is_the_only_capture_error_marked_offline(tmp_path: Path) -> None:
+    store = InMemoryStreams()
+    store.enqueue(TaskRecord(task_id="transport-failure-task", symbol="601872"))
+    bridge = FakeDeviceBridge(symbol="601872", failures=[RuntimeError("transport closed")])
+    bridge.online = False
+    control = RunnerControl()
+
+    task = Level2Runner(
+        store,
+        Level2Navigator(bridge),
+        tmp_path,
+        control,
+        parsed_value_source=types.SimpleNamespace(
+            read_direct=lambda _symbol: dict(PARSED_VALUES)
+        ),
+    ).run_once()
+
+    assert task is not None and task.status == TaskStatus.FAILED
+    assert task.error_code == "DEVICE_OFFLINE"
+    assert control.state == "OFFLINE"
 
 
 def test_navigator_requires_exact_symbol_and_tab_before_capturing() -> None:
@@ -35,72 +666,133 @@ def test_navigator_requires_exact_symbol_and_tab_before_capturing() -> None:
         raise AssertionError("mismatched symbol was captured")
 
 
-def test_navigator_requires_the_requested_tab_to_be_active_before_capturing() -> None:
-    """Tab labels can all remain visible in the tab bar; only the active one is valid."""
-    bridge = FakeDeviceBridge(symbol="SZ.000001", tab_activation=False)
+def test_navigator_rejects_ambiguous_exact_symbol_results() -> None:
+    bridge = FakeDeviceBridge(symbol="SZ.000001", exact_symbol_matches=2)
 
     try:
-        Level2Navigator(bridge).capture("SZ.000001", CaptureKind.LARGE_ORDER_AMOUNT)
+        Level2Navigator(bridge).capture("SZ.000001", CaptureKind.LARGE_ORDER_NET)
     except NavigationError as error:
-        assert "active" in str(error)
+        assert "unique" in str(error)
     else:
-        raise AssertionError("inactive tab was captured")
+        raise AssertionError("ambiguous symbol result was captured")
 
 
 def test_runner_retries_transient_navigation_up_to_three_attempts(tmp_path: Path) -> None:
-    """A temporary UI miss should be retried, but cannot spin forever."""
+    """Only failures before stock entry may repeat the symbol search."""
+    class TransientSearchBridge(FakeDeviceBridge):
+        search_attempts = 0
+
+        def wait_for_selector_text(self, selector: str, text: str, timeout: float) -> bool:
+            self.search_attempts += 1
+            if self.search_attempts < 3:
+                return False
+            return super().wait_for_selector_text(selector, text, timeout)
+
     store = InMemoryStreams()
     store.enqueue(TaskRecord(task_id="retry-task", symbol="SZ.000001"))
-    bridge = FakeDeviceBridge(symbol="SZ.000001", failures=[NavigationError("temporary"), NavigationError("temporary")])
-    runner = Level2Runner(store, Level2Navigator(bridge), tmp_path, RunnerControl())
+    bridge = TransientSearchBridge(symbol="SZ.000001")
+    runner = _successful_runner(store, Level2Navigator(bridge), tmp_path)
 
     task = runner.run_once()
 
     assert task is not None
     assert task.status == TaskStatus.COMPLETED
-    assert bridge.capture_attempts == 5
+    assert bridge.search_attempts == 3
+    assert bridge.capture_attempts == 3
 
 
 def test_runner_marks_login_requirement_waiting_for_admin(tmp_path: Path) -> None:
     """Login/CAPTCHA/device gates must wait for a human instead of being bypassed."""
     store = InMemoryStreams()
     store.enqueue(TaskRecord(task_id="admin-task", symbol="SZ.000001"))
+    store.enqueue(TaskRecord(task_id="later-task", symbol="SZ.000002"))
     bridge = FakeDeviceBridge(symbol="SZ.000001", failures=[NeedsAdminError("login required")])
-    runner = Level2Runner(store, Level2Navigator(bridge), tmp_path, RunnerControl())
+    runner = Level2Runner(
+        store,
+        Level2Navigator(bridge),
+        tmp_path,
+        RunnerControl(),
+        parsed_value_source=types.SimpleNamespace(
+            read_direct=lambda _symbol: dict(PARSED_VALUES)
+        ),
+    )
 
     task = runner.run_once()
 
     assert task is not None
     assert task.status == TaskStatus.WAITING_ADMIN
     assert task.error_code == "WAITING_ADMIN"
+    assert runner.control.queue_paused is True
+    assert runner.run_once() is None
+    assert store.get("later-task").status == TaskStatus.QUEUED
+
+
+def test_runner_does_not_leave_a_claimed_task_running_when_device_fails(tmp_path: Path) -> None:
+    store = InMemoryStreams()
+    store.enqueue(TaskRecord(task_id="offline-task", symbol="SZ.000001"))
+    control = RunnerControl()
+    runner = Level2Runner(
+        store,
+        Level2Navigator(FakeDeviceBridge(symbol="SZ.000001", failures=[RuntimeError("adb offline")], online=False)),
+        tmp_path,
+        control,
+        parsed_value_source=types.SimpleNamespace(
+            read_direct=lambda _symbol: dict(PARSED_VALUES)
+        ),
+    )
+
+    task = runner.run_once()
+
+    assert task is not None
+    assert task.status == TaskStatus.FAILED
+    assert task.error_code == "DEVICE_OFFLINE"
+    assert control.state == "OFFLINE"
 
 
 def test_waiting_admin_task_can_be_requeued_and_run_after_intervention(tmp_path: Path) -> None:
     """A human-cleared login gate must not strand the claimed FIFO task forever."""
     store = InMemoryStreams()
     store.enqueue(TaskRecord(task_id="recover-task", symbol="SZ.000001"))
-    blocked = Level2Runner(store, Level2Navigator(FakeDeviceBridge(symbol="SZ.000001", failures=[NeedsAdminError("login")])), tmp_path, RunnerControl()).run_once()
+    blocked = Level2Runner(
+        store,
+        Level2Navigator(
+            FakeDeviceBridge(symbol="SZ.000001", failures=[NeedsAdminError("login")])
+        ),
+        tmp_path,
+        RunnerControl(),
+        parsed_value_source=types.SimpleNamespace(
+            read_direct=lambda _symbol: dict(PARSED_VALUES)
+        ),
+    ).run_once()
 
     assert blocked is not None and blocked.status == TaskStatus.WAITING_ADMIN
     assert store.requeue_waiting("recover-task").status == TaskStatus.QUEUED
-    recovered = Level2Runner(store, Level2Navigator(FakeDeviceBridge(symbol="SZ.000001")), tmp_path, RunnerControl()).run_once()
+    recovered = _successful_runner(store, Level2Navigator(FakeDeviceBridge(symbol="SZ.000001")), tmp_path).run_once()
 
     assert recovered is not None and recovered.status == TaskStatus.COMPLETED
 
 
-def test_runner_keeps_completed_tabs_when_a_later_tab_fails(tmp_path: Path) -> None:
-    """Successful verified screens remain available when one later tab is unavailable."""
+def test_runner_does_not_publish_a_long_capture_when_one_source_frame_fails(tmp_path: Path) -> None:
+    """A missing middle frame cannot produce a truthful continuous long screenshot."""
     store = InMemoryStreams()
     store.enqueue(TaskRecord(task_id="partial-task", symbol="SZ.000001"))
-    bridge = FakeDeviceBridge(symbol="SZ.000001", failures=[None, NavigationError("bad tab"), NavigationError("bad tab"), NavigationError("bad tab")])
-    runner = Level2Runner(store, Level2Navigator(bridge), tmp_path, RunnerControl())
+    bridge = FakeDeviceBridge(symbol="SZ.000001", failures=[None, NavigationError("bad chart"), None])
+    runner = Level2Runner(
+        store,
+        Level2Navigator(bridge),
+        tmp_path,
+        RunnerControl(),
+        parsed_value_source=types.SimpleNamespace(
+            read_direct=lambda _symbol: dict(PARSED_VALUES)
+        ),
+    )
 
     task = runner.run_once()
 
     assert task is not None
-    assert task.status == TaskStatus.PARTIAL
-    assert task.captures[CaptureKind.LARGE_ORDER_NET].path == tmp_path / "partial-task" / "LARGE_ORDER_NET.png"
-    assert (tmp_path / "partial-task" / "LARGE_ORDER_NET.png").is_file()
+    assert task.status == TaskStatus.FAILED
+    assert task.error_code == "NAVIGATION_FAILED"
+    assert task.long_capture.path is None
 
 
 def test_runner_control_pauses_queue_and_only_lock_owner_can_forward_input() -> None:

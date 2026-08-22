@@ -2,8 +2,14 @@
 
 This is a single-host deployment: a public web/API service controls one
 administrator-owned Android instance over its private ADB connection. It does
-not store THS login details, bypass login/CAPTCHA/device checks, or use private
-THS protocols. The deployment is **not supported yet** until the real APK
+not store THS login details or bypass login/CAPTCHA/device checks. Data-only
+tasks ask the already logged-in App's own curve manager to perform its normal
+authentication, signing, and market-data requests, then read the App-parsed
+callback through Frida; the service does not reimplement or expose the private
+wire protocol. When a task requests a long screenshot, numeric OCR is used only
+when a Level2 value is missing. Data-only tasks skip search, text input, stock
+page switching, scrolling, screenshots, stitching, OCR, and PNG storage. The
+deployment is **not supported yet** until the real APK
 passes the smoke checklist below.
 
 ## Supported profiles only
@@ -15,10 +21,10 @@ passes the smoke checklist below.
   `/dev/vndbinder`, and `/dev/binderfs`; check kernel Binder/memfd support
   before deploying. Rootless Docker and generic/unverified VPS configurations
   are intentionally rejected.
-- `macos-avd`: Apple Silicon Mac only. Redis, API, and Caddy run in Docker;
-  the API 33 `arm64-v8a` Android VM runs natively on that same Mac. It is not
-  Dockerized. Docker reaches the host's default localhost ADB server through
-  `host.docker.internal`, with no public ADB port mapping.
+- `macos-avd`: Apple Silicon Mac only. Redis and the combined web/API service
+  run in Docker; the API 33 `arm64-v8a` Android VM runs natively on that same
+  Mac. It is not Dockerized. Docker reaches the host's default localhost ADB
+  server through `host.docker.internal`, with no public ADB port mapping.
 
 Both profiles require a practical minimum of 4 CPU cores, 8 GiB RAM, and 30
 GiB free disk. Preflight also requires the exact external APK SHA-256:
@@ -44,7 +50,7 @@ not in this repository, Docker build context, or Git history.
    ```
 
 3. Build and start the isolated profile. Redis and ADB have no host `ports:`
-   entries; only Caddy publishes 80/443.
+   entries; the combined FastAPI web/API service publishes HTTP port 8000.
 
    ```sh
    docker compose -f deploy/compose.yml --profile linux-redroid up -d --build
@@ -85,29 +91,68 @@ claim the VPS is supported.
    docker compose --env-file deploy/macos.env -f deploy/compose.yml up -d --build
    ```
 
+3. The emulator must run Frida server `16.7.19`, matching the Python client in
+   the API image. Keep it private and forward it through the local ADB server:
+
+   ```sh
+   adb -s emulator-5554 root
+   adb -s emulator-5554 push /absolute/path/to/frida-server-16.7.19-android-arm64 /data/local/tmp/ths-frida-server
+   adb -s emulator-5554 shell chmod 0755 /data/local/tmp/ths-frida-server
+   adb -s emulator-5554 shell '/data/local/tmp/ths-frida-server >/dev/null 2>&1 &'
+   adb -s emulator-5554 forward tcp:27042 tcp:27042
+   ```
+
 `host.docker.internal:5037` is an internal Docker Desktop bridge, not a public
 port. The native emulator's selected serial is `emulator-5554`; set
 `ADB_SERIAL` in `deploy/macos.env` if the Android SDK assigns a different one.
 
-## Images, volumes, and HTTPS
+## Image, volumes, and HTTP access
 
-The API and Caddy Dockerfile targets are multi-architecture base-image builds;
-publish them where needed with, for example:
+The API image includes the built React frontend and uses multi-architecture
+base images. Publish it where needed with, for example:
 
 ```sh
 docker buildx build --platform linux/amd64,linux/arm64 --target api -t example/ths-level2-api:latest --push .
-docker buildx build --platform linux/amd64,linux/arm64 --target caddy -t example/ths-level2-caddy:latest --push .
 ```
 
 Compose persists `capture-data`, `redis-data`, `redroid-data` (Linux only),
-`caddy-data`, and `caddy-config`. Capture retention remains the API's 24-hour
-cleanup policy; queue metadata retention remains seven days. Do not remove any
-volume as part of an upgrade unless its data has been deliberately backed up.
+`template-data`, and `admin-data`. Put only manually calibrated,
+non-secret PNG anchors under `template-data` (`search.png` and optional tab
+anchors); the API loads them as an OpenCV fallback after selector checks.
+Capture retention remains the API's 24-hour cleanup policy; queue metadata
+retention remains seven days. Do not remove any volume as part of an upgrade
+unless its data has been deliberately backed up.
 
-For a real domain, point its DNS A/AAAA records at the host, open only TCP
-80/443, set `CADDY_SITE_ADDRESS=level2.example.com` in the shell or deployment
-environment, and restart Caddy. Caddy then obtains/renews HTTPS certificates.
-Keep API port 8000, Redis 6379, Redroid ADB 5555, and macOS ADB 5037 private.
+The approved local deployment serves both the React site and API from
+`http://HOST:8000/`; set `APP_PORT` to change the host-side port. Redis 6379,
+Redroid ADB 5555, and macOS ADB 5037 remain private. The administrator console
+is `http://HOST:8000/#admin`, and its device WebSocket uses the same origin.
+For this HTTP deployment, `ADMIN_COOKIE_SECURE=0` allows the administrator
+session to survive page refreshes.
+
+Plain HTTP does not encrypt the administrator password, session cookie, device
+screen, or input events. Use this mode only on a trusted local network. If the
+service is later published through a trusted external HTTPS reverse proxy, set
+`ADMIN_COOKIE_SECURE=1` and restrict direct access to port 8000.
+
+Public submissions accept `{"symbol":"601872","include_long_capture":true}`.
+The screenshot option defaults to `true` for existing clients. Set it to
+`false` to request and return the eight values without any App UI navigation or
+image creation. Confirmed market mappings are `600/601/603/605/688/689 → 17`,
+`000/001/002/003/300/301 → 33`, `920 → 151`,
+`501/502/506/508/510/511/512/513/515/516/517/518/519/520/526/530/551/560/561/562/563/588/589 → 20`,
+and `158/159/160/161/162/163/164/165/166/167/168/169/180 → 36`; an unknown
+prefix is rejected instead of guessed. If an exact code is shared by a bond
+and a fund, the App result is filtered to the expected fund market and the bond
+market is ignored. Such a result reports `long_capture.status` as `SKIPPED`;
+missing App callback fields make the task `PARTIAL` and never trigger UI,
+screenshot, or OCR fallback.
+
+Taking the administrator device lock pauses new Runner work automatically. The
+lock release leaves the queue paused; use the explicit queue-resume control
+after manual login or recovery. Failed jobs can be retried from the admin page
+with their task ID, while a generated long screenshot and any recognized
+values remain available.
 
 ## Smoke acceptance checklist
 
@@ -118,10 +163,14 @@ unit tests or Compose parsing does not establish platform support.
 - [ ] An administrator completes normal manual THS login; no automation
       bypasses login, CAPTCHA, device verification, or entitlement gates.
 - [ ] The app stays alive for five minutes after login.
-- [ ] Each requested page is visibly verified: 大单净量, 大单金额, 散户数量.
-- [ ] Public job `601872` reaches all three verified pages within 120 seconds.
-- [ ] The result files appear under the capture volume and the public status
-      shows the corresponding three captures.
+- [ ] A stock page can be opened once and scrolled through all four stacked
+      charts, including 大单净量, 大单金额, and 散户数量.
+- [ ] Public job `601872` returns 股票名称, 当前股价, 当前涨跌幅, 换手率,
+      散户数量, 大单净量, 大单金额, and the latest MACDFS point, plus one
+      complete stitched long screenshot, within 120 seconds excluding queue time.
+- [ ] The long screenshot appears under the capture volume, covers the stock
+      header through the bottom chart, and is available from the public result
+      page for 24 hours.
 
 Real APK selector identifiers and visual templates still require this manual
 verification. Until it succeeds, these are deployment candidates—not a claim

@@ -101,10 +101,30 @@ def test_device_websocket_converts_png_to_jpeg_frame() -> None:
     """ADB's PNG screenshot is converted to the protocol's required JPEG frame."""
     client = TestClient(create_app(admin_password_hash=PasswordHasher().hash("admin-secret"), device_bridge=FakeDeviceBridge(symbol="SZ.000001", screenshot=TINY_PNG)), base_url="https://testserver")
     assert client.post("/api/admin/session", json={"password": "admin-secret"}).status_code == 204
+    assert client.post(
+        "/api/admin/lock/acquire",
+        headers={"X-CSRF-Token": client.cookies.get("ths_csrf")},
+    ).status_code == 200
     with client.websocket_connect("wss://testserver/api/admin/device") as socket:
         socket.receive_json()
         frame = socket.receive_json()
     assert b64decode(frame["data"]).startswith(b"\xff\xd8")
+
+
+def test_device_websocket_does_not_capture_before_the_admin_takes_control() -> None:
+    """An observer-only admin page must not compete with an active collection job for ADB."""
+    bridge = FakeDeviceBridge(symbol="SZ.000001", screenshot=b"\xff\xd8jpg\xff\xd9")
+    client = TestClient(
+        create_app(admin_password_hash=PasswordHasher().hash("admin-secret"), device_bridge=bridge),
+        base_url="https://testserver",
+    )
+    assert client.post("/api/admin/session", json={"password": "admin-secret"}).status_code == 204
+
+    with client.websocket_connect("wss://testserver/api/admin/device") as socket:
+        assert socket.receive_json()["locked"] is False
+        sleep(0.35)
+
+    assert bridge.capture_attempts == 0
 
 
 def test_device_websocket_rejects_duplicate_or_older_input_sequences() -> None:
@@ -158,3 +178,22 @@ def test_device_stream_keeps_four_fps_ticker_running_during_continuous_input() -
     assert monotonic() - started < 0.9
     assert len(frames) == 2
     assert bridge.capture_attempts == 2
+
+
+def test_websocket_disconnect_releases_the_session_device_lock() -> None:
+    app = create_app(
+        admin_password_hash=PasswordHasher().hash("admin-secret"),
+        device_bridge=FakeDeviceBridge(symbol="SZ.000001", screenshot=b"\xff\xd8jpg\xff\xd9"),
+    )
+    client = TestClient(app, base_url="https://testserver")
+    assert client.post("/api/admin/session", json={"password": "admin-secret"}).status_code == 204
+    csrf = client.cookies.get("ths_csrf")
+    assert client.post("/api/admin/lock/acquire", headers={"X-CSRF-Token": csrf}).status_code == 200
+    session_id = client.cookies.get("ths_admin_session")
+
+    with client.websocket_connect("wss://testserver/api/admin/device") as socket:
+        socket.receive_json()
+        socket.close()
+        sleep(0.1)
+
+    assert app.state.runner_control.lock_state(session_id) == {"locked": False}

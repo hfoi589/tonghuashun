@@ -5,7 +5,7 @@ from time import sleep
 from fastapi.testclient import TestClient
 
 from level2_service.api import create_app
-from level2_service.models import CaptureKind, CaptureStatus, TaskStatus
+from level2_service.models import CaptureKind, CaptureStatus, TaskRecord, TaskStatus
 from level2_service.queue import InMemoryStreams
 
 
@@ -27,3 +27,16 @@ def test_app_lifespan_runs_retention_and_stops_its_background_task(tmp_path: Pat
         assert task.status == TaskStatus.EXPIRED
 
     assert app.state.cleanup_task.done()
+
+
+def test_app_startup_recovers_a_task_claimed_by_the_previous_process() -> None:
+    store = InMemoryStreams()
+    store.enqueue(TaskRecord(task_id="interrupted", symbol="601872"))
+    assert store.next_queued().status == TaskStatus.RUNNING
+
+    with TestClient(create_app(store=store)):
+        assert store.get("interrupted").status == TaskStatus.QUEUED
+
+    assert [event["data"] for event in store.events_after("interrupted")] == [
+        "QUEUED", "RUNNING", "QUEUED",
+    ]

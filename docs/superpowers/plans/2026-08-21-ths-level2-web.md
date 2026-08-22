@@ -27,7 +27,10 @@ Implement FastAPI API, Redis Streams job state, public task token, SSE updates, 
 
 Implement the public submit/status/result pages and password-protected admin page. Use the Task 1 API types. Add SSE status rendering, three capture cards, admin queue controls, runner health, 3–5 FPS WebSocket screen display, pointer/keyboard event forwarding, and explicit admin takeover/resume controls. Write frontend tests for submit flow, partial results, expired links, admin auth, and lock state.
 
-### Task 3: Android runner, deployment profiles, and verification
+### Task 3: Android runner and device WebSocket protocol
 
-Implement the runner state machine, ADB/uiautomator2 selectors, OpenCV fallback, screenshot validation, retry and WAITING_ADMIN handling, fake-device fixtures, Linux Redroid profile, ARM Mac AVD bootstrap, APK hash/preflight checks, Caddy/Compose configuration, health checks, and end-to-end verification documentation. Do not claim a platform supported until the real APK installs, stays alive for five minutes, reaches Level2 after manual login, and captures the three pages.
+Implement the runner state machine, ADB/uiautomator2 selectors, OpenCV fallback, screenshot validation, retry and WAITING_ADMIN handling, fake-device fixtures, and the typed WebSocket frame/status/input protocol already defined by the frontend. Capture the three exact Level2 page kinds and publish runner health/lock state without logging credentials or keystrokes.
 
+### Task 4: Deployment profiles, preflight, and verification
+
+Implement Linux Redroid and ARM Mac AVD deployment profiles, APK hash/preflight checks, Caddy/Compose configuration, health checks, retention volumes, admin setup, and end-to-end verification documentation. Do not claim a platform supported until the real APK installs, stays alive for five minutes, reaches Level2 after manual login, and captures the three pages.

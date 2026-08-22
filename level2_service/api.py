@@ -5,37 +5,63 @@ from __future__ import annotations
 import json
 import re
 import secrets
+from threading import RLock
 from asyncio import FIRST_COMPLETED, CancelledError, Event, TimeoutError, create_task, gather, get_running_loop, sleep, to_thread, wait, wait_for
 from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import AsyncIterator, Optional
+from typing import AsyncIterator, Callable, Optional
 
 from fastapi import Depends, FastAPI, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
 from starlette.websockets import WebSocketState
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
-from .models import CaptureKind, CaptureStatus, TaskRecord, TaskStatus, utc_now
+from .models import CaptureKind, CaptureStatus, TaskRecord, TaskStatus, ValueSource, utc_now
+from .parsed_values import (
+    DirectRequestError,
+    SymbolLookup,
+    SymbolLookupAmbiguousError,
+    SymbolLookupNotFoundError,
+    UnsupportedMarketError,
+    market_code_for_symbol,
+)
 from .queue import InMemoryStreams, QueueFullError, TaskStore
 from .runner import ADBDeviceBridge, DeviceBridge, Level2Runner, RunnerControl, jpeg_base64
-from .security import AdminSessionManager
+from .security import AdminSessionManager, persist_password_hash
+from .symbol_cache import InMemorySymbolLookupCache, SymbolLookupCache
 
 
 class SubmitTask(BaseModel):
     symbol: str
+    include_long_capture: bool = True
 
     @field_validator("symbol")
     @classmethod
     def normalize_app_search_symbol(cls, value: str) -> str:
-        normalized = value.strip().upper()
-        if not re.fullmatch(r"[A-Z0-9._-]{1,16}", normalized):
-            raise ValueError("symbol must be 1-16 App-searchable characters")
+        normalized = value.strip()
+        if not re.fullmatch(r"[0-9]{6}", normalized):
+            raise ValueError("symbol must be a six-digit stock code")
         return normalized
+
+    @model_validator(mode="after")
+    def validate_direct_request_market(self) -> "SubmitTask":
+        try:
+            market_code_for_symbol(self.symbol)
+        except UnsupportedMarketError as error:
+            raise ValueError(str(error)) from error
+        return self
 
 
 class LoginRequest(BaseModel):
     password: str = Field(min_length=1)
+
+
+class PasswordChangeRequest(BaseModel):
+    current_password: str = Field(min_length=1)
+    new_password: str = Field(min_length=1)
+    new_password_confirmation: str = Field(min_length=1)
 
 
 class CaptureResponse(BaseModel):
@@ -45,13 +71,47 @@ class CaptureResponse(BaseModel):
     expires_at: Optional[datetime]
 
 
+class TaskValuesResponse(BaseModel):
+    stock_name: Optional[str]
+    current_price: Optional[str]
+    change_percent: Optional[str]
+    turnover_rate: Optional[str]
+    large_order_net: Optional[str]
+    large_order_amount: Optional[str]
+    retail_count: Optional[str]
+    macdfs: Optional[str]
+
+
+class TaskValueSourcesResponse(BaseModel):
+    stock_name: Optional[ValueSource]
+    current_price: Optional[ValueSource]
+    change_percent: Optional[ValueSource]
+    turnover_rate: Optional[ValueSource]
+    large_order_net: Optional[ValueSource]
+    large_order_amount: Optional[ValueSource]
+    retail_count: Optional[ValueSource]
+    macdfs: Optional[ValueSource]
+
+
+class LongCaptureResponse(BaseModel):
+    status: CaptureStatus
+    url: Optional[str]
+    expires_at: Optional[datetime]
+
+
 class TaskResponse(BaseModel):
     public_id: str
     symbol: str
+    include_long_capture: bool
     status: TaskStatus
     error_code: Optional[str]
+    queue_position: Optional[int]
     created_at: datetime
+    collected_at: Optional[datetime]
     captures: list[CaptureResponse]
+    values: TaskValuesResponse
+    value_sources: TaskValueSourcesResponse
+    long_capture: LongCaptureResponse
 
 
 class RunnerHealthResponse(BaseModel):
@@ -68,6 +128,12 @@ class QueueResponse(BaseModel):
     paused: bool
 
 
+class SymbolLookupResponse(BaseModel):
+    symbol: str
+    name: str
+    market: str
+
+
 def create_app(
     *,
     store: TaskStore | None = None,
@@ -79,6 +145,11 @@ def create_app(
     runner: Level2Runner | None = None,
     runner_poll_interval_seconds: float = 1.0,
     admin_session_secret: str | None = None,
+    password_persist_path: Path | None = None,
+    frontend_root: Path | None = None,
+    secure_admin_cookies: bool = True,
+    symbol_lookup: Callable[[str], SymbolLookup] | None = None,
+    symbol_lookup_cache: SymbolLookupCache | None = None,
 ) -> FastAPI:
     """Build an isolated application instance for one service process."""
     if cleanup_interval_seconds <= 0:
@@ -89,6 +160,7 @@ def create_app(
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         stop = Event()
+        app.state.store.recover_running()
 
         async def retention_loop() -> None:
             while not stop.is_set():
@@ -125,17 +197,31 @@ def create_app(
 
     app = FastAPI(title="THS Level2 Capture Service", lifespan=lifespan)
     app.state.store = store or InMemoryStreams()
-    app.state.admin_sessions = AdminSessionManager(admin_password_hash, session_secret=admin_session_secret)
+    persist = None if password_persist_path is None else lambda value: persist_password_hash(password_persist_path, value)
+    app.state.admin_sessions = AdminSessionManager(
+        admin_password_hash,
+        session_secret=admin_session_secret,
+        persist_password_hash=persist,
+    )
     app.state.runner_control = runner_control or RunnerControl()
     app.state.device_bridge = device_bridge or ADBDeviceBridge()
     app.state.capture_root = (capture_root or Path("captures")).resolve()
+    app.state.frontend_root = frontend_root.resolve() if frontend_root is not None else None
+    app.state.secure_admin_cookies = secure_admin_cookies
+    app.state.symbol_lookup = symbol_lookup
+    app.state.symbol_verification_enabled = symbol_lookup is not None or symbol_lookup_cache is not None
+    app.state.symbol_lookup_cache = symbol_lookup_cache or InMemorySymbolLookupCache()
+    app.state.symbol_lookup_cache_lock = RLock()
     set_capture_root = getattr(app.state.store, "set_capture_root", None)
     if callable(set_capture_root):
         set_capture_root(app.state.capture_root)
 
     def require_admin(request: Request):
-        session = app.state.admin_sessions.valid_session(request.cookies.get("ths_admin_session"))
+        session_id = request.cookies.get("ths_admin_session")
+        session = app.state.admin_sessions.valid_session(session_id)
         if session is None:
+            if session_id:
+                app.state.runner_control.disconnect_session(session_id)
             raise HTTPException(status_code=401, detail="admin authentication required")
         return session
 
@@ -144,21 +230,88 @@ def create_app(
             raise HTTPException(status_code=403, detail="CSRF token required")
         return session
 
+    def task_response(task: TaskRecord) -> TaskResponse:
+        public = task.as_public()
+        positioner = getattr(app.state.store, "queue_position", None)
+        public["queue_position"] = positioner(task.task_id) if callable(positioner) else None
+        return TaskResponse.model_validate(public)
+
+    def resolve_symbol(symbol: str) -> SymbolLookup:
+        try:
+            expected_market = market_code_for_symbol(symbol)
+        except UnsupportedMarketError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+
+        try:
+            with app.state.symbol_lookup_cache_lock:
+                cached = app.state.symbol_lookup_cache.get(symbol)
+                if cached is not None:
+                    if cached.symbol != symbol or cached.market != expected_market:
+                        raise DirectRequestError(
+                            "SYMBOL_LOOKUP_INVALID",
+                            "cached App search returned a mismatched stock",
+                        )
+                    return cached
+                lookup = app.state.symbol_lookup
+                if lookup is None:
+                    raise HTTPException(
+                        status_code=503,
+                        detail="symbol lookup temporarily unavailable",
+                    )
+                result = lookup(symbol)
+                if result.symbol != symbol or result.market != expected_market:
+                    raise DirectRequestError(
+                        "SYMBOL_LOOKUP_INVALID",
+                        "App search returned a mismatched stock",
+                    )
+                app.state.symbol_lookup_cache.set(result)
+                return result
+        except SymbolLookupNotFoundError as error:
+            raise HTTPException(status_code=404, detail="symbol not found") from error
+        except SymbolLookupAmbiguousError as error:
+            raise HTTPException(status_code=409, detail="symbol lookup is ambiguous") from error
+        except DirectRequestError as error:
+            raise HTTPException(
+                status_code=503,
+                detail="symbol lookup temporarily unavailable",
+            ) from error
+        except HTTPException:
+            raise
+        except Exception as error:
+            raise HTTPException(
+                status_code=503,
+                detail="symbol lookup temporarily unavailable",
+            ) from error
+
+    @app.get("/api/v1/symbols/{symbol}", response_model=SymbolLookupResponse)
+    def lookup_public_symbol(symbol: str) -> SymbolLookupResponse:
+        normalized = symbol.strip()
+        if not re.fullmatch(r"[0-9]{6}", normalized):
+            raise HTTPException(status_code=422, detail="symbol must be a six-digit stock code")
+        result = resolve_symbol(normalized)
+        return SymbolLookupResponse(symbol=result.symbol, name=result.name, market=result.market)
+
     @app.post("/api/v1/jobs", status_code=202, response_model=TaskResponse)
     def submit_task(payload: SubmitTask) -> TaskResponse:
-        task = TaskRecord(task_id=secrets.token_urlsafe(24), symbol=payload.symbol)
+        if app.state.symbol_verification_enabled:
+            resolve_symbol(payload.symbol)
+        task = TaskRecord(
+            task_id=secrets.token_urlsafe(24),
+            symbol=payload.symbol,
+            include_long_capture=payload.include_long_capture,
+        )
         try:
             app.state.store.enqueue(task)
         except QueueFullError:
             raise HTTPException(status_code=429, detail="queue is full") from None
-        return TaskResponse.model_validate(task.as_public())
+        return task_response(task)
 
     @app.get("/api/v1/jobs/{public_id}", response_model=TaskResponse)
     def get_task(public_id: str) -> TaskResponse:
         task = app.state.store.get(public_id)
         if task is None:
             raise HTTPException(status_code=404, detail="task not found")
-        return TaskResponse.model_validate(task.as_public())
+        return task_response(task)
 
     @app.get("/api/v1/jobs/{public_id}/captures/{kind}")
     def get_capture(public_id: str, kind: CaptureKind):
@@ -169,6 +322,25 @@ def create_app(
         if capture.status.value == "EXPIRED":
             raise HTTPException(status_code=410, detail="capture has expired")
         if capture.status.value != "READY" or capture.path is None:
+            raise HTTPException(status_code=404, detail="capture is not available")
+        path = capture.path.resolve()
+        try:
+            path.relative_to(app.state.capture_root)
+        except ValueError:
+            raise HTTPException(status_code=404, detail="capture is not available") from None
+        if not path.is_file():
+            raise HTTPException(status_code=404, detail="capture is not available")
+        return FileResponse(path, media_type="image/png")
+
+    @app.get("/api/v1/jobs/{public_id}/capture")
+    def get_long_capture(public_id: str):
+        task = app.state.store.get(public_id)
+        if task is None:
+            raise HTTPException(status_code=404, detail="task not found")
+        capture = task.long_capture
+        if capture.status == CaptureStatus.EXPIRED:
+            raise HTTPException(status_code=410, detail="capture has expired")
+        if capture.status != CaptureStatus.READY or capture.path is None:
             raise HTTPException(status_code=404, detail="capture is not available")
         path = capture.path.resolve()
         try:
@@ -202,22 +374,43 @@ def create_app(
         return StreamingResponse(event_stream(), media_type="text/event-stream")
 
     @app.post("/api/admin/session", status_code=204)
-    def admin_login(payload: LoginRequest, response: Response) -> None:
+    def admin_login(payload: LoginRequest, request: Request, response: Response) -> None:
         sessions = app.state.admin_sessions
         if not sessions.configured:
             raise HTTPException(status_code=503, detail="admin login is not configured")
+        identifier = request.client.host if request.client else "unknown"
+        if not sessions.login_allowed(identifier):
+            raise HTTPException(
+                status_code=429,
+                detail="too many failed admin logins",
+                headers={"Retry-After": "60"},
+            )
         session = sessions.authenticate(payload.password)
         if session is None:
+            sessions.record_login_failure(identifier)
             raise HTTPException(status_code=401, detail="invalid credentials")
-        response.set_cookie("ths_admin_session", session.session_id, httponly=True, samesite="strict", secure=True)
-        response.set_cookie("ths_csrf", session.csrf_token, httponly=False, samesite="strict", secure=True)
+        sessions.record_login_success(identifier)
+        response.set_cookie("ths_admin_session", session.session_id, httponly=True, samesite="strict", secure=secure_admin_cookies)
+        response.set_cookie("ths_csrf", session.csrf_token, httponly=False, samesite="strict", secure=secure_admin_cookies)
+
+    @app.get("/api/admin/session", status_code=204)
+    def admin_session_probe(_session=Depends(require_admin)) -> None:
+        """Confirm that the browser's secure administrator cookie is still valid."""
+
+    @app.post("/api/admin/password", status_code=204)
+    def admin_change_password(payload: PasswordChangeRequest, session=Depends(require_csrf)) -> None:
+        if payload.new_password != payload.new_password_confirmation:
+            raise HTTPException(status_code=422, detail="new passwords do not match")
+        if not app.state.admin_sessions.change_password(payload.current_password, payload.new_password):
+            raise HTTPException(status_code=401, detail="invalid current password")
+        app.state.runner_control.disconnect_session(session.session_id)
 
     @app.post("/api/admin/session/logout", status_code=204)
     def admin_logout(response: Response, session=Depends(require_csrf)) -> None:
         app.state.admin_sessions.revoke(session.session_id)
         app.state.runner_control.disconnect_session(session.session_id)
-        response.delete_cookie("ths_admin_session", httponly=True, samesite="strict", secure=True)
-        response.delete_cookie("ths_csrf", httponly=False, samesite="strict", secure=True)
+        response.delete_cookie("ths_admin_session", httponly=True, samesite="strict", secure=secure_admin_cookies)
+        response.delete_cookie("ths_csrf", httponly=False, samesite="strict", secure=secure_admin_cookies)
 
     @app.get("/api/admin/runner")
     def runner_health(_session=Depends(require_admin)) -> RunnerHealthResponse:
@@ -248,7 +441,18 @@ def create_app(
             resumed = app.state.store.requeue_waiting(public_id)
         except ValueError as error:
             raise HTTPException(status_code=409, detail=str(error)) from None
-        return TaskResponse.model_validate(resumed.as_public())
+        return task_response(resumed)
+
+    @app.post("/api/admin/jobs/{public_id}/retry", response_model=TaskResponse)
+    def retry_failed_job(public_id: str, _session=Depends(require_csrf)) -> TaskResponse:
+        task = app.state.store.get(public_id)
+        if task is None:
+            raise HTTPException(status_code=404, detail="task not found")
+        try:
+            retried = app.state.store.retry_failed(public_id)
+        except ValueError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from None
+        return task_response(retried)
 
     @app.get("/api/admin/queue", response_model=QueueResponse)
     def queue_status(_session=Depends(require_admin)) -> QueueResponse:
@@ -261,7 +465,8 @@ def create_app(
 
     @app.post("/api/admin/queue/resume", response_model=QueueResponse)
     def resume_queue(_session=Depends(require_csrf)) -> QueueResponse:
-        app.state.runner_control.resume_queue()
+        if not app.state.runner_control.resume_queue():
+            raise HTTPException(status_code=409, detail="release device control before resuming the queue")
         return QueueResponse(paused=False)
 
     @app.websocket("/api/admin/device")
@@ -281,7 +486,11 @@ def create_app(
         await websocket.send_json(control.status(session.session_id))
 
         def session_is_valid() -> bool:
-            return app.state.admin_sessions.valid_session(session.session_id) is not None
+            valid = app.state.admin_sessions.valid_session(session.session_id)
+            if valid is None:
+                control.disconnect_session(session.session_id)
+                return False
+            return True
 
         async def receive_input() -> None:
             last_input_sequence = 0
@@ -303,7 +512,7 @@ def create_app(
                     return
                 last_input_sequence = input_sequence
                 if control.authorizes_input(session.session_id):
-                    _forward_input(bridge, event)
+                    await to_thread(_forward_input, bridge, event)
 
         async def emit_frames() -> None:
             frame_sequence = 0
@@ -312,8 +521,11 @@ def create_app(
                 if not session_is_valid():
                     await _close_device_socket(websocket, 1008)
                     return
+                if not control.authorizes_input(session.session_id):
+                    await websocket.send_json(control.status(session.session_id))
+                    continue
                 try:
-                    encoded = jpeg_base64(bridge.screenshot_png())
+                    encoded = jpeg_base64(await to_thread(bridge.screenshot_png))
                 except Exception:
                     control.heartbeat("OFFLINE")
                     await websocket.send_json(control.status(session.session_id))
@@ -337,6 +549,19 @@ def create_app(
                     task.cancel()
             await gather(receiver, ticker, return_exceptions=True)
             unregister_socket()
+
+    if app.state.frontend_root is not None:
+        index_file = app.state.frontend_root / "index.html"
+        assets_root = app.state.frontend_root / "assets"
+        if index_file.is_file():
+            if assets_root.is_dir():
+                app.mount("/assets", StaticFiles(directory=assets_root), name="frontend-assets")
+
+            @app.api_route("/{frontend_path:path}", methods=["GET", "HEAD"], include_in_schema=False)
+            def frontend_fallback(frontend_path: str):
+                if frontend_path == "api" or frontend_path.startswith("api/"):
+                    raise HTTPException(status_code=404, detail="Not Found")
+                return FileResponse(index_file, media_type="text/html")
 
     return app
 

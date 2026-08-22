@@ -1,11 +1,12 @@
 import json
+from threading import Barrier, Thread
 
 import pytest
 
 from fastapi.testclient import TestClient
 
 from level2_service.api import create_app
-from level2_service.models import CaptureKind, TaskRecord, TaskStatus
+from level2_service.models import CaptureKind, MetricKind, TaskRecord, TaskStatus
 from level2_service.queue import RedisStreamsStore
 
 
@@ -21,6 +22,10 @@ class FakeRedis:
     def delete(self, key): self.values.pop(key, None)
     def rpush(self, key, value): self.lists.setdefault(key, []).append(value)
     def lpush(self, key, value): self.lists.setdefault(key, []).insert(0, value)
+    def lrange(self, key, start, end):
+        values = self.lists.get(key, [])
+        stop = None if end == -1 else end + 1
+        return values[start:stop]
     def sadd(self, key, value): self.sets.setdefault(key, set()).add(value)
     def srem(self, key, value): self.sets.setdefault(key, set()).discard(value)
     def smembers(self, key): return self.sets.get(key, set())
@@ -31,6 +36,65 @@ class FakeRedis:
         return entries[-1][0]
     def xrange(self, key, _start, _end): return self.streams.get(key, [])
     def eval(self, script, _keys, queue_key, prefix, event_stream, *args):
+        if "THS_ENQUEUE" in script:
+            index_key, event_stream_name, cap, task_id, payload = (event_stream, *args)
+            pending = 0
+            for existing_id in self.sets.get(index_key, set()):
+                raw = self.values.get(prefix + existing_id)
+                if raw and json.loads(raw)["status"] in {"QUEUED", "RUNNING", "WAITING_ADMIN"}:
+                    pending += 1
+            if pending >= int(cap):
+                return False
+            self.values[prefix + task_id] = payload
+            self.sadd(index_key, task_id)
+            self.rpush(queue_key, task_id)
+            self.xadd(event_stream_name, {"event": "status", "task_id": task_id, "data": "QUEUED"})
+            return True
+        if "THS_RECOVER_RUNNING" in script:
+            index_key, event_stream_name, timestamp = (event_stream, *args)
+            recovered = []
+            for task_id in self.sets.get(index_key, set()):
+                key = prefix + task_id
+                payload = self.values.get(key)
+                if not payload:
+                    continue
+                task = json.loads(payload)
+                if task["status"] == "RUNNING":
+                    recovered.append((task["created_at"], task_id, task))
+            recovered.sort()
+            updated_payloads = []
+            for _created_at, task_id, task in recovered:
+                task["status"] = "QUEUED"
+                task["error_code"] = None
+                task["completed_at"] = None
+                task["updated_at"] = timestamp
+                updated = json.dumps(task)
+                self.values[prefix + task_id] = updated
+                self.xadd(event_stream_name, {"event": "status", "task_id": task_id, "data": "QUEUED"})
+                updated_payloads.append(updated)
+            for _created_at, task_id, _task in reversed(recovered):
+                self.lpush(queue_key, task_id)
+            return updated_payloads
+        if "task.status ~= 'FAILED'" in script:
+            task_id, timestamp = args
+            key = prefix + task_id
+            payload = self.values.get(key)
+            if not payload:
+                return False
+            task = json.loads(payload)
+            if task["status"] == "QUEUED":
+                return payload
+            if task["status"] != "FAILED":
+                return False
+            task["status"] = "QUEUED"
+            task["error_code"] = None
+            task["completed_at"] = None
+            task["updated_at"] = timestamp
+            updated = json.dumps(task)
+            self.values[key] = updated
+            self.rpush(queue_key, task_id)
+            self.xadd(event_stream, {"event": "status", "task_id": task_id, "data": "QUEUED"})
+            return updated
         if "WAITING_ADMIN" in script:
             task_id, timestamp = args
             key = prefix + task_id
@@ -45,7 +109,7 @@ class FakeRedis:
             task["updated_at"] = timestamp
             updated = json.dumps(task)
             self.values[key] = updated
-            self.lpush(queue_key, task_id)
+            self.rpush(queue_key, task_id)
             self.xadd(event_stream, {"event": "status", "task_id": task_id, "data": "QUEUED"})
             return updated
         (timestamp,) = args
@@ -69,7 +133,7 @@ def test_redis_store_exposes_the_full_task_store_contract() -> None:
     """A partial adapter cannot back production routes when Redis is configured."""
     store = RedisStreamsStore(FakeRedis())
 
-    for method in ("enqueue", "get", "transition", "complete_capture", "events_after", "cleanup", "next_queued", "requeue_waiting"):
+    for method in ("enqueue", "get", "transition", "complete_capture", "events_after", "cleanup", "next_queued", "recover_running", "requeue_waiting", "retry_failed"):
         assert callable(getattr(store, method, None))
 
 
@@ -77,6 +141,39 @@ def test_redis_store_rejects_an_incomplete_client_before_app_construction() -> N
     """Deferring a missing Redis method until the first public request hides deployment errors."""
     with pytest.raises(TypeError, match="RedisStreamsStore requires redis client methods"):
         RedisStreamsStore(object())
+
+
+def test_redis_pending_cap_is_atomic_across_concurrent_submissions() -> None:
+    class InterleavingRedis(FakeRedis):
+        def __init__(self) -> None:
+            super().__init__()
+            self.barrier = Barrier(2)
+
+        def smembers(self, key):
+            result = super().smembers(key)
+            self.barrier.wait()
+            return result
+
+    redis = InterleavingRedis()
+    store = RedisStreamsStore(redis, pending_cap=1)
+    results: list[Exception | None] = []
+
+    def enqueue(task_id: str) -> None:
+        try:
+            store.enqueue(TaskRecord(task_id=task_id, symbol="600938"))
+        except Exception as error:
+            results.append(error)
+        else:
+            results.append(None)
+
+    threads = [Thread(target=enqueue, args=(task_id,)) for task_id in ("one", "two")]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert results.count(None) == 1
+    assert sum(result is not None for result in results) == 1
 
 
 def test_redis_store_persists_state_and_claims_fifo_jobs_once() -> None:
@@ -97,6 +194,141 @@ def test_redis_store_persists_state_and_claims_fifo_jobs_once() -> None:
     assert [event["data"] for event in store.events_after("first")] == ["QUEUED", "RUNNING", "PARTIAL"]
 
 
+def test_redis_restart_recovery_atomically_requeues_running_work_before_later_jobs() -> None:
+    redis = FakeRedis()
+    original = RedisStreamsStore(redis)
+    original.enqueue(TaskRecord(task_id="interrupted", symbol="601872"))
+    original.enqueue(TaskRecord(task_id="later", symbol="600938"))
+    assert original.next_queued().task_id == "interrupted"
+
+    restarted = RedisStreamsStore(redis)
+    recovered = restarted.recover_running()
+
+    assert [task.task_id for task in recovered] == ["interrupted"]
+    assert redis.lists["ths:jobs:pending"] == ["interrupted", "later"]
+    assert [event["data"] for event in restarted.events_after("interrupted")] == [
+        "QUEUED", "RUNNING", "QUEUED",
+    ]
+    assert restarted.recover_running() == []
+    assert restarted.next_queued().task_id == "interrupted"
+
+
+def test_redis_store_round_trips_the_long_result_and_values() -> None:
+    """A process restart must not lose the image URL or recognized values."""
+    redis = FakeRedis()
+    store = RedisStreamsStore(redis)
+    store.enqueue(TaskRecord(task_id="long", symbol="601872"))
+    store.next_queued()
+
+    store.complete_result(
+        "long",
+        {
+            MetricKind.STOCK_NAME: "招商轮船",
+            MetricKind.CURRENT_PRICE: "19.78",
+            MetricKind.CHANGE_PERCENT: "7.15%",
+            MetricKind.TURNOVER_RATE: "2.40%",
+            MetricKind.LARGE_ORDER_NET: "-0.02",
+            MetricKind.LARGE_ORDER_AMOUNT: "-2802.6万",
+            MetricKind.RETAIL_COUNT: "21.23",
+            MetricKind.MACDFS: "+0.012",
+        },
+        "/tmp/LONG.png",
+        ocr_metrics={MetricKind.LARGE_ORDER_AMOUNT},
+    )
+    restored = RedisStreamsStore(redis).get("long")
+
+    assert restored is not None and restored.status == TaskStatus.COMPLETED
+    assert restored.long_capture.path.as_posix() == "/tmp/LONG.png"
+    assert restored.values[MetricKind.LARGE_ORDER_AMOUNT] == "-2802.6万"
+    assert restored.value_sources[MetricKind.LARGE_ORDER_AMOUNT].value == "OCR"
+    assert restored.value_sources[MetricKind.LARGE_ORDER_NET].value == "INTERFACE"
+    assert restored.collected_at is not None
+
+
+def test_redis_store_round_trips_the_data_only_option() -> None:
+    """A restart must not turn a data-only task back into a screenshot task."""
+    redis = FakeRedis()
+    store = RedisStreamsStore(redis)
+    store.enqueue(TaskRecord(task_id="data-only", symbol="601872", include_long_capture=False))
+
+    restored = RedisStreamsStore(redis).get("data-only")
+
+    assert restored is not None
+    assert restored.include_long_capture is False
+    assert restored.long_capture.status.value == "SKIPPED"
+
+
+def test_redis_store_completes_a_data_only_task_without_an_image_path() -> None:
+    """Production persistence must accept direct values without inventing a PNG path."""
+    redis = FakeRedis()
+    store = RedisStreamsStore(redis)
+    store.enqueue(TaskRecord(task_id="data-only-result", symbol="601872", include_long_capture=False))
+    store.next_queued()
+
+    result = store.complete_result(
+        "data-only-result",
+        {kind: f"value-{kind.value}" for kind in MetricKind},
+        None,
+    )
+    restored = RedisStreamsStore(redis).get("data-only-result")
+
+    assert result.status == TaskStatus.COMPLETED
+    assert restored is not None and restored.status == TaskStatus.COMPLETED
+    assert restored.long_capture.status.value == "SKIPPED"
+    assert restored.long_capture.path is None
+    assert restored.collected_at is not None
+
+
+def test_redis_store_reads_tasks_written_before_long_results_existed() -> None:
+    """Deploying the new schema must not make queued or completed legacy tasks unreadable."""
+    payload = json.dumps({
+        "task_id": "legacy",
+        "symbol": "601872",
+        "status": "QUEUED",
+        "created_at": "2026-08-21T00:00:00+00:00",
+        "updated_at": "2026-08-21T00:00:00+00:00",
+        "completed_at": None,
+        "error_code": None,
+        "captures": {
+            kind.value: {"status": "PENDING", "path": None, "captured_at": None}
+            for kind in CaptureKind
+        },
+    })
+
+    restored = RedisStreamsStore._deserialize(payload)
+
+    assert all(value is None for value in restored.values.values())
+    assert restored.include_long_capture is True
+    assert restored.long_capture.status.value == "PENDING"
+
+
+def test_redis_store_reads_tasks_written_with_only_the_three_legacy_values() -> None:
+    """Adding quote and MACDFS fields must not make existing completed tasks unreadable."""
+    payload = json.dumps({
+        "task_id": "legacy-values",
+        "symbol": "601872",
+        "status": "COMPLETED",
+        "created_at": "2026-08-21T00:00:00+00:00",
+        "updated_at": "2026-08-21T00:01:00+00:00",
+        "completed_at": "2026-08-21T00:01:00+00:00",
+        "error_code": None,
+        "captures": {
+            kind.value: {"status": "PENDING", "path": None, "captured_at": None}
+            for kind in CaptureKind
+        },
+        "values": {
+            "LARGE_ORDER_NET": "-0.02",
+            "LARGE_ORDER_AMOUNT": "-2802.6万",
+            "RETAIL_COUNT": "21.23",
+        },
+    })
+
+    restored = RedisStreamsStore._deserialize(payload)
+
+    assert restored.values[MetricKind.LARGE_ORDER_NET] == "-0.02"
+    assert restored.values[MetricKind.STOCK_NAME] is None
+
+
 def test_redis_requeue_waiting_is_atomic_and_idempotent() -> None:
     """Concurrent resume clicks must yield one pending entry and one QUEUED event."""
     redis = FakeRedis()
@@ -111,6 +343,33 @@ def test_redis_requeue_waiting_is_atomic_and_idempotent() -> None:
 
     assert redis.lists["ths:jobs:pending"] == ["waiting"]
     assert [event["data"] for event in first.events_after("waiting")] == ["QUEUED", "RUNNING", "WAITING_ADMIN", "QUEUED"]
+
+
+def test_redis_waiting_recovery_is_requeued_after_already_queued_jobs() -> None:
+    redis = FakeRedis()
+    store = RedisStreamsStore(redis)
+    store.enqueue(TaskRecord(task_id="waiting", symbol="600938"))
+    store.enqueue(TaskRecord(task_id="later", symbol="000001"))
+    store.next_queued()
+    store.transition("waiting", TaskStatus.WAITING_ADMIN, error_code="WAITING_ADMIN")
+
+    store.requeue_waiting("waiting")
+
+    assert store.next_queued().task_id == "later"
+
+
+def test_redis_retry_failed_is_atomic_and_preserves_capture_state() -> None:
+    redis = FakeRedis()
+    store = RedisStreamsStore(redis)
+    store.enqueue(TaskRecord(task_id="failed", symbol="SZ.000001"))
+    store.next_queued()
+    store.complete_capture("failed", CaptureKind.LARGE_ORDER_NET, "/tmp/net.png")
+    store.transition("failed", TaskStatus.FAILED, error_code="DEVICE_OFFLINE")
+
+    assert store.retry_failed("failed").status == TaskStatus.QUEUED
+    assert RedisStreamsStore(redis).retry_failed("failed").status == TaskStatus.QUEUED
+    assert redis.lists["ths:jobs:pending"] == ["failed"]
+    assert store.get("failed").captures[CaptureKind.LARGE_ORDER_NET].status.value == "READY"
 
 
 def test_public_routes_work_when_the_redis_adapter_is_configured() -> None:

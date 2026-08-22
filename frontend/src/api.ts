@@ -1,6 +1,6 @@
 export const captureKinds = ['LARGE_ORDER_NET', 'LARGE_ORDER_AMOUNT', 'RETAIL_COUNT'] as const
 export type CaptureKind = (typeof captureKinds)[number]
-export type CaptureStatus = 'PENDING' | 'READY' | 'EXPIRED'
+export type CaptureStatus = 'PENDING' | 'READY' | 'SKIPPED' | 'EXPIRED'
 export type JobStatus = 'QUEUED' | 'RUNNING' | 'WAITING_ADMIN' | 'COMPLETED' | 'PARTIAL' | 'FAILED' | 'EXPIRED'
 
 export interface Capture {
@@ -10,13 +10,49 @@ export interface Capture {
   expires_at: string | null
 }
 
+export interface JobValues {
+  stock_name: string | null
+  current_price: string | null
+  change_percent: string | null
+  turnover_rate: string | null
+  large_order_net: string | null
+  large_order_amount: string | null
+  retail_count: string | null
+  macdfs: string | null
+}
+
+export type ValueSource = 'INTERFACE' | 'OCR'
+
+export interface JobValueSources {
+  stock_name: ValueSource | null
+  current_price: ValueSource | null
+  change_percent: ValueSource | null
+  turnover_rate: ValueSource | null
+  large_order_net: ValueSource | null
+  large_order_amount: ValueSource | null
+  retail_count: ValueSource | null
+  macdfs: ValueSource | null
+}
+
+export interface LongCapture {
+  status: CaptureStatus
+  url: string | null
+  expires_at: string | null
+}
+
 export interface Job {
   public_id: string
   symbol: string
+  include_long_capture: boolean
   status: JobStatus
   error_code: string | null
+  queue_position?: number | null
   created_at: string
+  collected_at: string | null
   captures: Capture[]
+  values: JobValues
+  value_sources?: JobValueSources
+  long_capture: LongCapture
 }
 
 export interface RunnerHealth {
@@ -31,6 +67,12 @@ export interface LockState {
 
 export interface QueueState {
   paused: boolean
+}
+
+export interface SymbolLookup {
+  symbol: string
+  name: string
+  market: string
 }
 
 export class ApiError extends Error {
@@ -55,16 +97,34 @@ async function request<T>(url: string, init?: RequestInit): Promise<T> {
 }
 
 export const api = {
-  submitJob: (symbol: string) => request<Job>('/api/v1/jobs', {
+  lookupSymbol: (symbol: string, signal?: AbortSignal) => request<SymbolLookup>(
+    `/api/v1/symbols/${encodeURIComponent(symbol)}`,
+    { signal },
+  ),
+  submitJob: (symbol: string, includeLongCapture = true) => request<Job>('/api/v1/jobs', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ symbol }),
+    body: JSON.stringify({ symbol, include_long_capture: includeLongCapture }),
   }),
   getJob: (publicId: string) => request<Job>(`/api/v1/jobs/${encodeURIComponent(publicId)}`),
   login: (password: string) => request<void>('/api/admin/session', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ password }),
+  }),
+  adminSession: () => request<void>('/api/admin/session'),
+  changePassword: (currentPassword: string, newPassword: string, confirmation: string, csrfToken: string) => request<void>('/api/admin/password', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrfToken },
+    body: JSON.stringify({
+      current_password: currentPassword,
+      new_password: newPassword,
+      new_password_confirmation: confirmation,
+    }),
+  }),
+  logout: (csrfToken: string) => request<void>('/api/admin/session/logout', {
+    method: 'POST',
+    headers: { 'X-CSRF-Token': csrfToken },
   }),
   runner: () => request<RunnerHealth>('/api/admin/runner'),
   lock: () => request<LockState>('/api/admin/lock'),
@@ -78,6 +138,10 @@ export const api = {
     headers: { 'X-CSRF-Token': csrfToken },
   }),
   resumeWaitingJob: (publicId: string, csrfToken: string) => request<Job>(`/api/admin/jobs/${encodeURIComponent(publicId)}/resume`, {
+    method: 'POST',
+    headers: { 'X-CSRF-Token': csrfToken },
+  }),
+  retryFailedJob: (publicId: string, csrfToken: string) => request<Job>(`/api/admin/jobs/${encodeURIComponent(publicId)}/retry`, {
     method: 'POST',
     headers: { 'X-CSRF-Token': csrfToken },
   }),

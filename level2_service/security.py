@@ -5,8 +5,13 @@ from __future__ import annotations
 import secrets
 import hashlib
 import hmac
+import os
+import tempfile
+from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Callable
 
 from argon2 import PasswordHasher
 from argon2.exceptions import InvalidHashError, VerifyMismatchError
@@ -32,12 +37,17 @@ class AdminSessionManager:
         password_hash: str | None,
         session_ttl: timedelta = timedelta(hours=8),
         session_secret: str | None = None,
+        persist_password_hash: Callable[[str], None] | None = None,
     ) -> None:
         self.password_hash = password_hash
         self.session_ttl = session_ttl
         self._session_secret = session_secret.encode("utf-8") if session_secret else None
         self._hasher = PasswordHasher(type=Type.ID)
+        self._persist_password_hash = persist_password_hash
         self._sessions: dict[str, AdminSession] = {}
+        self._login_failures: dict[str, deque[datetime]] = {}
+        self.login_failure_limit = 5
+        self.login_failure_window = timedelta(minutes=1)
 
     @property
     def configured(self) -> bool:
@@ -58,6 +68,43 @@ class AdminSessionManager:
         )
         self._sessions[session.session_id] = session
         return session
+
+    def change_password(self, current_password: str, new_password: str) -> bool:
+        """Verify and atomically rotate the password used by future sessions."""
+        if self.password_hash is None:
+            return False
+        try:
+            if not self._hasher.verify(self.password_hash, current_password):
+                return False
+        except (InvalidHashError, VerifyMismatchError):
+            return False
+        replacement = self._hasher.hash(new_password)
+        if self._persist_password_hash is not None:
+            self._persist_password_hash(replacement)
+        self.password_hash = replacement
+        self._sessions.clear()
+        self._login_failures.clear()
+        return True
+
+    def login_allowed(self, identifier: str) -> bool:
+        now = _now()
+        failures = self._login_failures.get(identifier)
+        if failures is None:
+            return True
+        cutoff = now - self.login_failure_window
+        while failures and failures[0] <= cutoff:
+            failures.popleft()
+        if not failures:
+            self._login_failures.pop(identifier, None)
+            return True
+        return len(failures) < self.login_failure_limit
+
+    def record_login_failure(self, identifier: str) -> None:
+        self.login_allowed(identifier)
+        self._login_failures.setdefault(identifier, deque()).append(_now())
+
+    def record_login_success(self, identifier: str) -> None:
+        self._login_failures.pop(identifier, None)
 
     def valid_session(self, session_id: str | None) -> AdminSession | None:
         if not session_id:
@@ -88,3 +135,29 @@ class AdminSessionManager:
             return False
         expected = hmac.new(self._session_secret, nonce.encode("ascii"), hashlib.sha256).hexdigest()
         return hmac.compare_digest(signature, expected)
+
+
+def persist_password_hash(path: Path, password_hash: str) -> None:
+    """Atomically persist an Argon2id hash with owner-only permissions."""
+    if not password_hash.startswith("$argon2id$"):
+        raise ValueError("password hash must be Argon2id")
+    path = path.expanduser()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent, text=True)
+    try:
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as temporary:
+            descriptor = -1
+            temporary.write(password_hash)
+            temporary.write("\n")
+            temporary.flush()
+            os.fsync(temporary.fileno())
+        os.replace(temporary_name, path)
+        os.chmod(path, 0o600)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        try:
+            os.unlink(temporary_name)
+        except FileNotFoundError:
+            pass

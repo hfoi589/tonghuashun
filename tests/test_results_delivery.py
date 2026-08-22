@@ -4,7 +4,7 @@ from datetime import timedelta
 from fastapi.testclient import TestClient
 
 from level2_service.api import create_app
-from level2_service.models import CaptureKind, TaskStatus
+from level2_service.models import CaptureKind, MetricKind, TaskStatus
 from level2_service.queue import InMemoryStreams
 
 
@@ -22,6 +22,60 @@ def test_ready_capture_is_served_only_from_the_configured_capture_root(tmp_path:
 
     assert response.status_code == 200
     assert response.content == b"verified-png-bytes"
+
+
+def test_public_result_exposes_eight_values_and_serves_one_long_capture(tmp_path: Path) -> None:
+    """The public contract must expose the full current snapshot beside the merged image."""
+    capture = tmp_path / "LONG.png"
+    capture.write_bytes(b"merged-png-bytes")
+    store = InMemoryStreams()
+    client = TestClient(create_app(store=store, capture_root=tmp_path))
+    public_id = client.post("/api/v1/jobs", json={"symbol": "601872"}).json()["public_id"]
+    store.transition(public_id, TaskStatus.RUNNING)
+    store.complete_result(
+        public_id,
+        {
+            MetricKind.STOCK_NAME: "招商轮船",
+            MetricKind.CURRENT_PRICE: "19.78",
+            MetricKind.CHANGE_PERCENT: "7.15%",
+            MetricKind.TURNOVER_RATE: "2.40%",
+            MetricKind.RETAIL_COUNT: "21.23",
+            MetricKind.LARGE_ORDER_NET: "-0.02",
+            MetricKind.LARGE_ORDER_AMOUNT: "-2802.6万",
+            MetricKind.MACDFS: "+0.012",
+        },
+        str(capture),
+        ocr_metrics={MetricKind.LARGE_ORDER_NET},
+    )
+
+    body = client.get(f"/api/v1/jobs/{public_id}").json()
+    image = client.get(f"/api/v1/jobs/{public_id}/capture")
+
+    assert body["values"] == {
+        "stock_name": "招商轮船",
+        "current_price": "19.78",
+        "change_percent": "7.15%",
+        "turnover_rate": "2.40%",
+        "large_order_net": "-0.02",
+        "large_order_amount": "-2802.6万",
+        "retail_count": "21.23",
+        "macdfs": "+0.012",
+    }
+    assert body["value_sources"] == {
+        "stock_name": "INTERFACE",
+        "current_price": "INTERFACE",
+        "change_percent": "INTERFACE",
+        "turnover_rate": "INTERFACE",
+        "large_order_net": "OCR",
+        "large_order_amount": "INTERFACE",
+        "retail_count": "INTERFACE",
+        "macdfs": "INTERFACE",
+    }
+    assert body["collected_at"] is not None
+    assert body["long_capture"]["status"] == "READY"
+    assert body["long_capture"]["url"] == f"/api/v1/jobs/{public_id}/capture"
+    assert image.status_code == 200
+    assert image.content == b"merged-png-bytes"
 
 
 def test_status_events_are_exposed_as_sse_envelopes() -> None:

@@ -85,6 +85,8 @@ def validate_host_profile(
     elif profile == "macos-avd":
         if normalized_arch not in {"arm64", "aarch64"} or not apple_silicon:
             errors.append("macos-avd requires Apple Silicon (arm64)")
+        if not docker_available:
+            errors.append("Docker is required for the web services on macos-avd")
         if not android_sdk_available:
             errors.append("Android SDK platform-tools, emulator, and API 33 image are required")
         if not avd_available:

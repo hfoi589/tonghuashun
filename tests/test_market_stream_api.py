@@ -19,6 +19,12 @@ class ApiMarketSource:
             source_time="2026-08-24T09:31:02+08:00",
             collected_at=datetime.now(timezone.utc),
             quote={"current_price": "19.78", "change_percent": "+2.22%"},
+            intraday_series={
+                "macdfs": {
+                    "unit": None,
+                    "points": [{"time": "09:31", "value": "+0.012"}],
+                }
+            },
             capabilities={"order_book": {"available": True, "actual_depth": 10, "permission_limited": False}},
         )
 
@@ -63,6 +69,9 @@ def test_market_snapshot_and_kline_routes_require_user_authentication(tmp_path) 
 
     assert snapshot.status_code == 200
     assert snapshot.json()["quote"]["current_price"] == "19.78"
+    assert snapshot.json()["intraday_series"]["macdfs"]["points"] == [
+        {"time": "09:31", "value": "+0.012"}
+    ]
     assert snapshot.json()["sequence"] == 1
     assert series.status_code == 200
     assert series.json()["bars"][0]["close"] == "19.78"
@@ -97,6 +106,7 @@ def test_market_websocket_authenticates_and_pushes_subscribed_snapshots(tmp_path
     assert subscribed == {"type": "subscribed", "watchlist": [], "detail": "601872"}
     assert snapshot["type"] == "snapshot"
     assert snapshot["data"]["symbol"] == "601872"
+    assert snapshot["data"]["intraday_series"]["macdfs"]["points"][0]["value"] == "+0.012"
 
 
 def test_admin_market_health_reports_broker_cadence_and_cache(tmp_path) -> None:

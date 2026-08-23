@@ -1,6 +1,7 @@
 import { FormEvent, useEffect, useRef, useState } from 'react'
 import { AdminPage } from './AdminPage'
-import { ApiError, api, type IntradayMetricSeries, type IntradaySeriesValues, type Job, type JobStatus, type JobStreamState, type MainFundFlowPeriod, type SymbolLookup, type ValueSource, subscribeToJob } from './api'
+import { ApiError, api, type IntradaySeriesValues, type Job, type JobStatus, type JobStreamState, type MainFundFlowPeriod, type SymbolLookup, type ValueSource, subscribeToJob } from './api'
+import { IntradayMetricChart } from './IntradayMetricChart'
 import './styles.css'
 
 const HISTORY_STORAGE_KEY = 'ths_level2_job_history'
@@ -169,152 +170,11 @@ function FundFlowTable({ task, finished }: { task: Job, finished: boolean }) {
   </section>
 }
 
-const CHART_WIDTH = 720
-const CHART_HEIGHT = 218
-const CHART_LEFT = 58
-const CHART_RIGHT = 18
-const CHART_TOP = 18
-const CHART_BOTTOM = 34
-
-function numericPointValues(series: IntradayMetricSeries): Array<number | null> {
-  return series.points.map((point) => {
-    if (point.value === null) return null
-    const value = Number(point.value)
-    return Number.isFinite(value) ? value : null
-  })
-}
-
-function IntradayChart({ title, series, directional }: {
-  title: string,
-  series: IntradayMetricSeries,
-  directional: boolean,
-}) {
-  const [selectedIndex, setSelectedIndex] = useState(Math.max(0, series.points.length - 1))
-  if (series.points.length === 0) {
-    return <figure className="intraday-chart intraday-chart-empty">
-      <figcaption>
-        <div><span>当日分时</span><h4>{title}</h4></div>
-      </figcaption>
-      <p className="minor">暂无分时数据</p>
-    </figure>
-  }
-
-  const values = numericPointValues(series)
-  const validValues = values.filter((value): value is number => value !== null)
-  const domainValues = directional ? [...validValues, 0] : validValues
-  let minimum = domainValues.length > 0 ? Math.min(...domainValues) : 0
-  let maximum = domainValues.length > 0 ? Math.max(...domainValues) : 1
-  if (minimum === maximum) {
-    const padding = Math.max(Math.abs(minimum) * .08, 1)
-    minimum -= padding
-    maximum += padding
-  } else {
-    const padding = (maximum - minimum) * .08
-    minimum -= padding
-    maximum += padding
-  }
-  const plotWidth = CHART_WIDTH - CHART_LEFT - CHART_RIGHT
-  const plotHeight = CHART_HEIGHT - CHART_TOP - CHART_BOTTOM
-  const xFor = (index: number) => CHART_LEFT + (index / Math.max(1, series.points.length - 1)) * plotWidth
-  const yFor = (value: number) => CHART_TOP + ((maximum - value) / (maximum - minimum)) * plotHeight
-  let path = ''
-  let segmentOpen = false
-  values.forEach((value, index) => {
-    if (value === null) {
-      segmentOpen = false
-      return
-    }
-    path += `${segmentOpen ? ' L' : 'M'} ${xFor(index).toFixed(2)} ${yFor(value).toFixed(2)}`
-    segmentOpen = true
-  })
-  const safeIndex = Math.min(selectedIndex, series.points.length - 1)
-  const selectedPoint = series.points[safeIndex]
-  const selectedValue = values[safeIndex]
-  const latestValue = [...validValues].at(-1) ?? 0
-  const tone: MarketTone = latestValue > 0 ? 'up' : latestValue < 0 ? 'down' : 'neutral'
-  const midIndex = Math.floor((series.points.length - 1) / 2)
-  const tickIndices = [...new Set([0, midIndex, series.points.length - 1])]
-
-  return <figure className={`intraday-chart market-${tone}`}>
-    <figcaption>
-      <div>
-        <span>当日分时</span>
-        <h4>{title}</h4>
-      </div>
-      <div className="chart-readout" aria-live="polite">
-        <time>{selectedPoint.time}</time>
-        <strong>{selectedPoint.value ?? '—'}{selectedPoint.value !== null ? series.unit : ''}</strong>
-      </div>
-    </figcaption>
-    <div className="intraday-chart-frame">
-      <svg
-        viewBox={`0 0 ${CHART_WIDTH} ${CHART_HEIGHT}`}
-        role="img"
-        aria-label={`${title}当日分时图`}
-        tabIndex={0}
-        onKeyDown={(event) => {
-          if (event.key === 'ArrowLeft') {
-            event.preventDefault()
-            setSelectedIndex((current) => Math.max(0, current - 1))
-          } else if (event.key === 'ArrowRight') {
-            event.preventDefault()
-            setSelectedIndex((current) => Math.min(series.points.length - 1, current + 1))
-          } else if (event.key === 'Home') {
-            event.preventDefault()
-            setSelectedIndex(0)
-          } else if (event.key === 'End') {
-            event.preventDefault()
-            setSelectedIndex(series.points.length - 1)
-          }
-        }}
-        onPointerMove={(event) => {
-          const bounds = event.currentTarget.getBoundingClientRect()
-          if (bounds.width === 0) return
-          const scaledX = ((event.clientX - bounds.left) / bounds.width) * CHART_WIDTH
-          const ratio = Math.max(0, Math.min(1, (scaledX - CHART_LEFT) / plotWidth))
-          setSelectedIndex(Math.round(ratio * (series.points.length - 1)))
-        }}
-      >
-        <title>{title}当日分时图，可使用左右方向键查看各时点数值</title>
-        {[0, .5, 1].map((ratio) => <line
-          className="chart-grid-line"
-          key={ratio}
-          x1={CHART_LEFT}
-          x2={CHART_WIDTH - CHART_RIGHT}
-          y1={CHART_TOP + ratio * plotHeight}
-          y2={CHART_TOP + ratio * plotHeight}
-        />)}
-        {minimum <= 0 && maximum >= 0 && <line
-          className="chart-zero-line"
-          x1={CHART_LEFT}
-          x2={CHART_WIDTH - CHART_RIGHT}
-          y1={yFor(0)}
-          y2={yFor(0)}
-        />}
-        <path className="chart-series-line" d={path} />
-        {selectedValue !== null && <>
-          <line className="chart-cursor-line" x1={xFor(safeIndex)} x2={xFor(safeIndex)} y1={CHART_TOP} y2={CHART_TOP + plotHeight} />
-          <circle className="chart-active-point" cx={xFor(safeIndex)} cy={yFor(selectedValue)} r="5" />
-        </>}
-        {tickIndices.map((index) => <text
-          className="chart-axis-label"
-          key={index}
-          x={xFor(index)}
-          y={CHART_HEIGHT - 10}
-          textAnchor={index === 0 ? 'start' : index === series.points.length - 1 ? 'end' : 'middle'}
-        >{series.points[index].time}</text>)}
-        <text className="chart-axis-label" x={CHART_LEFT - 8} y={CHART_TOP + 4} textAnchor="end">{maximum.toFixed(2)}</text>
-        <text className="chart-axis-label" x={CHART_LEFT - 8} y={CHART_TOP + plotHeight} textAnchor="end">{minimum.toFixed(2)}</text>
-      </svg>
-    </div>
-  </figure>
-}
-
 function IntradayCharts({ series, publicId }: { series: IntradaySeriesValues, publicId: string }) {
   const charts = [
-    ['large_order_net', '大单净量', true],
-    ['large_order_amount', '大单金额', true],
-    ['retail_count', '散户数量', false],
+    ['large_order_net', '大单净量', true, 2],
+    ['large_order_amount', '大单金额', true, 1],
+    ['retail_count', '散户数量', false, 2],
   ] as const
 
   if (!charts.some(([key]) => series[key].points.length > 0)) return null
@@ -327,9 +187,10 @@ function IntradayCharts({ series, publicId }: { series: IntradaySeriesValues, pu
       <span className="minor">悬停或使用左右键查看每个时点</span>
     </div>
     <div className="intraday-chart-list">
-      {charts.map(([key, title, directional]) => <IntradayChart
+      {charts.map(([key, title, directional, precision]) => <IntradayMetricChart
         directional={directional}
         key={key}
+        precision={precision}
         series={series[key]}
         title={title}
       />)}

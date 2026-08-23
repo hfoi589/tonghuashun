@@ -1,6 +1,7 @@
 import { FormEvent, useEffect, useMemo, useRef, useState } from 'react'
 import { ApiError } from './api'
 import { DailyKChart } from './DailyKChart'
+import { IntradayMetricChart } from './IntradayMetricChart'
 import {
   marketApi,
   marketStreamUrl,
@@ -203,6 +204,34 @@ function FundFlow({ values }: { values: MarketSnapshot['main_fund_flow'] }) {
   </section>
 }
 
+const marketIntradayCharts = [
+  ['large_order_net', '大单净量', true, 2],
+  ['large_order_amount', '大单金额', true, 1],
+  ['retail_count', '散户数量', false, 2],
+  ['macdfs', 'MACDFS', true, 3],
+] as const
+
+function MarketIntradayCharts({ symbol, series }: {
+  symbol: string,
+  series: MarketSnapshot['intraday_series'],
+}) {
+  return <section className="market-intraday-stack" aria-label="App 内部指标分时">
+    <header>
+      <div><span>APP INTERNAL</span><h3>当日指标分时</h3></div>
+      <small>悬停、触摸或使用方向键查看时点</small>
+    </header>
+    <div className="market-intraday-list">
+      {marketIntradayCharts.map(([key, title, directional, precision]) => <IntradayMetricChart
+        directional={directional}
+        key={`${symbol}-${key}`}
+        precision={precision}
+        series={series[key] ?? { unit: key === 'large_order_amount' ? '万' : null, points: [] }}
+        title={title}
+      />)}
+    </div>
+  </section>
+}
+
 function Detail({ item, snapshot, period, setPeriod, series, dailyLoading, dailyError }: {
   item: { symbol: string, name: string },
   snapshot?: MarketSnapshot,
@@ -227,7 +256,10 @@ function Detail({ item, snapshot, period, setPeriod, series, dailyLoading, daily
     <section className="market-chart-panel">
       <nav className="market-period-tabs" aria-label="图表周期">{chartPeriods.map(([value, label]) => <button type="button" key={value} className={period === value ? 'active' : ''} onClick={() => setPeriod(value)}>{label}</button>)}</nav>
       {period === 'timeshare'
-        ? <LineChart name={snapshot?.name ?? item.name} points={snapshot?.timeshare ?? []} />
+        ? <>
+          <LineChart name={snapshot?.name ?? item.name} points={snapshot?.timeshare ?? []} />
+          <MarketIntradayCharts symbol={snapshot?.symbol ?? item.symbol} series={snapshot?.intraday_series ?? {}} />
+        </>
         : period === 'day'
           ? <DailyKPanel name={snapshot?.name ?? item.name} page={series} loading={dailyLoading} error={dailyError} />
         : !klineAvailable

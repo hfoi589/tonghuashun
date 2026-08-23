@@ -1,4 +1,4 @@
-import { ApiError, type SymbolLookup } from './api'
+import { ApiError, type IntradayMetricSeries, type SymbolLookup } from './api'
 
 export interface MarketUser {
   id: number
@@ -34,6 +34,8 @@ export interface MarketCapability {
   adjustment?: string
 }
 
+export type MarketIntradayMetricKey = 'large_order_net' | 'large_order_amount' | 'retail_count' | 'macdfs'
+
 export interface MarketSnapshot {
   symbol: string
   name: string | null
@@ -45,7 +47,7 @@ export interface MarketSnapshot {
   age_seconds: number
   quote: Record<string, string | null>
   timeshare: TimesharePoint[]
-  intraday_series: Record<string, { unit: string | null, points: Array<{ time: string, value: string | null }> }>
+  intraday_series: Partial<Record<MarketIntradayMetricKey, IntradayMetricSeries>>
   order_book: Array<{ side: string, level: number, price: string | null, volume: string | null }>
   trades: Array<{ time: string, price: string | null, volume: string | null, side: string | null }>
   main_fund_flow: Record<string, Record<string, string | null>>

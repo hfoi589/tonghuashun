@@ -173,6 +173,25 @@ button { cursor: pointer; }
 .market-chart-area { fill: rgba(226,35,46,.07); stroke: none; }
 .candle-up line, .candle-up rect { stroke: var(--market-red); fill: white; vector-effect: non-scaling-stroke; }
 .candle-down line, .candle-down rect { stroke: var(--market-green); fill: var(--market-green); vector-effect: non-scaling-stroke; }
+.market-intraday-stack {
+  --intraday-up: var(--market-red);
+  --intraday-down: var(--market-green);
+  --intraday-neutral: var(--market-ink);
+  --intraday-ink: var(--market-ink);
+  --intraday-muted: var(--market-muted);
+  --intraday-grid: #eceef1;
+  --intraday-zero: #afb3b9;
+  --intraday-cursor: #777d85;
+  --intraday-axis: #858a92;
+  border-top: 1px solid var(--market-line);
+}
+.market-intraday-stack > header { min-height: 62px; padding: 12px 16px; display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+.market-intraday-stack > header span { display: block; margin-bottom: 3px; color: var(--market-muted); font-size: 10px; letter-spacing: .08em; }
+.market-intraday-stack > header h3 { margin: 0; font-size: 16px; }
+.market-intraday-stack > header small { color: var(--market-muted); font-size: 11px; }
+.market-intraday-list { display: grid; }
+.market-intraday-list .intraday-chart { min-width: 0; padding: 13px 16px 16px; border-top: 1px solid var(--market-line); }
+.market-intraday-list .intraday-empty-message { min-height: 150px; display: grid; place-items: center; }
 .market-empty-chart,
 .market-capability-gap { min-height: 300px; display: grid; place-content: center; text-align: center; color: var(--market-muted); }
 .market-capability-gap { gap: 8px; }
@@ -185,9 +204,13 @@ button { cursor: pointer; }
 .daily-k-status span:first-child { background: #fff0f1; color: var(--market-red); font-weight: 750; }
 .daily-k-status .warning { background: #fff3d9; color: #8a641a; }
 .daily-k-chart-shell { min-width: 0; }
-.daily-k-readout { min-height: 68px; padding: 9px 12px; display: flex; align-content: center; flex-wrap: wrap; gap: 5px 14px; border-bottom: 1px solid var(--market-line); color: #5d626a; font: 11px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace; }
-.daily-k-readout strong { color: var(--market-ink); }
-.daily-k-readout span { min-width: 0; overflow-wrap: anywhere; }
+.daily-k-readout { min-height: 92px; padding: 10px 12px; display: grid; align-content: center; gap: 7px; border-bottom: 1px solid var(--market-line); color: #5d626a; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; line-height: 1.45; }
+.daily-k-readout-row { min-width: 0; display: flex; align-items: baseline; flex-wrap: wrap; gap: 5px 14px; }
+.daily-k-readout-primary { padding-bottom: 2px; }
+.daily-k-readout-primary time { color: var(--market-ink); font-size: 12px; font-weight: 800; }
+.daily-k-readout-metric { min-width: 0; display: inline-flex; align-items: baseline; gap: 5px; font-size: 11px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.daily-k-readout-metric b { font-weight: 800; }
+.daily-k-readout-metric > span { font-weight: 650; }
 .daily-k-chart { width: 100%; height: 720px; min-width: 0; touch-action: pan-y; }
 .daily-k-attribution { margin: 0; padding: 7px 12px 9px; border-top: 1px solid var(--market-line); color: #92979e; font-size: 10px; text-align: right; }
 .daily-k-attribution a { color: #5e6874; }
@@ -249,8 +272,13 @@ button { cursor: pointer; }
   .market-period-tabs { overflow-x: auto; padding: 0 4px; }
   .market-period-tabs button { padding: 0 13px; }
   .market-price-chart { min-height: 235px; }
+  .market-intraday-stack > header { align-items: flex-start; flex-wrap: wrap; gap: 6px; padding: 11px 10px; }
+  .market-intraday-stack > header small { width: 100%; }
+  .market-intraday-list .intraday-chart { padding: 10px 8px 12px; }
   .market-empty-chart, .market-capability-gap { min-height: 230px; padding: 20px; }
-  .daily-k-readout { min-height: 86px; padding: 8px; gap: 4px 9px; font-size: 10px; }
+  .daily-k-readout { min-height: 118px; padding: 9px 8px; gap: 6px; font-size: 11px; }
+  .daily-k-readout-row { gap: 5px 10px; }
+  .daily-k-readout-primary time, .daily-k-readout-metric { font-size: 11px; }
   .daily-k-chart { height: 560px; }
   .market-fund-table th, .market-fund-table td { padding: 9px 5px; }
   .market-capability-grid { grid-template-columns: 1fr; }

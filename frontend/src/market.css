@@ -198,6 +198,8 @@ button { cursor: pointer; }
 .market-capability-gap strong { color: #454950; font-size: 15px; }
 .market-capability-gap span { max-width: 440px; font-size: 12px; line-height: 1.5; }
 .market-capability-gap small { max-width: 520px; overflow-wrap: anywhere; }
+.daily-k-retry { justify-self: center; min-height: 36px; padding: 0 14px; border: 1px solid #c9cdd2; border-radius: 3px; background: white; color: var(--market-ink); font-size: 12px; font-weight: 700; }
+.daily-k-retry:hover { border-color: var(--market-red); color: var(--market-red); }
 .daily-k-panel { min-width: 0; overflow: hidden; }
 .daily-k-status { min-height: 38px; padding: 8px 12px; display: flex; align-items: center; flex-wrap: wrap; gap: 7px; border-bottom: 1px solid var(--market-line); }
 .daily-k-status span { padding: 4px 8px; border-radius: 2px; background: #eef1f4; color: #555b63; font-size: 11px; }

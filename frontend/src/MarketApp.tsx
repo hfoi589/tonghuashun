@@ -115,19 +115,21 @@ function CandleChart({ name, bars }: { name: string, bars: KlineBar[] }) {
   </svg>
 }
 
-function DailyKPanel({ name, page, loading, error, onSelectionChange }: {
+function DailyKPanel({ name, page, loading, error, onSelectionChange, onRetry }: {
   name: string,
   page?: MarketSeriesPage,
   loading: boolean,
   error?: string,
   onSelectionChange: (selection: DailyKSelection) => void,
+  onRetry: () => void,
 }) {
   if (loading) return <div className="market-empty-chart">正在加载前复权日 K…</div>
-  if (error && !page) return <div className="market-capability-gap"><strong>日 K 加载失败</strong><span>{error}</span></div>
+  if (error && !page) return <div className="market-capability-gap"><strong>日 K 加载失败</strong><span>{error}</span><button className="daily-k-retry" type="button" onClick={onRetry}>重新加载日 K</button></div>
   if (!page || page.bars.length === 0) return <div className="market-capability-gap">
     <strong>日 K 数据暂不可用</strong>
     <span>{page?.source_error ?? error ?? 'KLINE_SOURCES_UNAVAILABLE'}</span>
     {page && Object.entries(page.source_errors).map(([source, code]) => code && <small key={source}>{source}: {code}</small>)}
+    <button className="daily-k-retry" type="button" onClick={onRetry}>重新加载日 K</button>
   </div>
   const sourceLabel = page.source === 'THS_PUBLIC'
     ? '10jqka 公开源'
@@ -262,7 +264,7 @@ function MarketIntradayCharts({ symbol, series }: {
   </section>
 }
 
-function Detail({ item, snapshot, period, setPeriod, series, dailyLoading, dailyError }: {
+function Detail({ item, snapshot, period, setPeriod, series, dailyLoading, dailyError, onRetryDaily }: {
   item: { symbol: string, name: string },
   snapshot?: MarketSnapshot,
   period: ChartPeriod,
@@ -270,6 +272,7 @@ function Detail({ item, snapshot, period, setPeriod, series, dailyLoading, daily
   series?: MarketSeriesPage,
   dailyLoading: boolean,
   dailyError?: string,
+  onRetryDaily: () => void,
 }) {
   const quote = snapshot?.quote ?? {}
   const [dailySelection, setDailySelection] = useState<DailyKSelection | null>(null)
@@ -324,7 +327,7 @@ function Detail({ item, snapshot, period, setPeriod, series, dailyLoading, daily
           <MarketIntradayCharts symbol={snapshot?.symbol ?? item.symbol} series={snapshot?.intraday_series ?? {}} />
         </>
         : period === 'day'
-          ? <DailyKPanel name={snapshot?.name ?? item.name} page={series} loading={dailyLoading} error={dailyError} onSelectionChange={setDailySelection} />
+          ? <DailyKPanel name={snapshot?.name ?? item.name} page={series} loading={dailyLoading} error={dailyError} onSelectionChange={setDailySelection} onRetry={onRetryDaily} />
         : !klineAvailable
           ? <div className="market-capability-gap"><strong>App 内部 K 线接口尚未确认</strong><span>为避免展示错误行情，这里不会使用网页源、OCR 或猜测参数。</span></div>
           : <CandleChart name={snapshot?.name ?? item.name} bars={series?.bars ?? []} />}
@@ -357,6 +360,7 @@ export function MarketApp() {
   const [dailySeries, setDailySeries] = useState<Record<string, MarketSeriesPage>>({})
   const [dailyLoading, setDailyLoading] = useState<Record<string, boolean>>({})
   const [dailyErrors, setDailyErrors] = useState<Record<string, string>>({})
+  const [dailyRetryVersion, setDailyRetryVersion] = useState(0)
   const [symbol, setSymbol] = useState('')
   const [message, setMessage] = useState('')
   const [connection, setConnection] = useState<'live' | 'reconnecting' | 'unavailable'>('unavailable')
@@ -416,11 +420,27 @@ export function MarketApp() {
     void marketApi.series(requestedSymbol, 'day').then((value) => {
       setDailySeries((current) => ({ ...current, [requestedSymbol]: value }))
     }).catch((reason) => {
+      requestedDailySeries.current.delete(requestedSymbol)
       setDailyErrors((current) => ({ ...current, [requestedSymbol]: reason instanceof Error ? reason.message : '日 K 读取失败' }))
     }).finally(() => {
       setDailyLoading((current) => ({ ...current, [requestedSymbol]: false }))
     })
-  }, [auth, selected, user?.must_change_password])
+  }, [auth, dailyRetryVersion, selected, user?.must_change_password])
+
+  function retryDailySeries(symbol: string) {
+    requestedDailySeries.current.delete(symbol)
+    setDailySeries((current) => {
+      const next = { ...current }
+      delete next[symbol]
+      return next
+    })
+    setDailyErrors((current) => {
+      const next = { ...current }
+      delete next[symbol]
+      return next
+    })
+    setDailyRetryVersion((current) => current + 1)
+  }
 
   useEffect(() => {
     if (period === 'timeshare' || period === 'day' || !selected || !selectedKlineAvailable) {
@@ -515,7 +535,7 @@ export function MarketApp() {
       </aside>
       <div className="market-main-pane">
         {message && <div className="market-message" role="status">{message}<button type="button" onClick={() => setMessage('')}>关闭</button></div>}
-        {selectedItem ? <Detail item={selectedItem} snapshot={snapshots[selectedItem.symbol]} period={period} setPeriod={setPeriod} series={period === 'day' ? dailySeries[selectedItem.symbol] : legacySeries} dailyLoading={dailyLoading[selectedItem.symbol] === true} dailyError={dailyErrors[selectedItem.symbol]} /> : <section className="market-no-selection"><div className="market-brand-mark">顺</div><h1>从自选中选择一只股票</h1><p>行情会通过当前登录的同花顺 App 内部接口动态更新。</p></section>}
+        {selectedItem ? <Detail item={selectedItem} snapshot={snapshots[selectedItem.symbol]} period={period} setPeriod={setPeriod} series={period === 'day' ? dailySeries[selectedItem.symbol] : legacySeries} dailyLoading={dailyLoading[selectedItem.symbol] === true} dailyError={dailyErrors[selectedItem.symbol]} onRetryDaily={() => retryDailySeries(selectedItem.symbol)} /> : <section className="market-no-selection"><div className="market-brand-mark">顺</div><h1>从自选中选择一只股票</h1><p>行情会通过当前登录的同花顺 App 内部接口动态更新。</p></section>}
       </div>
     </div>
   </main>

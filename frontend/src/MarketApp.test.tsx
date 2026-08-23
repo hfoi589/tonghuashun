@@ -242,4 +242,50 @@ describe('MarketApp', () => {
     await waitFor(() => expect(screen.getByRole('img', { name: '中远海能前复权日K图' })).toHaveTextContent('600026'))
     expect(screen.queryByRole('img', { name: '招商轮船前复权日K图' })).not.toBeInTheDocument()
   })
+
+  it('allows a transient daily K-line failure to be retried without reloading the page', async () => {
+    let seriesCalls = 0
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url === '/api/v1/session') return jsonResponse({
+        id: 7, username: 'wilson', enabled: true, must_change_password: false, created_at: '2026-08-23T00:00:00+00:00',
+      })
+      if (url === '/api/v1/watchlists') return jsonResponse({ groups: [{
+        id: 1, name: '自选', sort_order: 0, is_primary: true,
+        items: [{ symbol: '601872', name: '招商轮船', market: '17' }],
+      }] })
+      if (url.includes('/snapshot')) return jsonResponse({
+        symbol: '601872', name: '招商轮船', market: '17', sequence: 1, source_time: '15:00',
+        collected_at: '2026-08-23T07:00:00+00:00', stale: false, age_seconds: 0.2,
+        quote: { price: '19.78' }, timeshare: [], intraday_series: {}, order_book: [], trades: [], main_fund_flow: {},
+        capabilities: { daily_kline: { available: true, adjustment: 'qfq' }, kline: { available: false } },
+        source_errors: { core_metrics: null, main_fund_flow: null },
+      })
+      if (url.includes('/series?period=day&limit=240')) {
+        seriesCalls += 1
+        if (seriesCalls === 1) return jsonResponse({ detail: 'PUBLIC_KLINE_HTTP_ERROR' }, 503)
+        return jsonResponse({
+          symbol: '601872', period: 'day',
+          bars: [{ time: '2026-08-21', open: '18.49', high: '20.10', low: '18.49', close: '19.78', volume: '193604931', amount: '3808373130' }],
+          indicators: {}, next_cursor: null, source_error: null, adjustment: 'qfq', source: 'THS_PUBLIC', cached: false, stale: false,
+          source_errors: { public_kline: null, app_kline: null },
+        })
+      }
+      throw new Error(`unexpected request: ${url}`)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    vi.stubGlobal('WebSocket', undefined)
+
+    render(<MarketApp />)
+
+    await screen.findByRole('button', { name: /招商轮船/ })
+    await waitFor(() => expect(seriesCalls).toBe(1))
+    await userEvent.click(screen.getByRole('button', { name: '日K' }))
+    expect(await screen.findByText('日 K 加载失败')).toBeInTheDocument()
+
+    await userEvent.click(screen.getByRole('button', { name: '重新加载日 K' }))
+
+    expect(await screen.findByRole('img', { name: '招商轮船前复权日K图' })).toBeInTheDocument()
+    expect(seriesCalls).toBe(2)
+  })
 })

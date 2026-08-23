@@ -299,7 +299,7 @@ class TonghuashunPublicDailyKlineProvider:
         *,
         fetch: Callable[[str, float], str] = _http_get,
         timeout_seconds: float = 8.0,
-        attempts: int = 2,
+        attempts: int = 3,
     ) -> None:
         self.fetch = fetch
         self.timeout_seconds = timeout_seconds

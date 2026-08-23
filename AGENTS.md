@@ -26,7 +26,7 @@ GET /api/v1/symbols/{symbol}
 调用时必须使用六位数字，例如：
 
 ```sh
-curl -fsS "http://127.0.0.1:8000/api/v1/symbols/601872"
+curl -fsS "http://127.0.0.1:8001/api/v1/symbols/601872"
 ```
 
 服务只接受已确认的股票和当前交易所基金代码前缀：
@@ -77,7 +77,7 @@ Content-Type: application/json
 纯数据请求示例：
 
 ```sh
-curl -fsS -X POST "http://127.0.0.1:8000/api/v1/jobs" \
+curl -fsS -X POST "http://127.0.0.1:8001/api/v1/jobs" \
   -H 'Content-Type: application/json' \
   -d '{"symbol":"601872","include_long_capture":false}'
 ```
@@ -98,7 +98,7 @@ curl -fsS -X POST "http://127.0.0.1:8000/api/v1/jobs" \
 查询任务状态：
 
 ```sh
-curl -fsS "http://127.0.0.1:8000/api/v1/jobs/${PUBLIC_ID}"
+curl -fsS "http://127.0.0.1:8001/api/v1/jobs/${PUBLIC_ID}"
 ```
 
 也可以订阅状态事件，并在每次事件后获取完整任务：
@@ -121,12 +121,25 @@ GET /api/v1/jobs/{public_id}
 | `retail_count` | 最新散户数量指标，保留两位小数 |
 | `macdfs` | 最新 MACDFS 点，保留三位小数，正数带 `+` |
 
+`values.main_fund_flow` 是可选增强，按 `today`、`three_day`、`five_day`
+三个周期返回。每个周期包含独立的动态 `unit`（`万元` 或 `亿元`），以及
+`main_net_inflow`、`main_visible_inflow`、`main_hidden_inflow`、
+`retail_inflow` 四个保留两位小数的字符串或 `null`。主力净流入必须直接采用
+`charge_main_capital`；散户流入按 App 模型定义为主力净流入的相反数。成功的
+资金值来源为 `INTERFACE`，缺失值来源为 `null`。
+
 `value_sources` 中，已返回指标必须为 `INTERFACE`，缺失指标必须为 `null`。
 缺失字段保持 `null`，绝不能从 OCR 或截图中补齐。八项指标完整时任务为
 `COMPLETED`；任一指标缺失时任务为 `PARTIAL`，错误码为
 `VALUE_RECOGNITION_FAILED`。App 内部直接请求失败时，任务为 `FAILED`，并保留
 原始接口错误码，例如 `DIRECT_APP_OFFLINE`、`DIRECT_REQUEST_TIMEOUT` 或
 `DIRECT_MANAGER_UNAVAILABLE`；不得替换成 UI 降级路径。
+
+双账号模式下，`source_errors` 固定包含 `core_metrics` 和
+`main_fund_flow`。原八项接口失败时任务为 `FAILED`；资金接口明确失败时保留
+原八项结果并返回 `PARTIAL`，原始资金错误写入
+`source_errors.main_fund_flow`。资金接口有效响应但个别字段缺失时，资金字段
+保持 `null`，不影响原八项完整任务的 `COMPLETED` 状态。
 
 提交和状态查询的预期错误：
 
@@ -142,8 +155,15 @@ GET /api/v1/jobs/{public_id}
 
 ## 本地部署
 
-- 在本 Mac 上必须使用 `deploy/macos.env` 部署，HTTP 使用 8000 端口，不得重新引入 Caddy。
+- 当前 Mac 双设备角色固定如下：
+  - `core_metrics`：`THS_CORE_33_ARM64 / emulator-5556 / 27043`，用于股票名称、原八项指标、自动页面导航和长截图。
+  - `main_fund_flow`：`THS_API_33_ARM64 / emulator-5554 / 27042`，只用于资金 1/3/5 日接口。
+- `emulator-5554` 是受保护的当前资金账号。禁止退出登录、切换账号、克隆 AVD、重装/卸载 App、清数据、`force-stop` 或自动页面导航。
+- 自动任务导航和长截图只能操作 `emulator-5556`。核心设备必须保持 `wm size 1080x1920` 和 `wm density 480`；使用 `scripts/configure-macos-core-display.sh` 校准。
+- 在本 Mac 上必须使用 `deploy/macos.env` 部署，HTTP 使用 8001 端口，不得重新引入 Caddy。
+- 双账号变量 `CORE_ADB_SERIAL`、`CORE_FRIDA_SERVER_ENDPOINT`、`FUND_ADB_SERIAL`、`FUND_FRIDA_SERVER_ENDPOINT` 必须四项齐全；旧单设备变量仅用于兼容模式。
 - 重建 API 服务时必须保留 Redis 数据卷以及 Android 模拟器数据和登录状态。
+- 管理页面同时显示两台设备；两个 WebSocket 为 `/api/admin/devices/core_metrics` 和 `/api/admin/devices/main_fund_flow`，旧 `/api/admin/device` 只映射到 `core_metrics`。
 
 ---
 
@@ -176,7 +196,7 @@ GET /api/v1/symbols/{symbol}
 Call it with exactly six digits, for example:
 
 ```sh
-curl -fsS "http://127.0.0.1:8000/api/v1/symbols/601872"
+curl -fsS "http://127.0.0.1:8001/api/v1/symbols/601872"
 ```
 
 The service accepts only confirmed stock and current exchange-fund prefixes:
@@ -230,7 +250,7 @@ Content-Type: application/json
 Example data-only request:
 
 ```sh
-curl -fsS -X POST "http://127.0.0.1:8000/api/v1/jobs" \
+curl -fsS -X POST "http://127.0.0.1:8001/api/v1/jobs" \
   -H 'Content-Type: application/json' \
   -d '{"symbol":"601872","include_long_capture":false}'
 ```
@@ -255,7 +275,7 @@ parsing.
 Read the task status:
 
 ```sh
-curl -fsS "http://127.0.0.1:8000/api/v1/jobs/${PUBLIC_ID}"
+curl -fsS "http://127.0.0.1:8001/api/v1/jobs/${PUBLIC_ID}"
 ```
 
 Or subscribe to status events and fetch the full task after each event:
@@ -278,6 +298,14 @@ The terminal result is in `values`:
 | `retail_count` | Latest retail-count indicator, two decimal places |
 | `macdfs` | Latest MACDFS point, three decimal places; positive values include `+` |
 
+`values.main_fund_flow` is an optional enhancement with `today`,
+`three_day`, and `five_day` periods. Each period carries its own dynamic
+`unit` (`万元` or `亿元`) plus `main_net_inflow`, `main_visible_inflow`,
+`main_hidden_inflow`, and `retail_inflow`, each a two-decimal string or
+`null`. Use `charge_main_capital` directly for main net inflow; retail inflow
+is the App model's negation of that value. Successful fund values have source
+`INTERFACE`; missing values have source `null`.
+
 `value_sources` must be `INTERFACE` for a returned metric and `null` for a
 missing metric. A missing field remains `null`; it is never filled from OCR or
 the screenshot. A complete result is `COMPLETED`; any missing field is
@@ -285,6 +313,13 @@ the screenshot. A complete result is `COMPLETED`; any missing field is
 request fails, the task is `FAILED` and keeps the original interface error code
 (for example `DIRECT_APP_OFFLINE`, `DIRECT_REQUEST_TIMEOUT`, or
 `DIRECT_MANAGER_UNAVAILABLE`); do not replace it with a UI fallback.
+
+In dual-account mode, `source_errors` always contains `core_metrics` and
+`main_fund_flow`. A core-interface failure makes the task `FAILED`. An explicit
+fund-interface failure preserves the core values and returns `PARTIAL`, with
+the original code in `source_errors.main_fund_flow`. Missing fields in an
+otherwise valid fund response remain `null` and do not prevent `COMPLETED`
+when all eight required core values are present.
 
 Expected submission/status errors:
 
@@ -301,5 +336,12 @@ chart heading is present; it is never a source for any field in `values`.
 
 ## Local deployment
 
-- On this Mac, deploy with `deploy/macos.env`, keep HTTP on port 8000, and do not reintroduce Caddy.
+- The current Mac has two fixed device roles:
+  - `core_metrics`: `THS_CORE_33_ARM64 / emulator-5556 / 27043` for symbol lookup, the eight required values, automated UI navigation, and long captures.
+  - `main_fund_flow`: `THS_API_33_ARM64 / emulator-5554 / 27042` only for 1/3/5-day fund-flow interface requests.
+- `emulator-5554` holds the protected current fund account. Never log it out, switch accounts, clone the AVD, reinstall/uninstall or clear the App, `force-stop` it, or navigate it automatically.
+- Automated navigation and long captures may operate only on `emulator-5556`. Keep the core device at `wm size 1080x1920` and `wm density 480`; use `scripts/configure-macos-core-display.sh` to calibrate it.
+- On this Mac, deploy with `deploy/macos.env`, keep HTTP on port 8001, and do not reintroduce Caddy.
+- `CORE_ADB_SERIAL`, `CORE_FRIDA_SERVER_ENDPOINT`, `FUND_ADB_SERIAL`, and `FUND_FRIDA_SERVER_ENDPOINT` must be provided together; legacy single-device variables are compatibility-only.
 - Preserve the Redis volume and Android emulator data/login state when rebuilding the API service.
+- The admin page shows both devices concurrently. Its WebSockets are `/api/admin/devices/core_metrics` and `/api/admin/devices/main_fund_flow`; legacy `/api/admin/device` maps only to `core_metrics`.

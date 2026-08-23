@@ -1,19 +1,30 @@
 from __future__ import annotations
 
+import json
+import shutil
+import subprocess
 import sys
+import time
 import types
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier, Event, Lock
 
 from level2_service.models import MetricKind
 import pytest
 
 from level2_service.parsed_values import (
+    DirectReadOutcome,
     DirectRequestError,
+    DualAccountParsedValueSource,
     FridaParsedValueSource,
     SymbolLookup,
     SymbolLookupAmbiguousError,
     SymbolLookupNotFoundError,
     UnsupportedMarketError,
     market_code_for_symbol,
+    _FRIDA_CORE_DIRECT_SCRIPT,
+    _FRIDA_DIRECT_SCRIPT,
+    _FRIDA_FUND_DIRECT_SCRIPT,
 )
 
 
@@ -56,7 +67,16 @@ def test_frida_source_selects_the_requested_stock_and_formats_all_runtime_values
 
     values = source.read("601872")
 
-    assert values == {
+    assert {kind: values[kind] for kind in (
+        MetricKind.STOCK_NAME,
+        MetricKind.CURRENT_PRICE,
+        MetricKind.CHANGE_PERCENT,
+        MetricKind.TURNOVER_RATE,
+        MetricKind.RETAIL_COUNT,
+        MetricKind.LARGE_ORDER_NET,
+        MetricKind.LARGE_ORDER_AMOUNT,
+        MetricKind.MACDFS,
+    )} == {
         MetricKind.STOCK_NAME: "招商轮船",
         MetricKind.CURRENT_PRICE: "19.78",
         MetricKind.CHANGE_PERCENT: "7.15%",
@@ -210,6 +230,366 @@ def test_direct_read_passes_the_derived_market_to_the_app_and_formats_fresh_valu
     assert values[MetricKind.LARGE_ORDER_AMOUNT] == "-2802.6万"
 
 
+def test_direct_payload_turns_the_big_order_permission_sentinel_into_missing_values() -> None:
+    payload = _runtime_payload()
+    payload["indicators"] = [
+        {"symbol": "601872", "techid": 7031, "values": [-2147483648]},
+        {"symbol": "601872", "techid": 7032, "values": [-2147483648]},
+        {"symbol": "601872", "techid": 7034, "values": [21.2263]},
+        {"symbol": "601872", "techid": 7051, "values": [0.0119]},
+    ]
+
+    values = FridaParsedValueSource._parse_payload(payload, "601872")
+
+    assert values[MetricKind.LARGE_ORDER_NET] is None
+    assert values[MetricKind.LARGE_ORDER_AMOUNT] is None
+    assert values[MetricKind.RETAIL_COUNT] == "21.23"
+
+
+def test_dual_account_source_queries_both_apps_in_parallel_and_merges_by_whitelist() -> None:
+    core_started = Event()
+    fund_started = Event()
+
+    class CoreSource:
+        def read_direct(self, _symbol: str):
+            core_started.set()
+            assert fund_started.wait(1), "fund query did not start in parallel"
+            return {
+                MetricKind.STOCK_NAME: "中国海油",
+                MetricKind.CURRENT_PRICE: "29.10",
+                MetricKind.MAIN_FLOW_TODAY_NET: "must-not-cross-source-boundary",
+            }
+
+        def lookup_symbol(self, symbol: str):
+            return SymbolLookup(symbol=symbol, name="中国海油", market="17")
+
+    class FundSource:
+        def read_direct(self, _symbol: str):
+            fund_started.set()
+            assert core_started.wait(1), "core query did not start in parallel"
+            return {
+                MetricKind.STOCK_NAME: "must-not-cross-source-boundary",
+                MetricKind.MAIN_FLOW_TODAY_NET: "1.56",
+                MetricKind.MAIN_FLOW_TODAY_UNIT: "亿元",
+            }
+
+    source = DualAccountParsedValueSource(CoreSource(), FundSource())
+
+    outcome = source.read_direct("600938")
+
+    assert isinstance(outcome, DirectReadOutcome)
+    assert outcome.values[MetricKind.STOCK_NAME] == "中国海油"
+    assert outcome.values[MetricKind.CURRENT_PRICE] == "29.10"
+    assert outcome.values[MetricKind.MAIN_FLOW_TODAY_NET] == "1.56"
+    assert outcome.values[MetricKind.MAIN_FLOW_TODAY_UNIT] == "亿元"
+    assert outcome.source_errors == {
+        "core_metrics": None,
+        "main_fund_flow": None,
+    }
+    assert source.lookup_symbol("600938").name == "中国海油"
+
+
+def test_dual_account_source_keeps_core_values_when_the_fund_interface_fails() -> None:
+    core = types.SimpleNamespace(
+        read_direct=lambda _symbol: {
+            MetricKind.STOCK_NAME: "中国海油",
+            MetricKind.CURRENT_PRICE: "29.10",
+        },
+        lookup_symbol=lambda symbol: SymbolLookup(symbol=symbol, name="中国海油", market="17"),
+    )
+
+    def fund_failure(_symbol: str):
+        raise DirectRequestError("FUND_QUERY_REJECTED")
+
+    source = DualAccountParsedValueSource(
+        core,
+        types.SimpleNamespace(read_direct=fund_failure),
+    )
+
+    outcome = source.read_direct("600938")
+
+    assert outcome.values[MetricKind.STOCK_NAME] == "中国海油"
+    assert outcome.values[MetricKind.MAIN_FLOW_TODAY_NET] is None
+    assert outcome.source_errors["main_fund_flow"] == "FUND_QUERY_REJECTED"
+
+
+def test_dual_account_source_preserves_a_core_interface_error_as_fatal() -> None:
+    def core_failure(_symbol: str):
+        raise DirectRequestError("DIRECT_MANAGER_UNAVAILABLE")
+
+    source = DualAccountParsedValueSource(
+        types.SimpleNamespace(read_direct=core_failure),
+        types.SimpleNamespace(read_direct=lambda _symbol: {}),
+    )
+
+    with pytest.raises(DirectRequestError) as raised:
+        source.read_direct("600938")
+
+    assert raised.value.error_code == "DIRECT_MANAGER_UNAVAILABLE"
+
+
+def test_direct_payload_formats_main_fund_flow_by_period_and_keeps_app_net_value() -> None:
+    payload = _runtime_payload()
+    payload["fund_flows"] = [
+        {
+            "period": "today",
+            "current_unit": 100000000,
+            "main_in": 5.35,
+            "main_listed": -0.28,
+            "main_grey": 5.63,
+            "main_retail_investor": -5.35,
+        },
+        {
+            "period": "three_day",
+            "current_unit": 100000000,
+            "main_in": 12.96,
+            "main_listed": 3.63,
+            "main_grey": 9.34,
+            "main_retail_investor": -12.96,
+        },
+        {
+            "period": "five_day",
+            "current_unit": 100000000,
+            "main_in": 15.95,
+            "main_listed": 3.39,
+            "main_grey": 12.57,
+            "main_retail_investor": -15.95,
+        },
+    ]
+
+    values = FridaParsedValueSource._parse_payload(payload, "601872")
+
+    assert values[MetricKind.MAIN_FLOW_TODAY_UNIT] == "亿元"
+    assert values[MetricKind.MAIN_FLOW_TODAY_NET] == "5.35"
+    assert values[MetricKind.MAIN_FLOW_TODAY_VISIBLE] == "-0.28"
+    assert values[MetricKind.MAIN_FLOW_TODAY_HIDDEN] == "5.63"
+    assert values[MetricKind.MAIN_FLOW_TODAY_RETAIL] == "-5.35"
+    assert values[MetricKind.MAIN_FLOW_THREE_DAY_NET] == "12.96"
+    assert values[MetricKind.MAIN_FLOW_THREE_DAY_VISIBLE] == "3.63"
+    assert values[MetricKind.MAIN_FLOW_THREE_DAY_HIDDEN] == "9.34"
+    assert values[MetricKind.MAIN_FLOW_THREE_DAY_RETAIL] == "-12.96"
+    assert values[MetricKind.MAIN_FLOW_FIVE_DAY_NET] == "15.95"
+    assert values[MetricKind.MAIN_FLOW_FIVE_DAY_VISIBLE] == "3.39"
+    assert values[MetricKind.MAIN_FLOW_FIVE_DAY_HIDDEN] == "12.57"
+    assert values[MetricKind.MAIN_FLOW_FIVE_DAY_RETAIL] == "-15.95"
+
+
+def test_direct_payload_formats_fund_flow_units_and_leaves_missing_fields_empty() -> None:
+    values = FridaParsedValueSource._parse_payload(
+        {
+            "quotes": [],
+            "indicators": [],
+            "fund_flows": [
+                {
+                    "period": "today",
+                    "current_unit": 10000,
+                    "main_in": "-123.456",
+                    "main_listed": None,
+                    "main_grey": "0",
+                    "main_retail_investor": "123.456",
+                },
+                {"period": "three_day", "current_unit": 100000000, "main_in": None},
+            ],
+        },
+        "601872",
+    )
+
+    assert values[MetricKind.MAIN_FLOW_TODAY_UNIT] == "万元"
+    assert values[MetricKind.MAIN_FLOW_TODAY_NET] == "-123.46"
+    assert values[MetricKind.MAIN_FLOW_TODAY_VISIBLE] is None
+    assert values[MetricKind.MAIN_FLOW_TODAY_HIDDEN] == "0.00"
+    assert values[MetricKind.MAIN_FLOW_TODAY_RETAIL] == "123.46"
+    assert values[MetricKind.MAIN_FLOW_THREE_DAY_UNIT] == "亿元"
+    assert values[MetricKind.MAIN_FLOW_THREE_DAY_NET] is None
+
+
+def test_direct_script_uses_the_three_capital_indicators_and_sequential_windows() -> None:
+    for query_id in (
+        "charge_main_capital",
+        "charge_main_listed_capital",
+        "charge_main_grey_capital",
+    ):
+        assert query_id in _FRIDA_DIRECT_SCRIPT
+    assert "sif-charge-indicator-capital" in _FRIDA_DIRECT_SCRIPT
+    assert "HurricaneDataSource" in _FRIDA_DIRECT_SCRIPT
+    assert "win_size" in _FRIDA_DIRECT_SCRIPT
+    assert _FRIDA_DIRECT_SCRIPT.index("['today', 1]") < _FRIDA_DIRECT_SCRIPT.index("['three_day', 3]")
+    assert _FRIDA_DIRECT_SCRIPT.index("['three_day', 3]") < _FRIDA_DIRECT_SCRIPT.index("['five_day', 5]")
+    assert "requestFundFlow(spec[0], spec[1])" in _FRIDA_DIRECT_SCRIPT
+
+
+def test_dual_account_scripts_keep_core_and_fund_requests_on_their_owned_apps() -> None:
+    assert "7031" in _FRIDA_CORE_DIRECT_SCRIPT
+    assert "charge_main_capital" in _FRIDA_FUND_DIRECT_SCRIPT
+    assert "requestScope === 'core_metrics'" in _FRIDA_CORE_DIRECT_SCRIPT
+    assert "requestScope === 'main_fund_flow'" in _FRIDA_FUND_DIRECT_SCRIPT
+    assert "? Promise.resolve()" in _FRIDA_CORE_DIRECT_SCRIPT
+    assert _FRIDA_FUND_DIRECT_SCRIPT.index("['today', 1]") < _FRIDA_FUND_DIRECT_SCRIPT.index("['three_day', 3]")
+    assert _FRIDA_FUND_DIRECT_SCRIPT.index("['three_day', 3]") < _FRIDA_FUND_DIRECT_SCRIPT.index("['five_day', 5]")
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="Node.js is not installed")
+def test_core_direct_script_initializes_an_app_owned_manager_without_an_open_stock_page() -> None:
+    """Falling back to a live qwg instance makes every cold App start fail."""
+    harness = f"""
+const calls = [];
+const manager = {{}};
+const registry = {{
+  p: (pageKey) => {{ calls.push(['p', pageKey]); return manager; }},
+  w: (pageKey, requests, mode) => {{ calls.push(['w', pageKey, requests.items.length, mode]); }},
+  t: (pageKey) => {{ calls.push(['t', pageKey]); }}
+}};
+globalThis.rpc = {{ exports: {{}} }};
+globalThis.Java = {{
+  perform: (callback) => callback(),
+  choose: (_name, callbacks) => callbacks.onComplete(),
+  cast: (value) => value,
+  use: (name) => {{
+    if (name === 'rwg') return {{ i: () => registry }};
+    if (name === 'java.util.ArrayList') return {{ $new: () => ({{
+      items: [],
+      add(value) {{ this.items.push(value); }}
+    }}) }};
+    if (name === 'java.util.HashMap') return {{ $new: () => ({{ put() {{}} }}) }};
+    if (name === 'java.lang.Integer') return {{ valueOf: (value) => value }};
+    if (name === 'ayg') return {{ $new: () => ({{ z() {{}} }}) }};
+    if (name === 'com.hexin.android.biz_frame.eqframe.event.struct.EQBasicStockInfo') {{
+      return {{ $new: () => {{ throw new Error('stop after manager initialization'); }} }};
+    }}
+    return {{}};
+  }}
+}};
+new Function({json.dumps(_FRIDA_CORE_DIRECT_SCRIPT)})();
+rpc.exports.request('600938', '17', 1000, 'core_metrics').then((result) => {{
+  process.stdout.write(JSON.stringify({{ calls, result }}));
+}});
+"""
+
+    completed = subprocess.run(
+        ["node", "-e", harness],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    result = json.loads(completed.stdout)
+    assert [call[0] for call in result["calls"]] == ["p", "w", "t"]
+    assert result["calls"][1][2:] == [1, 3]
+    assert result["calls"][0][1] == result["calls"][2][1]
+    assert result["result"]["error_code"] == "DIRECT_REQUEST_UNAVAILABLE"
+
+
+def test_request_scope_selects_the_matching_frida_runtime() -> None:
+    core = FridaParsedValueSource("core:27042", request_scope="core_metrics")
+    fund = FridaParsedValueSource("fund:27042", request_scope="main_fund_flow")
+
+    assert core._direct_reader is FridaParsedValueSource._read_core_runtime
+    assert fund._direct_reader is FridaParsedValueSource._read_fund_runtime
+
+
+@pytest.mark.parametrize(
+    ("scope", "expected_code"),
+    [
+        ("core_metrics", "DIRECT_APP_OFFLINE"),
+        ("main_fund_flow", "DIRECT_FUND_FLOW_APP_OFFLINE"),
+    ],
+)
+def test_scoped_direct_read_reports_a_stopped_frida_server_as_app_offline(
+    monkeypatch, scope: str, expected_code: str
+) -> None:
+    """A dead role-specific Frida server must not be hidden as DIRECT_REQUEST_FAILED."""
+
+    class ServerNotRunningError(Exception):
+        pass
+
+    class FakeDevice:
+        def enumerate_applications(self):
+            raise ServerNotRunningError("unable to connect to remote frida-server")
+
+    fake_frida = types.SimpleNamespace(
+        ServerNotRunningError=ServerNotRunningError,
+        get_device_manager=lambda: types.SimpleNamespace(
+            add_remote_device=lambda _endpoint: FakeDevice()
+        ),
+    )
+    monkeypatch.setitem(sys.modules, "frida", fake_frida)
+    source = FridaParsedValueSource("role:27042", request_scope=scope)
+
+    with pytest.raises(DirectRequestError) as raised:
+        source.read_direct("600938")
+
+    assert raised.value.error_code == expected_code
+
+
+def test_role_specific_frida_device_creation_is_serialized(monkeypatch) -> None:
+    """Concurrent add_remote_device calls can invalidate the first Frida device handle."""
+    start = Barrier(2)
+    counter_lock = Lock()
+    active_calls = 0
+    maximum_active_calls = 0
+
+    class FakeExports:
+        def request(self, _symbol, _market, _timeout, _scope):
+            return _runtime_payload()
+
+    class FakeScript:
+        exports_sync = FakeExports()
+
+        def load(self):
+            pass
+
+        def unload(self):
+            pass
+
+    class FakeSession:
+        def create_script(self, _source):
+            return FakeScript()
+
+        def detach(self):
+            pass
+
+    class FakeDevice:
+        def enumerate_applications(self):
+            return [types.SimpleNamespace(identifier="com.hexin.plat.android", pid=3526)]
+
+        def attach(self, _pid):
+            return FakeSession()
+
+    class RaceSensitiveDeviceManager:
+        def add_remote_device(self, _endpoint):
+            nonlocal active_calls, maximum_active_calls
+            with counter_lock:
+                active_calls += 1
+                maximum_active_calls = max(maximum_active_calls, active_calls)
+                raced = active_calls > 1
+            time.sleep(0.05)
+            with counter_lock:
+                active_calls -= 1
+            if raced:
+                raise RuntimeError("device is gone")
+            return FakeDevice()
+
+    manager = RaceSensitiveDeviceManager()
+    fake_frida = types.SimpleNamespace(get_device_manager=lambda: manager)
+    monkeypatch.setitem(sys.modules, "frida", fake_frida)
+    sources = (
+        FridaParsedValueSource("core:27043", request_scope="core_metrics"),
+        FridaParsedValueSource("fund:27042", request_scope="main_fund_flow"),
+    )
+
+    def read(source):
+        start.wait()
+        return source.read_direct("601872")
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(read, sources))
+
+    assert all(result[MetricKind.STOCK_NAME] == "招商轮船" for result in results)
+    assert maximum_active_calls == 1
+
+
 def test_direct_read_surfaces_an_app_request_timeout_instead_of_scanning_stale_cache() -> None:
     source = FridaParsedValueSource(
         "127.0.0.1:27042",
@@ -235,6 +615,21 @@ def test_direct_read_preserves_the_specific_app_bridge_error_code() -> None:
         source.read_direct("601872")
 
     assert raised.value.error_code == "DIRECT_MANAGER_UNAVAILABLE"
+
+
+def test_direct_read_preserves_a_fund_flow_callback_error_code() -> None:
+    source = FridaParsedValueSource(
+        "127.0.0.1:27042",
+        direct_reader=lambda *_args: {
+            "error_code": "FUND_QUERY_REJECTED",
+            "error_message": "capital indicator rejected",
+        },
+    )
+
+    with pytest.raises(DirectRequestError) as raised:
+        source.read_direct("601872")
+
+    assert raised.value.error_code == "FUND_QUERY_REJECTED"
 
 
 def test_default_direct_reader_calls_the_app_rpc_with_symbol_market_and_timeout(monkeypatch) -> None:

@@ -10,7 +10,7 @@ from asyncio import FIRST_COMPLETED, CancelledError, Event, TimeoutError, create
 from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import AsyncIterator, Callable, Optional
+from typing import AsyncIterator, Callable, Mapping, Optional
 
 from fastapi import Depends, FastAPI, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, StreamingResponse
@@ -71,6 +71,33 @@ class CaptureResponse(BaseModel):
     expires_at: Optional[datetime]
 
 
+class MainFundFlowPeriodResponse(BaseModel):
+    unit: Optional[str]
+    main_net_inflow: Optional[str]
+    main_visible_inflow: Optional[str]
+    main_hidden_inflow: Optional[str]
+    retail_inflow: Optional[str]
+
+
+class MainFundFlowResponse(BaseModel):
+    today: MainFundFlowPeriodResponse
+    three_day: MainFundFlowPeriodResponse
+    five_day: MainFundFlowPeriodResponse
+
+
+class MainFundFlowPeriodSourcesResponse(BaseModel):
+    main_net_inflow: Optional[ValueSource]
+    main_visible_inflow: Optional[ValueSource]
+    main_hidden_inflow: Optional[ValueSource]
+    retail_inflow: Optional[ValueSource]
+
+
+class MainFundFlowSourcesResponse(BaseModel):
+    today: MainFundFlowPeriodSourcesResponse
+    three_day: MainFundFlowPeriodSourcesResponse
+    five_day: MainFundFlowPeriodSourcesResponse
+
+
 class TaskValuesResponse(BaseModel):
     stock_name: Optional[str]
     current_price: Optional[str]
@@ -80,6 +107,7 @@ class TaskValuesResponse(BaseModel):
     large_order_amount: Optional[str]
     retail_count: Optional[str]
     macdfs: Optional[str]
+    main_fund_flow: MainFundFlowResponse
 
 
 class TaskValueSourcesResponse(BaseModel):
@@ -91,6 +119,7 @@ class TaskValueSourcesResponse(BaseModel):
     large_order_amount: Optional[ValueSource]
     retail_count: Optional[ValueSource]
     macdfs: Optional[ValueSource]
+    main_fund_flow: MainFundFlowSourcesResponse
 
 
 class LongCaptureResponse(BaseModel):
@@ -99,12 +128,18 @@ class LongCaptureResponse(BaseModel):
     expires_at: Optional[datetime]
 
 
+class SourceErrorsResponse(BaseModel):
+    core_metrics: Optional[str]
+    main_fund_flow: Optional[str]
+
+
 class TaskResponse(BaseModel):
     public_id: str
     symbol: str
     include_long_capture: bool
     status: TaskStatus
     error_code: Optional[str]
+    source_errors: SourceErrorsResponse
     queue_position: Optional[int]
     created_at: datetime
     collected_at: Optional[datetime]
@@ -128,6 +163,18 @@ class QueueResponse(BaseModel):
     paused: bool
 
 
+class AdminDeviceHealthResponse(BaseModel):
+    role: str
+    label: str
+    adb: str
+    app: str
+    frida: str
+
+
+class AdminDevicesResponse(BaseModel):
+    devices: list[AdminDeviceHealthResponse]
+
+
 class SymbolLookupResponse(BaseModel):
     symbol: str
     name: str
@@ -141,6 +188,8 @@ def create_app(
     capture_root: Path | None = None,
     cleanup_interval_seconds: float = 60.0,
     device_bridge: DeviceBridge | None = None,
+    device_bridges: Mapping[str, DeviceBridge] | None = None,
+    device_health_probes: Mapping[str, Callable[[], Mapping[str, str]]] | None = None,
     runner_control: RunnerControl | None = None,
     runner: Level2Runner | None = None,
     runner_poll_interval_seconds: float = 1.0,
@@ -204,7 +253,12 @@ def create_app(
         persist_password_hash=persist,
     )
     app.state.runner_control = runner_control or RunnerControl()
-    app.state.device_bridge = device_bridge or ADBDeviceBridge()
+    primary_bridge = device_bridge or ADBDeviceBridge()
+    configured_bridges = dict(device_bridges or {})
+    configured_bridges.setdefault("core_metrics", primary_bridge)
+    app.state.device_bridges = configured_bridges
+    app.state.device_bridge = configured_bridges["core_metrics"]
+    app.state.device_health_probes = dict(device_health_probes or {})
     app.state.capture_root = (capture_root or Path("captures")).resolve()
     app.state.frontend_root = frontend_root.resolve() if frontend_root is not None else None
     app.state.secure_admin_cookies = secure_admin_cookies
@@ -469,21 +523,71 @@ def create_app(
             raise HTTPException(status_code=409, detail="release device control before resuming the queue")
         return QueueResponse(paused=False)
 
-    @app.websocket("/api/admin/device")
-    async def device_stream(websocket: WebSocket) -> None:
+    device_labels = {
+        "core_metrics": "八项账号",
+        "main_fund_flow": "资金账号",
+    }
+
+    def role_device_health(role: str, bridge: DeviceBridge) -> AdminDeviceHealthResponse:
+        probe = app.state.device_health_probes.get(role)
+        if probe is not None:
+            try:
+                health = dict(probe())
+            except Exception:
+                health = {}
+            adb_state = health.get("adb", "OFFLINE")
+            app_state = health.get("app", "OFFLINE")
+            frida_state = health.get("frida", "OFFLINE")
+        else:
+            try:
+                online = bool(bridge.is_online())
+            except Exception:
+                online = False
+            adb_state = "ONLINE" if online else "OFFLINE"
+            app_state = adb_state
+            frida_state = "UNKNOWN"
+        return AdminDeviceHealthResponse(
+            role=role,
+            label=device_labels[role],
+            adb=adb_state,
+            app=app_state,
+            frida=frida_state,
+        )
+
+    @app.get("/api/admin/devices", response_model=AdminDevicesResponse)
+    def admin_devices(_session=Depends(require_admin)) -> AdminDevicesResponse:
+        devices: list[AdminDeviceHealthResponse] = []
+        for role in ("core_metrics", "main_fund_flow"):
+            bridge = app.state.device_bridges.get(role)
+            if bridge is not None:
+                devices.append(role_device_health(role, bridge))
+        return AdminDevicesResponse(devices=devices)
+
+    async def stream_device_role(
+        websocket: WebSocket,
+        role: str,
+        *,
+        include_device_health: bool,
+    ) -> None:
         session = app.state.admin_sessions.valid_session(websocket.cookies.get("ths_admin_session"))
         if session is None:
             await websocket.close(code=1008)
             return
+        bridge = app.state.device_bridges.get(role)
+        if bridge is None:
+            await websocket.close(code=1008)
+            return
         await websocket.accept()
         control = app.state.runner_control
-        bridge = app.state.device_bridge
         loop = get_running_loop()
         unregister_socket = control.register_socket(
             session.session_id,
             lambda: loop.call_soon_threadsafe(lambda: create_task(_close_device_socket(websocket, 1008))),
         )
         await websocket.send_json(control.status(session.session_id))
+        if include_device_health:
+            health = await to_thread(role_device_health, role, bridge)
+            await websocket.send_json({"type": "device_status", **health.model_dump()})
 
         def session_is_valid() -> bool:
             valid = app.state.admin_sessions.valid_session(session.session_id)
@@ -517,7 +621,7 @@ def create_app(
         async def emit_frames() -> None:
             frame_sequence = 0
             while True:
-                await sleep(0.25)
+                await sleep(0.5)
                 if not session_is_valid():
                     await _close_device_socket(websocket, 1008)
                     return
@@ -527,11 +631,13 @@ def create_app(
                 try:
                     encoded = jpeg_base64(await to_thread(bridge.screenshot_png))
                 except Exception:
-                    control.heartbeat("OFFLINE")
                     await websocket.send_json(control.status(session.session_id))
                     continue
                 frame_sequence += 1
                 await websocket.send_json({"type": "frame", "encoding": "jpeg", "sequence": frame_sequence, "capturedAt": utc_now().isoformat(), "data": encoded})
+                if include_device_health and frame_sequence % 10 == 0:
+                    health = await to_thread(role_device_health, role, bridge)
+                    await websocket.send_json({"type": "device_status", **health.model_dump()})
                 await websocket.send_json(control.status(session.session_id))
 
         receiver = create_task(receive_input())
@@ -549,6 +655,14 @@ def create_app(
                     task.cancel()
             await gather(receiver, ticker, return_exceptions=True)
             unregister_socket()
+
+    @app.websocket("/api/admin/device")
+    async def legacy_device_stream(websocket: WebSocket) -> None:
+        await stream_device_role(websocket, "core_metrics", include_device_health=False)
+
+    @app.websocket("/api/admin/devices/{role}")
+    async def device_stream(websocket: WebSocket, role: str) -> None:
+        await stream_device_role(websocket, role, include_device_health=True)
 
     if app.state.frontend_root is not None:
         index_file = app.state.frontend_root / "index.html"

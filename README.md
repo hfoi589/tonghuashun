@@ -1,13 +1,13 @@
 # 同花顺 Level2 截图服务
 
-This is a single-host deployment: a public web/API service controls one
-administrator-owned Android instance over its private ADB connection. It does
+This is a single-host deployment: a public web/API service controls two
+administrator-owned Android instances over private ADB connections. It does
 not store THS login details or bypass login/CAPTCHA/device checks. Data-only
 tasks ask the already logged-in App's own curve manager to perform its normal
 authentication, signing, and market-data requests, then read the App-parsed
 callback through Frida; the service does not reimplement or expose the private
-wire protocol. When a task requests a long screenshot, numeric OCR is used only
-when a Level2 value is missing. Data-only tasks skip search, text input, stock
+wire protocol. OCR is used only for non-data structural validation of an
+optional long screenshot and never fills task metrics. Data-only tasks skip search, text input, stock
 page switching, scrolling, screenshots, stitching, OCR, and PNG storage. The
 deployment is **not supported yet** until the real APK
 passes the smoke checklist below.
@@ -72,13 +72,15 @@ claim the VPS is supported.
 
 ## Apple Silicon macOS / native AVD
 
-1. Create the same secret file and bootstrap the native Android VM (Android SDK
-   command-line tools must already be on `PATH`):
+1. Create the same secret file and bootstrap the two isolated native Android
+   VMs (Android SDK command-line tools must already be on `PATH`):
 
    ```sh
    ./scripts/setup-admin.sh .env
    python3 scripts/preflight.py --apk-only --apk /absolute/path/to/ths.apk
-   ./scripts/bootstrap-macos-avd.sh /absolute/path/to/ths.apk
+   ./scripts/bootstrap-macos-dual-avd.sh \
+     /absolute/path/to/ths.apk \
+     /absolute/path/to/frida-server-16.7.19-android-arm64
    python3 scripts/preflight.py --profile macos-avd --apk /absolute/path/to/ths.apk
    ```
 
@@ -91,20 +93,22 @@ claim the VPS is supported.
    docker compose --env-file deploy/macos.env -f deploy/compose.yml up -d --build
    ```
 
-3. The emulator must run Frida server `16.7.19`, matching the Python client in
-   the API image. Keep it private and forward it through the local ADB server:
+3. The bootstrap keeps `THS_API_33_ARM64 / emulator-5554` and its login
+   untouched for `main_fund_flow`. It creates the clean
+   `THS_CORE_33_ARM64 / emulator-5556` only when absent, then pauses for manual
+   login with the big-order-enabled account. It never accepts credentials.
+   Frida server `16.7.19` is forwarded independently:
 
    ```sh
-   adb -s emulator-5554 root
-   adb -s emulator-5554 push /absolute/path/to/frida-server-16.7.19-android-arm64 /data/local/tmp/ths-frida-server
-   adb -s emulator-5554 shell chmod 0755 /data/local/tmp/ths-frida-server
-   adb -s emulator-5554 shell '/data/local/tmp/ths-frida-server >/dev/null 2>&1 &'
    adb -s emulator-5554 forward tcp:27042 tcp:27042
+   adb -s emulator-5556 forward tcp:27043 tcp:27042
    ```
 
 `host.docker.internal:5037` is an internal Docker Desktop bridge, not a public
-port. The native emulator's selected serial is `emulator-5554`; set
-`ADB_SERIAL` in `deploy/macos.env` if the Android SDK assigns a different one.
+port. Dual mode uses `CORE_ADB_SERIAL`, `CORE_FRIDA_SERVER_ENDPOINT`,
+`FUND_ADB_SERIAL`, and `FUND_FRIDA_SERVER_ENDPOINT`; if any one is set, all
+four are required. Legacy `ADB_SERIAL` and `FRIDA_SERVER_ENDPOINT` remain
+available for a single device.
 
 ## Image, volumes, and HTTP access
 
@@ -124,21 +128,24 @@ retention remains seven days. Do not remove any volume as part of an upgrade
 unless its data has been deliberately backed up.
 
 The approved local deployment serves both the React site and API from
-`http://HOST:8000/`; set `APP_PORT` to change the host-side port. Redis 6379,
+`http://HOST:8001/`; set `APP_PORT` to change the host-side port. Redis 6379,
 Redroid ADB 5555, and macOS ADB 5037 remain private. The administrator console
-is `http://HOST:8000/#admin`, and its device WebSocket uses the same origin.
+is `http://HOST:8001/#admin`. It shows both devices through independent
+same-origin WebSockets; the fund panel is marked “当前账号，禁止退出”.
 For this HTTP deployment, `ADMIN_COOKIE_SECURE=0` allows the administrator
 session to survive page refreshes.
 
 Plain HTTP does not encrypt the administrator password, session cookie, device
 screen, or input events. Use this mode only on a trusted local network. If the
 service is later published through a trusted external HTTPS reverse proxy, set
-`ADMIN_COOKIE_SECURE=1` and restrict direct access to port 8000.
+`ADMIN_COOKIE_SECURE=1` and restrict direct access to port 8001.
 
 Public submissions accept `{"symbol":"601872","include_long_capture":true}`.
 The screenshot option defaults to `true` for existing clients. Set it to
-`false` to request and return the eight values without any App UI navigation or
-image creation. Confirmed market mappings are `600/601/603/605/688/689 → 17`,
+`false` to request the eight required values plus optional three-period fund
+flow without any App UI navigation or image creation. Core metrics and symbol
+lookup use only the core account; fund flow uses only the preserved fund
+account. Confirmed market mappings are `600/601/603/605/688/689 → 17`,
 `000/001/002/003/300/301 → 33`, `920 → 151`,
 `501/502/506/508/510/511/512/513/515/516/517/518/519/520/526/530/551/560/561/562/563/588/589 → 20`,
 and `158/159/160/161/162/163/164/165/166/167/168/169/180 → 36`; an unknown

@@ -399,6 +399,97 @@ input:hover { border-color: #8ea9aa; }
 
 .value-placeholder { margin: 0; min-height: 1.5em; font-weight: 650; }
 
+.fund-flow-section {
+  margin-top: 1.2rem;
+  border: 1px solid #dfe9e9;
+  border-radius: 14px;
+  background: var(--surface-muted);
+  padding: 1rem;
+}
+
+.fund-flow-heading {
+  margin-bottom: .8rem;
+}
+
+.fund-flow-heading h3 {
+  margin: 0;
+  color: #17333b;
+  font-size: 1.05rem;
+}
+
+.fund-flow-table-wrap {
+  overflow-x: auto;
+  border: 1px solid var(--border);
+  border-radius: 11px;
+  background: var(--surface);
+  -webkit-overflow-scrolling: touch;
+}
+
+.fund-flow-table {
+  width: 100%;
+  min-width: 520px;
+  border-collapse: collapse;
+  font-variant-numeric: tabular-nums;
+}
+
+.fund-flow-table th,
+.fund-flow-table td {
+  border-bottom: 1px solid #e5eeee;
+  padding: .72rem .85rem;
+  text-align: right;
+  white-space: nowrap;
+}
+
+.fund-flow-table thead th {
+  background: #f4f9f8;
+  color: #426169;
+  font-size: .78rem;
+  font-weight: 750;
+}
+
+.fund-flow-table thead th:first-child,
+.fund-flow-table tbody th {
+  text-align: left;
+}
+
+.fund-flow-table thead th span,
+.fund-flow-table thead th small {
+  display: block;
+}
+
+.fund-flow-table thead th small {
+  margin-top: .15rem;
+  color: var(--text-muted);
+  font-size: .7rem;
+  font-weight: 600;
+}
+
+.fund-flow-table tbody th {
+  color: #506970;
+  font-size: .82rem;
+  font-weight: 700;
+}
+
+.fund-flow-table tbody td {
+  color: var(--market-neutral);
+  font-size: 1rem;
+  font-weight: 760;
+}
+
+.fund-flow-table tbody td > span {
+  display: inline-block;
+  min-width: 4.8rem;
+}
+
+.fund-flow-table tbody td .ocr-source {
+  margin-left: .4rem;
+}
+
+.fund-flow-table tbody tr:last-child th,
+.fund-flow-table tbody tr:last-child td {
+  border-bottom: 0;
+}
+
 .capture-drawer {
   margin-top: 1rem;
   overflow: hidden;
@@ -529,6 +620,44 @@ button.capture-toggle:active { box-shadow: inset 0 2px 5px rgba(18, 49, 54, .08)
 .button-row { display: flex; flex-wrap: wrap; gap: .6rem; }
 .password-change-form { display: grid; gap: .55rem; min-width: min(360px, 100%); }
 .device-actions { display: flex; flex-wrap: wrap; gap: .6rem; margin-top: .8rem; }
+.admin-device-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  align-items: start;
+  gap: 1rem;
+}
+.admin-device-grid .device-panel { min-width: 0; }
+.device-account-warning {
+  margin: .8rem 0 0;
+  padding: .65rem .75rem;
+  border: 1px solid #f0b7ad;
+  border-radius: 8px;
+  color: #9f2e1f;
+  background: #fff1ee;
+  font-weight: 760;
+  letter-spacing: .02em;
+}
+.device-health {
+  display: flex;
+  flex-wrap: wrap;
+  gap: .45rem;
+  margin: .75rem 0 0;
+}
+.device-health > div {
+  display: inline-flex;
+  align-items: center;
+  gap: .35rem;
+  padding: .3rem .5rem;
+  border: 1px solid #dae3e8;
+  border-radius: 999px;
+  background: #f7fafb;
+  font-size: .75rem;
+}
+.device-health dt { color: #5f6f79; font-weight: 720; }
+.device-health dd { margin: 0; font-weight: 760; }
+.device-health-online { color: var(--success); }
+.device-health-offline { color: var(--danger); }
+.device-health-unknown { color: #71808a; }
 .device-canvas {
   display: block;
   width: auto;
@@ -553,6 +682,7 @@ button.capture-toggle:active { box-shadow: inset 0 2px 5px rgba(18, 49, 54, .08)
 
 @media (max-width: 900px) {
   .value-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .admin-device-grid { grid-template-columns: 1fr; }
 }
 
 @media (max-width: 720px) {
@@ -582,6 +712,9 @@ button.capture-toggle:active { box-shadow: inset 0 2px 5px rgba(18, 49, 54, .08)
   .value-card { display: flex; align-items: center; justify-content: space-between; gap: 1rem; padding: .78rem .9rem; }
   .value-label { margin: 0; }
   .indicator-value { font-size: 1.35rem; text-align: right; }
+  .fund-flow-section { margin-top: .9rem; padding: .75rem; }
+  .fund-flow-heading { align-items: flex-start; }
+  .fund-flow-heading .minor { font-size: .78rem; }
   button.capture-toggle { align-items: flex-start; flex-direction: column; }
   .capture-toggle-label { width: 100%; justify-content: space-between; }
   .capture-actions { justify-content: stretch; }

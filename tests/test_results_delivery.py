@@ -60,6 +60,11 @@ def test_public_result_exposes_eight_values_and_serves_one_long_capture(tmp_path
         "large_order_amount": "-2802.6万",
         "retail_count": "21.23",
         "macdfs": "+0.012",
+        "main_fund_flow": {
+            "today": {"unit": None, "main_net_inflow": None, "main_visible_inflow": None, "main_hidden_inflow": None, "retail_inflow": None},
+            "three_day": {"unit": None, "main_net_inflow": None, "main_visible_inflow": None, "main_hidden_inflow": None, "retail_inflow": None},
+            "five_day": {"unit": None, "main_net_inflow": None, "main_visible_inflow": None, "main_hidden_inflow": None, "retail_inflow": None},
+        },
     }
     assert body["value_sources"] == {
         "stock_name": "INTERFACE",
@@ -70,6 +75,11 @@ def test_public_result_exposes_eight_values_and_serves_one_long_capture(tmp_path
         "large_order_amount": "INTERFACE",
         "retail_count": "INTERFACE",
         "macdfs": "INTERFACE",
+        "main_fund_flow": {
+            "today": {"main_net_inflow": None, "main_visible_inflow": None, "main_hidden_inflow": None, "retail_inflow": None},
+            "three_day": {"main_net_inflow": None, "main_visible_inflow": None, "main_hidden_inflow": None, "retail_inflow": None},
+            "five_day": {"main_net_inflow": None, "main_visible_inflow": None, "main_hidden_inflow": None, "retail_inflow": None},
+        },
     }
     assert body["collected_at"] is not None
     assert body["long_capture"]["status"] == "READY"

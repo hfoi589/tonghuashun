@@ -258,6 +258,42 @@ def test_redis_store_round_trips_the_data_only_option() -> None:
     assert restored.long_capture.status.value == "SKIPPED"
 
 
+def test_redis_store_round_trips_source_errors_and_defaults_legacy_tasks_to_empty() -> None:
+    redis = FakeRedis()
+    store = RedisStreamsStore(redis)
+    store.enqueue(TaskRecord(task_id="fund-error", symbol="600938", include_long_capture=False))
+    store.next_queued()
+    store.complete_result(
+        "fund-error",
+        {kind: f"value-{kind.value}" for kind in MetricKind},
+        None,
+        source_errors={"main_fund_flow": "DIRECT_FUND_FLOW_TIMEOUT"},
+    )
+
+    restored = RedisStreamsStore(redis).get("fund-error")
+
+    assert restored is not None
+    assert restored.source_errors == {
+        "core_metrics": None,
+        "main_fund_flow": "DIRECT_FUND_FLOW_TIMEOUT",
+    }
+
+    legacy = RedisStreamsStore._deserialize(json.dumps({
+        "task_id": "old-task",
+        "symbol": "601872",
+        "status": "COMPLETED",
+        "created_at": "2026-08-21T00:00:00+00:00",
+        "updated_at": "2026-08-21T00:01:00+00:00",
+        "completed_at": "2026-08-21T00:01:00+00:00",
+        "error_code": None,
+        "captures": {},
+    }))
+    assert legacy.source_errors == {
+        "core_metrics": None,
+        "main_fund_flow": None,
+    }
+
+
 def test_redis_store_completes_a_data_only_task_without_an_image_path() -> None:
     """Production persistence must accept direct values without inventing a PNG path."""
     redis = FakeRedis()

@@ -8,6 +8,7 @@ from argon2 import PasswordHasher
 from fastapi.testclient import TestClient
 
 from level2_service.main import DeploymentSettings, create_production_app
+from level2_service.parsed_values import DualAccountParsedValueSource
 from level2_service.runner import DailyCheckState, OpenCVTemplateFallback, long_capture_has_net_heading
 from level2_service.symbol_cache import RedisSymbolLookupCache
 from scripts.preflight import PreflightError, validate_apk, validate_host_profile
@@ -126,6 +127,48 @@ def test_production_factory_wires_the_configured_frida_runtime_source(tmp_path: 
     assert settings.frida_server_endpoint == "host.docker.internal:27042"
     assert app.state.runner.parsed_value_source.endpoint == "host.docker.internal:27042"
     assert isinstance(app.state.symbol_lookup_cache, RedisSymbolLookupCache)
+
+
+def test_settings_require_all_four_dual_account_device_variables() -> None:
+    base = {
+        "ADMIN_PASSWORD_HASH": "$argon2id$example",
+        "ADMIN_SESSION_SECRET": "s" * 32,
+        "CORE_ADB_SERIAL": "emulator-5556",
+    }
+
+    with pytest.raises(ValueError, match="CORE_ADB_SERIAL.*CORE_FRIDA_SERVER_ENDPOINT.*FUND_ADB_SERIAL.*FUND_FRIDA_SERVER_ENDPOINT"):
+        DeploymentSettings.from_environ(base)
+
+
+def test_production_factory_wires_two_independent_bridges_and_frida_sources(tmp_path: Path) -> None:
+    settings = DeploymentSettings.from_environ(
+        {
+            "ADMIN_PASSWORD_HASH": "$argon2id$example",
+            "ADMIN_SESSION_SECRET": "s" * 32,
+            "CAPTURE_ROOT": str(tmp_path),
+            "CORE_ADB_SERIAL": "emulator-5556",
+            "CORE_FRIDA_SERVER_ENDPOINT": "host.docker.internal:27043",
+            "FUND_ADB_SERIAL": "emulator-5554",
+            "FUND_FRIDA_SERVER_ENDPOINT": "host.docker.internal:27042",
+        }
+    )
+
+    app = create_production_app(
+        settings=settings,
+        redis_client_factory=lambda _url: FakeRedis(),
+        bridge_factory=FakeBridge,
+        runner_factory=FakeRunner,
+    )
+
+    assert settings.dual_account_mode is True
+    assert app.state.device_bridges["core_metrics"].serial == "emulator-5556"
+    assert app.state.device_bridges["main_fund_flow"].serial == "emulator-5554"
+    assert app.state.runner.navigator.bridge is app.state.device_bridges["core_metrics"]
+    assert isinstance(app.state.runner.parsed_value_source, DualAccountParsedValueSource)
+    assert app.state.runner.parsed_value_source.core_source.endpoint == "host.docker.internal:27043"
+    assert app.state.runner.parsed_value_source.core_source.request_scope == "core_metrics"
+    assert app.state.runner.parsed_value_source.fund_source.endpoint == "host.docker.internal:27042"
+    assert app.state.runner.parsed_value_source.fund_source.request_scope == "main_fund_flow"
 
 
 def test_production_factory_persists_daily_check_in_the_admin_volume(tmp_path: Path) -> None:

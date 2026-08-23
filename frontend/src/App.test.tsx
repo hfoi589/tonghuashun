@@ -4,6 +4,12 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import App, { JobResult } from './App'
 import { subscribeToJob, type Job, type SymbolLookup } from './api'
 
+const emptyFundFlow = {
+  today: { unit: null, main_net_inflow: null, main_visible_inflow: null, main_hidden_inflow: null, retail_inflow: null },
+  three_day: { unit: null, main_net_inflow: null, main_visible_inflow: null, main_hidden_inflow: null, retail_inflow: null },
+  five_day: { unit: null, main_net_inflow: null, main_visible_inflow: null, main_hidden_inflow: null, retail_inflow: null },
+}
+
 const task: Job = {
   public_id: 'public-job-1',
   symbol: '600938',
@@ -26,6 +32,7 @@ const task: Job = {
     large_order_amount: null,
     retail_count: null,
     macdfs: null,
+    main_fund_flow: emptyFundFlow,
   },
   long_capture: { status: 'PENDING', url: null, expires_at: null },
 }
@@ -231,6 +238,7 @@ describe('Level2 web UI', () => {
         large_order_amount: '-2802.6万',
         retail_count: '21.23',
         macdfs: '+0.012',
+        main_fund_flow: emptyFundFlow,
       },
     }} />)
 
@@ -239,6 +247,31 @@ describe('Level2 web UI', () => {
     expect(within(screen.getByText('大单金额').closest('article')!).getByText('-2802.6万')).toHaveClass('market-down')
     expect(within(screen.getByText('散户数量').closest('article')!).getByText('+21.23')).toHaveClass('market-up')
     expect(within(screen.getByText('MACDFS').closest('article')!).getByText('+0.012')).toHaveClass('market-up')
+  })
+
+  it('renders the three-period main fund flow comparison with dynamic units and signs', () => {
+    render(<JobResult task={{
+      ...task,
+      status: 'COMPLETED',
+      values: {
+        ...task.values,
+        main_fund_flow: {
+          today: { unit: '亿元', main_net_inflow: '5.35', main_visible_inflow: '-0.28', main_hidden_inflow: '5.63', retail_inflow: '-5.35' },
+          three_day: { unit: '亿元', main_net_inflow: '12.96', main_visible_inflow: '3.63', main_hidden_inflow: '9.34', retail_inflow: '-12.96' },
+          five_day: { unit: '万元', main_net_inflow: null, main_visible_inflow: null, main_hidden_inflow: null, retail_inflow: null },
+        },
+      },
+    }} />)
+
+    expect(screen.getByRole('columnheader', { name: /当日 亿元/ })).toBeInTheDocument()
+    expect(screen.getByRole('columnheader', { name: /3日 亿元/ })).toBeInTheDocument()
+    expect(screen.getByRole('columnheader', { name: /5日 万元/ })).toBeInTheDocument()
+    const netRow = screen.getByText('主力净流入').closest('tr')!
+    expect(within(netRow).getByText('+5.35')).toHaveClass('market-up')
+    expect(within(netRow).getByText('+12.96')).toHaveClass('market-up')
+    expect(within(netRow).getByText('未识别')).toBeInTheDocument()
+    const retailRow = screen.getByText('散户流入').closest('tr')!
+    expect(within(retailRow).getByText('-5.35')).toHaveClass('market-down')
   })
 
   it('keeps zero, unparseable, missing, price, and turnover values neutral', () => {
@@ -255,6 +288,7 @@ describe('Level2 web UI', () => {
         large_order_amount: '+0.0万',
         retail_count: '未知',
         macdfs: null,
+        main_fund_flow: emptyFundFlow,
       },
     }} />)
 
@@ -285,6 +319,11 @@ describe('Level2 web UI', () => {
         large_order_amount: 'INTERFACE' as const,
         retail_count: null,
         macdfs: null,
+        main_fund_flow: {
+          today: { main_net_inflow: null, main_visible_inflow: null, main_hidden_inflow: null, retail_inflow: null },
+          three_day: { main_net_inflow: null, main_visible_inflow: null, main_hidden_inflow: null, retail_inflow: null },
+          five_day: { main_net_inflow: null, main_visible_inflow: null, main_hidden_inflow: null, retail_inflow: null },
+        },
       },
     }
 
@@ -310,6 +349,7 @@ describe('Level2 web UI', () => {
         large_order_amount: '-2802.6万',
         retail_count: '21.23',
         macdfs: '+0.012',
+        main_fund_flow: emptyFundFlow,
       },
       long_capture: { status: 'READY', url: '/api/v1/jobs/public-job-1/capture', expires_at: '2026-08-22T08:00:00+00:00' },
     }} />)
@@ -353,6 +393,7 @@ describe('Level2 web UI', () => {
         large_order_amount: '-2802.6万',
         retail_count: '21.23',
         macdfs: '+0.012',
+        main_fund_flow: emptyFundFlow,
       },
       long_capture: { status: 'SKIPPED', url: null, expires_at: null },
     }} />)

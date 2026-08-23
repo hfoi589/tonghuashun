@@ -17,6 +17,15 @@ export interface RunnerStatus {
   sequence?: number
 }
 
+export interface DeviceStatus {
+  type: 'device_status'
+  role: 'core_metrics' | 'main_fund_flow'
+  label: string
+  adb: 'ONLINE' | 'OFFLINE' | 'UNKNOWN'
+  app: 'ONLINE' | 'OFFLINE' | 'UNKNOWN'
+  frida: 'ONLINE' | 'OFFLINE' | 'UNKNOWN'
+}
+
 export type RunnerState = 'BOOTING' | 'READY' | 'ADMIN_CONTROL' | 'NEEDS_ADMIN' | 'OFFLINE'
 const runnerStates: ReadonlySet<string> = new Set(['BOOTING', 'READY', 'ADMIN_CONTROL', 'NEEDS_ADMIN', 'OFFLINE'])
 
@@ -31,7 +40,7 @@ export interface DeviceInput {
   event: DeviceInputEvent
 }
 
-export type DeviceServerMessage = DeviceFrame | RunnerStatus
+export type DeviceServerMessage = DeviceFrame | RunnerStatus | DeviceStatus
 
 export function parseDeviceServerMessage(value: unknown): DeviceServerMessage | undefined {
   if (!value || typeof value !== 'object') return undefined
@@ -43,6 +52,24 @@ export function parseDeviceServerMessage(value: unknown): DeviceServerMessage | 
   if (message.type === 'runner_status' && typeof message.state === 'string' && runnerStates.has(message.state) && typeof message.locked === 'boolean' && (sequence === undefined || typeof sequence === 'number')) {
     const state = message.state as RunnerState
     return sequence === undefined ? { type: 'runner_status', state, locked: message.locked } : { type: 'runner_status', state, locked: message.locked, sequence }
+  }
+  const healthStates = new Set(['ONLINE', 'OFFLINE', 'UNKNOWN'])
+  if (
+    message.type === 'device_status'
+    && (message.role === 'core_metrics' || message.role === 'main_fund_flow')
+    && typeof message.label === 'string'
+    && typeof message.adb === 'string' && healthStates.has(message.adb)
+    && typeof message.app === 'string' && healthStates.has(message.app)
+    && typeof message.frida === 'string' && healthStates.has(message.frida)
+  ) {
+    return {
+      type: 'device_status',
+      role: message.role,
+      label: message.label,
+      adb: message.adb as DeviceStatus['adb'],
+      app: message.app as DeviceStatus['app'],
+      frida: message.frida as DeviceStatus['frida'],
+    }
   }
   return undefined
 }

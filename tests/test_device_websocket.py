@@ -63,6 +63,90 @@ def test_device_websocket_authenticates_and_validates_typed_input() -> None:
             raise AssertionError("invalid envelope remained open")
 
 
+def test_admin_devices_reports_both_roles_without_account_or_endpoint_details() -> None:
+    core = FakeDeviceBridge(symbol="600938")
+    fund = FakeDeviceBridge(symbol="600938")
+    client = TestClient(
+        create_app(
+            admin_password_hash=PasswordHasher().hash("admin-secret"),
+            device_bridges={"core_metrics": core, "main_fund_flow": fund},
+        ),
+        base_url="https://testserver",
+    )
+    assert client.post("/api/admin/session", json={"password": "admin-secret"}).status_code == 204
+
+    response = client.get("/api/admin/devices")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "devices": [
+            {
+                "role": "core_metrics",
+                "label": "八项账号",
+                "adb": "ONLINE",
+                "app": "ONLINE",
+                "frida": "UNKNOWN",
+            },
+            {
+                "role": "main_fund_flow",
+                "label": "资金账号",
+                "adb": "ONLINE",
+                "app": "ONLINE",
+                "frida": "UNKNOWN",
+            },
+        ]
+    }
+    serialized = response.text.lower()
+    assert "serial" not in serialized
+    assert "endpoint" not in serialized
+    assert "login" not in serialized
+
+
+def test_two_device_websockets_route_input_only_to_the_target_device() -> None:
+    core = FakeDeviceBridge(symbol="600938", screenshot=b"\xff\xd8core\xff\xd9")
+    fund = FakeDeviceBridge(symbol="600938", screenshot=b"\xff\xd8fund\xff\xd9")
+    app = create_app(
+        admin_password_hash=PasswordHasher().hash("admin-secret"),
+        device_bridges={"core_metrics": core, "main_fund_flow": fund},
+    )
+    client = TestClient(app, base_url="https://testserver")
+    assert client.post("/api/admin/session", json={"password": "admin-secret"}).status_code == 204
+    csrf = client.cookies.get("ths_csrf")
+    assert client.post("/api/admin/lock/acquire", headers={"X-CSRF-Token": csrf}).status_code == 200
+
+    with client.websocket_connect("wss://testserver/api/admin/devices/core_metrics") as core_socket, client.websocket_connect("wss://testserver/api/admin/devices/main_fund_flow") as fund_socket:
+        assert core_socket.receive_json()["locked"] is True
+        assert fund_socket.receive_json()["locked"] is True
+        core_socket.send_json({"type": "input", "sequence": 1, "event": {"kind": "tap", "x": 0.1, "y": 0.2}})
+        fund_socket.send_json({"type": "input", "sequence": 1, "event": {"kind": "swipe", "startX": 0.1, "startY": 0.8, "endX": 0.1, "endY": 0.2}})
+        core_socket.receive_json()
+        fund_socket.receive_json()
+
+    assert core.inputs == [("tap", 0.1, 0.2)]
+    assert fund.inputs == [("swipe", 0.1, 0.8, 0.1, 0.2)]
+
+
+def test_legacy_device_websocket_maps_to_the_core_metrics_device() -> None:
+    core = FakeDeviceBridge(symbol="600938", screenshot=b"\xff\xd8core\xff\xd9")
+    fund = FakeDeviceBridge(symbol="600938", screenshot=b"\xff\xd8fund\xff\xd9")
+    app = create_app(
+        admin_password_hash=PasswordHasher().hash("admin-secret"),
+        device_bridges={"core_metrics": core, "main_fund_flow": fund},
+    )
+    client = TestClient(app, base_url="https://testserver")
+    assert client.post("/api/admin/session", json={"password": "admin-secret"}).status_code == 204
+    csrf = client.cookies.get("ths_csrf")
+    client.post("/api/admin/lock/acquire", headers={"X-CSRF-Token": csrf})
+
+    with client.websocket_connect("wss://testserver/api/admin/device") as socket:
+        socket.receive_json()
+        socket.send_json({"type": "input", "sequence": 1, "event": {"kind": "tap", "x": 0.4, "y": 0.6}})
+        socket.receive_json()
+
+    assert core.inputs == [("tap", 0.4, 0.6)]
+    assert fund.inputs == []
+
+
 def test_device_websocket_rejects_anonymous_connection() -> None:
     """The device stream cannot become a public screen-sharing endpoint."""
     client = TestClient(create_app(device_bridge=FakeDeviceBridge(symbol="SZ.000001")), base_url="https://testserver")
@@ -147,8 +231,8 @@ def test_device_websocket_rejects_duplicate_or_older_input_sequences() -> None:
     assert client.app.state.device_bridge.inputs == [("tap", 0.1, 0.2)]
 
 
-def test_device_stream_keeps_four_fps_ticker_running_during_continuous_input() -> None:
-    """A busy input receiver cannot starve the independent 250ms frame ticker."""
+def test_device_stream_keeps_two_fps_ticker_running_during_continuous_input() -> None:
+    """Two simultaneous streams should keep total screenshot load near the old 4 FPS."""
     bridge = FakeDeviceBridge(symbol="SZ.000001", screenshot=b"\xff\xd8jpg\xff\xd9")
     client = TestClient(create_app(admin_password_hash=PasswordHasher().hash("admin-secret"), device_bridge=bridge), base_url="https://testserver")
     assert client.post("/api/admin/session", json={"password": "admin-secret"}).status_code == 204
@@ -175,7 +259,7 @@ def test_device_stream_keeps_four_fps_ticker_running_during_continuous_input() -
         stop.set()
         sender.join(timeout=1)
 
-    assert monotonic() - started < 0.9
+    assert 0.8 <= monotonic() - started < 1.4
     assert len(frames) == 2
     assert bridge.capture_attempts == 2
 

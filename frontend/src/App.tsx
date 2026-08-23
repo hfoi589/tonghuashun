@@ -1,6 +1,6 @@
 import { FormEvent, useEffect, useRef, useState } from 'react'
 import { AdminPage } from './AdminPage'
-import { ApiError, api, type Job, type JobStatus, type JobStreamState, type SymbolLookup, type ValueSource, subscribeToJob } from './api'
+import { ApiError, api, type Job, type JobStatus, type JobStreamState, type MainFundFlowPeriod, type SymbolLookup, type ValueSource, subscribeToJob } from './api'
 import './styles.css'
 
 const HISTORY_STORAGE_KEY = 'ths_level2_job_history'
@@ -87,6 +87,74 @@ function ValueCard({ name, value, source, finished, directional = false }: {
   </article>
 }
 
+const emptyFundFlowPeriod: MainFundFlowPeriod = {
+  unit: null,
+  main_net_inflow: null,
+  main_visible_inflow: null,
+  main_hidden_inflow: null,
+  retail_inflow: null,
+}
+
+const fundFlowRows = [
+  ['main_net_inflow', '主力净流入'],
+  ['main_visible_inflow', '主力明盘'],
+  ['main_hidden_inflow', '主力暗盘'],
+  ['retail_inflow', '散户流入'],
+] as const
+
+const fundFlowColumns = [
+  ['today', '当日'],
+  ['three_day', '3日'],
+  ['five_day', '5日'],
+] as const
+
+function FundFlowTable({ task, finished }: { task: Job, finished: boolean }) {
+  const fundFlow = task.values.main_fund_flow ?? {
+    today: emptyFundFlowPeriod,
+    three_day: emptyFundFlowPeriod,
+    five_day: emptyFundFlowPeriod,
+  }
+  const sources = task.value_sources?.main_fund_flow
+
+  return <section className="fund-flow-section" aria-labelledby={`fund-flow-title-${task.public_id}`}>
+    <div className="section-heading fund-flow-heading">
+      <div>
+        <p className="eyebrow">资金增强指标</p>
+        <h3 id={`fund-flow-title-${task.public_id}`}>主力流向</h3>
+      </div>
+      <span className="minor">单位按 App 周期返回</span>
+    </div>
+    <div className="fund-flow-table-wrap">
+      <table className="fund-flow-table">
+        <caption className="sr-only">主力流向当日、3日、5日对比</caption>
+        <thead>
+          <tr>
+            <th scope="col">指标</th>
+            {fundFlowColumns.map(([period, label]) => <th scope="col" key={period}>
+              <span>{label}</span>
+              <small>{fundFlow[period]?.unit ?? '—'}</small>
+            </th>)}
+          </tr>
+        </thead>
+        <tbody>
+          {fundFlowRows.map(([field, label]) => <tr key={field}>
+            <th scope="row">{label}</th>
+            {fundFlowColumns.map(([period]) => {
+              const value = fundFlow[period]?.[field] ?? null
+              const displayValue = value ? formatDirectionalValue(value) : null
+              const source = sources?.[period]?.[field]
+              return <td key={period} className={displayValue ? `market-${displayValue.tone}` : undefined}>
+                <span className={displayValue ? `market-${displayValue.tone}` : undefined}>{displayValue?.text ?? (finished ? '未识别' : '待采集')}</span>
+                {source === 'OCR' && <small className="ocr-source">OCR识别</small>}
+              </td>
+            })}
+          </tr>)}
+        </tbody>
+      </table>
+    </div>
+  </section>
+}
+
 export function JobResult({ task, isLatest = false }: { task: Job, isLatest?: boolean }) {
   const [captureOpen, setCaptureOpen] = useState(false)
   const finished = task.status === 'COMPLETED' || task.status === 'PARTIAL'
@@ -122,6 +190,8 @@ export function JobResult({ task, isLatest = false }: { task: Job, isLatest?: bo
       <ValueCard name="散户数量" value={task.values.retail_count} source={task.value_sources?.retail_count} finished={finished} directional />
       <ValueCard name="MACDFS" value={task.values.macdfs} source={task.value_sources?.macdfs} finished={finished} directional />
     </div>}
+
+    {task.status !== 'EXPIRED' && <FundFlowTable task={task} finished={finished} />}
 
     {captureReady ? <section className="capture-drawer">
       <button

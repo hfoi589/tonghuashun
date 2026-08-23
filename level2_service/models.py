@@ -28,6 +28,64 @@ class MetricKind(str, Enum):
     LARGE_ORDER_NET = "LARGE_ORDER_NET"
     LARGE_ORDER_AMOUNT = "LARGE_ORDER_AMOUNT"
     MACDFS = "MACDFS"
+    MAIN_FLOW_TODAY_NET = "MAIN_FLOW_TODAY_NET"
+    MAIN_FLOW_TODAY_VISIBLE = "MAIN_FLOW_TODAY_VISIBLE"
+    MAIN_FLOW_TODAY_HIDDEN = "MAIN_FLOW_TODAY_HIDDEN"
+    MAIN_FLOW_TODAY_RETAIL = "MAIN_FLOW_TODAY_RETAIL"
+    MAIN_FLOW_THREE_DAY_NET = "MAIN_FLOW_THREE_DAY_NET"
+    MAIN_FLOW_THREE_DAY_VISIBLE = "MAIN_FLOW_THREE_DAY_VISIBLE"
+    MAIN_FLOW_THREE_DAY_HIDDEN = "MAIN_FLOW_THREE_DAY_HIDDEN"
+    MAIN_FLOW_THREE_DAY_RETAIL = "MAIN_FLOW_THREE_DAY_RETAIL"
+    MAIN_FLOW_FIVE_DAY_NET = "MAIN_FLOW_FIVE_DAY_NET"
+    MAIN_FLOW_FIVE_DAY_VISIBLE = "MAIN_FLOW_FIVE_DAY_VISIBLE"
+    MAIN_FLOW_FIVE_DAY_HIDDEN = "MAIN_FLOW_FIVE_DAY_HIDDEN"
+    MAIN_FLOW_FIVE_DAY_RETAIL = "MAIN_FLOW_FIVE_DAY_RETAIL"
+    MAIN_FLOW_TODAY_UNIT = "MAIN_FLOW_TODAY_UNIT"
+    MAIN_FLOW_THREE_DAY_UNIT = "MAIN_FLOW_THREE_DAY_UNIT"
+    MAIN_FLOW_FIVE_DAY_UNIT = "MAIN_FLOW_FIVE_DAY_UNIT"
+
+
+REQUIRED_METRICS = frozenset(
+    {
+        MetricKind.STOCK_NAME,
+        MetricKind.CURRENT_PRICE,
+        MetricKind.CHANGE_PERCENT,
+        MetricKind.TURNOVER_RATE,
+        MetricKind.RETAIL_COUNT,
+        MetricKind.LARGE_ORDER_NET,
+        MetricKind.LARGE_ORDER_AMOUNT,
+        MetricKind.MACDFS,
+    }
+)
+
+FUND_FLOW_PERIODS = (
+    ("today", "当日", MetricKind.MAIN_FLOW_TODAY_UNIT),
+    ("three_day", "3日", MetricKind.MAIN_FLOW_THREE_DAY_UNIT),
+    ("five_day", "5日", MetricKind.MAIN_FLOW_FIVE_DAY_UNIT),
+)
+
+FUND_FLOW_METRICS = {
+    "today": {
+        "main_net_inflow": MetricKind.MAIN_FLOW_TODAY_NET,
+        "main_visible_inflow": MetricKind.MAIN_FLOW_TODAY_VISIBLE,
+        "main_hidden_inflow": MetricKind.MAIN_FLOW_TODAY_HIDDEN,
+        "retail_inflow": MetricKind.MAIN_FLOW_TODAY_RETAIL,
+    },
+    "three_day": {
+        "main_net_inflow": MetricKind.MAIN_FLOW_THREE_DAY_NET,
+        "main_visible_inflow": MetricKind.MAIN_FLOW_THREE_DAY_VISIBLE,
+        "main_hidden_inflow": MetricKind.MAIN_FLOW_THREE_DAY_HIDDEN,
+        "retail_inflow": MetricKind.MAIN_FLOW_THREE_DAY_RETAIL,
+    },
+    "five_day": {
+        "main_net_inflow": MetricKind.MAIN_FLOW_FIVE_DAY_NET,
+        "main_visible_inflow": MetricKind.MAIN_FLOW_FIVE_DAY_VISIBLE,
+        "main_hidden_inflow": MetricKind.MAIN_FLOW_FIVE_DAY_HIDDEN,
+        "retail_inflow": MetricKind.MAIN_FLOW_FIVE_DAY_RETAIL,
+    },
+}
+
+SOURCE_ERROR_KEYS = ("core_metrics", "main_fund_flow")
 
 
 class ValueSource(str, Enum):
@@ -86,6 +144,9 @@ class TaskRecord:
     completed_at: datetime | None = None
     collected_at: datetime | None = None
     error_code: str | None = None
+    source_errors: dict[str, str | None] = field(
+        default_factory=lambda: {key: None for key in SOURCE_ERROR_KEYS}
+    )
     captures: dict[CaptureKind, CaptureRecord] = field(
         default_factory=lambda: {kind: CaptureRecord(kind) for kind in CaptureKind}
     )
@@ -106,12 +167,31 @@ class TaskRecord:
         return self.created_at + timedelta(days=7)
 
     def as_public(self) -> dict[str, Any]:
+        main_fund_flow: dict[str, dict[str, str | None]] = {}
+        main_fund_flow_sources: dict[str, dict[str, str | None]] = {}
+        for period, _, unit_kind in FUND_FLOW_PERIODS:
+            metrics = FUND_FLOW_METRICS[period]
+            main_fund_flow[period] = {
+                "unit": self.values[unit_kind],
+                **{
+                    field: self.values[kind]
+                    for field, kind in metrics.items()
+                },
+            }
+            main_fund_flow_sources[period] = {
+                field: self._public_value_source(kind)
+                for field, kind in metrics.items()
+            }
         return {
             "public_id": self.task_id,
             "symbol": self.symbol,
             "include_long_capture": self.include_long_capture,
             "status": self.status.value,
             "error_code": self.error_code,
+            "source_errors": {
+                key: self.source_errors.get(key)
+                for key in SOURCE_ERROR_KEYS
+            },
             "queue_position": None,
             "created_at": self.created_at.isoformat(),
             "collected_at": self.collected_at.isoformat() if self.collected_at else None,
@@ -141,6 +221,7 @@ class TaskRecord:
                 "large_order_amount": self.values[MetricKind.LARGE_ORDER_AMOUNT],
                 "retail_count": self.values[MetricKind.RETAIL_COUNT],
                 "macdfs": self.values[MetricKind.MACDFS],
+                "main_fund_flow": main_fund_flow,
             },
             "value_sources": {
                 "stock_name": self._public_value_source(MetricKind.STOCK_NAME),
@@ -151,6 +232,7 @@ class TaskRecord:
                 "large_order_amount": self._public_value_source(MetricKind.LARGE_ORDER_AMOUNT),
                 "retail_count": self._public_value_source(MetricKind.RETAIL_COUNT),
                 "macdfs": self._public_value_source(MetricKind.MACDFS),
+                "main_fund_flow": main_fund_flow_sources,
             },
             "long_capture": {
                 "status": self.long_capture.status.value,

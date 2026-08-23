@@ -131,6 +131,134 @@ def test_long_result_completion_stores_one_image_and_eight_values() -> None:
     assert all(capture.status == CaptureStatus.PENDING for capture in result.captures.values())
 
 
+def test_legacy_eight_values_can_complete_when_optional_fund_flow_is_empty() -> None:
+    store = InMemoryStreams()
+    store.enqueue(TaskRecord(task_id="legacy-complete", symbol="601872"))
+    store.next_queued()
+
+    result = store.complete_result("legacy-complete", FULL_VALUES, "/tmp/LONG.png")
+
+    assert result.status == TaskStatus.COMPLETED
+    assert result.values[MetricKind.MAIN_FLOW_TODAY_NET] is None
+    public = result.as_public()
+    assert public["values"]["main_fund_flow"]["today"] == {
+        "unit": None,
+        "main_net_inflow": None,
+        "main_visible_inflow": None,
+        "main_hidden_inflow": None,
+        "retail_inflow": None,
+    }
+    assert public["value_sources"]["main_fund_flow"]["today"] == {
+        "main_net_inflow": None,
+        "main_visible_inflow": None,
+        "main_hidden_inflow": None,
+        "retail_inflow": None,
+    }
+    assert public["source_errors"] == {
+        "core_metrics": None,
+        "main_fund_flow": None,
+    }
+
+
+def test_fund_interface_error_keeps_complete_core_values_but_makes_task_partial() -> None:
+    store = InMemoryStreams()
+    store.enqueue(TaskRecord(task_id="fund-failed", symbol="600938", include_long_capture=False))
+    store.next_queued()
+
+    result = store.complete_result(
+        "fund-failed",
+        FULL_VALUES,
+        None,
+        source_errors={
+            "core_metrics": None,
+            "main_fund_flow": "FUND_QUERY_REJECTED",
+        },
+    )
+
+    assert result.status == TaskStatus.PARTIAL
+    assert result.error_code == "FUND_QUERY_REJECTED"
+    assert result.values[MetricKind.STOCK_NAME] == "招商轮船"
+    assert result.source_errors["main_fund_flow"] == "FUND_QUERY_REJECTED"
+    assert result.as_public()["source_errors"] == {
+        "core_metrics": None,
+        "main_fund_flow": "FUND_QUERY_REJECTED",
+    }
+
+
+def test_missing_required_core_value_takes_precedence_over_a_fund_source_error() -> None:
+    store = InMemoryStreams()
+    store.enqueue(TaskRecord(task_id="both-partial", symbol="600938", include_long_capture=False))
+    store.next_queued()
+
+    result = store.complete_result(
+        "both-partial",
+        FULL_VALUES | {MetricKind.LARGE_ORDER_NET: None},
+        None,
+        source_errors={"main_fund_flow": "DIRECT_FUND_FLOW_TIMEOUT"},
+    )
+
+    assert result.status == TaskStatus.PARTIAL
+    assert result.error_code == "VALUE_RECOGNITION_FAILED"
+    assert result.source_errors["main_fund_flow"] == "DIRECT_FUND_FLOW_TIMEOUT"
+
+
+def test_required_legacy_value_still_controls_partial_status_with_fund_flow_present() -> None:
+    store = InMemoryStreams()
+    store.enqueue(TaskRecord(task_id="legacy-partial", symbol="601872"))
+    store.next_queued()
+    values = FULL_VALUES | {
+        MetricKind.LARGE_ORDER_AMOUNT: None,
+        MetricKind.MAIN_FLOW_TODAY_NET: "5.35",
+        MetricKind.MAIN_FLOW_TODAY_VISIBLE: "-0.28",
+        MetricKind.MAIN_FLOW_TODAY_HIDDEN: "5.63",
+        MetricKind.MAIN_FLOW_TODAY_RETAIL: "-5.35",
+    }
+
+    result = store.complete_result("legacy-partial", values, "/tmp/LONG.png")
+
+    assert result.status == TaskStatus.PARTIAL
+    assert result.error_code == "VALUE_RECOGNITION_FAILED"
+
+
+def test_public_main_fund_flow_preserves_direct_net_and_interface_sources() -> None:
+    store = InMemoryStreams()
+    store.enqueue(TaskRecord(task_id="fund-flow", symbol="601872", include_long_capture=False))
+    store.next_queued()
+    values = FULL_VALUES | {
+        MetricKind.MAIN_FLOW_TODAY_UNIT: "亿元",
+        MetricKind.MAIN_FLOW_TODAY_NET: "5.35",
+        MetricKind.MAIN_FLOW_TODAY_VISIBLE: "-0.28",
+        MetricKind.MAIN_FLOW_TODAY_HIDDEN: "5.63",
+        MetricKind.MAIN_FLOW_TODAY_RETAIL: "-5.35",
+        MetricKind.MAIN_FLOW_THREE_DAY_UNIT: "亿元",
+        MetricKind.MAIN_FLOW_THREE_DAY_NET: "12.96",
+        MetricKind.MAIN_FLOW_THREE_DAY_VISIBLE: "3.63",
+        MetricKind.MAIN_FLOW_THREE_DAY_HIDDEN: "9.34",
+        MetricKind.MAIN_FLOW_THREE_DAY_RETAIL: "-12.96",
+        MetricKind.MAIN_FLOW_FIVE_DAY_UNIT: "亿元",
+        MetricKind.MAIN_FLOW_FIVE_DAY_NET: "15.95",
+        MetricKind.MAIN_FLOW_FIVE_DAY_VISIBLE: "3.39",
+        MetricKind.MAIN_FLOW_FIVE_DAY_HIDDEN: "12.57",
+        MetricKind.MAIN_FLOW_FIVE_DAY_RETAIL: "-15.95",
+    }
+
+    public = store.complete_result("fund-flow", values, None).as_public()
+
+    assert public["values"]["main_fund_flow"]["three_day"] == {
+        "unit": "亿元",
+        "main_net_inflow": "12.96",
+        "main_visible_inflow": "3.63",
+        "main_hidden_inflow": "9.34",
+        "retail_inflow": "-12.96",
+    }
+    assert public["value_sources"]["main_fund_flow"]["five_day"] == {
+        "main_net_inflow": "INTERFACE",
+        "main_visible_inflow": "INTERFACE",
+        "main_hidden_inflow": "INTERFACE",
+        "retail_inflow": "INTERFACE",
+    }
+
+
 def test_long_result_is_partial_when_one_value_cannot_be_validated() -> None:
     """A missing OCR value must stay visibly missing instead of being guessed or called complete."""
     store = InMemoryStreams()

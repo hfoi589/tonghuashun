@@ -2,15 +2,17 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from threading import RLock
 from typing import Any, Callable, Protocol
 
-from .models import MetricKind
+from .models import FUND_FLOW_METRICS, FUND_FLOW_PERIODS, MetricKind, REQUIRED_METRICS
 
 
 APP_PACKAGE = "com.hexin.plat.android"
+_FRIDA_DEVICE_MANAGER_LOCK = RLock()
 SHANGHAI_PREFIXES = ("600", "601", "603", "605", "688", "689")
 SHENZHEN_PREFIXES = ("000", "001", "002", "003", "300", "301")
 BEIJING_PREFIXES = ("920",)
@@ -56,6 +58,11 @@ SHENZHEN_FUND_PREFIXES = (
 )
 
 
+def _add_remote_frida_device(frida_module: Any, endpoint: str) -> Any:
+    with _FRIDA_DEVICE_MANAGER_LOCK:
+        return frida_module.get_device_manager().add_remote_device(endpoint)
+
+
 class UnsupportedMarketError(ValueError):
     """The symbol cannot be mapped to a market code confirmed in this App build."""
 
@@ -85,6 +92,14 @@ class SymbolLookup:
     securities_code: str | None = None
 
 
+@dataclass(frozen=True)
+class DirectReadOutcome:
+    """Merged direct-interface result plus non-fatal per-App failures."""
+
+    values: dict[MetricKind, str | None]
+    source_errors: dict[str, str | None]
+
+
 def market_code_for_symbol(symbol: str) -> str:
     normalized = str(symbol).strip()
     if len(normalized) != 6 or not normalized.isdigit():
@@ -105,13 +120,66 @@ def market_code_for_symbol(symbol: str) -> str:
 class ParsedValueSource(Protocol):
     def read(self, symbol: str) -> dict[MetricKind, str | None]: ...
 
-    def read_direct(self, symbol: str) -> dict[MetricKind, str | None]: ...
+    def read_direct(
+        self, symbol: str
+    ) -> dict[MetricKind, str | None] | DirectReadOutcome: ...
 
     def lookup_symbol(self, symbol: str) -> SymbolLookup: ...
 
 
 def empty_metric_values() -> dict[MetricKind, str | None]:
     return {kind: None for kind in MetricKind}
+
+
+FUND_ONLY_METRICS = frozenset(MetricKind) - REQUIRED_METRICS
+
+
+class DualAccountParsedValueSource:
+    """Query independent App accounts concurrently and merge only owned fields."""
+
+    def __init__(self, core_source: Any, fund_source: Any) -> None:
+        self.core_source = core_source
+        self.fund_source = fund_source
+
+    def read(self, symbol: str) -> dict[MetricKind, str | None]:
+        return self.core_source.read(symbol)
+
+    def lookup_symbol(self, symbol: str) -> SymbolLookup:
+        return self.core_source.lookup_symbol(symbol)
+
+    def read_direct(self, symbol: str) -> DirectReadOutcome:
+        with ThreadPoolExecutor(max_workers=2, thread_name_prefix="ths-direct") as executor:
+            core_future = executor.submit(self.core_source.read_direct, symbol)
+            fund_future = executor.submit(self.fund_source.read_direct, symbol)
+            try:
+                core_values = core_future.result()
+            except DirectRequestError:
+                raise
+            except Exception as error:
+                raise DirectRequestError("DIRECT_REQUEST_FAILED", str(error)) from error
+
+            fund_error: str | None = None
+            try:
+                fund_values = fund_future.result()
+            except DirectRequestError as error:
+                fund_error = error.error_code
+                fund_values = {}
+            except Exception:
+                fund_error = "DIRECT_FUND_FLOW_REQUEST_FAILED"
+                fund_values = {}
+
+        values = empty_metric_values()
+        for kind in REQUIRED_METRICS:
+            values[kind] = core_values.get(kind)
+        for kind in FUND_ONLY_METRICS:
+            values[kind] = fund_values.get(kind)
+        return DirectReadOutcome(
+            values=values,
+            source_errors={
+                "core_metrics": None,
+                "main_fund_flow": fund_error,
+            },
+        )
 
 
 class FridaParsedValueSource:
@@ -123,15 +191,26 @@ class FridaParsedValueSource:
         *,
         package: str = APP_PACKAGE,
         timeout_seconds: float = 8,
+        request_scope: str = "all",
         runtime_reader: Callable[[str, str, float], dict[str, Any]] | None = None,
         direct_reader: Callable[[str, str, float, str, str], dict[str, Any]] | None = None,
         lookup_reader: Callable[[str, str, float, str], dict[str, Any]] | None = None,
     ) -> None:
+        if request_scope not in {"all", "core_metrics", "main_fund_flow"}:
+            raise ValueError(f"unknown direct request scope: {request_scope}")
         self.endpoint = endpoint
         self.package = package
         self.timeout_seconds = timeout_seconds
+        self.request_scope = request_scope
         self._runtime_reader = runtime_reader or self._read_runtime
-        self._direct_reader = direct_reader or self._read_direct_runtime
+        if direct_reader is not None:
+            self._direct_reader = direct_reader
+        elif request_scope == "core_metrics":
+            self._direct_reader = self._read_core_runtime
+        elif request_scope == "main_fund_flow":
+            self._direct_reader = self._read_fund_runtime
+        else:
+            self._direct_reader = self._read_direct_runtime
         self._lookup_reader = lookup_reader or self._lookup_runtime
         self._frida_lock = RLock()
 
@@ -157,7 +236,24 @@ class FridaParsedValueSource:
         except (UnsupportedMarketError, DirectRequestError):
             raise
         except Exception as error:
-            raise DirectRequestError("DIRECT_REQUEST_FAILED", str(error)) from error
+            bridge_offline = type(error).__name__ in {
+                "ProcessNotFoundError",
+                "ServerNotRunningError",
+                "TransportError",
+            }
+            if bridge_offline:
+                error_code = (
+                    "DIRECT_FUND_FLOW_APP_OFFLINE"
+                    if self.request_scope == "main_fund_flow"
+                    else "DIRECT_APP_OFFLINE"
+                )
+            else:
+                error_code = (
+                    "DIRECT_FUND_FLOW_REQUEST_FAILED"
+                    if self.request_scope == "main_fund_flow"
+                    else "DIRECT_REQUEST_FAILED"
+                )
+            raise DirectRequestError(error_code, str(error)) from error
         error_code = _text(payload.get("error_code"))
         if error_code is not None:
             raise DirectRequestError(error_code, _text(payload.get("error_message")))
@@ -247,7 +343,7 @@ class FridaParsedValueSource:
             values = indicator.get("values")
             if not isinstance(values, (list, tuple)) or not values:
                 continue
-            latest = _decimal(values[-1])
+            latest = _interface_decimal(values[-1])
             if latest is not None:
                 latest_by_techid[techid] = latest
 
@@ -260,13 +356,43 @@ class FridaParsedValueSource:
         )
         result[MetricKind.RETAIL_COUNT] = _format_number(latest_by_techid.get(7034), 2)
         result[MetricKind.MACDFS] = _format_number(latest_by_techid.get(7051), 3, show_plus=True)
+        for flow in payload.get("fund_flows", ()):
+            if not isinstance(flow, dict):
+                continue
+            period = _fund_flow_period(flow.get("period", flow.get("win_size")))
+            if period is None:
+                continue
+            _, _, unit_kind = next(item for item in FUND_FLOW_PERIODS if item[0] == period)
+            metrics = FUND_FLOW_METRICS[period]
+            unit = _fund_flow_unit(flow.get("current_unit", flow.get("currentUnit")))
+            result[unit_kind] = unit
+            main_in = _interface_decimal(_flow_value(flow, "main_in", "mainIn", "main_capital"))
+            visible = _interface_decimal(
+                _flow_value(flow, "main_listed", "mainListed", "main_visible_inflow")
+            )
+            hidden = _interface_decimal(
+                _flow_value(flow, "main_grey", "mainGrey", "main_hidden_inflow")
+            )
+            retail_raw = _flow_value(
+                flow,
+                "main_retail_investor",
+                "mainRetailInvestor",
+                "retail_inflow",
+            )
+            retail = _interface_decimal(retail_raw)
+            if retail is None and main_in is not None:
+                retail = -main_in
+            result[metrics["main_net_inflow"]] = _format_number(main_in, 2)
+            result[metrics["main_visible_inflow"]] = _format_number(visible, 2)
+            result[metrics["main_hidden_inflow"]] = _format_number(hidden, 2)
+            result[metrics["retail_inflow"]] = _format_number(retail, 2)
         return result
 
     @staticmethod
     def _read_runtime(endpoint: str, package: str, _timeout_seconds: float) -> dict[str, Any]:
         import frida  # type: ignore[import-not-found]
 
-        device = frida.get_device_manager().add_remote_device(endpoint)
+        device = _add_remote_frida_device(frida, endpoint)
         application = next(
             (item for item in device.enumerate_applications() if item.identifier == package and item.pid),
             None,
@@ -294,7 +420,7 @@ class FridaParsedValueSource:
     ) -> dict[str, Any]:
         import frida  # type: ignore[import-not-found]
 
-        device = frida.get_device_manager().add_remote_device(endpoint)
+        device = _add_remote_frida_device(frida, endpoint)
         application = next(
             (item for item in device.enumerate_applications() if item.identifier == package and item.pid),
             None,
@@ -317,6 +443,82 @@ class FridaParsedValueSource:
                 session.detach()
 
     @staticmethod
+    def _read_core_runtime(
+        endpoint: str,
+        package: str,
+        timeout_seconds: float,
+        symbol: str,
+        market: str,
+    ) -> dict[str, Any]:
+        return FridaParsedValueSource._read_scoped_direct_runtime(
+            endpoint,
+            package,
+            timeout_seconds,
+            symbol,
+            market,
+            "core_metrics",
+            _FRIDA_CORE_DIRECT_SCRIPT,
+        )
+
+    @staticmethod
+    def _read_fund_runtime(
+        endpoint: str,
+        package: str,
+        timeout_seconds: float,
+        symbol: str,
+        market: str,
+    ) -> dict[str, Any]:
+        return FridaParsedValueSource._read_scoped_direct_runtime(
+            endpoint,
+            package,
+            timeout_seconds,
+            symbol,
+            market,
+            "main_fund_flow",
+            _FRIDA_FUND_DIRECT_SCRIPT,
+        )
+
+    @staticmethod
+    def _read_scoped_direct_runtime(
+        endpoint: str,
+        package: str,
+        timeout_seconds: float,
+        symbol: str,
+        market: str,
+        request_scope: str,
+        script_source: str,
+    ) -> dict[str, Any]:
+        import frida  # type: ignore[import-not-found]
+
+        device = _add_remote_frida_device(frida, endpoint)
+        application = next(
+            (item for item in device.enumerate_applications() if item.identifier == package and item.pid),
+            None,
+        )
+        if application is None:
+            error_code = (
+                "DIRECT_FUND_FLOW_APP_OFFLINE"
+                if request_scope == "main_fund_flow"
+                else "DIRECT_APP_OFFLINE"
+            )
+            raise DirectRequestError(error_code, "THS process is not running")
+        session = device.attach(application.pid)
+        script = session.create_script(script_source)
+        try:
+            script.load()
+            return script.exports_sync.request(
+                symbol,
+                market,
+                max(1000, round(timeout_seconds * 1000)),
+                request_scope,
+            )
+        finally:
+            try:
+                script.unload()
+            finally:
+                session.detach()
+
+    @staticmethod
     def _lookup_runtime(
         endpoint: str,
         package: str,
@@ -325,7 +527,7 @@ class FridaParsedValueSource:
     ) -> dict[str, Any]:
         import frida  # type: ignore[import-not-found]
 
-        device = frida.get_device_manager().add_remote_device(endpoint)
+        device = _add_remote_frida_device(frida, endpoint)
         application = next(
             (item for item in device.enumerate_applications() if item.identifier == package and item.pid),
             None,
@@ -388,6 +590,15 @@ def _decimal(value: object) -> Decimal | None:
     return number if number.is_finite() else None
 
 
+def _interface_decimal(value: object) -> Decimal | None:
+    """Discard App permission sentinels before unit conversion or formatting."""
+
+    number = _decimal(value)
+    if number in {Decimal("-2147483648"), Decimal("-9223372036854775808")}:
+        return None
+    return number
+
+
 def _format_number(
     value: Decimal | None,
     places: int,
@@ -403,6 +614,39 @@ def _format_number(
         rounded = abs(rounded)
     prefix = "+" if show_plus and rounded > 0 else ""
     return f"{prefix}{rounded:.{places}f}{suffix}"
+
+
+def _flow_value(flow: dict[str, Any], *keys: str) -> object:
+    for key in keys:
+        if key in flow:
+            return flow[key]
+    return None
+
+
+def _fund_flow_period(value: object) -> str | None:
+    text = _text(value)
+    if text in {"today", "three_day", "five_day"}:
+        return text
+    try:
+        window = int(float(text)) if text is not None else None
+    except (TypeError, ValueError):
+        return None
+    return {1: "today", 3: "three_day", 5: "five_day"}.get(window)
+
+
+def _fund_flow_unit(value: object) -> str | None:
+    text = _text(value)
+    if text is None:
+        return None
+    try:
+        number = Decimal(text)
+    except InvalidOperation:
+        return None
+    if number == Decimal(10000):
+        return "万元"
+    if number == Decimal(100000000):
+        return "亿元"
+    return None
 
 
 _FRIDA_SCRIPT = r"""
@@ -573,7 +817,7 @@ rpc.exports = {
 
 _FRIDA_DIRECT_SCRIPT = r"""
 rpc.exports = {
-  request: function (requestedSymbol, requestedMarket, timeoutMilliseconds) {
+  request: function (requestedSymbol, requestedMarket, timeoutMilliseconds, requestedScope) {
     return new Promise(function (resolve) {
       Java.perform(function () {
         var Group = Java.use('qwg$i');
@@ -591,15 +835,29 @@ rpc.exports = {
         var CurveRegistry = Java.use('rwg');
         var symbol = String(requestedSymbol);
         var market = String(requestedMarket);
+        var requestScope = requestedScope === undefined || requestedScope === null
+          ? 'all'
+          : String(requestedScope);
         var deadline = Date.now() + Math.max(1000, Number(timeoutMilliseconds));
         var settled = false;
         var manager = null;
         var mainGroup = null;
-        var payload = { quotes: [], indicators: [], missing_techids: [] };
+        var payload = { quotes: [], indicators: [], missing_techids: [], fund_flows: [] };
+        var fundClient = null;
+        var fundCallbackCounter = 0;
+        var standaloneManagerKey = null;
+        var standaloneRegistry = null;
+
+        function cleanupStandaloneManager() {
+          if (standaloneRegistry === null || standaloneManagerKey === null) return;
+          try { standaloneRegistry.t(standaloneManagerKey); } catch (_) {}
+          standaloneManagerKey = null;
+        }
 
         function complete(result) {
           if (settled) return;
           settled = true;
+          cleanupStandaloneManager();
           resolve(result);
         }
 
@@ -711,6 +969,20 @@ rpc.exports = {
           return waitForMain(group);
         }
 
+        function initializeStandaloneManager() {
+          var ArrayList = Java.use('java.util.ArrayList');
+          standaloneRegistry = CurveRegistry.i();
+          standaloneManagerKey = 'codex_direct_' + requestScope + '_' + symbol + '_'
+            + String(Date.now()) + '_' + String(Math.floor(Math.random() * 1000000));
+          manager = standaloneRegistry.p(standaloneManagerKey);
+          if (manager === null) throw new Error('standalone curve manager is unavailable');
+          var initRequest = Ayg.$new(43, 2, 7001, 7001, true);
+          initRequest.z(parameters(symbol, market, true));
+          var initRequests = ArrayList.$new();
+          initRequests.add(initRequest);
+          standaloneRegistry.w(standaloneManagerKey, initRequests, 3);
+        }
+
         function quote(base) {
           var priceSeries = valuesFromCurve(base, 10);
           var changeSeries = valuesFromCurve(base, 34315);
@@ -797,6 +1069,136 @@ rpc.exports = {
           });
         }
 
+        function requestFundFlow(period, winSize) {
+          return new Promise(function (accept, reject) {
+            var settledFlow = false;
+            var timer = setTimeout(function () {
+              if (settledFlow) return;
+              settledFlow = true;
+              reject({ code: 'DIRECT_FUND_FLOW_TIMEOUT', message: period + ' fund flow response timed out' });
+            }, Math.max(1000, deadline - Date.now()));
+
+            function finish(value) {
+              if (settledFlow) return;
+              settledFlow = true;
+              clearTimeout(timer);
+              accept(value);
+            }
+
+            function failFlow(code, message) {
+              if (settledFlow) return;
+              settledFlow = true;
+              clearTimeout(timer);
+              reject({ code: code, message: message });
+            }
+
+            try {
+              var HashMapFlow = Java.use('java.util.HashMap');
+              var ArrayListFlow = Java.use('java.util.ArrayList');
+              var SecurityFlow = Java.use('com.hexin.android.biz_quote_base_api.Security');
+              var HurricaneFlow = Java.use('com.hexin.android.biz_securities_indicator_fetcher_model.HurricaneIndicator');
+              var QueryParamFlow = Java.use('com.hexin.android.biz_securities_indicator_fetcher_model.QueryParam');
+              var QueryCallbackFlow = Java.use('com.hexin.android.biz_securities_indicator_fetcher_api.QueryCallback');
+              var ChargeFundFlowManager = Java.use('com.hexin.android.biz_quote.tab.bussiness.capital.today.manager.ChargeFundManager');
+              var chargeFundManager = ChargeFundFlowManager._a.value;
+              var indicatorParams = HashMapFlow.$new();
+              indicatorParams.put('win_size', String(winSize));
+              var security = SecurityFlow.$new(symbol, market, symbol);
+              var securities = ArrayListFlow.$new();
+              securities.add(security);
+              var indicators = ArrayListFlow.$new();
+              [
+                'charge_main_capital',
+                'charge_main_listed_capital',
+                'charge_main_grey_capital'
+              ].forEach(function (queryId) {
+                indicators.add(HurricaneFlow.$new(
+                  queryId,
+                  'HurricaneDataSource',
+                  'DAY_1',
+                  '0',
+                  indicatorParams,
+                  null,
+                  null
+                ));
+              });
+              var queryParam = QueryParamFlow.$new(securities, indicators, null, null, null);
+              fundCallbackCounter += 1;
+              var callbackName = 'FundFlowQueryCallback' + String(fundCallbackCounter);
+              var FundCallback = Java.registerClass({
+                name: callbackName,
+                implements: [QueryCallbackFlow],
+                methods: {
+                  onNext: function (tableData) {
+                    try {
+                      var data = chargeFundManager.M(tableData);
+                      if (data === null) {
+                        finish(null);
+                        return;
+                      }
+                      data.parseData();
+                      finish({
+                        period: period,
+                        current_unit: scalar(data.currentUnit.value),
+                        main_in: scalar(data.getMainIn()),
+                        main_listed: scalar(data.getMainListed()),
+                        main_grey: scalar(data.getMainGrey()),
+                        main_retail_investor: scalar(data.getMainRetailInvestor())
+                      });
+                    } catch (error) {
+                      failFlow('DIRECT_FUND_FLOW_RESPONSE_INVALID', String(error));
+                    }
+                  },
+                  onError: function (code, message) {
+                    var rawCode = scalar(code) || 'DIRECT_FUND_FLOW_REQUEST_FAILED';
+                    failFlow(rawCode, scalar(message) || rawCode);
+                  }
+                }
+              });
+              if (fundClient === null) {
+                failFlow('DIRECT_FUND_FLOW_MANAGER_UNAVAILABLE', 'fund flow query client is unavailable');
+                return;
+              }
+              fundClient.query(queryParam, FundCallback.$new());
+            } catch (error) {
+              failFlow('DIRECT_FUND_FLOW_MANAGER_UNAVAILABLE', String(error));
+            }
+          });
+        }
+
+        function requestFundFlows() {
+          return new Promise(function (accept, reject) {
+            try {
+              var IndicatorManagerApi = Java.use('com.hexin.android.biz_securities_indicator_fetcher_api.IndicatorManager');
+              var IndicatorDataServiceImpl = Java.use('com.hexin.android.biz_securities_indicator_fetcher.IndicatorDataServiceImpl');
+              var FundLambda = Java.use('com.hexin.android.biz_quote.tab.bussiness.capital.today.manager.ChargeFundManager$fetchData$queryClient$1');
+              var service = Java.cast(
+                IndicatorManagerApi.INSTANCE.value.getIndicatorDataService(),
+                IndicatorDataServiceImpl
+              );
+              var fundLambda = FundLambda.INSTANCE.value;
+              // This App lambda creates HurricaneDataSource config with Source-Id: sif-charge-indicator-capital.
+              fundClient = service.obtainClient(201, fundLambda);
+              var chain = Promise.resolve();
+              var specs = [
+                ['today', 1],
+                ['three_day', 3],
+                ['five_day', 5]
+              ];
+              specs.forEach(function (spec) {
+                chain = chain.then(function () {
+                  return requestFundFlow(spec[0], spec[1]).then(function (flow) {
+                    payload.fund_flows.push(flow || { period: spec[0] });
+                  });
+                });
+              });
+              chain.then(accept).catch(reject);
+            } catch (error) {
+              reject({ code: 'DIRECT_FUND_FLOW_MANAGER_UNAVAILABLE', message: String(error) });
+            }
+          });
+        }
+
         Java.choose('qwg', {
           onMatch: function (candidate) {
             try {
@@ -806,18 +1208,34 @@ rpc.exports = {
             } catch (_) {}
           },
           onComplete: function () {
-            if (manager === null) {
-              fail('DIRECT_MANAGER_UNAVAILABLE', 'active App curve manager is unavailable');
+            if (requestScope === 'main_fund_flow') {
+              requestFundFlows().then(function () {
+                complete(payload);
+              }).catch(function (error) {
+                fail(error.code || 'DIRECT_FUND_FLOW_RESPONSE_INVALID', error.message || error);
+              });
               return;
             }
+            if (requestScope === 'core_metrics' || manager === null) {
+              try {
+                initializeStandaloneManager();
+              } catch (managerError) {
+                fail('DIRECT_MANAGER_UNAVAILABLE', managerError);
+                return;
+              }
+            }
+            var fundPromise = requestScope === 'core_metrics'
+              ? Promise.resolve()
+              : requestFundFlows();
             var base;
             try {
               base = requestMain();
             } catch (error) {
+              fundPromise.catch(function () {});
               fail('DIRECT_REQUEST_UNAVAILABLE', error);
               return;
             }
-            base.then(function (baseCurve) {
+            var quotePromise = base.then(function (baseCurve) {
               payload.quotes.push(quote(baseCurve));
               var specs = [
                 [7031, 33007, false],
@@ -834,16 +1252,14 @@ rpc.exports = {
                   });
                 });
               });
-              chain.then(function () {
-                removeGroup(mainGroup);
-                complete(payload);
-              }).catch(function (error) {
-                removeGroup(mainGroup);
-                fail('DIRECT_RESPONSE_INVALID', error);
-              });
+              return chain;
+            });
+            Promise.all([quotePromise, fundPromise]).then(function () {
+              removeGroup(mainGroup);
+              complete(payload);
             }).catch(function (error) {
               removeGroup(mainGroup);
-              fail(error.code || 'DIRECT_REQUEST_FAILED', error.message || error);
+              fail(error.code || 'DIRECT_RESPONSE_INVALID', error.message || error);
             });
           }
         });
@@ -852,3 +1268,8 @@ rpc.exports = {
   }
 };
 """
+
+# The shared bridge has an explicit scope gate before either request chain starts.
+# Separate constants make the selected App role auditable at the Python boundary.
+_FRIDA_CORE_DIRECT_SCRIPT = _FRIDA_DIRECT_SCRIPT
+_FRIDA_FUND_DIRECT_SCRIPT = _FRIDA_DIRECT_SCRIPT

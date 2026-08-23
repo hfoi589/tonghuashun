@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import socket
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Mapping
@@ -10,7 +11,7 @@ from typing import Callable, Mapping
 from fastapi import FastAPI
 
 from .api import create_app
-from .parsed_values import FridaParsedValueSource
+from .parsed_values import DualAccountParsedValueSource, FridaParsedValueSource
 from .queue import RedisStreamsStore
 from .runner import ADBDeviceBridge, DailyCheckState, Level2Navigator, Level2Runner, OpenCVTemplateFallback, RunnerControl, TAB_LABELS, long_capture_has_net_heading
 from .security import persist_password_hash
@@ -32,6 +33,11 @@ class DeploymentSettings:
     frontend_root: Path | None
     admin_cookie_secure: bool
     frida_server_endpoint: str | None
+    dual_account_mode: bool
+    core_adb_serial: str | None
+    core_frida_server_endpoint: str | None
+    fund_adb_serial: str | None
+    fund_frida_server_endpoint: str | None
     daily_check_state_file: Path
 
     @classmethod
@@ -56,9 +62,30 @@ class DeploymentSettings:
             raise ValueError("RUNNER_POLL_INTERVAL_SECONDS must be a positive number") from error
         if poll_interval <= 0:
             raise ValueError("RUNNER_POLL_INTERVAL_SECONDS must be a positive number")
-        adb_serial = values.get("ADB_SERIAL", "").strip()
-        if not adb_serial:
-            raise ValueError("ADB_SERIAL is required")
+        dual_names = (
+            "CORE_ADB_SERIAL",
+            "CORE_FRIDA_SERVER_ENDPOINT",
+            "FUND_ADB_SERIAL",
+            "FUND_FRIDA_SERVER_ENDPOINT",
+        )
+        dual_values = {name: values.get(name, "").strip() for name in dual_names}
+        dual_account_mode = any(dual_values.values())
+        if dual_account_mode and not all(dual_values.values()):
+            raise ValueError(
+                "dual-account mode requires CORE_ADB_SERIAL, "
+                "CORE_FRIDA_SERVER_ENDPOINT, FUND_ADB_SERIAL, and "
+                "FUND_FRIDA_SERVER_ENDPOINT"
+            )
+        legacy_adb_serial = values.get("ADB_SERIAL", "").strip()
+        legacy_frida_endpoint = values.get("FRIDA_SERVER_ENDPOINT", "").strip() or None
+        if dual_account_mode:
+            adb_serial = dual_values["CORE_ADB_SERIAL"]
+            frida_server_endpoint = dual_values["CORE_FRIDA_SERVER_ENDPOINT"]
+        else:
+            adb_serial = legacy_adb_serial
+            frida_server_endpoint = legacy_frida_endpoint
+            if not adb_serial:
+                raise ValueError("ADB_SERIAL is required")
         template_root_value = values.get("TEMPLATE_ROOT", "").strip()
         frontend_root_value = values.get("FRONTEND_ROOT", "").strip()
         cookie_secure_value = values.get("ADMIN_COOKIE_SECURE", "1").strip().lower()
@@ -81,7 +108,12 @@ class DeploymentSettings:
             runner_poll_interval_seconds=poll_interval,
             frontend_root=Path(frontend_root_value).resolve() if frontend_root_value else None,
             admin_cookie_secure=admin_cookie_secure,
-            frida_server_endpoint=values.get("FRIDA_SERVER_ENDPOINT", "").strip() or None,
+            frida_server_endpoint=frida_server_endpoint,
+            dual_account_mode=dual_account_mode,
+            core_adb_serial=dual_values["CORE_ADB_SERIAL"] or None,
+            core_frida_server_endpoint=dual_values["CORE_FRIDA_SERVER_ENDPOINT"] or None,
+            fund_adb_serial=dual_values["FUND_ADB_SERIAL"] or None,
+            fund_frida_server_endpoint=dual_values["FUND_FRIDA_SERVER_ENDPOINT"] or None,
             daily_check_state_file=Path(
                 values.get("DAILY_CHECK_STATE_FILE", "/data/admin/daily-check.json")
             ).expanduser().resolve(),
@@ -92,6 +124,40 @@ def _redis_client_from_url(url: str) -> object:
     from redis import Redis
 
     return Redis.from_url(url)
+
+
+def _device_health_probe(
+    bridge: ADBDeviceBridge,
+    frida_endpoint: str | None,
+) -> Callable[[], Mapping[str, str]]:
+    def probe() -> Mapping[str, str]:
+        try:
+            adb_online = bool(bridge.is_online())
+        except Exception:
+            adb_online = False
+        app_running = getattr(bridge, "app_running", None)
+        try:
+            app_online = adb_online and (
+                bool(app_running()) if callable(app_running) else adb_online
+            )
+        except Exception:
+            app_online = False
+        frida_state = "UNKNOWN"
+        if frida_endpoint:
+            host, separator, port_text = frida_endpoint.rpartition(":")
+            if separator and host and port_text.isdigit():
+                try:
+                    with socket.create_connection((host, int(port_text)), timeout=0.5):
+                        frida_state = "ONLINE"
+                except OSError:
+                    frida_state = "OFFLINE"
+        return {
+            "adb": "ONLINE" if adb_online else "OFFLINE",
+            "app": "ONLINE" if app_online else "OFFLINE",
+            "frida": frida_state,
+        }
+
+    return probe
 
 
 def create_production_app(
@@ -109,7 +175,46 @@ def create_production_app(
     adb_environment = os.environ.copy()
     if config.adb_server_socket:
         adb_environment["ADB_SERVER_SOCKET"] = config.adb_server_socket
-    bridge = bridge_factory(adb=config.adb_path, serial=config.adb_serial, environment=adb_environment)
+    if config.dual_account_mode:
+        assert config.core_adb_serial is not None
+        assert config.fund_adb_serial is not None
+        core_bridge = bridge_factory(
+            adb=config.adb_path,
+            serial=config.core_adb_serial,
+            environment=adb_environment,
+        )
+        fund_bridge = bridge_factory(
+            adb=config.adb_path,
+            serial=config.fund_adb_serial,
+            environment=adb_environment,
+        )
+        device_bridges = {
+            "core_metrics": core_bridge,
+            "main_fund_flow": fund_bridge,
+        }
+        device_health_probes = {
+            "core_metrics": _device_health_probe(
+                core_bridge,
+                config.core_frida_server_endpoint,
+            ),
+            "main_fund_flow": _device_health_probe(
+                fund_bridge,
+                config.fund_frida_server_endpoint,
+            ),
+        }
+    else:
+        core_bridge = bridge_factory(
+            adb=config.adb_path,
+            serial=config.adb_serial,
+            environment=adb_environment,
+        )
+        device_bridges = {"core_metrics": core_bridge}
+        device_health_probes = {
+            "core_metrics": _device_health_probe(
+                core_bridge,
+                config.frida_server_endpoint,
+            )
+        }
     control = RunnerControl()
     templates: dict[str, Path] = {}
     if config.template_root:
@@ -122,12 +227,26 @@ def create_production_app(
                 if candidate.is_file():
                     templates[f"tab:{label}"] = candidate
                     break
-    navigator = Level2Navigator(bridge, OpenCVTemplateFallback(templates))
-    parsed_value_source = (
-        FridaParsedValueSource(config.frida_server_endpoint)
-        if config.frida_server_endpoint
-        else None
-    )
+    navigator = Level2Navigator(core_bridge, OpenCVTemplateFallback(templates))
+    if config.dual_account_mode:
+        assert config.core_frida_server_endpoint is not None
+        assert config.fund_frida_server_endpoint is not None
+        parsed_value_source = DualAccountParsedValueSource(
+            FridaParsedValueSource(
+                config.core_frida_server_endpoint,
+                request_scope="core_metrics",
+            ),
+            FridaParsedValueSource(
+                config.fund_frida_server_endpoint,
+                request_scope="main_fund_flow",
+            ),
+        )
+    else:
+        parsed_value_source = (
+            FridaParsedValueSource(config.frida_server_endpoint)
+            if config.frida_server_endpoint
+            else None
+        )
     runner = runner_factory(
         store,
         navigator,
@@ -143,7 +262,9 @@ def create_production_app(
         password_persist_path=config.admin_password_file,
         admin_session_secret=config.admin_session_secret,
         capture_root=config.capture_root,
-        device_bridge=bridge,
+        device_bridge=core_bridge,
+        device_bridges=device_bridges,
+        device_health_probes=device_health_probes,
         runner_control=control,
         runner=runner,
         runner_poll_interval_seconds=config.runner_poll_interval_seconds,

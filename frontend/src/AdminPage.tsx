@@ -1,6 +1,6 @@
 import { FormEvent, KeyboardEvent, PointerEvent, useCallback, useEffect, useRef, useState } from 'react'
 import { ApiError, api, readCsrfToken, type QueueState, type RunnerHealth } from './api'
-import { parseDeviceServerMessage, type DeviceInputEvent } from './device-protocol'
+import { parseDeviceServerMessage, type DeviceInputEvent, type DeviceStatus } from './device-protocol'
 import { DeviceInputAdapter } from './device-stream'
 
 type DeviceConnection = 'UNCONFIGURED' | 'CONNECTING' | 'ONLINE' | 'OFFLINE'
@@ -14,7 +14,21 @@ function defaultDeviceStreamUrl(): string | undefined {
   return `${protocol}//${window.location.host}/api/admin/device`
 }
 
-export function DeviceViewport({ locked, active, streamUrl = defaultDeviceStreamUrl() }: { locked: boolean; active: boolean; streamUrl?: string }) {
+function roleDeviceStreamUrl(role: 'core_metrics' | 'main_fund_flow'): string | undefined {
+  if (typeof window === 'undefined' || !window.location.host) return undefined
+  const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
+  return `${protocol}//${window.location.host}/api/admin/devices/${role}`
+}
+
+interface DeviceViewportProps {
+  locked: boolean
+  active: boolean
+  streamUrl?: string
+  title?: string
+  warning?: string
+}
+
+export function DeviceViewport({ locked, active, streamUrl = defaultDeviceStreamUrl(), title = '设备画面', warning }: DeviceViewportProps) {
   const canvas = useRef<HTMLCanvasElement>(null)
   const socket = useRef<WebSocket | null>(null)
   const input = useRef<DeviceInputAdapter | null>(null)
@@ -22,6 +36,7 @@ export function DeviceViewport({ locked, active, streamUrl = defaultDeviceStream
   const [connection, setConnection] = useState<DeviceConnection>('UNCONFIGURED')
   const [runnerReady, setRunnerReady] = useState(false)
   const [runnerLocked, setRunnerLocked] = useState(false)
+  const [deviceHealth, setDeviceHealth] = useState<DeviceStatus | null>(null)
   if (!input.current) input.current = new DeviceInputAdapter(() => socket.current)
 
   useEffect(() => {
@@ -30,6 +45,7 @@ export function DeviceViewport({ locked, active, streamUrl = defaultDeviceStream
       socket.current = null
       setRunnerReady(false)
       setRunnerLocked(false)
+      setDeviceHealth(null)
       setConnection(active ? 'UNCONFIGURED' : 'OFFLINE')
       return
     }
@@ -43,6 +59,7 @@ export function DeviceViewport({ locked, active, streamUrl = defaultDeviceStream
       socket.current = null
       setRunnerReady(false)
       setRunnerLocked(false)
+      setDeviceHealth(null)
       setConnection('OFFLINE')
       return
     }
@@ -53,6 +70,7 @@ export function DeviceViewport({ locked, active, streamUrl = defaultDeviceStream
       setConnection('OFFLINE')
       setRunnerReady(false)
       setRunnerLocked(false)
+      setDeviceHealth(null)
     }
     client.onerror = () => setConnection('OFFLINE')
     client.onmessage = (event) => {
@@ -64,6 +82,10 @@ export function DeviceViewport({ locked, active, streamUrl = defaultDeviceStream
       if (message.type === 'runner_status') {
         setRunnerReady(message.state === 'READY' || message.state === 'ADMIN_CONTROL')
         setRunnerLocked(message.locked)
+        return
+      }
+      if (message.type === 'device_status') {
+        setDeviceHealth(message)
         return
       }
       const image = new Image()
@@ -100,14 +122,23 @@ export function DeviceViewport({ locked, active, streamUrl = defaultDeviceStream
     endX: 0.5,
     endY: direction === 'up' ? 0.72 : 0.3,
   })
-  const label = connection === 'ONLINE' ? '设备画面已连接（3–5 FPS）' : connection === 'CONNECTING' ? '正在连接设备画面…' : connection === 'UNCONFIGURED' ? '设备画面通道尚未配置，当前离线' : '设备画面连接不可用，当前离线'
+  const label = connection === 'ONLINE' ? '设备画面已连接（2 FPS）' : connection === 'CONNECTING' ? '正在连接设备画面…' : connection === 'UNCONFIGURED' ? '设备画面通道尚未配置，当前离线' : '设备画面连接不可用，当前离线'
   return <section className="device-panel">
-    <div className="section-heading"><h2>设备画面</h2><span className={`stream-state stream-${connection.toLowerCase()}`}>{label}</span></div>
+    <div className="section-heading"><h2>{title}</h2><span className={`stream-state stream-${connection.toLowerCase()}`}>{label}</span></div>
+    {warning && <p className="device-account-warning" role="note">{warning}</p>}
+    <dl className="device-health" aria-label={`${title}设备状态`}>
+      {(['adb', 'app', 'frida'] as const).map((key) => <div key={key}>
+        <dt>{key === 'adb' ? 'ADB' : key === 'app' ? 'App' : 'Frida'}</dt>
+        <dd className={`device-health-${(deviceHealth?.[key] ?? 'UNKNOWN').toLowerCase()}`}>
+          {deviceHealth?.[key] === 'ONLINE' ? '在线' : deviceHealth?.[key] === 'OFFLINE' ? '离线' : '待检测'}
+        </dd>
+      </div>)}
+    </dl>
     <div className="device-actions" aria-label="设备画面滚动控制">
       <button type="button" className="secondary" onClick={() => scroll('up')} disabled={!canSend}>上翻</button>
       <button type="button" className="secondary" onClick={() => scroll('down')} disabled={!canSend}>下翻</button>
     </div>
-    <canvas ref={canvas} width="540" height="960" tabIndex={canSend ? 0 : -1} aria-label="远程设备画面" className="device-canvas" onPointerDown={onPointerDown} onPointerUp={onPointerUp} onPointerCancel={onPointerCancel} onKeyDown={onKey} onKeyUp={onKey} />
+    <canvas ref={canvas} width="540" height="960" tabIndex={canSend ? 0 : -1} aria-label={`${title}远程设备画面`} className="device-canvas" onPointerDown={onPointerDown} onPointerUp={onPointerUp} onPointerCancel={onPointerCancel} onKeyDown={onKey} onKeyUp={onKey} />
     <p className="minor">拖动画面或使用“上翻 / 下翻”；点击画面后也可用 ↑/↓、PgUp/PgDn。仅当流、Runner 和当前会话锁均就绪时允许输入。</p>
   </section>
 }
@@ -281,6 +312,20 @@ export function AdminPage({ deviceStreamUrl }: { deviceStreamUrl?: string }) {
     <section className="admin-controls"><div><h2>重试失败任务</h2><p>设备恢复后，输入失败任务 ID 重新排入 FIFO 队列；已有合格截图会保留。</p></div><form className="button-row" onSubmit={retryFailedJob}><label htmlFor="failed-task">失败任务 ID</label><input id="failed-task" value={failedTaskId} onChange={(event) => setFailedTaskId(event.target.value)} autoComplete="off" /><button className="secondary" type="submit" disabled={!failedTaskId.trim()}>重试失败任务</button></form></section>
     <section className="admin-controls"><div><h2>修改管理员密码</h2><p>修改后当前会话会退出，使用新密码重新登录。</p></div><form className="password-change-form" onSubmit={changePassword} data-1p-ignore="true" data-lpignore="true"><label htmlFor="current-admin-password">当前管理员密码</label><input id="current-admin-password" type="password" autoComplete="current-password" data-1p-ignore="true" data-lpignore="true" value={currentPassword} onChange={(event) => setCurrentPassword(event.target.value)} required /><label htmlFor="new-admin-password">新管理员密码</label><input id="new-admin-password" type="password" autoComplete="new-password" data-1p-ignore="true" data-lpignore="true" value={newPassword} onChange={(event) => setNewPassword(event.target.value)} required /><label htmlFor="confirm-admin-password">确认新管理员密码</label><input id="confirm-admin-password" type="password" autoComplete="new-password" data-1p-ignore="true" data-lpignore="true" value={newPasswordConfirmation} onChange={(event) => setNewPasswordConfirmation(event.target.value)} required /><button className="secondary" type="submit">修改管理员密码</button></form></section>
     {message && <p className={message.includes('获得') || message.includes('交还') || message.includes('重新') ? 'success-message' : 'error'} role="status">{message}</p>}
-    <DeviceViewport locked={locked} active={authenticated} streamUrl={deviceStreamUrl} />
+    <div className="admin-device-grid">
+      <DeviceViewport
+        title="八项账号"
+        locked={locked}
+        active={authenticated}
+        streamUrl={deviceStreamUrl ?? roleDeviceStreamUrl('core_metrics')}
+      />
+      <DeviceViewport
+        title="资金账号"
+        warning="当前账号，禁止退出"
+        locked={locked}
+        active={authenticated}
+        streamUrl={deviceStreamUrl ?? roleDeviceStreamUrl('main_fund_flow')}
+      />
+    </div>
   </main>
 }

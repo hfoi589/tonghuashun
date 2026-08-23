@@ -11,6 +11,7 @@ from PIL import Image
 import pytest
 
 from level2_service.models import CaptureKind, CaptureStatus, MetricKind, TaskRecord, TaskStatus
+from level2_service.parsed_values import DirectReadOutcome
 from level2_service.queue import InMemoryStreams
 from level2_service.runner import (
     ADBDeviceBridge,
@@ -41,6 +42,10 @@ PARSED_VALUES = {
     MetricKind.LARGE_ORDER_AMOUNT: "-2802.6万",
     MetricKind.MACDFS: "+0.012",
 }
+
+
+def legacy_values(values):
+    return {kind: values[kind] for kind in PARSED_VALUES}
 
 
 def _successful_runner(store, navigator, capture_root: Path, control: RunnerControl | None = None) -> Level2Runner:
@@ -467,7 +472,7 @@ def test_runner_ignores_early_level2_marker_and_scrolls_until_page_stops(tmp_pat
         b"\x89PNG\r\n\x1a\nlong:" + b"|".join(source_frames[:-1])
     )
     assert list((tmp_path / "one-search-task").iterdir()) == [tmp_path / "one-search-task" / "LONG.png"]
-    assert task.values == values
+    assert legacy_values(task.values) == values
 
 
 def test_long_capture_net_heading_validation_rejects_the_reported_missing_title() -> None:
@@ -588,11 +593,11 @@ def test_long_capture_runner_uses_only_interface_values_and_leaves_missing_value
 
     assert task is not None and task.status == TaskStatus.PARTIAL
     assert task.error_code == "VALUE_RECOGNITION_FAILED"
-    assert task.values == background
+    assert legacy_values(task.values) == background
     assert task.value_sources[MetricKind.RETAIL_COUNT] is None
     assert all(
         task.value_sources[kind].value == "INTERFACE"
-        for kind in MetricKind
+        for kind in PARSED_VALUES
         if kind != MetricKind.RETAIL_COUNT
     )
     assert task.long_capture.status == CaptureStatus.READY
@@ -643,7 +648,7 @@ def test_data_only_runner_reads_parsed_values_without_capturing_or_running_ocr(t
 
     assert task is not None and task.status == TaskStatus.COMPLETED
     assert navigator.opened == []
-    assert task.values == PARSED_VALUES
+    assert legacy_values(task.values) == PARSED_VALUES
     assert task.long_capture.status == CaptureStatus.SKIPPED
     assert task.long_capture.path is None
     assert not (tmp_path / "data-only-task").exists()
@@ -678,17 +683,43 @@ def test_data_only_runner_never_uses_ocr_for_missing_interface_values(tmp_path: 
 
     assert task is not None and task.status == TaskStatus.PARTIAL
     assert task.error_code == "VALUE_RECOGNITION_FAILED"
-    assert task.values == values
+    assert legacy_values(task.values) == values
     assert task.value_sources[MetricKind.LARGE_ORDER_NET] is None
     assert all(
         task.value_sources[kind].value == "INTERFACE"
-        for kind in MetricKind
+        for kind in PARSED_VALUES
         if kind != MetricKind.LARGE_ORDER_NET
     )
     assert bridge.inputs == []
     assert task.long_capture.status == CaptureStatus.SKIPPED
     assert task.long_capture.path is None
     assert not (tmp_path / "partial-data-only-task").exists()
+
+
+def test_data_only_runner_publishes_a_nonfatal_fund_source_error_with_core_values(tmp_path: Path) -> None:
+    store = InMemoryStreams()
+    store.enqueue(TaskRecord(
+        task_id="fund-source-error",
+        symbol="600938",
+        include_long_capture=False,
+    ))
+    runner = _successful_runner(store, Level2Navigator(FakeDeviceBridge(symbol="600938")), tmp_path)
+    runner.parsed_value_source = types.SimpleNamespace(
+        read_direct=lambda _symbol: DirectReadOutcome(
+            values=dict(PARSED_VALUES),
+            source_errors={
+                "core_metrics": None,
+                "main_fund_flow": "DIRECT_FUND_FLOW_TIMEOUT",
+            },
+        )
+    )
+
+    task = runner.run_once()
+
+    assert task is not None and task.status == TaskStatus.PARTIAL
+    assert task.error_code == "DIRECT_FUND_FLOW_TIMEOUT"
+    assert legacy_values(task.values) == PARSED_VALUES
+    assert task.source_errors["main_fund_flow"] == "DIRECT_FUND_FLOW_TIMEOUT"
 
 
 def test_data_only_runner_preserves_interface_error_without_ocr_fallback(tmp_path: Path) -> None:
@@ -722,6 +753,7 @@ def test_data_only_runner_preserves_interface_error_without_ocr_fallback(tmp_pat
 
     assert task is not None and task.status == TaskStatus.FAILED
     assert task.error_code == "DIRECT_MANAGER_UNAVAILABLE"
+    assert task.source_errors["core_metrics"] == "DIRECT_MANAGER_UNAVAILABLE"
     assert all(value is None for value in task.values.values())
     assert all(source is None for source in task.value_sources.values())
     assert bridge.inputs == []

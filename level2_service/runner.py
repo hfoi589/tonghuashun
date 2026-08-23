@@ -22,7 +22,7 @@ from typing import Callable, Protocol
 from zoneinfo import ZoneInfo
 
 from .models import CaptureKind, MetricKind, TaskRecord, TaskStatus, utc_now
-from .parsed_values import DirectRequestError, ParsedValueSource, UnsupportedMarketError, market_code_for_symbol
+from .parsed_values import DirectReadOutcome, DirectRequestError, ParsedValueSource, UnsupportedMarketError, market_code_for_symbol
 from .queue import TaskStore
 
 
@@ -532,6 +532,7 @@ class DeviceBridge(Protocol):
     def is_selected(self, selector: str) -> bool: ...
     def input_text(self, value: str) -> None: ...
     def is_online(self) -> bool: ...
+    def app_running(self, package: str = APP_PACKAGE) -> bool: ...
 
 
 class TemplateFallback(Protocol):
@@ -797,6 +798,14 @@ class ADBDeviceBridge:
         except (OSError, subprocess.SubprocessError):
             return False
 
+    def app_running(self, package: str = APP_PACKAGE) -> bool:
+        if not self.is_online():
+            return False
+        try:
+            return bool(self._shell("pidof", package).strip())
+        except (OSError, subprocess.SubprocessError):
+            return False
+
     @staticmethod
     def _coordinate(value: float, limit: int) -> float:
         if not 0 <= value <= 1:
@@ -806,12 +815,15 @@ class ADBDeviceBridge:
     def _uiautomator(self):
         if self._uiautomator_adapter is not None:
             return self._uiautomator_adapter
+        if self.serial is None:
+            # Never let uiautomator2 guess when two account devices may be attached.
+            return None
         try:
             import uiautomator2 as u2  # type: ignore[import-not-found]
         except ImportError:
             return None
         self._configure_uiautomator_adb()
-        self._uiautomator_adapter = u2.connect(self.serial) if self.serial else u2.connect()
+        self._uiautomator_adapter = u2.connect(self.serial)
         return self._uiautomator_adapter
 
     def _run_uiautomator_action(self, action: Callable[[object], object]) -> object | None:
@@ -976,6 +988,9 @@ class FakeDeviceBridge:
         self.symbol = value
 
     def is_online(self) -> bool:
+        return self.online
+
+    def app_running(self, _package: str = APP_PACKAGE) -> bool:
         return self.online
 
     def visual_tap(self, name: str) -> bool:
@@ -1253,6 +1268,7 @@ class Level2Runner:
             self.control.heartbeat("READY")
             return None
         self.control.heartbeat("READY")
+        source_errors: dict[str, str | None] | None = None
         try:
             frames: tuple[bytes, ...] | None = None
             long_capture: bytes | None = None
@@ -1263,7 +1279,12 @@ class Level2Runner:
                     "DIRECT_REQUEST_UNAVAILABLE",
                     "App interface value source is not configured",
                 )
-            values = direct_reader(task.symbol)
+            direct_result = direct_reader(task.symbol)
+            if isinstance(direct_result, DirectReadOutcome):
+                values = direct_result.values
+                source_errors = direct_result.source_errors
+            else:
+                values = direct_result
             if task.include_long_capture:
                 for capture_attempt in range(2):
                     self._open_stock_with_retry(task.symbol)
@@ -1297,7 +1318,10 @@ class Level2Runner:
             failed = self.store.get(task.task_id) or task
             if failed.status in {TaskStatus.RUNNING, TaskStatus.PARTIAL}:
                 failed = self.store.transition(
-                    task.task_id, TaskStatus.FAILED, error_code=error.error_code
+                    task.task_id,
+                    TaskStatus.FAILED,
+                    error_code=error.error_code,
+                    source_errors={"core_metrics": error.error_code},
                 )
             self.control.heartbeat("READY" if self.device_online() else "OFFLINE")
             return failed
@@ -1314,6 +1338,7 @@ class Level2Runner:
                 task.task_id,
                 values,
                 str(path) if path is not None else None,
+                source_errors=source_errors,
             )
         except Exception:
             failed = self.store.get(task.task_id) or task

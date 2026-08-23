@@ -9,7 +9,7 @@ from pathlib import Path
 from threading import Lock
 from typing import Protocol
 
-from .models import CaptureKind, CaptureRecord, CaptureStatus, LongCaptureRecord, MetricKind, TaskRecord, TaskStatus, ValueSource, utc_now
+from .models import CaptureKind, CaptureRecord, CaptureStatus, LongCaptureRecord, MetricKind, REQUIRED_METRICS, SOURCE_ERROR_KEYS, TaskRecord, TaskStatus, ValueSource, utc_now
 
 
 class QueueFullError(RuntimeError):
@@ -28,9 +28,9 @@ class TaskStore(Protocol):
     def recover_running(self) -> list[TaskRecord]: ...
     def requeue_waiting(self, task_id: str) -> TaskRecord: ...
     def retry_failed(self, task_id: str) -> TaskRecord: ...
-    def transition(self, task_id: str, status: TaskStatus, *, error_code: str | None = None) -> TaskRecord: ...
+    def transition(self, task_id: str, status: TaskStatus, *, error_code: str | None = None, source_errors: dict[str, str | None] | None = None) -> TaskRecord: ...
     def complete_capture(self, task_id: str, kind: CaptureKind, path: str) -> TaskRecord: ...
-    def complete_result(self, task_id: str, values: dict[MetricKind, str | None], path: str | None, *, ocr_metrics: set[MetricKind] | None = None) -> TaskRecord: ...
+    def complete_result(self, task_id: str, values: dict[MetricKind, str | None], path: str | None, *, ocr_metrics: set[MetricKind] | None = None, source_errors: dict[str, str | None] | None = None) -> TaskRecord: ...
     def events_after(self, task_id: str, event_index: int = 0) -> list[dict[str, str]]: ...
     def cleanup(self, now: datetime) -> list[TaskRecord]: ...
 
@@ -44,6 +44,13 @@ _ALLOWED_TRANSITIONS = {
     TaskStatus.FAILED: set(),
     TaskStatus.EXPIRED: set(),
 }
+
+
+def _normalized_source_errors(
+    source_errors: dict[str, str | None] | None,
+) -> dict[str, str | None]:
+    provided = source_errors or {}
+    return {key: provided.get(key) for key in SOURCE_ERROR_KEYS}
 
 
 class InMemoryStreams:
@@ -92,6 +99,7 @@ class InMemoryStreams:
         for task in recovered:
             task.status = TaskStatus.QUEUED
             task.error_code = None
+            task.source_errors = _normalized_source_errors(None)
             task.completed_at = None
             task.updated_at = utc_now()
             self._emit(task)
@@ -118,6 +126,7 @@ class InMemoryStreams:
         self._move_to_fifo_tail(task_id)
         task.status = TaskStatus.QUEUED
         task.error_code = None
+        task.source_errors = _normalized_source_errors(None)
         task.updated_at = utc_now()
         self._emit(task)
         return task
@@ -132,6 +141,7 @@ class InMemoryStreams:
         task.status = TaskStatus.QUEUED
         task.error_code = None
         task.completed_at = None
+        task.source_errors = _normalized_source_errors(None)
         task.updated_at = utc_now()
         self._emit(task)
         return task
@@ -139,12 +149,14 @@ class InMemoryStreams:
     def set_capture_root(self, capture_root: Path) -> None:
         self.capture_root = capture_root.resolve()
 
-    def transition(self, task_id: str, status: TaskStatus, *, error_code: str | None = None) -> TaskRecord:
+    def transition(self, task_id: str, status: TaskStatus, *, error_code: str | None = None, source_errors: dict[str, str | None] | None = None) -> TaskRecord:
         task = self._tasks[task_id]
         if status not in _ALLOWED_TRANSITIONS[task.status]:
             raise InvalidTransitionError(f"{task.status.value} cannot transition to {status.value}")
         task.status = status
         task.error_code = error_code
+        if source_errors is not None:
+            task.source_errors = _normalized_source_errors(source_errors)
         task.updated_at = utc_now()
         if status in {TaskStatus.COMPLETED, TaskStatus.FAILED}:
             task.completed_at = task.updated_at
@@ -167,7 +179,7 @@ class InMemoryStreams:
         self._emit(task)
         return task
 
-    def complete_result(self, task_id: str, values: dict[MetricKind, str | None], path: str | None, *, ocr_metrics: set[MetricKind] | None = None) -> TaskRecord:
+    def complete_result(self, task_id: str, values: dict[MetricKind, str | None], path: str | None, *, ocr_metrics: set[MetricKind] | None = None, source_errors: dict[str, str | None] | None = None) -> TaskRecord:
         task = self._tasks[task_id]
         if task.status not in {TaskStatus.RUNNING, TaskStatus.PARTIAL}:
             raise InvalidTransitionError(f"{task.status.value} cannot accept a result")
@@ -181,6 +193,7 @@ class InMemoryStreams:
             )
             for kind in MetricKind
         }
+        task.source_errors = _normalized_source_errors(source_errors)
         now = utc_now()
         if task.include_long_capture:
             if path is None:
@@ -196,8 +209,18 @@ class InMemoryStreams:
             task.long_capture.captured_at = None
         task.collected_at = now
         task.updated_at = now
-        task.status = TaskStatus.COMPLETED if all(task.values.values()) else TaskStatus.PARTIAL
-        task.error_code = None if task.status == TaskStatus.COMPLETED else "VALUE_RECOGNITION_FAILED"
+        required_complete = all(task.values[kind] is not None for kind in REQUIRED_METRICS)
+        fund_error = task.source_errors["main_fund_flow"]
+        task.status = (
+            TaskStatus.COMPLETED
+            if required_complete and fund_error is None
+            else TaskStatus.PARTIAL
+        )
+        task.error_code = (
+            None
+            if task.status == TaskStatus.COMPLETED
+            else fund_error if required_complete else "VALUE_RECOGNITION_FAILED"
+        )
         task.completed_at = task.updated_at
         self._emit(task)
         return task
@@ -326,6 +349,7 @@ local updated = {}
 for index, entry in ipairs(recovered) do
   entry.task.status = 'QUEUED'
   entry.task.error_code = cjson.null
+  entry.task.source_errors = {core_metrics = cjson.null, main_fund_flow = cjson.null}
   entry.task.completed_at = cjson.null
   entry.task.updated_at = ARGV[1]
   local payload = cjson.encode(entry.task)
@@ -345,6 +369,7 @@ local task = cjson.decode(payload)
 if task.status ~= 'WAITING_ADMIN' then return false end
 task.status = 'QUEUED'
 task.error_code = cjson.null
+task.source_errors = {core_metrics = cjson.null, main_fund_flow = cjson.null}
 task.updated_at = ARGV[2]
 local updated = cjson.encode(task)
 redis.call('SET', KEYS[2] .. ARGV[1], updated)
@@ -360,6 +385,7 @@ if task.status == 'QUEUED' then return payload end
 if task.status ~= 'FAILED' then return false end
 task.status = 'QUEUED'
 task.error_code = cjson.null
+task.source_errors = {core_metrics = cjson.null, main_fund_flow = cjson.null}
 task.completed_at = cjson.null
 task.updated_at = ARGV[2]
 local updated = cjson.encode(task)
@@ -476,12 +502,14 @@ return updated
             return task
         raise InvalidTransitionError(f"{task.status.value} cannot be retried")
 
-    def transition(self, task_id: str, status: TaskStatus, *, error_code: str | None = None) -> TaskRecord:
+    def transition(self, task_id: str, status: TaskStatus, *, error_code: str | None = None, source_errors: dict[str, str | None] | None = None) -> TaskRecord:
         task = self._required(task_id)
         if status not in _ALLOWED_TRANSITIONS[task.status]:
             raise InvalidTransitionError(f"{task.status.value} cannot transition to {status.value}")
         task.status = status
         task.error_code = error_code
+        if source_errors is not None:
+            task.source_errors = _normalized_source_errors(source_errors)
         task.updated_at = utc_now()
         if status in {TaskStatus.COMPLETED, TaskStatus.FAILED}:
             task.completed_at = task.updated_at
@@ -506,7 +534,7 @@ return updated
         self._emit(task)
         return task
 
-    def complete_result(self, task_id: str, values: dict[MetricKind, str | None], path: str | None, *, ocr_metrics: set[MetricKind] | None = None) -> TaskRecord:
+    def complete_result(self, task_id: str, values: dict[MetricKind, str | None], path: str | None, *, ocr_metrics: set[MetricKind] | None = None, source_errors: dict[str, str | None] | None = None) -> TaskRecord:
         task = self._required(task_id)
         if task.status not in {TaskStatus.RUNNING, TaskStatus.PARTIAL}:
             raise InvalidTransitionError(f"{task.status.value} cannot accept a result")
@@ -520,6 +548,7 @@ return updated
             )
             for kind in MetricKind
         }
+        task.source_errors = _normalized_source_errors(source_errors)
         now = utc_now()
         if task.include_long_capture:
             if path is None:
@@ -535,8 +564,18 @@ return updated
             task.long_capture.captured_at = None
         task.collected_at = now
         task.updated_at = now
-        task.status = TaskStatus.COMPLETED if all(task.values.values()) else TaskStatus.PARTIAL
-        task.error_code = None if task.status == TaskStatus.COMPLETED else "VALUE_RECOGNITION_FAILED"
+        required_complete = all(task.values[kind] is not None for kind in REQUIRED_METRICS)
+        fund_error = task.source_errors["main_fund_flow"]
+        task.status = (
+            TaskStatus.COMPLETED
+            if required_complete and fund_error is None
+            else TaskStatus.PARTIAL
+        )
+        task.error_code = (
+            None
+            if task.status == TaskStatus.COMPLETED
+            else fund_error if required_complete else "VALUE_RECOGNITION_FAILED"
+        )
         task.completed_at = task.updated_at
         self._save(task)
         self._emit(task)
@@ -620,6 +659,10 @@ return updated
             "completed_at": task.completed_at.isoformat() if task.completed_at else None,
             "collected_at": task.collected_at.isoformat() if task.collected_at else None,
             "error_code": task.error_code,
+            "source_errors": {
+                key: task.source_errors.get(key)
+                for key in SOURCE_ERROR_KEYS
+            },
             "captures": {
                 kind.value: {
                     "status": capture.status.value,
@@ -657,9 +700,13 @@ return updated
                 else None
             ),
             error_code=raw["error_code"],
+            source_errors=_normalized_source_errors(raw.get("source_errors")),
         )
         for kind in CaptureKind:
-            capture = raw["captures"][kind.value]
+            capture = raw.get("captures", {}).get(
+                kind.value,
+                {"status": "PENDING", "path": None, "captured_at": None},
+            )
             task.captures[kind] = CaptureRecord(
                 kind=kind,
                 status=CaptureStatus(capture["status"]),

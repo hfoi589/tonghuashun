@@ -10,6 +10,20 @@ export interface Capture {
   expires_at: string | null
 }
 
+export interface MainFundFlowPeriod {
+  unit: string | null
+  main_net_inflow: string | null
+  main_visible_inflow: string | null
+  main_hidden_inflow: string | null
+  retail_inflow: string | null
+}
+
+export interface MainFundFlowValues {
+  today: MainFundFlowPeriod
+  three_day: MainFundFlowPeriod
+  five_day: MainFundFlowPeriod
+}
+
 export interface JobValues {
   stock_name: string | null
   current_price: string | null
@@ -19,6 +33,7 @@ export interface JobValues {
   large_order_amount: string | null
   retail_count: string | null
   macdfs: string | null
+  main_fund_flow: MainFundFlowValues
 }
 
 export type ValueSource = 'INTERFACE' | 'OCR'
@@ -32,6 +47,18 @@ export interface JobValueSources {
   large_order_amount: ValueSource | null
   retail_count: ValueSource | null
   macdfs: ValueSource | null
+  main_fund_flow: {
+    today: MainFundFlowPeriodSources
+    three_day: MainFundFlowPeriodSources
+    five_day: MainFundFlowPeriodSources
+  }
+}
+
+export interface MainFundFlowPeriodSources {
+  main_net_inflow: ValueSource | null
+  main_visible_inflow: ValueSource | null
+  main_hidden_inflow: ValueSource | null
+  retail_inflow: ValueSource | null
 }
 
 export interface LongCapture {
@@ -46,6 +73,10 @@ export interface Job {
   include_long_capture: boolean
   status: JobStatus
   error_code: string | null
+  source_errors?: {
+    core_metrics: string | null
+    main_fund_flow: string | null
+  }
   queue_position?: number | null
   created_at: string
   collected_at: string | null

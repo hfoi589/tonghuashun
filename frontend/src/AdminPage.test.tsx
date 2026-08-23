@@ -1,4 +1,4 @@
-import { cleanup, render, screen, waitFor } from '@testing-library/react'
+import { cleanup, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { AdminPage, DeviceViewport } from './AdminPage'
@@ -234,6 +234,82 @@ describe('AdminPage', () => {
     await waitFor(() => expect(FakeWebSocket.instance?.url).toBe(`ws://${window.location.host}/api/admin/device`))
   })
 
+  it('keeps both account devices online simultaneously and warns against exiting the fund account', async () => {
+    class FakeWebSocket {
+      static urls: string[] = []
+      static OPEN = 1
+      readyState = FakeWebSocket.OPEN
+      close = vi.fn()
+      send = vi.fn()
+      onopen: (() => void) | null = null
+      onclose: (() => void) | null = null
+      onerror: (() => void) | null = null
+      onmessage: ((event: MessageEvent) => void) | null = null
+      constructor(url: string) { FakeWebSocket.urls.push(url) }
+    }
+    vi.stubGlobal('WebSocket', FakeWebSocket)
+    vi.mocked(fetch)
+      .mockResolvedValueOnce(new Response(null, { status: 204 }))
+      .mockResolvedValueOnce(jsonResponse({ state: 'READY', last_heartbeat: null, queue_paused: false }))
+      .mockResolvedValueOnce(jsonResponse({ locked: false }))
+      .mockResolvedValueOnce(jsonResponse({ paused: false }))
+
+    render(<AdminPage />)
+
+    expect(await screen.findByRole('heading', { name: '八项账号' })).toBeInTheDocument()
+    expect(screen.getByRole('heading', { name: '资金账号' })).toBeInTheDocument()
+    expect(screen.getByText('当前账号，禁止退出')).toBeInTheDocument()
+    await waitFor(() => expect(FakeWebSocket.urls).toEqual(expect.arrayContaining([
+      `ws://${window.location.host}/api/admin/devices/core_metrics`,
+      `ws://${window.location.host}/api/admin/devices/main_fund_flow`,
+    ])))
+  })
+
+  it('routes each panel controls through only its own websocket', async () => {
+    class FakeWebSocket {
+      static instances = new Map<string, FakeWebSocket>()
+      static OPEN = 1
+      readyState = FakeWebSocket.OPEN
+      close = vi.fn()
+      send = vi.fn()
+      onopen: (() => void) | null = null
+      onclose: (() => void) | null = null
+      onerror: (() => void) | null = null
+      onmessage: ((event: MessageEvent) => void) | null = null
+      constructor(public readonly url: string) { FakeWebSocket.instances.set(url, this) }
+    }
+    vi.stubGlobal('WebSocket', FakeWebSocket)
+    render(<div className="admin-device-grid">
+      <DeviceViewport title="八项账号" active locked streamUrl="ws://runner/core" />
+      <DeviceViewport title="资金账号" active locked streamUrl="ws://runner/fund" />
+    </div>)
+    const coreSocket = FakeWebSocket.instances.get('ws://runner/core')!
+    const fundSocket = FakeWebSocket.instances.get('ws://runner/fund')!
+    for (const socket of [coreSocket, fundSocket]) {
+      socket.onopen?.()
+      socket.onmessage?.({ data: JSON.stringify({ type: 'runner_status', state: 'ADMIN_CONTROL', locked: true }) } as MessageEvent)
+    }
+    coreSocket.onmessage?.({ data: JSON.stringify({
+      type: 'device_status', role: 'core_metrics', label: '八项账号', adb: 'ONLINE', app: 'ONLINE', frida: 'ONLINE',
+    }) } as MessageEvent)
+    fundSocket.onmessage?.({ data: JSON.stringify({
+      type: 'device_status', role: 'main_fund_flow', label: '资金账号', adb: 'ONLINE', app: 'ONLINE', frida: 'OFFLINE',
+    }) } as MessageEvent)
+
+    const user = userEvent.setup()
+    const corePanel = screen.getByRole('heading', { name: '八项账号' }).closest('section')!
+    const fundPanel = screen.getByRole('heading', { name: '资金账号' }).closest('section')!
+    await waitFor(() => expect(within(corePanel).getAllByText('在线')).toHaveLength(3))
+    expect(within(fundPanel).getByText('离线')).toBeInTheDocument()
+    await user.click(within(corePanel).getByRole('button', { name: '上翻' }))
+    await user.click(within(fundPanel).getByRole('button', { name: '下翻' }))
+
+    expect(coreSocket.send).toHaveBeenCalledTimes(1)
+    expect(fundSocket.send).toHaveBeenCalledTimes(1)
+    expect(coreSocket.send).toHaveBeenCalledWith(expect.stringContaining('"startY":0.3'))
+    expect(fundSocket.send).toHaveBeenCalledWith(expect.stringContaining('"startY":0.72'))
+  })
+
   it('provides explicit up and down controls that send normalized swipe events', async () => {
     class FakeWebSocket {
       static instance: FakeWebSocket | undefined
@@ -287,7 +363,7 @@ describe('AdminPage', () => {
     await user.click(screen.getByRole('button', { name: '接管设备' }))
 
     await waitFor(() => expect(screen.getByText('设备由其他管理会话控制，请先交还控制')).toBeInTheDocument())
-    expect(screen.getByText('正在连接设备画面…')).toBeInTheDocument()
+    expect(screen.getAllByText('正在连接设备画面…')).toHaveLength(2)
     expect(screen.getByRole('button', { name: '接管设备' })).toBeInTheDocument()
   })
 

@@ -3,6 +3,10 @@ import { cleanup, render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { MarketApp } from './MarketApp'
 
+vi.mock('./DailyKChart', () => ({
+  DailyKChart: ({ name, page }: { name: string, page: { symbol: string } }) => <div role="img" aria-label={`${name}前复权日K图`}>{page.symbol}</div>,
+}))
+
 function jsonResponse(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
     status,
@@ -78,10 +82,28 @@ describe('MarketApp', () => {
         capabilities: {
           timeshare: { available: true, reason: null },
           kline: { available: false, reason: 'DIRECT_KLINE_UNAVAILABLE' },
+          daily_kline: { available: true, adjustment: 'qfq' },
           order_book: { available: false, reason: 'APP_INTERFACE_NOT_CONFIRMED' },
           trades: { available: false, reason: 'APP_INTERFACE_NOT_CONFIRMED' },
         },
         source_errors: { core_metrics: null, main_fund_flow: null },
+      })
+      if (url.includes('/series?period=day&limit=240')) return jsonResponse({
+        symbol: '601872',
+        period: 'day',
+        bars: [{ time: '2026-08-21', open: '8.10', high: '8.40', low: '8.00', close: '8.33', volume: '10000', amount: '83300' }],
+        indicators: {
+          ma5: ['8.20'], ma13: ['8.10'], ma21: ['8.00'], ma60: [null], ma120: [null], ma250: [null],
+          boll_mid: ['8.10'], boll_upper: ['8.40'], boll_lower: ['7.80'],
+          macd_dif: ['0.10'], macd_dea: ['0.08'], macd_hist: ['0.04'],
+        },
+        next_cursor: null,
+        source_error: null,
+        adjustment: 'qfq',
+        source: 'THS_PUBLIC',
+        cached: false,
+        stale: false,
+        source_errors: { public_kline: null, app_kline: null },
       })
       throw new Error(`unexpected request: ${url}`)
     })
@@ -94,7 +116,72 @@ describe('MarketApp', () => {
     expect((await screen.findAllByText('8.33')).length).toBeGreaterThan(0)
     expect(screen.getByRole('img', { name: '招商轮船分时价格图' })).toBeInTheDocument()
     expect(screen.getByText('14:56 更新')).toBeInTheDocument()
+    expect(screen.getAllByRole('button', { name: /^(分时|日K|五日|周K|月K)$/ }).map((button) => button.textContent)).toEqual([
+      '分时', '日K', '五日', '周K', '月K',
+    ])
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(
+      '/api/v1/market/symbols/601872/series?period=day&limit=240',
+      expect.anything(),
+    ))
     await userEvent.click(screen.getByRole('button', { name: '日K' }))
-    await waitFor(() => expect(screen.getByText('App 内部 K 线接口尚未确认')).toBeInTheDocument())
+    expect(await screen.findByRole('img', { name: '招商轮船前复权日K图' })).toBeInTheDocument()
+    expect(screen.getByText('前复权')).toBeInTheDocument()
+    expect(screen.getByText('10jqka 公开源')).toBeInTheDocument()
+    expect(fetchMock.mock.calls.filter(([url]) => String(url).includes('/series?period=day')).length).toBe(1)
+  })
+
+  it('keeps a slow previous daily response from replacing the selected stock', async () => {
+    let resolveFirstSeries: (response: Response) => void = () => undefined
+    const firstSeries = new Promise<Response>((resolve) => { resolveFirstSeries = resolve })
+    const seriesBody = (symbol: string) => ({
+      symbol,
+      period: 'day',
+      bars: [{ time: '2026-08-21', open: '10', high: '11', low: '9', close: '10.5', volume: '10000', amount: '100000' }],
+      indicators: {},
+      next_cursor: null,
+      source_error: null,
+      adjustment: 'qfq',
+      source: 'THS_PUBLIC',
+      cached: false,
+      stale: false,
+      source_errors: { public_kline: null, app_kline: null },
+    })
+    const snapshotBody = (symbol: string, name: string) => ({
+      symbol, name, market: '17', sequence: 1, source_time: '14:56',
+      collected_at: '2026-08-23T06:56:01+00:00', stale: false, age_seconds: 0.2,
+      quote: { price: '10.50' }, timeshare: [], intraday_series: {}, order_book: [], trades: [], main_fund_flow: {},
+      capabilities: { kline: { available: false }, daily_kline: { available: true, adjustment: 'qfq' } },
+      source_errors: { core_metrics: null, main_fund_flow: null },
+    })
+    const fetchMock = vi.fn((input: RequestInfo | URL): Promise<Response> => {
+      const url = String(input)
+      if (url === '/api/v1/session') return Promise.resolve(jsonResponse({
+        id: 7, username: 'wilson', enabled: true, must_change_password: false, created_at: '2026-08-23T00:00:00+00:00',
+      }))
+      if (url === '/api/v1/watchlists') return Promise.resolve(jsonResponse({ groups: [{
+        id: 1, name: '自选', sort_order: 0, items: [
+          { symbol: '601872', name: '招商轮船', market: '17' },
+          { symbol: '600026', name: '中远海能', market: '17' },
+        ],
+      }] }))
+      if (url.includes('/601872/snapshot')) return Promise.resolve(jsonResponse(snapshotBody('601872', '招商轮船')))
+      if (url.includes('/600026/snapshot')) return Promise.resolve(jsonResponse(snapshotBody('600026', '中远海能')))
+      if (url.includes('/601872/series')) return firstSeries
+      if (url.includes('/600026/series')) return Promise.resolve(jsonResponse(seriesBody('600026')))
+      return Promise.reject(new Error(`unexpected request: ${url}`))
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    vi.stubGlobal('WebSocket', undefined)
+
+    render(<MarketApp />)
+
+    await waitFor(() => expect(fetchMock.mock.calls.some(([url]) => String(url).includes('/601872/series'))).toBe(true))
+    await userEvent.click(await screen.findByRole('button', { name: /中远海能/ }))
+    await userEvent.click(screen.getByRole('button', { name: '日K' }))
+    expect(await screen.findByRole('img', { name: '中远海能前复权日K图' })).toHaveTextContent('600026')
+
+    resolveFirstSeries(jsonResponse(seriesBody('601872')))
+    await waitFor(() => expect(screen.getByRole('img', { name: '中远海能前复权日K图' })).toHaveTextContent('600026'))
+    expect(screen.queryByRole('img', { name: '招商轮船前复权日K图' })).not.toBeInTheDocument()
   })
 })

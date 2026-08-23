@@ -8,6 +8,7 @@ from argon2 import PasswordHasher
 from fastapi.testclient import TestClient
 
 from level2_service.main import DeploymentSettings, create_production_app
+from level2_service.daily_kline import DailyKlineMarketDataSource
 from level2_service.market_accounts import RedisMarketSessionStore, SQLiteMarketAccountStore
 from level2_service.market_data import MarketDataBroker
 from level2_service.parsed_values import DualAccountParsedValueSource
@@ -157,7 +158,15 @@ def test_production_factory_wires_persistent_market_accounts_sessions_and_broker
     assert isinstance(app.state.market_account_store, SQLiteMarketAccountStore)
     assert isinstance(app.state.market_session_store, RedisMarketSessionStore)
     assert isinstance(app.state.market_data_broker, MarketDataBroker)
-    assert app.state.market_data_broker.source is app.state.runner.parsed_value_source
+    assert isinstance(app.state.market_data_broker.source, DailyKlineMarketDataSource)
+    assert app.state.market_data_broker.source.app_source is app.state.runner.parsed_value_source
+    assert app.state.market_data_broker.stats()["daily_kline"] == {
+        "cache_entries": 0,
+        "public_successes": 0,
+        "app_fallbacks": 0,
+        "stale_cache_hits": 0,
+        "failures": 0,
+    }
 
 
 def test_settings_require_all_four_dual_account_device_variables() -> None:

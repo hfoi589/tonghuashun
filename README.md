@@ -173,10 +173,25 @@ The independently owned fund-flow account is capped at one request per symbol
 per 15 seconds even while the core quote refreshes faster. These are polling
 cadences, not an exchange tick guarantee: measured App callback latency and
 device availability still determine when a fresh frame arrives. The current
-App response provides 241 one-minute points for the trading-day curves. K-line,
-ten-level order book, and time-and-sales panels stay explicitly unavailable
-until their exact App-internal request contracts are confirmed; the service
-does not substitute an Internet quote, OCR value, or guessed request parameter.
+App response provides 241 one-minute points for the trading-day curves. The
+Market detail page separately loads a front-adjusted daily K-line once per
+selected symbol from the 10jqka public yearly line endpoint. It returns 240
+visible bars after 249 hidden warm-up bars and computes MA(5/13/21/60/120/250),
+BOLL(20,2), MACD(12,26,9), and volume server-side. This public chart source is
+isolated from job values: it never fills or replaces any of the eight task
+metrics, which remain App-interface-only. Daily K-line responses expose their
+source, adjustment, cache, stale, and per-source error state. Fresh cache TTL is
+60 seconds during trading sessions and 15 minutes outside them; stale data is
+served only after both the public source and the App fallback path fail.
+
+A core-device probe confirmed that the App constructs daily K requests with
+`period=5`, front-adjustment `quan=10`, and data IDs `1/7/8/9/11/13/19` for
+date/open/high/low/close/volume/amount. The independent Frida request path is
+still deliberately gated as `DIRECT_KLINE_UNAVAILABLE` because it has not yet
+completed reliably outside the visible chart controller. It is not enabled by
+guessing or by UI/OCR extraction. Ten-level order book and time-and-sales panels
+also stay explicitly unavailable until their exact App-internal contracts are
+confirmed.
 
 Taking the administrator device lock pauses new Runner work automatically. The
 lock release leaves the queue paused; use the explicit queue-resume control

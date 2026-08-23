@@ -1,0 +1,50 @@
+{
+  "probe_scope": "core_metrics",
+  "device_role": "emulator-5556",
+  "request": {
+    "stockcode": "301396",
+    "marketid": "33",
+    "period": "5",
+    "quan": "10",
+    "klinecount": "378",
+    "primary_data_id": 7101
+  },
+  "response_data_ids": {
+    "time": 1,
+    "open": 7,
+    "high": 8,
+    "low": 9,
+    "close": 11,
+    "volume": 13,
+    "amount": 19
+  },
+  "bars": [
+    {
+      "time": "20260819",
+      "open": "196",
+      "high": "205.88",
+      "low": "191.01",
+      "close": "192.02",
+      "volume": "16865156",
+      "amount": "3343310200"
+    },
+    {
+      "time": "20260820",
+      "open": "191.32",
+      "high": "195.4",
+      "low": "185.28",
+      "close": "190",
+      "volume": "16716570",
+      "amount": "3170547600"
+    },
+    {
+      "time": "20260821",
+      "open": "185.07",
+      "high": "190.24",
+      "low": "180.42",
+      "close": "186.06",
+      "volume": "12525535",
+      "amount": "2325301300"
+    }
+  ]
+}

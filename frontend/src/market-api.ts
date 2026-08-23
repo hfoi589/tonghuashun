@@ -30,7 +30,8 @@ export interface TimesharePoint {
 
 export interface MarketCapability {
   available: boolean
-  reason: string | null
+  reason?: string | null
+  adjustment?: string
 }
 
 export interface MarketSnapshot {
@@ -69,6 +70,11 @@ export interface MarketSeriesPage {
   indicators: Record<string, Array<string | null>>
   next_cursor: string | null
   source_error: string | null
+  adjustment: 'qfq' | null
+  source: 'THS_PUBLIC' | 'THS_APP' | null
+  cached: boolean
+  stale: boolean
+  source_errors: Record<string, string | null>
 }
 
 async function request<T>(url: string, init?: RequestInit): Promise<T> {
@@ -131,7 +137,7 @@ export const marketApi = {
   lookupSymbol: (symbol: string) => request<SymbolLookup>(`/api/v1/symbols/${encodeURIComponent(symbol)}`),
   snapshot: (symbol: string) => request<MarketSnapshot>(`/api/v1/market/symbols/${encodeURIComponent(symbol)}/snapshot`),
   series: (symbol: string, period: string) => request<MarketSeriesPage>(
-    `/api/v1/market/symbols/${encodeURIComponent(symbol)}/series?period=${encodeURIComponent(period)}&limit=180`,
+    `/api/v1/market/symbols/${encodeURIComponent(symbol)}/series?period=${encodeURIComponent(period)}&limit=240`,
   ),
 }
 

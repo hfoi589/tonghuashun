@@ -1,5 +1,6 @@
 import { FormEvent, useEffect, useMemo, useRef, useState } from 'react'
 import { ApiError } from './api'
+import { DailyKChart } from './DailyKChart'
 import {
   marketApi,
   marketStreamUrl,
@@ -17,8 +18,8 @@ type ChartPeriod = 'timeshare' | 'five_day' | 'day' | 'week' | 'month'
 
 const chartPeriods: Array<[ChartPeriod, string]> = [
   ['timeshare', '分时'],
-  ['five_day', '五日'],
   ['day', '日K'],
+  ['five_day', '五日'],
   ['week', '周K'],
   ['month', '月K'],
 ]
@@ -87,6 +88,37 @@ function CandleChart({ name, bars }: { name: string, bars: KlineBar[] }) {
       </g>
     })}
   </svg>
+}
+
+function DailyKPanel({ name, page, loading, error }: {
+  name: string,
+  page?: MarketSeriesPage,
+  loading: boolean,
+  error?: string,
+}) {
+  if (loading) return <div className="market-empty-chart">正在加载前复权日 K…</div>
+  if (error && !page) return <div className="market-capability-gap"><strong>日 K 加载失败</strong><span>{error}</span></div>
+  if (!page || page.bars.length === 0) return <div className="market-capability-gap">
+    <strong>日 K 数据暂不可用</strong>
+    <span>{page?.source_error ?? error ?? 'KLINE_SOURCES_UNAVAILABLE'}</span>
+    {page && Object.entries(page.source_errors).map(([source, code]) => code && <small key={source}>{source}: {code}</small>)}
+  </div>
+  const sourceLabel = page.source === 'THS_PUBLIC'
+    ? '10jqka 公开源'
+    : page.source === 'THS_APP'
+      ? 'core_metrics App'
+      : '未知来源'
+  return <div className="daily-k-panel">
+    <div className="daily-k-status">
+      <span>前复权</span>
+      <span>{sourceLabel}</span>
+      {page.cached && <span>缓存</span>}
+      {page.stale && <span className="warning">过期缓存</span>}
+      {page.source_error && <span className="warning">{page.source_error}</span>}
+      {page.stale && Object.entries(page.source_errors).map(([source, code]) => code && <span className="warning" key={source}>{source}: {code}</span>)}
+    </div>
+    <DailyKChart name={name} page={page} />
+  </div>
 }
 
 function PasswordChange({ user, onDone }: { user: MarketUser, onDone: (user: MarketUser) => void }) {
@@ -171,12 +203,14 @@ function FundFlow({ values }: { values: MarketSnapshot['main_fund_flow'] }) {
   </section>
 }
 
-function Detail({ item, snapshot, period, setPeriod, series }: {
+function Detail({ item, snapshot, period, setPeriod, series, dailyLoading, dailyError }: {
   item: { symbol: string, name: string },
   snapshot?: MarketSnapshot,
   period: ChartPeriod,
   setPeriod: (period: ChartPeriod) => void,
   series?: MarketSeriesPage,
+  dailyLoading: boolean,
+  dailyError?: string,
 }) {
   const quote = snapshot?.quote ?? {}
   const changeTone = tone(quote.change_percent)
@@ -194,6 +228,8 @@ function Detail({ item, snapshot, period, setPeriod, series }: {
       <nav className="market-period-tabs" aria-label="图表周期">{chartPeriods.map(([value, label]) => <button type="button" key={value} className={period === value ? 'active' : ''} onClick={() => setPeriod(value)}>{label}</button>)}</nav>
       {period === 'timeshare'
         ? <LineChart name={snapshot?.name ?? item.name} points={snapshot?.timeshare ?? []} />
+        : period === 'day'
+          ? <DailyKPanel name={snapshot?.name ?? item.name} page={series} loading={dailyLoading} error={dailyError} />
         : !klineAvailable
           ? <div className="market-capability-gap"><strong>App 内部 K 线接口尚未确认</strong><span>为避免展示错误行情，这里不会使用网页源、OCR 或猜测参数。</span></div>
           : <CandleChart name={snapshot?.name ?? item.name} bars={series?.bars ?? []} />}
@@ -222,11 +258,15 @@ export function MarketApp() {
   const [selected, setSelected] = useState<string | null>(null)
   const [snapshots, setSnapshots] = useState<Record<string, MarketSnapshot>>({})
   const [period, setPeriod] = useState<ChartPeriod>('timeshare')
-  const [series, setSeries] = useState<MarketSeriesPage>()
+  const [legacySeries, setLegacySeries] = useState<MarketSeriesPage>()
+  const [dailySeries, setDailySeries] = useState<Record<string, MarketSeriesPage>>({})
+  const [dailyLoading, setDailyLoading] = useState<Record<string, boolean>>({})
+  const [dailyErrors, setDailyErrors] = useState<Record<string, string>>({})
   const [symbol, setSymbol] = useState('')
   const [message, setMessage] = useState('')
   const [connection, setConnection] = useState<'live' | 'reconnecting' | 'unavailable'>('unavailable')
   const socket = useRef<WebSocket | null>(null)
+  const requestedDailySeries = useRef(new Set<string>())
 
   const allItems = useMemo(() => {
     const found = new Map<string, { symbol: string, name: string, market: string }>()
@@ -269,12 +309,31 @@ export function MarketApp() {
   }, [auth, selected, user?.must_change_password])
 
   useEffect(() => {
-    if (period === 'timeshare' || !selected || !selectedKlineAvailable) {
-      setSeries(undefined)
+    if (!selected || auth !== 'authenticated' || user?.must_change_password || requestedDailySeries.current.has(selected)) return
+    requestedDailySeries.current.add(selected)
+    const requestedSymbol = selected
+    setDailyLoading((current) => ({ ...current, [requestedSymbol]: true }))
+    setDailyErrors((current) => {
+      const next = { ...current }
+      delete next[requestedSymbol]
+      return next
+    })
+    void marketApi.series(requestedSymbol, 'day').then((value) => {
+      setDailySeries((current) => ({ ...current, [requestedSymbol]: value }))
+    }).catch((reason) => {
+      setDailyErrors((current) => ({ ...current, [requestedSymbol]: reason instanceof Error ? reason.message : '日 K 读取失败' }))
+    }).finally(() => {
+      setDailyLoading((current) => ({ ...current, [requestedSymbol]: false }))
+    })
+  }, [auth, selected, user?.must_change_password])
+
+  useEffect(() => {
+    if (period === 'timeshare' || period === 'day' || !selected || !selectedKlineAvailable) {
+      setLegacySeries(undefined)
       return
     }
     let active = true
-    void marketApi.series(selected, period).then((value) => { if (active) setSeries(value) }).catch((reason) => { if (active) setMessage(reason instanceof Error ? reason.message : 'K 线读取失败') })
+    void marketApi.series(selected, period).then((value) => { if (active) setLegacySeries(value) }).catch((reason) => { if (active) setMessage(reason instanceof Error ? reason.message : 'K 线读取失败') })
     return () => { active = false }
   }, [period, selected, selectedKlineAvailable])
 
@@ -358,7 +417,7 @@ export function MarketApp() {
       </aside>
       <div className="market-main-pane">
         {message && <div className="market-message" role="status">{message}<button type="button" onClick={() => setMessage('')}>关闭</button></div>}
-        {selectedItem ? <Detail item={selectedItem} snapshot={snapshots[selectedItem.symbol]} period={period} setPeriod={setPeriod} series={series} /> : <section className="market-no-selection"><div className="market-brand-mark">顺</div><h1>从自选中选择一只股票</h1><p>行情会通过当前登录的同花顺 App 内部接口动态更新。</p></section>}
+        {selectedItem ? <Detail item={selectedItem} snapshot={snapshots[selectedItem.symbol]} period={period} setPeriod={setPeriod} series={period === 'day' ? dailySeries[selectedItem.symbol] : legacySeries} dailyLoading={dailyLoading[selectedItem.symbol] === true} dailyError={dailyErrors[selectedItem.symbol]} /> : <section className="market-no-selection"><div className="market-brand-mark">顺</div><h1>从自选中选择一只股票</h1><p>行情会通过当前登录的同花顺 App 内部接口动态更新。</p></section>}
       </div>
     </div>
   </main>

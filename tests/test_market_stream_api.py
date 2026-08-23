@@ -29,6 +29,11 @@ class ApiMarketSource:
             bars=(KlineBar(time="2026-08-22", open="19.10", high="19.90", low="19.00", close="19.78", volume="10000", amount="200000"),),
             indicators={"ma5": ("19.22",)},
             next_cursor=None,
+            adjustment="qfq",
+            source="THS_PUBLIC",
+            cached=True,
+            stale=False,
+            source_errors={"public_kline": None, "app_kline": None},
         )
 
 
@@ -61,6 +66,16 @@ def test_market_snapshot_and_kline_routes_require_user_authentication(tmp_path) 
     assert snapshot.json()["sequence"] == 1
     assert series.status_code == 200
     assert series.json()["bars"][0]["close"] == "19.78"
+    body = series.json()
+    assert {key: body[key] for key in (
+        "adjustment", "source", "cached", "stale", "source_errors"
+    )} == {
+        "adjustment": "qfq",
+        "source": "THS_PUBLIC",
+        "cached": True,
+        "stale": False,
+        "source_errors": {"public_kline": None, "app_kline": None},
+    }
 
 
 def test_market_websocket_authenticates_and_pushes_subscribed_snapshots(tmp_path) -> None:

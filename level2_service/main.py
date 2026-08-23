@@ -11,6 +11,7 @@ from typing import Callable, Mapping
 from fastapi import FastAPI
 
 from .api import create_app
+from .daily_kline import DailyKlineMarketDataSource, TonghuashunPublicDailyKlineProvider
 from .market_accounts import RedisMarketSessionStore, SQLiteMarketAccountStore
 from .market_data import MarketDataBroker, is_china_market_open
 from .parsed_values import DualAccountParsedValueSource, FridaParsedValueSource
@@ -269,7 +270,14 @@ def create_production_app(
     market_accounts = SQLiteMarketAccountStore(config.market_database_path)
     market_sessions = RedisMarketSessionStore(redis_client)
     market_broker = (
-        MarketDataBroker(parsed_value_source, is_market_open=is_china_market_open)
+        MarketDataBroker(
+            DailyKlineMarketDataSource(
+                parsed_value_source,
+                TonghuashunPublicDailyKlineProvider(),
+                is_market_open=is_china_market_open,
+            ),
+            is_market_open=is_china_market_open,
+        )
         if parsed_value_source is not None
         else None
     )

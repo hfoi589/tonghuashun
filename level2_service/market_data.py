@@ -92,6 +92,13 @@ class MarketSeriesPage:
     indicators: dict[str, tuple[str | None, ...]] = field(default_factory=dict)
     next_cursor: str | None = None
     source_error: str | None = None
+    adjustment: str | None = None
+    source: str | None = None
+    cached: bool = False
+    stale: bool = False
+    source_errors: dict[str, str | None] = field(
+        default_factory=lambda: {"public_kline": None, "app_kline": None}
+    )
 
     def as_public(self) -> dict[str, Any]:
         return asdict(self)
@@ -152,12 +159,12 @@ class MarketDataBroker:
     def has_subscriber(self, client_id: str) -> bool:
         return client_id in self._subscriptions
 
-    def stats(self) -> dict[str, int | float | bool]:
+    def stats(self) -> dict[str, Any]:
         subscribed_symbols: set[str] = set()
         for watchlist, detail in self._subscriptions.values():
             subscribed_symbols.update(watchlist)
             subscribed_symbols.update(detail)
-        return {
+        stats: dict[str, Any] = {
             "market_open": bool(self.is_market_open()),
             "subscribers": len(self._subscriptions),
             "subscribed_symbols": len(subscribed_symbols),
@@ -166,6 +173,10 @@ class MarketDataBroker:
             "watchlist_interval_seconds": float(self.watchlist_interval_seconds),
             "closed_interval_seconds": float(self.closed_interval_seconds),
         }
+        daily_stats = getattr(self.source, "daily_kline_stats", None)
+        if callable(daily_stats):
+            stats["daily_kline"] = daily_stats()
+        return stats
 
     def cached_snapshot(self, symbol: str) -> MarketSnapshot | None:
         return self._cache.get(symbol)

@@ -719,9 +719,10 @@ class FridaParsedValueSource:
         payload: dict[str, Any], symbol: str
     ) -> dict[MetricKind, dict[str, Any]]:
         specs = {
-            7031: (MetricKind.LARGE_ORDER_NET, 2, Decimal(1), None),
-            7032: (MetricKind.LARGE_ORDER_AMOUNT, 1, Decimal(10000), "万"),
-            7034: (MetricKind.RETAIL_COUNT, 2, Decimal(1), None),
+            7031: (MetricKind.LARGE_ORDER_NET, 2, Decimal(1), None, False),
+            7032: (MetricKind.LARGE_ORDER_AMOUNT, 1, Decimal(10000), "万", False),
+            7034: (MetricKind.RETAIL_COUNT, 2, Decimal(1), None, False),
+            7051: (MetricKind.MACDFS, 3, Decimal(1), None, True),
         }
         result: dict[MetricKind, dict[str, Any]] = {}
         for indicator in payload.get("indicators", ()):
@@ -742,7 +743,7 @@ class FridaParsedValueSource:
                 continue
             if not isinstance(values, (list, tuple)):
                 values = ()
-            kind, places, divisor, unit = spec
+            kind, places, divisor, unit, show_plus = spec
             trailing_values = list(values[-len(times):]) if len(values) > len(times) else list(values)
             leading_gaps = len(times) - len(trailing_values)
             points: list[dict[str, str | None]] = []
@@ -762,6 +763,7 @@ class FridaParsedValueSource:
                         "value": _format_number(
                             number / divisor if number is not None else None,
                             places,
+                            show_plus=show_plus,
                         ),
                     }
                 )

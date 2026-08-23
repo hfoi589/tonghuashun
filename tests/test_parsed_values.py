@@ -287,6 +287,34 @@ def test_direct_read_preserves_the_three_app_intraday_series_with_their_time_axi
     }
 
 
+def test_direct_read_preserves_the_macdfs_intraday_series_with_signed_three_decimal_values() -> None:
+    """Dropping techid 7051 would leave the Market MACDFS chart empty."""
+    payload = _runtime_payload()
+    payload["indicators"] = [
+        {
+            "symbol": "601872",
+            "techid": 7051,
+            "times": [930, 931, 932],
+            "values": [-0.00249, 0.011903988574406313, -2147483648],
+        },
+    ]
+
+    outcome = FridaParsedValueSource(
+        "127.0.0.1:27042",
+        request_scope="core_metrics",
+        direct_reader=lambda *_args: payload,
+    ).read_direct("601872")
+
+    assert outcome.intraday_series[MetricKind.MACDFS] == {
+        "unit": None,
+        "points": [
+            {"time": "09:30", "value": "-0.002"},
+            {"time": "09:31", "value": "+0.012"},
+            {"time": "09:32", "value": None},
+        ],
+    }
+
+
 def test_market_snapshot_uses_the_direct_app_quote_and_timeshare_arrays() -> None:
     payload = _runtime_payload()
     payload["quotes"][1].update(
@@ -296,6 +324,14 @@ def test_market_snapshot_uses_the_direct_app_quote_and_timeshare_arrays() -> Non
             "prices": [8.31, 8.34, 8.33],
             "volumes": [1200, 800, 500],
             "amounts": [9972, 6672, 4165],
+        }
+    )
+    payload["indicators"].append(
+        {
+            "symbol": "601872",
+            "techid": 7051,
+            "times": [930, 931, 932],
+            "values": [0.009, 0.0104, 0.011903988574406313],
         }
     )
     source = FridaParsedValueSource(
@@ -314,6 +350,10 @@ def test_market_snapshot_uses_the_direct_app_quote_and_timeshare_arrays() -> Non
     assert snapshot.source_time == "09:32"
     assert [point.time for point in snapshot.timeshare] == ["09:30", "09:31", "09:32"]
     assert [point.price for point in snapshot.timeshare] == ["8.31", "8.34", "8.33"]
+    assert snapshot.intraday_series["macdfs"]["points"][-1] == {
+        "time": "09:32",
+        "value": "+0.012",
+    }
     assert snapshot.capabilities["timeshare"]["available"] is True
     assert snapshot.capabilities["order_book"] == {
         "available": False,

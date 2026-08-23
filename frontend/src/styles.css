@@ -415,74 +415,6 @@ input:hover { border-color: #8ea9aa; }
   gap: 1rem;
 }
 
-.intraday-chart {
-  min-width: 0;
-  margin: 0;
-  overflow: visible;
-}
-
-.intraday-chart figcaption {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 1rem;
-  padding: .3rem 0 .15rem;
-}
-
-.intraday-chart figcaption > div:first-child { display: grid; gap: .16rem; }
-.intraday-chart figcaption span {
-  color: #6a7e83;
-  font-size: .68rem;
-  font-weight: 800;
-  letter-spacing: .1em;
-}
-.intraday-chart h4 { margin: 0; color: #213c43; font-size: .94rem; }
-
-.chart-readout {
-  display: flex;
-  align-items: baseline;
-  gap: .7rem;
-  font-variant-numeric: tabular-nums;
-}
-.chart-readout time { color: var(--text-muted); font-size: .78rem; }
-.chart-readout strong { color: currentColor; font-size: 1.04rem; }
-
-.intraday-chart-frame {
-  width: 100%;
-  min-width: 0;
-  overflow: hidden;
-  padding: .2rem 0 0;
-}
-
-.intraday-chart svg {
-  display: block;
-  width: 100%;
-  min-width: 0;
-  max-width: 100%;
-  height: auto;
-  outline: none;
-}
-
-.chart-grid-line { stroke: #e7eeee; stroke-width: 1; }
-.chart-zero-line { stroke: #a9bbbb; stroke-dasharray: 5 5; stroke-width: 1.2; }
-.chart-series-line {
-  fill: none;
-  stroke: currentColor;
-  stroke-linecap: round;
-  stroke-linejoin: round;
-  stroke-width: 2.3;
-  vector-effect: non-scaling-stroke;
-}
-.chart-cursor-line { stroke: #6f8589; stroke-dasharray: 3 4; stroke-width: 1; }
-.chart-active-point { fill: var(--surface); stroke: currentColor; stroke-width: 3; }
-.chart-axis-label {
-  fill: #74858a;
-  font-size: 10px;
-  font-variant-numeric: tabular-nums;
-}
-
-.intraday-chart-empty > .minor { margin: 0; padding: 2rem 1rem; text-align: center; }
-
 .fund-flow-section {
   margin-top: 1.2rem;
   border: 1px solid #dfe9e9;
@@ -818,9 +750,6 @@ button.capture-toggle:active { box-shadow: inset 0 2px 5px rgba(18, 49, 54, .08)
   .indicator-value { font-size: 1.35rem; text-align: right; }
   .fund-flow-section { margin-top: .9rem; padding: .75rem; }
   .intraday-section { margin-top: .9rem; padding: .75rem; }
-  .intraday-chart figcaption { gap: .45rem; }
-  .chart-readout { margin-left: auto; }
-  .chart-axis-label { font-size: 18px; }
   .fund-flow-heading { align-items: flex-start; }
   .fund-flow-heading .minor { font-size: .78rem; }
   .fund-flow-table th, .fund-flow-table td { padding: .5rem .16rem; }

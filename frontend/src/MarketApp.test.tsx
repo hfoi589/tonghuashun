@@ -75,7 +75,24 @@ describe('MarketApp', () => {
           { time: '09:30', price: '8.20', average_price: null, volume: '1200' },
           { time: '14:56', price: '8.33', average_price: null, volume: '900' },
         ],
-        intraday_series: {},
+        intraday_series: {
+          large_order_net: {
+            unit: null,
+            points: [{ time: '09:30', value: '-0.03' }, { time: '14:56', value: '-0.02' }],
+          },
+          large_order_amount: {
+            unit: '万',
+            points: [{ time: '09:30', value: '-3397.0' }, { time: '14:56', value: '-2802.6' }],
+          },
+          retail_count: {
+            unit: null,
+            points: [{ time: '09:30', value: '21.75' }, { time: '14:56', value: '21.23' }],
+          },
+          macdfs: {
+            unit: null,
+            points: [{ time: '09:30', value: '+0.009' }, { time: '14:56', value: '+0.012' }],
+          },
+        },
         order_book: [],
         trades: [],
         main_fund_flow: {},
@@ -114,7 +131,15 @@ describe('MarketApp', () => {
 
     expect(await screen.findByRole('button', { name: /招商轮船/ })).toBeInTheDocument()
     expect((await screen.findAllByText('8.33')).length).toBeGreaterThan(0)
-    expect(screen.getByRole('img', { name: '招商轮船分时价格图' })).toBeInTheDocument()
+    const priceChart = screen.getByRole('img', { name: '招商轮船分时价格图' })
+    const netChart = screen.getByRole('img', { name: '大单净量当日分时图' })
+    const amountChart = screen.getByRole('img', { name: '大单金额当日分时图' })
+    const retailChart = screen.getByRole('img', { name: '散户数量当日分时图' })
+    const macdfsChart = screen.getByRole('img', { name: 'MACDFS当日分时图' })
+    expect(priceChart.compareDocumentPosition(netChart) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+    expect(netChart.compareDocumentPosition(amountChart) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+    expect(amountChart.compareDocumentPosition(retailChart) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+    expect(retailChart.compareDocumentPosition(macdfsChart) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
     expect(screen.getByText('14:56 更新')).toBeInTheDocument()
     expect(screen.getAllByRole('button', { name: /^(分时|日K|五日|周K|月K)$/ }).map((button) => button.textContent)).toEqual([
       '分时', '日K', '五日', '周K', '月K',
@@ -125,6 +150,7 @@ describe('MarketApp', () => {
     ))
     await userEvent.click(screen.getByRole('button', { name: '日K' }))
     expect(await screen.findByRole('img', { name: '招商轮船前复权日K图' })).toBeInTheDocument()
+    expect(screen.queryByRole('img', { name: 'MACDFS当日分时图' })).not.toBeInTheDocument()
     expect(screen.getByText('前复权')).toBeInTheDocument()
     expect(screen.getByText('10jqka 公开源')).toBeInTheDocument()
     expect(fetchMock.mock.calls.filter(([url]) => String(url).includes('/series?period=day')).length).toBe(1)

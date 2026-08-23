@@ -78,6 +78,14 @@ describe('DailyKChart', () => {
     expect(chartHarness.series[10].setData).toHaveBeenCalledWith(expect.arrayContaining([
       expect.objectContaining({ time: '2026-08-21', value: 193604931, color: '#e2232e' }),
     ]))
+    expect(chartHarness.series.slice(1, 7).map((item) => ({
+      lineStyle: item.options.lineStyle,
+      lineWidth: item.options.lineWidth,
+    }))).toEqual(Array(6).fill({ lineStyle: 0, lineWidth: 2 }))
+    expect(chartHarness.series.slice(7, 10).map((item) => ({
+      lineStyle: item.options.lineStyle,
+      lineWidth: item.options.lineWidth,
+    }))).toEqual(Array(3).fill({ lineStyle: 2, lineWidth: 1 }))
   })
 
   it('shows aligned latest values and TradingView attribution', () => {

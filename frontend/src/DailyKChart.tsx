@@ -158,10 +158,11 @@ export function DailyKChart({ name, page, onSelectionChange }: {
     }))
 
     overlayLines.forEach(([key, color]) => {
+      const isBoll = key.startsWith('boll_')
       const series = chart.addSeries(LineSeries, {
         color,
-        lineWidth: 1,
-        lineStyle: key.startsWith('boll_') ? LineStyle.Dashed : LineStyle.Solid,
+        lineWidth: isBoll ? 1 : 2,
+        lineStyle: isBoll ? LineStyle.Dashed : LineStyle.Solid,
         priceLineVisible: false,
         lastValueVisible: false,
         crosshairMarkerVisible: false,

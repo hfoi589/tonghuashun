@@ -234,6 +234,15 @@ def test_redis_store_round_trips_the_long_result_and_values() -> None:
         },
         "/tmp/LONG.png",
         ocr_metrics={MetricKind.LARGE_ORDER_AMOUNT},
+        intraday_series={
+            MetricKind.LARGE_ORDER_NET: {
+                "unit": None,
+                "points": [
+                    {"time": "09:30", "value": "-0.03"},
+                    {"time": "09:31", "value": "-0.02"},
+                ],
+            }
+        },
     )
     restored = RedisStreamsStore(redis).get("long")
 
@@ -242,6 +251,13 @@ def test_redis_store_round_trips_the_long_result_and_values() -> None:
     assert restored.values[MetricKind.LARGE_ORDER_AMOUNT] == "-2802.6万"
     assert restored.value_sources[MetricKind.LARGE_ORDER_AMOUNT].value == "OCR"
     assert restored.value_sources[MetricKind.LARGE_ORDER_NET].value == "INTERFACE"
+    assert restored.intraday_series[MetricKind.LARGE_ORDER_NET] == {
+        "unit": None,
+        "points": [
+            {"time": "09:30", "value": "-0.03"},
+            {"time": "09:31", "value": "-0.02"},
+        ],
+    }
     assert restored.collected_at is not None
 
 

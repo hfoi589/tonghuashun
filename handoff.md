@@ -78,6 +78,13 @@ Runner 对外仍只有一个 `read_direct(symbol)` 数据入口，内部并行�
 - `retail_count`
 - `macdfs`
 
+当前交易日分时曲线位于 `values.intraday_series`，包含
+`large_order_net`、`large_order_amount`、`retail_count` 三条独立曲线。
+每条曲线保存 `unit` 和按时间排序的 `points`（`time` 为 `HH:mm`，`value`
+为格式化字符串或 `null`）；大单金额单位为 `万`。这些点与最新值一样，只能由
+核心设备的 `read_direct()` App 内部接口返回，严禁用 UI、OCR 或截图补齐。
+曲线缺失不改变原八项字段决定的任务状态。
+
 资金增强数据位于 `values.main_fund_flow`，周期为 `today`、`three_day`、
 `five_day`。每个周期保存独立动态单位 `万元` 或 `亿元`，以及：
 

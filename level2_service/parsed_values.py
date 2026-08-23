@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from threading import RLock
 from typing import Any, Callable, Protocol
@@ -98,6 +98,13 @@ class DirectReadOutcome:
 
     values: dict[MetricKind, str | None]
     source_errors: dict[str, str | None]
+    intraday_series: dict[MetricKind, dict[str, Any]] = field(default_factory=dict)
+
+    def __getitem__(self, kind: MetricKind) -> str | None:
+        return self.values[kind]
+
+    def get(self, kind: MetricKind, default: str | None = None) -> str | None:
+        return self.values.get(kind, default)
 
 
 def market_code_for_symbol(symbol: str) -> str:
@@ -152,7 +159,7 @@ class DualAccountParsedValueSource:
             core_future = executor.submit(self.core_source.read_direct, symbol)
             fund_future = executor.submit(self.fund_source.read_direct, symbol)
             try:
-                core_values = core_future.result()
+                core_result = core_future.result()
             except DirectRequestError:
                 raise
             except Exception as error:
@@ -160,13 +167,25 @@ class DualAccountParsedValueSource:
 
             fund_error: str | None = None
             try:
-                fund_values = fund_future.result()
+                fund_result = fund_future.result()
             except DirectRequestError as error:
                 fund_error = error.error_code
-                fund_values = {}
+                fund_result = {}
             except Exception:
                 fund_error = "DIRECT_FUND_FLOW_REQUEST_FAILED"
-                fund_values = {}
+                fund_result = {}
+
+        if isinstance(core_result, DirectReadOutcome):
+            core_values = core_result.values
+            intraday_series = core_result.intraday_series
+        else:
+            core_values = core_result
+            intraday_series = {}
+        fund_values = (
+            fund_result.values
+            if isinstance(fund_result, DirectReadOutcome)
+            else fund_result
+        )
 
         values = empty_metric_values()
         for kind in REQUIRED_METRICS:
@@ -179,6 +198,7 @@ class DualAccountParsedValueSource:
                 "core_metrics": None,
                 "main_fund_flow": fund_error,
             },
+            intraday_series=intraday_series,
         )
 
 
@@ -222,7 +242,7 @@ class FridaParsedValueSource:
         except Exception:
             return empty_metric_values()
 
-    def read_direct(self, symbol: str) -> dict[MetricKind, str | None]:
+    def read_direct(self, symbol: str) -> DirectReadOutcome:
         market = market_code_for_symbol(symbol)
         try:
             with self._frida_lock:
@@ -257,7 +277,11 @@ class FridaParsedValueSource:
         error_code = _text(payload.get("error_code"))
         if error_code is not None:
             raise DirectRequestError(error_code, _text(payload.get("error_message")))
-        return self._parse_payload(payload, symbol)
+        return DirectReadOutcome(
+            values=self._parse_payload(payload, symbol),
+            source_errors={"core_metrics": None, "main_fund_flow": None},
+            intraday_series=self._parse_intraday_series(payload, symbol),
+        )
 
     def lookup_symbol(self, symbol: str) -> SymbolLookup:
         normalized = str(symbol).strip()
@@ -386,6 +410,60 @@ class FridaParsedValueSource:
             result[metrics["main_visible_inflow"]] = _format_number(visible, 2)
             result[metrics["main_hidden_inflow"]] = _format_number(hidden, 2)
             result[metrics["retail_inflow"]] = _format_number(retail, 2)
+        return result
+
+    @staticmethod
+    def _parse_intraday_series(
+        payload: dict[str, Any], symbol: str
+    ) -> dict[MetricKind, dict[str, Any]]:
+        specs = {
+            7031: (MetricKind.LARGE_ORDER_NET, 2, Decimal(1), None),
+            7032: (MetricKind.LARGE_ORDER_AMOUNT, 1, Decimal(10000), "万"),
+            7034: (MetricKind.RETAIL_COUNT, 2, Decimal(1), None),
+        }
+        result: dict[MetricKind, dict[str, Any]] = {}
+        for indicator in payload.get("indicators", ()):
+            if not isinstance(indicator, dict) or not _symbols_match(
+                indicator.get("symbol"), symbol
+            ):
+                continue
+            try:
+                techid = int(indicator.get("techid"))
+            except (TypeError, ValueError):
+                continue
+            spec = specs.get(techid)
+            if spec is None:
+                continue
+            times = indicator.get("times")
+            values = indicator.get("values")
+            if not isinstance(times, (list, tuple)) or not times:
+                continue
+            if not isinstance(values, (list, tuple)):
+                values = ()
+            kind, places, divisor, unit = spec
+            trailing_values = list(values[-len(times):]) if len(values) > len(times) else list(values)
+            leading_gaps = len(times) - len(trailing_values)
+            points: list[dict[str, str | None]] = []
+            for index, raw_time in enumerate(times):
+                formatted_time = _format_intraday_time(raw_time)
+                if formatted_time is None:
+                    continue
+                raw_value = (
+                    trailing_values[index - leading_gaps]
+                    if index >= leading_gaps
+                    else None
+                )
+                number = _interface_decimal(raw_value)
+                points.append(
+                    {
+                        "time": formatted_time,
+                        "value": _format_number(
+                            number / divisor if number is not None else None,
+                            places,
+                        ),
+                    }
+                )
+            result[kind] = {"unit": unit, "points": points}
         return result
 
     @staticmethod
@@ -597,6 +675,19 @@ def _interface_decimal(value: object) -> Decimal | None:
     if number in {Decimal("-2147483648"), Decimal("-9223372036854775808")}:
         return None
     return number
+
+
+def _format_intraday_time(value: object) -> str | None:
+    text = _text(value)
+    if text is None:
+        return None
+    compact = text.replace(":", "")
+    if compact.isdigit() and 3 <= len(compact) <= 4:
+        padded = compact.zfill(4)
+        hour, minute = int(padded[:2]), int(padded[2:])
+        if 0 <= hour <= 23 and 0 <= minute <= 59:
+            return f"{hour:02d}:{minute:02d}"
+    return text
 
 
 def _format_number(
@@ -1048,7 +1139,8 @@ rpc.exports = {
                       clearInterval(timer);
                       removeGroup(group);
                       if (processor !== null) try { processor.clear(); } catch (_) {}
-                      accept({ symbol: symbol, techid: techId, values: selected });
+                      var times = valuesFromCurve(parsed._d.value, 1) || valuesFromCurve(base, 1);
+                      accept({ symbol: symbol, techid: techId, times: times || [], values: selected });
                       return;
                     }
                   }

@@ -9,7 +9,7 @@ from pathlib import Path
 from threading import Lock
 from typing import Protocol
 
-from .models import CaptureKind, CaptureRecord, CaptureStatus, LongCaptureRecord, MetricKind, REQUIRED_METRICS, SOURCE_ERROR_KEYS, TaskRecord, TaskStatus, ValueSource, utc_now
+from .models import CaptureKind, CaptureRecord, CaptureStatus, INTRADAY_METRICS, LongCaptureRecord, MetricKind, REQUIRED_METRICS, SOURCE_ERROR_KEYS, TaskRecord, TaskStatus, ValueSource, normalized_intraday_series, utc_now
 
 
 class QueueFullError(RuntimeError):
@@ -30,7 +30,7 @@ class TaskStore(Protocol):
     def retry_failed(self, task_id: str) -> TaskRecord: ...
     def transition(self, task_id: str, status: TaskStatus, *, error_code: str | None = None, source_errors: dict[str, str | None] | None = None) -> TaskRecord: ...
     def complete_capture(self, task_id: str, kind: CaptureKind, path: str) -> TaskRecord: ...
-    def complete_result(self, task_id: str, values: dict[MetricKind, str | None], path: str | None, *, ocr_metrics: set[MetricKind] | None = None, source_errors: dict[str, str | None] | None = None) -> TaskRecord: ...
+    def complete_result(self, task_id: str, values: dict[MetricKind, str | None], path: str | None, *, ocr_metrics: set[MetricKind] | None = None, source_errors: dict[str, str | None] | None = None, intraday_series: dict[MetricKind, dict[str, object]] | None = None) -> TaskRecord: ...
     def events_after(self, task_id: str, event_index: int = 0) -> list[dict[str, str]]: ...
     def cleanup(self, now: datetime) -> list[TaskRecord]: ...
 
@@ -179,7 +179,7 @@ class InMemoryStreams:
         self._emit(task)
         return task
 
-    def complete_result(self, task_id: str, values: dict[MetricKind, str | None], path: str | None, *, ocr_metrics: set[MetricKind] | None = None, source_errors: dict[str, str | None] | None = None) -> TaskRecord:
+    def complete_result(self, task_id: str, values: dict[MetricKind, str | None], path: str | None, *, ocr_metrics: set[MetricKind] | None = None, source_errors: dict[str, str | None] | None = None, intraday_series: dict[MetricKind, dict[str, object]] | None = None) -> TaskRecord:
         task = self._tasks[task_id]
         if task.status not in {TaskStatus.RUNNING, TaskStatus.PARTIAL}:
             raise InvalidTransitionError(f"{task.status.value} cannot accept a result")
@@ -193,6 +193,7 @@ class InMemoryStreams:
             )
             for kind in MetricKind
         }
+        task.intraday_series = normalized_intraday_series(intraday_series)
         task.source_errors = _normalized_source_errors(source_errors)
         now = utc_now()
         if task.include_long_capture:
@@ -534,7 +535,7 @@ return updated
         self._emit(task)
         return task
 
-    def complete_result(self, task_id: str, values: dict[MetricKind, str | None], path: str | None, *, ocr_metrics: set[MetricKind] | None = None, source_errors: dict[str, str | None] | None = None) -> TaskRecord:
+    def complete_result(self, task_id: str, values: dict[MetricKind, str | None], path: str | None, *, ocr_metrics: set[MetricKind] | None = None, source_errors: dict[str, str | None] | None = None, intraday_series: dict[MetricKind, dict[str, object]] | None = None) -> TaskRecord:
         task = self._required(task_id)
         if task.status not in {TaskStatus.RUNNING, TaskStatus.PARTIAL}:
             raise InvalidTransitionError(f"{task.status.value} cannot accept a result")
@@ -548,6 +549,7 @@ return updated
             )
             for kind in MetricKind
         }
+        task.intraday_series = normalized_intraday_series(intraday_series)
         task.source_errors = _normalized_source_errors(source_errors)
         now = utc_now()
         if task.include_long_capture:
@@ -676,6 +678,11 @@ return updated
                 kind.value: source.value if source is not None else None
                 for kind, source in task.value_sources.items()
             },
+            "intraday_series": {
+                kind.value: series
+                for _, kind, _ in INTRADAY_METRICS
+                if (series := task.intraday_series.get(kind)) is not None
+            },
             "long_capture": {
                 "status": task.long_capture.status.value,
                 "path": str(task.long_capture.path) if task.long_capture.path else None,
@@ -721,6 +728,11 @@ return updated
                 if source is not None
                 else ValueSource.INTERFACE if task.values[kind] is not None else None
             )
+        stored_intraday = raw.get("intraday_series", {})
+        task.intraday_series = normalized_intraday_series({
+            kind: stored_intraday.get(kind.value, {})
+            for _, kind, _ in INTRADAY_METRICS
+        })
         long_capture = raw.get("long_capture")
         if long_capture:
             task.long_capture = LongCaptureRecord(

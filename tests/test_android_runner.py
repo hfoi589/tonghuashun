@@ -711,6 +711,12 @@ def test_data_only_runner_publishes_a_nonfatal_fund_source_error_with_core_value
                 "core_metrics": None,
                 "main_fund_flow": "DIRECT_FUND_FLOW_TIMEOUT",
             },
+            intraday_series={
+                MetricKind.RETAIL_COUNT: {
+                    "unit": None,
+                    "points": [{"time": "09:31", "value": "21.23"}],
+                }
+            },
         )
     )
 
@@ -720,6 +726,9 @@ def test_data_only_runner_publishes_a_nonfatal_fund_source_error_with_core_value
     assert task.error_code == "DIRECT_FUND_FLOW_TIMEOUT"
     assert legacy_values(task.values) == PARSED_VALUES
     assert task.source_errors["main_fund_flow"] == "DIRECT_FUND_FLOW_TIMEOUT"
+    assert task.intraday_series[MetricKind.RETAIL_COUNT]["points"] == [
+        {"time": "09:31", "value": "21.23"}
+    ]
 
 
 def test_data_only_runner_preserves_interface_error_without_ocr_fallback(tmp_path: Path) -> None:

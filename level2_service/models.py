@@ -85,6 +85,12 @@ FUND_FLOW_METRICS = {
     },
 }
 
+INTRADAY_METRICS = (
+    ("large_order_net", MetricKind.LARGE_ORDER_NET, None),
+    ("large_order_amount", MetricKind.LARGE_ORDER_AMOUNT, "万"),
+    ("retail_count", MetricKind.RETAIL_COUNT, None),
+)
+
 SOURCE_ERROR_KEYS = ("core_metrics", "main_fund_flow")
 
 
@@ -156,6 +162,9 @@ class TaskRecord:
     value_sources: dict[MetricKind, ValueSource | None] = field(
         default_factory=lambda: {kind: None for kind in MetricKind}
     )
+    intraday_series: dict[MetricKind, dict[str, Any]] = field(
+        default_factory=lambda: normalized_intraday_series(None)
+    )
     long_capture: LongCaptureRecord = field(default_factory=LongCaptureRecord)
 
     def __post_init__(self) -> None:
@@ -169,6 +178,8 @@ class TaskRecord:
     def as_public(self) -> dict[str, Any]:
         main_fund_flow: dict[str, dict[str, str | None]] = {}
         main_fund_flow_sources: dict[str, dict[str, str | None]] = {}
+        intraday_series: dict[str, dict[str, Any]] = {}
+        intraday_series_sources: dict[str, str | None] = {}
         for period, _, unit_kind in FUND_FLOW_PERIODS:
             metrics = FUND_FLOW_METRICS[period]
             main_fund_flow[period] = {
@@ -182,6 +193,21 @@ class TaskRecord:
                 field: self._public_value_source(kind)
                 for field, kind in metrics.items()
             }
+        for field_name, kind, default_unit in INTRADAY_METRICS:
+            series = self.intraday_series.get(
+                kind,
+                {"unit": default_unit, "points": []},
+            )
+            points = [dict(point) for point in series.get("points", [])]
+            intraday_series[field_name] = {
+                "unit": series.get("unit", default_unit),
+                "points": points,
+            }
+            intraday_series_sources[field_name] = (
+                ValueSource.INTERFACE.value
+                if any(point.get("value") is not None for point in points)
+                else None
+            )
         return {
             "public_id": self.task_id,
             "symbol": self.symbol,
@@ -221,6 +247,7 @@ class TaskRecord:
                 "large_order_amount": self.values[MetricKind.LARGE_ORDER_AMOUNT],
                 "retail_count": self.values[MetricKind.RETAIL_COUNT],
                 "macdfs": self.values[MetricKind.MACDFS],
+                "intraday_series": intraday_series,
                 "main_fund_flow": main_fund_flow,
             },
             "value_sources": {
@@ -232,6 +259,7 @@ class TaskRecord:
                 "large_order_amount": self._public_value_source(MetricKind.LARGE_ORDER_AMOUNT),
                 "retail_count": self._public_value_source(MetricKind.RETAIL_COUNT),
                 "macdfs": self._public_value_source(MetricKind.MACDFS),
+                "intraday_series": intraday_series_sources,
                 "main_fund_flow": main_fund_flow_sources,
             },
             "long_capture": {
@@ -252,3 +280,23 @@ class TaskRecord:
     def _public_value_source(self, kind: MetricKind) -> str | None:
         source = self.value_sources[kind]
         return source.value if source is not None else None
+
+
+def normalized_intraday_series(
+    provided: dict[MetricKind, dict[str, Any]] | None,
+) -> dict[MetricKind, dict[str, Any]]:
+    source = provided or {}
+    normalized: dict[MetricKind, dict[str, Any]] = {}
+    for _, kind, default_unit in INTRADAY_METRICS:
+        series = source.get(kind, {})
+        raw_points = series.get("points", []) if isinstance(series, dict) else []
+        points = [
+            {"time": point.get("time"), "value": point.get("value")}
+            for point in raw_points
+            if isinstance(point, dict) and point.get("time") is not None
+        ]
+        normalized[kind] = {
+            "unit": series.get("unit", default_unit) if isinstance(series, dict) else default_unit,
+            "points": points,
+        }
+    return normalized

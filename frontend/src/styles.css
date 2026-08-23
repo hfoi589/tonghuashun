@@ -59,7 +59,7 @@ button:disabled { cursor: not-allowed; opacity: .5; }
 button.secondary { border-color: var(--border); background: #edf3f3; color: #27434b; }
 button.secondary:not(:disabled):hover { border-color: var(--border-strong); background: #e5eded; }
 
-button:focus-visible, input:focus-visible, a:focus-visible, .device-canvas:focus-visible {
+button:focus-visible, input:focus-visible, a:focus-visible, .device-canvas:focus-visible, .intraday-chart svg:focus-visible {
   outline: 3px solid rgba(31, 132, 148, .34);
   outline-offset: 2px;
 }
@@ -399,6 +399,90 @@ input:hover { border-color: #8ea9aa; }
 
 .value-placeholder { margin: 0; min-height: 1.5em; font-weight: 650; }
 
+.intraday-section {
+  margin-top: 1.2rem;
+  border: 1px solid #d8e5e4;
+  border-radius: 14px;
+  background: #f7faf9;
+  padding: 1rem;
+}
+
+.intraday-heading { margin-bottom: .85rem; }
+.intraday-heading h3 { margin: 0; color: #17333b; font-size: 1.05rem; }
+
+.intraday-chart-list {
+  display: grid;
+  gap: 1rem;
+}
+
+.intraday-chart {
+  min-width: 0;
+  margin: 0;
+  overflow: visible;
+}
+
+.intraday-chart figcaption {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: .3rem 0 .15rem;
+}
+
+.intraday-chart figcaption > div:first-child { display: grid; gap: .16rem; }
+.intraday-chart figcaption span {
+  color: #6a7e83;
+  font-size: .68rem;
+  font-weight: 800;
+  letter-spacing: .1em;
+}
+.intraday-chart h4 { margin: 0; color: #213c43; font-size: .94rem; }
+
+.chart-readout {
+  display: flex;
+  align-items: baseline;
+  gap: .7rem;
+  font-variant-numeric: tabular-nums;
+}
+.chart-readout time { color: var(--text-muted); font-size: .78rem; }
+.chart-readout strong { color: currentColor; font-size: 1.04rem; }
+
+.intraday-chart-frame {
+  width: 100%;
+  min-width: 0;
+  overflow: hidden;
+  padding: .2rem 0 0;
+}
+
+.intraday-chart svg {
+  display: block;
+  width: 100%;
+  min-width: 0;
+  max-width: 100%;
+  height: auto;
+  outline: none;
+}
+
+.chart-grid-line { stroke: #e7eeee; stroke-width: 1; }
+.chart-zero-line { stroke: #a9bbbb; stroke-dasharray: 5 5; stroke-width: 1.2; }
+.chart-series-line {
+  fill: none;
+  stroke: currentColor;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  stroke-width: 2.3;
+  vector-effect: non-scaling-stroke;
+}
+.chart-cursor-line { stroke: #6f8589; stroke-dasharray: 3 4; stroke-width: 1; }
+.chart-active-point { fill: var(--surface); stroke: currentColor; stroke-width: 3; }
+.chart-axis-label {
+  fill: #74858a;
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+}
+
+.intraday-chart-empty > .minor { margin: 0; padding: 2rem 1rem; text-align: center; }
+
 .fund-flow-section {
   margin-top: 1.2rem;
   border: 1px solid #dfe9e9;
@@ -418,16 +502,15 @@ input:hover { border-color: #8ea9aa; }
 }
 
 .fund-flow-table-wrap {
-  overflow-x: auto;
-  border: 1px solid var(--border);
-  border-radius: 11px;
-  background: var(--surface);
-  -webkit-overflow-scrolling: touch;
+  width: 100%;
+  min-width: 0;
+  overflow: hidden;
 }
 
 .fund-flow-table {
   width: 100%;
-  min-width: 520px;
+  min-width: 0;
+  table-layout: fixed;
   border-collapse: collapse;
   font-variant-numeric: tabular-nums;
 }
@@ -435,50 +518,39 @@ input:hover { border-color: #8ea9aa; }
 .fund-flow-table th,
 .fund-flow-table td {
   border-bottom: 1px solid #e5eeee;
-  padding: .72rem .85rem;
+  padding: .58rem .35rem;
   text-align: right;
   white-space: nowrap;
 }
 
 .fund-flow-table thead th {
-  background: #f4f9f8;
   color: #426169;
   font-size: .78rem;
   font-weight: 750;
 }
+
+.fund-flow-table thead th:first-child { width: 31%; }
 
 .fund-flow-table thead th:first-child,
 .fund-flow-table tbody th {
   text-align: left;
 }
 
-.fund-flow-table thead th span,
-.fund-flow-table thead th small {
-  display: block;
-}
-
-.fund-flow-table thead th small {
-  margin-top: .15rem;
-  color: var(--text-muted);
-  font-size: .7rem;
-  font-weight: 600;
-}
-
 .fund-flow-table tbody th {
   color: #506970;
-  font-size: .82rem;
+  font-size: .78rem;
   font-weight: 700;
 }
 
 .fund-flow-table tbody td {
   color: var(--market-neutral);
-  font-size: 1rem;
+  font-size: .92rem;
   font-weight: 760;
 }
 
 .fund-flow-table tbody td > span {
   display: inline-block;
-  min-width: 4.8rem;
+  min-width: 0;
 }
 
 .fund-flow-table tbody td .ocr-source {
@@ -713,8 +785,15 @@ button.capture-toggle:active { box-shadow: inset 0 2px 5px rgba(18, 49, 54, .08)
   .value-label { margin: 0; }
   .indicator-value { font-size: 1.35rem; text-align: right; }
   .fund-flow-section { margin-top: .9rem; padding: .75rem; }
+  .intraday-section { margin-top: .9rem; padding: .75rem; }
+  .intraday-chart figcaption { gap: .45rem; }
+  .chart-readout { margin-left: auto; }
+  .chart-axis-label { font-size: 18px; }
   .fund-flow-heading { align-items: flex-start; }
   .fund-flow-heading .minor { font-size: .78rem; }
+  .fund-flow-table th, .fund-flow-table td { padding: .5rem .16rem; }
+  .fund-flow-table thead th, .fund-flow-table tbody th { font-size: .72rem; }
+  .fund-flow-table tbody td { font-size: .8rem; }
   button.capture-toggle { align-items: flex-start; flex-direction: column; }
   .capture-toggle-label { width: 100%; justify-content: space-between; }
   .capture-actions { justify-content: stretch; }

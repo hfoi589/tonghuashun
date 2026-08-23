@@ -1269,6 +1269,7 @@ class Level2Runner:
             return None
         self.control.heartbeat("READY")
         source_errors: dict[str, str | None] | None = None
+        intraday_series: dict[MetricKind, dict[str, object]] | None = None
         try:
             frames: tuple[bytes, ...] | None = None
             long_capture: bytes | None = None
@@ -1283,6 +1284,7 @@ class Level2Runner:
             if isinstance(direct_result, DirectReadOutcome):
                 values = direct_result.values
                 source_errors = direct_result.source_errors
+                intraday_series = direct_result.intraday_series
             else:
                 values = direct_result
             if task.include_long_capture:
@@ -1339,6 +1341,7 @@ class Level2Runner:
                 values,
                 str(path) if path is not None else None,
                 source_errors=source_errors,
+                intraday_series=intraday_series,
             )
         except Exception:
             failed = self.store.get(task.task_id) or task

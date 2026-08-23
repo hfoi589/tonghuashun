@@ -131,6 +131,49 @@ def test_long_result_completion_stores_one_image_and_eight_values() -> None:
     assert all(capture.status == CaptureStatus.PENDING for capture in result.captures.values())
 
 
+def test_completed_result_publishes_intraday_series_without_changing_scalar_status() -> None:
+    """Keeping series outside the task result would lose it before the public API reads it."""
+    store = InMemoryStreams()
+    store.enqueue(TaskRecord(task_id="series-task", symbol="601872", include_long_capture=False))
+    store.next_queued()
+    series = {
+        MetricKind.LARGE_ORDER_NET: {
+            "unit": None,
+            "points": [
+                {"time": "09:30", "value": "-0.03"},
+                {"time": "09:31", "value": "-0.02"},
+            ],
+        },
+        MetricKind.LARGE_ORDER_AMOUNT: {
+            "unit": "万",
+            "points": [{"time": "09:31", "value": "-2802.6"}],
+        },
+        MetricKind.RETAIL_COUNT: {
+            "unit": None,
+            "points": [{"time": "09:31", "value": "21.23"}],
+        },
+    }
+
+    public = store.complete_result(
+        "series-task",
+        FULL_VALUES,
+        None,
+        intraday_series=series,
+    ).as_public()
+
+    assert public["status"] == "COMPLETED"
+    assert public["values"]["large_order_net"] == "-0.02"
+    assert public["values"]["intraday_series"]["large_order_amount"] == {
+        "unit": "万",
+        "points": [{"time": "09:31", "value": "-2802.6"}],
+    }
+    assert public["value_sources"]["intraday_series"] == {
+        "large_order_net": "INTERFACE",
+        "large_order_amount": "INTERFACE",
+        "retail_count": "INTERFACE",
+    }
+
+
 def test_legacy_eight_values_can_complete_when_optional_fund_flow_is_empty() -> None:
     store = InMemoryStreams()
     store.enqueue(TaskRecord(task_id="legacy-complete", symbol="601872"))

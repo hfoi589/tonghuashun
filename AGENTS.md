@@ -121,6 +121,21 @@ GET /api/v1/jobs/{public_id}
 | `retail_count` | 最新散户数量指标，保留两位小数 |
 | `macdfs` | 最新 MACDFS 点，保留三位小数，正数带 `+` |
 
+`values.intraday_series` 是当前交易日的 App 分时曲线，包含
+`large_order_net`、`large_order_amount` 和 `retail_count`。每条曲线返回
+独立的 `unit` 和按时间排序的 `points`；点的 `time` 为 `HH:mm`，`value` 为
+格式化字符串或 `null`。大单金额统一换算为 `万`。曲线只能来自
+`core_metrics` 的 `read_direct()` App 内部接口，禁止使用 UI、OCR 或截图补值。
+`value_sources.intraday_series` 对有有效点的曲线为 `INTERFACE`，否则为
+`null`；曲线缺失不改变原八项指标的任务完成状态。
+
+前端结果区的数据展示顺序固定为：原八项指标卡片（`MACDFS` 最后）、
+`main_fund_flow` 主力流向、`intraday_series` App 内部曲线。主力流向在前端
+统一换算为 `亿元` 并四舍五入保留两位小数，但 API 仍保留 App 返回的动态单位
+和原始格式化值。主力流向和 App 内部曲线都只保留各自最外层容器边框，内部
+表格/曲线不得再套卡片边框。资金表和 SVG 曲线必须在手机宽度内完整缩放，
+不得依赖横向滚动查看右侧内容。
+
 `values.main_fund_flow` 是可选增强，按 `today`、`three_day`、`five_day`
 三个周期返回。每个周期包含独立的动态 `unit`（`万元` 或 `亿元`），以及
 `main_net_inflow`、`main_visible_inflow`、`main_hidden_inflow`、
@@ -160,7 +175,10 @@ GET /api/v1/jobs/{public_id}
   - `main_fund_flow`：`THS_API_33_ARM64 / emulator-5554 / 27042`，只用于资金 1/3/5 日接口。
 - `emulator-5554` 是受保护的当前资金账号。禁止退出登录、切换账号、克隆 AVD、重装/卸载 App、清数据、`force-stop` 或自动页面导航。
 - 自动任务导航和长截图只能操作 `emulator-5556`。核心设备必须保持 `wm size 1080x1920` 和 `wm density 480`；使用 `scripts/configure-macos-core-display.sh` 校准。
-- 在本 Mac 上必须使用 `deploy/macos.env` 部署，HTTP 使用 8001 端口，不得重新引入 Caddy。
+- 在本 Mac 上必须使用 OrbStack Docker context 和 `deploy/macos.env` 部署，标准命令为
+  `docker --context orbstack compose --env-file .env --env-file deploy/macos.env -f deploy/compose.yml up -d --build`。
+  根目录 `.env` 提供管理密钥，`deploy/macos.env` 提供本 Mac 的设备配置；两者必须同时加载。
+  禁止使用 Docker Desktop 的 `desktop-linux` context。HTTP 使用 8001 端口，不得重新引入 Caddy。
 - 双账号变量 `CORE_ADB_SERIAL`、`CORE_FRIDA_SERVER_ENDPOINT`、`FUND_ADB_SERIAL`、`FUND_FRIDA_SERVER_ENDPOINT` 必须四项齐全；旧单设备变量仅用于兼容模式。
 - 重建 API 服务时必须保留 Redis 数据卷以及 Android 模拟器数据和登录状态。
 - 管理页面同时显示两台设备；两个 WebSocket 为 `/api/admin/devices/core_metrics` 和 `/api/admin/devices/main_fund_flow`，旧 `/api/admin/device` 只映射到 `core_metrics`。
@@ -298,6 +316,24 @@ The terminal result is in `values`:
 | `retail_count` | Latest retail-count indicator, two decimal places |
 | `macdfs` | Latest MACDFS point, three decimal places; positive values include `+` |
 
+`values.intraday_series` contains the current trading day's App intraday curves
+for `large_order_net`, `large_order_amount`, and `retail_count`. Each curve has
+its own `unit` and time-ordered `points`; point `time` is `HH:mm`, while `value`
+is a formatted string or `null`. Large-order amount uses `万`. Curves must come
+only from the `core_metrics` App-internal `read_direct()` request and must never
+be filled from UI text, OCR, or screenshots. A curve's
+`value_sources.intraday_series` entry is `INTERFACE` when it has at least one
+valid point and otherwise `null`. Missing curves do not affect completion based
+on the eight required scalar values.
+
+The frontend result order is fixed: the eight scalar cards (`MACDFS` last),
+`main_fund_flow`, then the `intraday_series` App curves. The frontend converts
+all fund-flow values to `亿元` and rounds them to two decimal places, while the
+API keeps the App's dynamic units and original formatted values. Fund flow and
+App curves retain only their outer section border; tables and individual curves
+must not add nested card borders. Both the fund table and SVG curves must fit a
+mobile viewport without horizontal scrolling to reveal right-side content.
+
 `values.main_fund_flow` is an optional enhancement with `today`,
 `three_day`, and `five_day` periods. Each period carries its own dynamic
 `unit` (`万元` or `亿元`) plus `main_net_inflow`, `main_visible_inflow`,
@@ -341,7 +377,13 @@ chart heading is present; it is never a source for any field in `values`.
   - `main_fund_flow`: `THS_API_33_ARM64 / emulator-5554 / 27042` only for 1/3/5-day fund-flow interface requests.
 - `emulator-5554` holds the protected current fund account. Never log it out, switch accounts, clone the AVD, reinstall/uninstall or clear the App, `force-stop` it, or navigate it automatically.
 - Automated navigation and long captures may operate only on `emulator-5556`. Keep the core device at `wm size 1080x1920` and `wm density 480`; use `scripts/configure-macos-core-display.sh` to calibrate it.
-- On this Mac, deploy with `deploy/macos.env`, keep HTTP on port 8001, and do not reintroduce Caddy.
+- On this Mac, deploy with the OrbStack Docker context and `deploy/macos.env`.
+  The canonical command is
+  `docker --context orbstack compose --env-file .env --env-file deploy/macos.env -f deploy/compose.yml up -d --build`.
+  The root `.env` provides the administrator secrets, while `deploy/macos.env`
+  provides this Mac's device configuration; load both files.
+  Do not use Docker Desktop's `desktop-linux` context. Keep HTTP on port 8001,
+  and do not reintroduce Caddy.
 - `CORE_ADB_SERIAL`, `CORE_FRIDA_SERVER_ENDPOINT`, `FUND_ADB_SERIAL`, and `FUND_FRIDA_SERVER_ENDPOINT` must be provided together; legacy single-device variables are compatibility-only.
 - Preserve the Redis volume and Android emulator data/login state when rebuilding the API service.
 - The admin page shows both devices concurrently. Its WebSockets are `/api/admin/devices/core_metrics` and `/api/admin/devices/main_fund_flow`; legacy `/api/admin/device` maps only to `core_metrics`.

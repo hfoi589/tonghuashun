@@ -24,6 +24,22 @@ export interface MainFundFlowValues {
   five_day: MainFundFlowPeriod
 }
 
+export interface IntradayPoint {
+  time: string
+  value: string | null
+}
+
+export interface IntradayMetricSeries {
+  unit: string | null
+  points: IntradayPoint[]
+}
+
+export interface IntradaySeriesValues {
+  large_order_net: IntradayMetricSeries
+  large_order_amount: IntradayMetricSeries
+  retail_count: IntradayMetricSeries
+}
+
 export interface JobValues {
   stock_name: string | null
   current_price: string | null
@@ -33,6 +49,7 @@ export interface JobValues {
   large_order_amount: string | null
   retail_count: string | null
   macdfs: string | null
+  intraday_series?: IntradaySeriesValues
   main_fund_flow: MainFundFlowValues
 }
 
@@ -47,6 +64,11 @@ export interface JobValueSources {
   large_order_amount: ValueSource | null
   retail_count: ValueSource | null
   macdfs: ValueSource | null
+  intraday_series?: {
+    large_order_net: ValueSource | null
+    large_order_amount: ValueSource | null
+    retail_count: ValueSource | null
+  }
   main_fund_flow: {
     today: MainFundFlowPeriodSources
     three_day: MainFundFlowPeriodSources

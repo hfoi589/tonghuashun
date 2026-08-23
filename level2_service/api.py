@@ -98,6 +98,28 @@ class MainFundFlowSourcesResponse(BaseModel):
     five_day: MainFundFlowPeriodSourcesResponse
 
 
+class IntradayPointResponse(BaseModel):
+    time: str
+    value: Optional[str]
+
+
+class IntradayMetricSeriesResponse(BaseModel):
+    unit: Optional[str]
+    points: list[IntradayPointResponse]
+
+
+class IntradaySeriesResponse(BaseModel):
+    large_order_net: IntradayMetricSeriesResponse
+    large_order_amount: IntradayMetricSeriesResponse
+    retail_count: IntradayMetricSeriesResponse
+
+
+class IntradaySeriesSourcesResponse(BaseModel):
+    large_order_net: Optional[ValueSource]
+    large_order_amount: Optional[ValueSource]
+    retail_count: Optional[ValueSource]
+
+
 class TaskValuesResponse(BaseModel):
     stock_name: Optional[str]
     current_price: Optional[str]
@@ -107,6 +129,7 @@ class TaskValuesResponse(BaseModel):
     large_order_amount: Optional[str]
     retail_count: Optional[str]
     macdfs: Optional[str]
+    intraday_series: IntradaySeriesResponse
     main_fund_flow: MainFundFlowResponse
 
 
@@ -119,6 +142,7 @@ class TaskValueSourcesResponse(BaseModel):
     large_order_amount: Optional[ValueSource]
     retail_count: Optional[ValueSource]
     macdfs: Optional[ValueSource]
+    intraday_series: IntradaySeriesSourcesResponse
     main_fund_flow: MainFundFlowSourcesResponse
 
 

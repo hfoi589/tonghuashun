@@ -249,29 +249,101 @@ describe('Level2 web UI', () => {
     expect(within(screen.getByText('MACDFS').closest('article')!).getByText('+0.012')).toHaveClass('market-up')
   })
 
-  it('renders the three-period main fund flow comparison with dynamic units and signs', () => {
+  it('converts every main fund flow period to rounded hundred-million values', () => {
     render(<JobResult task={{
       ...task,
       status: 'COMPLETED',
       values: {
         ...task.values,
         main_fund_flow: {
-          today: { unit: '亿元', main_net_inflow: '5.35', main_visible_inflow: '-0.28', main_hidden_inflow: '5.63', retail_inflow: '-5.35' },
-          three_day: { unit: '亿元', main_net_inflow: '12.96', main_visible_inflow: '3.63', main_hidden_inflow: '9.34', retail_inflow: '-12.96' },
+          today: { unit: '亿元', main_net_inflow: '5.355', main_visible_inflow: '-0.28', main_hidden_inflow: '5.63', retail_inflow: '-5.355' },
+          three_day: { unit: '万元', main_net_inflow: '12350', main_visible_inflow: '-12350', main_hidden_inflow: '50', retail_inflow: '-12350' },
           five_day: { unit: '万元', main_net_inflow: null, main_visible_inflow: null, main_hidden_inflow: null, retail_inflow: null },
         },
       },
     }} />)
 
-    expect(screen.getByRole('columnheader', { name: /当日 亿元/ })).toBeInTheDocument()
-    expect(screen.getByRole('columnheader', { name: /3日 亿元/ })).toBeInTheDocument()
-    expect(screen.getByRole('columnheader', { name: /5日 万元/ })).toBeInTheDocument()
+    expect(screen.getByText('统一单位：亿元')).toBeInTheDocument()
+    expect(screen.queryByText('万元')).not.toBeInTheDocument()
     const netRow = screen.getByText('主力净流入').closest('tr')!
-    expect(within(netRow).getByText('+5.35')).toHaveClass('market-up')
-    expect(within(netRow).getByText('+12.96')).toHaveClass('market-up')
+    expect(within(netRow).getByText('+5.36')).toHaveClass('market-up')
+    expect(within(netRow).getByText('+1.24')).toHaveClass('market-up')
     expect(within(netRow).getByText('未识别')).toBeInTheDocument()
+    const visibleRow = screen.getByText('主力明盘').closest('tr')!
+    expect(within(visibleRow).getByText('-1.24')).toHaveClass('market-down')
+    const hiddenRow = screen.getByText('主力暗盘').closest('tr')!
+    expect(within(hiddenRow).getByText('+0.01')).toHaveClass('market-up')
     const retailRow = screen.getByText('散户流入').closest('tr')!
-    expect(within(retailRow).getByText('-5.35')).toHaveClass('market-down')
+    expect(within(retailRow).getByText('-1.24')).toHaveClass('market-down')
+  })
+
+  it('places main fund flow after MACDFS and the intraday curves last', () => {
+    render(<JobResult task={{
+      ...task,
+      status: 'COMPLETED',
+      values: {
+        ...task.values,
+        intraday_series: {
+          large_order_net: { unit: null, points: [{ time: '09:30', value: '-0.02' }] },
+          large_order_amount: { unit: '万', points: [] },
+          retail_count: { unit: null, points: [] },
+        },
+      },
+    }} />)
+
+    const macdfs = screen.getByText('MACDFS').closest('article')!
+    const fundFlow = screen.getByRole('heading', { name: '主力流向' }).closest('section')!
+    const intraday = screen.getByRole('heading', { name: '当日分时' }).closest('section')!
+
+    expect(macdfs.compareDocumentPosition(fundFlow) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+    expect(fundFlow.compareDocumentPosition(intraday) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+  })
+
+  it('renders three separate intraday charts and lets the keyboard inspect earlier points', async () => {
+    const user = userEvent.setup()
+    render(<JobResult task={{
+      ...task,
+      status: 'COMPLETED',
+      values: {
+        ...task.values,
+        intraday_series: {
+          large_order_net: {
+            unit: null,
+            points: [
+              { time: '09:30', value: '-0.03' },
+              { time: '09:31', value: '-0.02' },
+            ],
+          },
+          large_order_amount: {
+            unit: '万',
+            points: [
+              { time: '09:30', value: '-3397.0' },
+              { time: '09:31', value: '-2802.6' },
+            ],
+          },
+          retail_count: {
+            unit: null,
+            points: [
+              { time: '09:30', value: '21.75' },
+              { time: '09:31', value: '21.23' },
+            ],
+          },
+        },
+      },
+    }} />)
+
+    const netChart = screen.getByRole('img', { name: '大单净量当日分时图' })
+    expect(screen.getByRole('img', { name: '大单金额当日分时图' })).toBeInTheDocument()
+    expect(screen.getByRole('img', { name: '散户数量当日分时图' })).toBeInTheDocument()
+    expect(within(netChart).getAllByText('09:30', { selector: '.chart-axis-label' })).toHaveLength(1)
+    expect(within(netChart.closest('figure')!).getByText('09:31', { selector: 'time' })).toBeInTheDocument()
+    expect(within(netChart.closest('figure')!).getByText('-0.02', { selector: 'strong' })).toBeInTheDocument()
+
+    netChart.focus()
+    await user.keyboard('{ArrowLeft}')
+
+    expect(within(netChart.closest('figure')!).getByText('09:30', { selector: 'time' })).toBeInTheDocument()
+    expect(within(netChart.closest('figure')!).getByText('-0.03', { selector: 'strong' })).toBeInTheDocument()
   })
 
   it('keeps zero, unparseable, missing, price, and turnover values neutral', () => {

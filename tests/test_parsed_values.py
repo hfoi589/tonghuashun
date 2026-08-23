@@ -230,6 +230,88 @@ def test_direct_read_passes_the_derived_market_to_the_app_and_formats_fresh_valu
     assert values[MetricKind.LARGE_ORDER_AMOUNT] == "-2802.6万"
 
 
+def test_direct_read_preserves_the_three_app_intraday_series_with_their_time_axis() -> None:
+    """Taking only values[-1] would make the public charts lose the App curve."""
+    payload = _runtime_payload()
+    payload["indicators"] = [
+        {
+            "symbol": "601872",
+            "techid": 7031,
+            "times": [930, 931],
+            "values": [-0.020211, -0.016403],
+        },
+        {
+            "symbol": "601872",
+            "techid": 7032,
+            "times": ["09:30", "09:31"],
+            "values": [-33970070, -28025640],
+        },
+        {
+            "symbol": "601872",
+            "techid": 7034,
+            "times": ["0930", "0931"],
+            "values": [21.753745905766515, 21.22634653875312],
+        },
+    ]
+    source = FridaParsedValueSource(
+        "127.0.0.1:27042",
+        request_scope="core_metrics",
+        direct_reader=lambda *_args: payload,
+    )
+
+    outcome = source.read_direct("601872")
+
+    assert outcome[MetricKind.LARGE_ORDER_NET] == "-0.02"
+    assert outcome.intraday_series == {
+        MetricKind.LARGE_ORDER_NET: {
+            "unit": None,
+            "points": [
+                {"time": "09:30", "value": "-0.02"},
+                {"time": "09:31", "value": "-0.02"},
+            ],
+        },
+        MetricKind.LARGE_ORDER_AMOUNT: {
+            "unit": "万",
+            "points": [
+                {"time": "09:30", "value": "-3397.0"},
+                {"time": "09:31", "value": "-2802.6"},
+            ],
+        },
+        MetricKind.RETAIL_COUNT: {
+            "unit": None,
+            "points": [
+                {"time": "09:30", "value": "21.75"},
+                {"time": "09:31", "value": "21.23"},
+            ],
+        },
+    }
+
+
+def test_intraday_series_right_aligns_short_values_and_keeps_permission_gaps() -> None:
+    """Dropping a sentinel or left-aligning a short computed curve shifts every tooltip."""
+    payload = _runtime_payload()
+    payload["indicators"] = [
+        {
+            "symbol": "601872",
+            "techid": 7034,
+            "times": [930, 931, 932],
+            "values": [21.2263, -2147483648],
+        },
+    ]
+
+    outcome = FridaParsedValueSource(
+        "127.0.0.1:27042",
+        request_scope="core_metrics",
+        direct_reader=lambda *_args: payload,
+    ).read_direct("601872")
+
+    assert outcome.intraday_series[MetricKind.RETAIL_COUNT]["points"] == [
+        {"time": "09:30", "value": None},
+        {"time": "09:31", "value": "21.23"},
+        {"time": "09:32", "value": None},
+    ]
+
+
 def test_direct_payload_turns_the_big_order_permission_sentinel_into_missing_values() -> None:
     payload = _runtime_payload()
     payload["indicators"] = [
@@ -254,11 +336,20 @@ def test_dual_account_source_queries_both_apps_in_parallel_and_merges_by_whiteli
         def read_direct(self, _symbol: str):
             core_started.set()
             assert fund_started.wait(1), "fund query did not start in parallel"
-            return {
-                MetricKind.STOCK_NAME: "中国海油",
-                MetricKind.CURRENT_PRICE: "29.10",
-                MetricKind.MAIN_FLOW_TODAY_NET: "must-not-cross-source-boundary",
-            }
+            return DirectReadOutcome(
+                values={
+                    MetricKind.STOCK_NAME: "中国海油",
+                    MetricKind.CURRENT_PRICE: "29.10",
+                    MetricKind.MAIN_FLOW_TODAY_NET: "must-not-cross-source-boundary",
+                },
+                source_errors={"core_metrics": None, "main_fund_flow": None},
+                intraday_series={
+                    MetricKind.LARGE_ORDER_NET: {
+                        "unit": None,
+                        "points": [{"time": "09:30", "value": "0.12"}],
+                    }
+                },
+            )
 
         def lookup_symbol(self, symbol: str):
             return SymbolLookup(symbol=symbol, name="中国海油", market="17")
@@ -282,6 +373,12 @@ def test_dual_account_source_queries_both_apps_in_parallel_and_merges_by_whiteli
     assert outcome.values[MetricKind.CURRENT_PRICE] == "29.10"
     assert outcome.values[MetricKind.MAIN_FLOW_TODAY_NET] == "1.56"
     assert outcome.values[MetricKind.MAIN_FLOW_TODAY_UNIT] == "亿元"
+    assert outcome.intraday_series == {
+        MetricKind.LARGE_ORDER_NET: {
+            "unit": None,
+            "points": [{"time": "09:30", "value": "0.12"}],
+        }
+    }
     assert outcome.source_errors == {
         "core_metrics": None,
         "main_fund_flow": None,
@@ -652,6 +749,10 @@ def test_default_direct_reader_calls_the_app_rpc_with_symbol_market_and_timeout(
     class FakeSession:
         def create_script(self, source: str):
             calls["script_has_request_export"] = "request: function" in source
+            calls["script_has_intraday_time_axis"] = (
+                "valuesFromCurve(parsed._d.value, 1)" in source
+                and "times: times || []" in source
+            )
             return FakeScript()
 
         def detach(self) -> None:
@@ -680,6 +781,7 @@ def test_default_direct_reader_calls_the_app_rpc_with_symbol_market_and_timeout(
         "endpoint": "127.0.0.1:27042",
         "pid": 26226,
         "script_has_request_export": True,
+        "script_has_intraday_time_axis": True,
         "loaded": True,
         "request": ("601872", "17", 3500),
         "unloaded": True,

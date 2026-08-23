@@ -145,7 +145,11 @@ The screenshot option defaults to `true` for existing clients. Set it to
 `false` to request the eight required values plus optional three-period fund
 flow without any App UI navigation or image creation. Core metrics and symbol
 lookup use only the core account; fund flow uses only the preserved fund
-account. Confirmed market mappings are `600/601/603/605/688/689 → 17`,
+account. The response also includes current-day intraday curves for large-order
+net volume, large-order amount, and retail count in `values.intraday_series`.
+Those curves come from the same core App-internal direct request; the existing
+scalar fields remain the latest points. Confirmed market mappings are
+`600/601/603/605/688/689 → 17`,
 `000/001/002/003/300/301 → 33`, `920 → 151`,
 `501/502/506/508/510/511/512/513/515/516/517/518/519/520/526/530/551/560/561/562/563/588/589 → 20`,
 and `158/159/160/161/162/163/164/165/166/167/168/169/180 → 36`; an unknown

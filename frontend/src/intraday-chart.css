@@ -13,18 +13,11 @@
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 1rem;
-  padding: .3rem 0 .15rem;
+  gap: .6rem;
+  padding: .1rem 0 0;
 }
 
-.intraday-chart figcaption > div:first-child { display: grid; gap: .16rem; }
-.intraday-chart figcaption span {
-  color: var(--intraday-muted, #6a7e83);
-  font-size: .68rem;
-  font-weight: 800;
-  letter-spacing: .1em;
-}
-.intraday-chart h4 { margin: 0; color: var(--intraday-ink, #213c43); font-size: .94rem; }
+.intraday-chart h4 { margin: 0; color: var(--intraday-ink, #213c43); font-size: .88rem; }
 
 .chart-readout {
   display: flex;
@@ -90,7 +83,7 @@
 .macd-histogram-down { fill: #00966d; }
 
 @media (max-width: 520px) {
-  .intraday-chart figcaption { flex-wrap: wrap; gap: .45rem; }
+  .intraday-chart figcaption { gap: .4rem; }
   .chart-readout { margin-left: auto; }
   .chart-axis-label { font-size: 18px; }
 }

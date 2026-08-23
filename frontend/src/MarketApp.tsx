@@ -346,29 +346,23 @@ function MarketIntradayCharts({ symbol, series, selectedTime }: {
   series: MarketSnapshot['intraday_series'],
   selectedTime?: string,
 }) {
-  return <section className="market-intraday-stack" aria-label="App 内部指标分时">
-    <header>
-      <div><span>APP INTERNAL</span><h3>当日指标分时</h3></div>
-      <small>随上方分时十字线同步</small>
-    </header>
-    <div className="market-intraday-list">
-      {marketIntradayCharts.map(([key, title, directional, precision]) => <IntradayMetricChart
-        directional={directional}
-        key={`${symbol}-${key}`}
-        precision={precision}
-        selectedTime={selectedTime}
-        series={series[key] ?? { unit: key === 'large_order_amount' ? '万' : null, points: [] }}
-        title={title}
-      />)}
-      <IntradayMacdChart
-        key={`${symbol}-macd`}
-        dea={series.macd_dea ?? { unit: null, points: [] }}
-        dif={series.macd_dif ?? { unit: null, points: [] }}
-        macd={series.macdfs ?? { unit: null, points: [] }}
-        selectedTime={selectedTime}
-      />
-    </div>
-  </section>
+  return <div className="market-intraday-list">
+    {marketIntradayCharts.map(([key, title, directional, precision]) => <IntradayMetricChart
+      directional={directional}
+      key={`${symbol}-${key}`}
+      precision={precision}
+      selectedTime={selectedTime}
+      series={series[key] ?? { unit: key === 'large_order_amount' ? '万' : null, points: [] }}
+      title={title}
+    />)}
+    <IntradayMacdChart
+      key={`${symbol}-macd`}
+      dea={series.macd_dea ?? { unit: null, points: [] }}
+      dif={series.macd_dif ?? { unit: null, points: [] }}
+      macd={series.macdfs ?? { unit: null, points: [] }}
+      selectedTime={selectedTime}
+    />
+  </div>
 }
 
 function Detail({ item, snapshot, period, setPeriod, series, dailyLoading, dailyError, onRetryDaily }: {

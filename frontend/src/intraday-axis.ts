@@ -40,3 +40,17 @@ export function nearestIntradayPointIndex(
   })
   return nearest
 }
+
+export function intradayPointIndexForTime(
+  points: Array<{ time: string }>,
+  selectedTime: string | undefined,
+): number {
+  if (points.length === 0) return 0
+  if (selectedTime === undefined) return points.length - 1
+  const exact = points.findIndex((point) => point.time === selectedTime)
+  if (exact >= 0) return exact
+  const targetRatio = intradayTimeRatio(selectedTime)
+  return targetRatio === null
+    ? points.length - 1
+    : nearestIntradayPointIndex(points, targetRatio)
+}

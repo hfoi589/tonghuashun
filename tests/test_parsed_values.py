@@ -25,6 +25,7 @@ from level2_service.parsed_values import (
     _FRIDA_CORE_DIRECT_SCRIPT,
     _FRIDA_DIRECT_SCRIPT,
     _FRIDA_FUND_DIRECT_SCRIPT,
+    _format_intraday_time,
 )
 
 
@@ -56,6 +57,22 @@ def _runtime_payload(macdfs: float = 0.011903988574406313) -> dict:
             {"symbol": "601872", "techid": 7051, "values": [0.01270280923973885, macdfs]},
         ],
     }
+
+
+def test_intraday_time_decodes_the_app_packed_hour_and_minute_bits() -> None:
+    """Exposing packed values such as 132688478 breaks every chart time label."""
+    assert _format_intraday_time(132688478) == "09:30"
+    assert _format_intraday_time(132688606) == "11:30"
+    assert _format_intraday_time(132688705) == "13:01"
+    assert _format_intraday_time(132688832) == "15:00"
+
+
+def test_intraday_time_does_not_misread_dates_timestamps_or_lunch_as_packed_times() -> None:
+    packed_lunch = (126 << 20) | (8 << 16) | (21 << 11) | (12 << 6)
+    assert _format_intraday_time(20200101) == "20200101"
+    assert _format_intraday_time(1724486400) == "1724486400"
+    assert _format_intraday_time(packed_lunch) == str(packed_lunch)
+    assert _format_intraday_time(-2147483648) == "-2147483648"
 
 
 def test_frida_source_selects_the_requested_stock_and_formats_all_runtime_values() -> None:
@@ -312,6 +329,43 @@ def test_direct_read_preserves_the_macdfs_intraday_series_with_signed_three_deci
             {"time": "09:31", "value": "+0.012"},
             {"time": "09:32", "value": None},
         ],
+    }
+
+
+def test_market_snapshot_preserves_app_macd_dif_dea_and_histogram_from_techid_7051() -> None:
+    """Reading only data id 36883 drops the two MACD lines shown by the App."""
+    payload = _runtime_payload()
+    payload["indicators"] = [
+        {
+            "symbol": "601872",
+            "techid": 7051,
+            "times": [930, 931],
+            "values": ["0.010", "0.012"],
+            "data_series": {
+                "36881": ["-0.001", "0.0024"],
+                "36882": ["-0.006", "-0.0045"],
+                "36883": ["0.010", "0.012"],
+            },
+        },
+    ]
+
+    snapshot = FridaParsedValueSource(
+        "127.0.0.1:27042",
+        request_scope="core_metrics",
+        direct_reader=lambda *_args: payload,
+    ).read_market_snapshot("601872", detail=True)
+
+    assert snapshot.intraday_series["macd_dif"]["points"] == [
+        {"time": "09:30", "value": "-0.001"},
+        {"time": "09:31", "value": "+0.002"},
+    ]
+    assert snapshot.intraday_series["macd_dea"]["points"] == [
+        {"time": "09:30", "value": "-0.006"},
+        {"time": "09:31", "value": "-0.005"},
+    ]
+    assert snapshot.intraday_series["macdfs"]["points"][-1] == {
+        "time": "09:31",
+        "value": "+0.012",
     }
 
 

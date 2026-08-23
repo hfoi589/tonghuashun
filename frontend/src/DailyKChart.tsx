@@ -11,6 +11,11 @@ import {
 } from 'lightweight-charts'
 import type { KlineBar, MarketSeriesPage } from './market-api'
 
+export interface DailyKSelection {
+  index: number
+  bar: KlineBar
+}
+
 const UP_COLOR = '#e2232e'
 const DOWN_COLOR = '#00966d'
 const NEUTRAL_READOUT_COLOR = '#5d626a'
@@ -98,13 +103,21 @@ function readout(page: MarketSeriesPage, selectedTime: string | undefined) {
   }
 }
 
-export function DailyKChart({ name, page }: { name: string, page: MarketSeriesPage }) {
+export function DailyKChart({ name, page, onSelectionChange }: {
+  name: string,
+  page: MarketSeriesPage,
+  onSelectionChange?: (selection: DailyKSelection) => void,
+}) {
   const container = useRef<HTMLDivElement>(null)
   const latestTime = page.bars.at(-1)?.time
   const [selectedTime, setSelectedTime] = useState<string | undefined>(latestTime)
   const selected = useMemo(() => readout(page, selectedTime), [page, selectedTime])
 
   useEffect(() => setSelectedTime(latestTime), [latestTime])
+
+  useEffect(() => {
+    if (selected.bar) onSelectionChange?.({ index: selected.index, bar: selected.bar })
+  }, [onSelectionChange, selected.bar, selected.index])
 
   useEffect(() => {
     if (!container.current || page.bars.length === 0) return

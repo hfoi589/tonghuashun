@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { act, cleanup, render, screen } from '@testing-library/react'
+import { act, cleanup, render, screen, waitFor } from '@testing-library/react'
 import type { MarketSeriesPage } from './market-api'
 
 const chartHarness = vi.hoisted(() => {
@@ -98,9 +98,10 @@ describe('DailyKChart', () => {
 
   it('uses the plotted series colors in the selected-point readout', () => {
     const value = page()
+    const onSelectionChange = vi.fn()
     value.indicators.ma5 = ['17.11', '18.54']
     value.indicators.macd_hist = ['-0.50', '0.50']
-    render(<DailyKChart name="招商轮船" page={value} />)
+    render(<DailyKChart name="招商轮船" page={value} onSelectionChange={onSelectionChange} />)
 
     expect(screen.getByTestId('readout-ma5')).toHaveStyle({ color: '#2d3439' })
     expect(screen.getByTestId('readout-ma13')).toHaveStyle({ color: '#f28e2b' })
@@ -127,6 +128,10 @@ describe('DailyKChart', () => {
     expect(screen.getByTestId('readout-volume')).toHaveStyle({ color: '#00966d' })
     expect(screen.getByTestId('readout-volume')).toHaveTextContent('成交量 5000.00股')
     expect(screen.getByTestId('readout-macd')).toHaveStyle({ color: '#00966d' })
+    return waitFor(() => expect(onSelectionChange).toHaveBeenLastCalledWith(expect.objectContaining({
+      index: 0,
+      bar: expect.objectContaining({ time: '2026-08-20', open: '18.70', close: '18.66' }),
+    })))
   })
 
   it('rounds every top indicator value to two decimals without repeating OHLC', () => {

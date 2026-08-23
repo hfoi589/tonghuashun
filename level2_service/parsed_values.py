@@ -559,10 +559,7 @@ class FridaParsedValueSource:
             collected_at=datetime.now(timezone.utc),
             quote=quote,
             timeshare=tuple(points),
-            intraday_series={
-                kind.value.lower(): series
-                for kind, series in cls._parse_intraday_series(payload, symbol).items()
-            },
+            intraday_series=cls._parse_market_intraday_series(payload, symbol),
             main_fund_flow=main_fund_flow,
             capabilities={
                 "timeshare": {
@@ -744,31 +741,96 @@ class FridaParsedValueSource:
             if not isinstance(values, (list, tuple)):
                 values = ()
             kind, places, divisor, unit, show_plus = spec
-            trailing_values = list(values[-len(times):]) if len(values) > len(times) else list(values)
-            leading_gaps = len(times) - len(trailing_values)
-            points: list[dict[str, str | None]] = []
-            for index, raw_time in enumerate(times):
-                formatted_time = _format_intraday_time(raw_time)
-                if formatted_time is None:
-                    continue
-                raw_value = (
-                    trailing_values[index - leading_gaps]
-                    if index >= leading_gaps
-                    else None
-                )
-                number = _interface_decimal(raw_value)
-                points.append(
-                    {
-                        "time": formatted_time,
-                        "value": _format_number(
-                            number / divisor if number is not None else None,
-                            places,
-                            show_plus=show_plus,
-                        ),
-                    }
-                )
+            points = FridaParsedValueSource._format_intraday_points(
+                times,
+                values,
+                places=places,
+                divisor=divisor,
+                show_plus=show_plus,
+            )
             result[kind] = {"unit": unit, "points": points}
         return result
+
+    @staticmethod
+    def _parse_market_intraday_series(
+        payload: dict[str, Any], symbol: str
+    ) -> dict[str, dict[str, Any]]:
+        result = {
+            kind.value.lower(): series
+            for kind, series in FridaParsedValueSource._parse_intraday_series(
+                payload, symbol
+            ).items()
+        }
+        macd_specs = {
+            "macd_dif": 36881,
+            "macd_dea": 36882,
+        }
+        for indicator in payload.get("indicators", ()):
+            if not isinstance(indicator, dict) or not _symbols_match(
+                indicator.get("symbol"), symbol
+            ):
+                continue
+            try:
+                techid = int(indicator.get("techid"))
+            except (TypeError, ValueError):
+                continue
+            if techid != 7051:
+                continue
+            times = indicator.get("times")
+            data_series = indicator.get("data_series")
+            if not isinstance(times, (list, tuple)) or not times:
+                continue
+            if not isinstance(data_series, dict):
+                continue
+            for field_name, data_id in macd_specs.items():
+                values = data_series.get(str(data_id), data_series.get(data_id))
+                if not isinstance(values, (list, tuple)):
+                    continue
+                result[field_name] = {
+                    "unit": None,
+                    "points": FridaParsedValueSource._format_intraday_points(
+                        times,
+                        values,
+                        places=3,
+                        divisor=Decimal(1),
+                        show_plus=True,
+                    ),
+                }
+        return result
+
+    @staticmethod
+    def _format_intraday_points(
+        times: list[Any] | tuple[Any, ...],
+        values: list[Any] | tuple[Any, ...],
+        *,
+        places: int,
+        divisor: Decimal,
+        show_plus: bool,
+    ) -> list[dict[str, str | None]]:
+        trailing_values = list(values[-len(times):]) if len(values) > len(times) else list(values)
+        leading_gaps = len(times) - len(trailing_values)
+        points: list[dict[str, str | None]] = []
+        for index, raw_time in enumerate(times):
+            formatted_time = _format_intraday_time(raw_time)
+            if formatted_time is None:
+                continue
+            raw_value = (
+                trailing_values[index - leading_gaps]
+                if index >= leading_gaps
+                else None
+            )
+            number = _interface_decimal(raw_value)
+            points.append(
+                {
+                    "time": formatted_time,
+                    "value": _format_number(
+                        number / divisor if number is not None else None,
+                        places,
+                        show_plus=show_plus,
+                    ),
+                }
+            )
+        return points
 
     @staticmethod
     def _read_runtime(endpoint: str, package: str, _timeout_seconds: float) -> dict[str, Any]:
@@ -1010,6 +1072,27 @@ def _format_intraday_time(value: object) -> str | None:
         hour, minute = int(padded[:2]), int(padded[2:])
         if 0 <= hour <= 23 and 0 <= minute <= 59:
             return f"{hour:02d}:{minute:02d}"
+    try:
+        packed = int(text)
+    except ValueError:
+        packed = 0
+    if packed > 0xFFFF:
+        year = ((packed >> 20) & 0xFFF) + 1900
+        month = (packed >> 16) & 0x0F
+        day = (packed >> 11) & 0x1F
+        hour = (packed >> 6) & 0x1F
+        minute = packed & 0x3F
+        valid_session = (
+            9 * 60 + 30 <= hour * 60 + minute <= 11 * 60 + 30
+            or 13 * 60 <= hour * 60 + minute <= 15 * 60
+        )
+        if 2000 <= year <= 2199 and valid_session:
+            try:
+                datetime(year, month, day)
+            except ValueError:
+                pass
+            else:
+                return f"{hour:02d}:{minute:02d}"
     return text
 
 
@@ -1426,7 +1509,7 @@ rpc.exports = {
           };
         }
 
-        function requestIndicator(base, techId, dataId, requireComputed) {
+        function requestIndicator(base, techId, dataId, requireComputed, extraDataIds) {
           return new Promise(function (accept) {
             var group = null;
             var processor = null;
@@ -1467,6 +1550,7 @@ rpc.exports = {
             var timer = setInterval(function () {
               Java.perform(function () {
                 try {
+                  var pollNow = Date.now();
                   var parser = group.c() === null ? null : group.c()._h.value;
                   if (parser !== null) {
                     var parsed = Java.cast(parser, CurveParser);
@@ -1474,15 +1558,30 @@ rpc.exports = {
                     var computedValues = valuesFromTable(parsed._h.value, dataId);
                     var selected = requireComputed ? computedValues : (computedValues || rawValues);
                     if (selected !== null && selected.length > 0) {
-                      clearInterval(timer);
-                      removeGroup(group);
-                      if (processor !== null) try { processor.clear(); } catch (_) {}
-                      var times = valuesFromCurve(parsed._d.value, 1) || valuesFromCurve(base, 1);
-                      accept({ symbol: symbol, techid: techId, times: times || [], values: selected });
-                      return;
+                      var dataSeries = {};
+                      dataSeries[String(dataId)] = selected;
+                      var extrasComplete = true;
+                      (extraDataIds || []).forEach(function (extraDataId) {
+                        var extraRaw = valuesFromCurve(parsed._d.value, extraDataId);
+                        var extraComputed = valuesFromTable(parsed._h.value, extraDataId);
+                        var extraSelected = extraComputed || extraRaw;
+                        if (extraSelected !== null && extraSelected.length > 0) {
+                          dataSeries[String(extraDataId)] = extraSelected;
+                        } else {
+                          extrasComplete = false;
+                        }
+                      });
+                      if (extrasComplete || pollNow >= indicatorDeadline) {
+                        clearInterval(timer);
+                        removeGroup(group);
+                        if (processor !== null) try { processor.clear(); } catch (_) {}
+                        var times = valuesFromCurve(parsed._d.value, 1) || valuesFromCurve(base, 1);
+                        accept({ symbol: symbol, techid: techId, times: times || [], values: selected, data_series: dataSeries });
+                        return;
+                      }
                     }
                   }
-                  if (Date.now() >= indicatorDeadline) {
+                  if (pollNow >= indicatorDeadline) {
                     clearInterval(timer);
                     removeGroup(group);
                     if (processor !== null) try { processor.clear(); } catch (_) {}
@@ -1671,12 +1770,12 @@ rpc.exports = {
                 [7031, 33007, false],
                 [7032, 33015, false],
                 [7034, 216, true],
-                [7051, 36883, false]
+                [7051, 36883, false, [36881, 36882]]
               ];
               var chain = Promise.resolve();
               specs.forEach(function (spec) {
                 chain = chain.then(function () {
-                  return requestIndicator(baseCurve, spec[0], spec[1], spec[2]).then(function (indicator) {
+                  return requestIndicator(baseCurve, spec[0], spec[1], spec[2], spec[3] || []).then(function (indicator) {
                     if (indicator === null) payload.missing_techids.push(spec[0]);
                     else payload.indicators.push(indicator);
                   });

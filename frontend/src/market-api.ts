@@ -18,6 +18,7 @@ export interface WatchlistGroup {
   id: number
   name: string
   sort_order: number
+  is_primary?: boolean
   items: WatchlistItem[]
 }
 
@@ -34,7 +35,7 @@ export interface MarketCapability {
   adjustment?: string
 }
 
-export type MarketIntradayMetricKey = 'large_order_net' | 'large_order_amount' | 'retail_count' | 'macdfs'
+export type MarketIntradayMetricKey = 'large_order_net' | 'large_order_amount' | 'retail_count' | 'macd_dif' | 'macd_dea' | 'macdfs'
 
 export interface MarketSnapshot {
   symbol: string

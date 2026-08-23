@@ -20,6 +20,14 @@ class ApiMarketSource:
             collected_at=datetime.now(timezone.utc),
             quote={"current_price": "19.78", "change_percent": "+2.22%"},
             intraday_series={
+                "macd_dif": {
+                    "unit": None,
+                    "points": [{"time": "09:31", "value": "+0.002"}],
+                },
+                "macd_dea": {
+                    "unit": None,
+                    "points": [{"time": "09:31", "value": "-0.005"}],
+                },
                 "macdfs": {
                     "unit": None,
                     "points": [{"time": "09:31", "value": "+0.012"}],
@@ -72,6 +80,8 @@ def test_market_snapshot_and_kline_routes_require_user_authentication(tmp_path) 
     assert snapshot.json()["intraday_series"]["macdfs"]["points"] == [
         {"time": "09:31", "value": "+0.012"}
     ]
+    assert snapshot.json()["intraday_series"]["macd_dif"]["points"][0]["value"] == "+0.002"
+    assert snapshot.json()["intraday_series"]["macd_dea"]["points"][0]["value"] == "-0.005"
     assert snapshot.json()["sequence"] == 1
     assert series.status_code == 200
     assert series.json()["bars"][0]["close"] == "19.78"

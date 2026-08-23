@@ -80,6 +80,7 @@ class WatchlistGroupResponse(BaseModel):
     id: int
     name: str
     sort_order: int
+    is_primary: bool
     items: list[WatchlistItemResponse]
 
 
@@ -100,6 +101,7 @@ def _group_response(group: WatchlistGroup) -> WatchlistGroupResponse:
         id=group.id,
         name=group.name,
         sort_order=group.sort_order,
+        is_primary=group.is_primary,
         items=[_item_response(item) for item in group.items],
     )
 

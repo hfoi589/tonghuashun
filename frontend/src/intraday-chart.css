@@ -77,6 +77,18 @@
 
 .intraday-empty-message { margin: 0; padding: 2rem 1rem; color: var(--intraday-muted, #6a7e83); text-align: center; }
 
+.macd-readout { flex-wrap: wrap; gap: .35rem .55rem; }
+.macd-readout b { font-size: .7rem; }
+.macd-readout strong { font-size: .9rem; }
+.macd-up { color: #e2232e !important; }
+.macd-down { color: #00966d !important; }
+.macd-dif-line,
+.macd-dea-line { fill: none; stroke-linecap: round; stroke-linejoin: round; stroke-width: 2; vector-effect: non-scaling-stroke; }
+.macd-dif-line { stroke: #30343a; }
+.macd-dea-line { stroke: #f06b35; }
+.macd-histogram-up { fill: #e2232e; }
+.macd-histogram-down { fill: #00966d; }
+
 @media (max-width: 520px) {
   .intraday-chart figcaption { flex-wrap: wrap; gap: .45rem; }
   .chart-readout { margin-left: auto; }

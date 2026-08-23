@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta, timezone
+import sqlite3
 
 import pytest
 
@@ -48,7 +49,12 @@ def test_watchlists_are_grouped_ordered_and_isolated_by_user(tmp_path) -> None:
     store.add_symbol(first.id, growth.id, lookup)
 
     assert [group.name for group in store.list_watchlists(first.id)] == ["自选", "成长"]
-    assert store.list_watchlists(first.id)[1].items[0].symbol == "300750"
+    first_watchlists = store.list_watchlists(first.id)
+    assert len(first_watchlists[0].items) == 1
+    assert first_watchlists[0].items[0].symbol == "300750"
+    assert first_watchlists[0].items[0].name == "宁德时代"
+    assert first_watchlists[1].items[0].symbol == "300750"
+    assert first_watchlists[1].items[0].name == "宁德时代"
     assert store.list_watchlists(second.id)[0].items == ()
     with pytest.raises(LookupError):
         store.add_symbol(second.id, growth.id, lookup)
@@ -83,6 +89,127 @@ def test_moving_a_symbol_inside_one_group_reorders_without_duplicating_it(tmp_pa
     store.move_symbol(user.id, group.id, group.id, "601872", 0)
 
     assert [item.symbol for item in store.list_watchlists(user.id)[0].items] == ["601872", "600938"]
+
+
+def test_custom_group_add_uses_immutable_primary_group_after_rename_and_reorder(tmp_path) -> None:
+    store = SQLiteMarketAccountStore(tmp_path / "market.db")
+    user = store.create_user("trader", "temporary-123")
+    primary = store.list_watchlists(user.id)[0]
+    custom = store.create_group(user.id, "航运")
+    renamed_primary = store.rename_group(user.id, primary.id, "核心自选")
+    store.reorder_groups(user.id, [custom.id, renamed_primary.id])
+
+    store.add_symbol(
+        user.id,
+        custom.id,
+        SymbolLookup(symbol="601872", name="招商轮船", market="17"),
+    )
+
+    groups = {group.id: group for group in store.list_watchlists(user.id)}
+    assert groups[primary.id].is_primary is True
+    assert groups[custom.id].is_primary is False
+    assert [item.symbol for item in groups[primary.id].items] == ["601872"]
+    assert [item.symbol for item in groups[custom.id].items] == ["601872"]
+
+
+def test_custom_group_add_refreshes_stale_primary_name_and_market(tmp_path) -> None:
+    store = SQLiteMarketAccountStore(tmp_path / "market.db")
+    user = store.create_user("trader", "temporary-123")
+    primary = store.list_watchlists(user.id)[0]
+    custom = store.create_group(user.id, "航运")
+    store.add_symbol(
+        user.id,
+        primary.id,
+        SymbolLookup(symbol="601872", name="旧名称", market="99"),
+    )
+
+    store.add_symbol(
+        user.id,
+        custom.id,
+        SymbolLookup(symbol="601872", name="招商轮船", market="17"),
+    )
+
+    groups = {group.id: group for group in store.list_watchlists(user.id)}
+    assert groups[primary.id].items[0] == groups[custom.id].items[0]
+    assert groups[primary.id].items[0].name == "招商轮船"
+    assert groups[primary.id].items[0].market == "17"
+
+
+def test_existing_market_database_migrates_an_immutable_primary_group(tmp_path) -> None:
+    path = tmp_path / "market.db"
+    connection = sqlite3.connect(path)
+    connection.executescript(
+        """
+        CREATE TABLE market_users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT NOT NULL COLLATE NOCASE UNIQUE,
+            password_hash TEXT NOT NULL,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            must_change_password INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE watchlist_groups (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL REFERENCES market_users(id) ON DELETE CASCADE,
+            name TEXT NOT NULL,
+            sort_order INTEGER NOT NULL,
+            UNIQUE(user_id, name)
+        );
+        CREATE TABLE watchlist_items (
+            group_id INTEGER NOT NULL REFERENCES watchlist_groups(id) ON DELETE CASCADE,
+            symbol TEXT NOT NULL,
+            name TEXT NOT NULL,
+            market TEXT NOT NULL,
+            sort_order INTEGER NOT NULL,
+            PRIMARY KEY(group_id, symbol)
+        );
+        INSERT INTO market_users(id,username,password_hash,created_at)
+        VALUES(1,'trader','unused','2026-08-24T00:00:00+00:00');
+        INSERT INTO watchlist_groups(id,user_id,name,sort_order) VALUES(1,1,'自选',1);
+        INSERT INTO watchlist_groups(id,user_id,name,sort_order) VALUES(2,1,'航运',0);
+        """
+    )
+    connection.close()
+
+    store = SQLiteMarketAccountStore(path)
+    groups = {group.id: group for group in store.list_watchlists(1)}
+
+    assert groups[1].is_primary is True
+    assert groups[2].is_primary is False
+
+
+def test_primary_group_duplication_does_not_consume_the_symbol_limit_twice(tmp_path) -> None:
+    store = SQLiteMarketAccountStore(tmp_path / "market.db", max_symbols_per_user=1)
+    user = store.create_user("trader", "temporary-123")
+    first_custom = store.create_group(user.id, "航运")
+    second_custom = store.create_group(user.id, "观察")
+    store.add_symbol(
+        user.id,
+        first_custom.id,
+        SymbolLookup(symbol="601872", name="招商轮船", market="17"),
+    )
+
+    with pytest.raises(ValueError, match="watchlist symbol limit reached"):
+        store.add_symbol(
+            user.id,
+            second_custom.id,
+            SymbolLookup(symbol="300750", name="宁德时代", market="33"),
+        )
+
+    groups = store.list_watchlists(user.id)
+    assert {item.symbol for group in groups for item in group.items} == {"601872"}
+
+
+def test_primary_watchlist_group_cannot_be_deleted(tmp_path) -> None:
+    store = SQLiteMarketAccountStore(tmp_path / "market.db")
+    user = store.create_user("trader", "temporary-123")
+    primary = store.list_watchlists(user.id)[0]
+    store.create_group(user.id, "航运")
+
+    with pytest.raises(ValueError, match="primary watchlist group cannot be deleted"):
+        store.delete_group(user.id, primary.id)
+
+    assert next(group for group in store.list_watchlists(user.id) if group.id == primary.id).is_primary is True
 
 
 def test_market_sessions_expire_and_can_be_revoked_per_user() -> None:

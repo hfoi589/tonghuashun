@@ -137,6 +137,8 @@ button { cursor: pointer; }
 .market-symbol-list > button span { display: grid; gap: 4px; }
 .market-symbol-list > button span:last-child { text-align: right; }
 .market-symbol-list strong { font-size: 14px; }
+.market-symbol-list .market-symbol-name { color: var(--market-red-dark); }
+.market-symbol-list > button.active .market-symbol-name { color: var(--market-red-dark); }
 .market-symbol-list small { color: #90959c; font: 11px ui-monospace, SFMono-Regular, monospace; }
 .market-watchlist-empty { margin: 24px 18px; padding: 25px 14px; border: 1px dashed #d7dade; display: grid; gap: 7px; text-align: center; }
 .market-watchlist-empty span { color: var(--market-muted); font-size: 12px; line-height: 1.5; }
@@ -167,10 +169,24 @@ button { cursor: pointer; }
 .market-period-tabs button { height: 45px; padding: 0 17px; border: 0; border-bottom: 2px solid transparent; background: transparent; color: var(--market-muted); font-size: 13px; }
 .market-period-tabs button.active { color: var(--market-red); border-color: var(--market-red); font-weight: 750; }
 .market-price-chart { display: block; width: 100%; height: auto; max-height: 430px; padding: 10px; overflow: visible; }
+.market-timeshare-chart-frame { padding: 10px; }
+.market-timeshare-price-chart { padding: 0; touch-action: pan-y; }
+.market-timeshare-chart { margin: 0; min-width: 0; }
+.market-timeshare-chart figcaption { min-height: 58px; padding: 10px 16px 7px; display: flex; align-items: center; justify-content: space-between; gap: 16px; border-bottom: 1px solid var(--market-line); }
+.market-timeshare-chart figcaption > div:first-child { display: grid; gap: 2px; }
+.market-timeshare-chart figcaption > div:first-child span { color: var(--market-muted); font-size: 10px; letter-spacing: .08em; }
+.market-timeshare-chart figcaption h3 { margin: 0; font-size: 15px; }
+.market-timeshare-readout { min-width: 0; display: flex; align-items: baseline; justify-content: flex-end; flex-wrap: wrap; gap: 5px 9px; color: var(--market-muted); font: 11px ui-monospace, SFMono-Regular, Menlo, monospace; font-variant-numeric: tabular-nums; }
+.market-timeshare-readout time { color: var(--market-ink); font-weight: 800; }
+.market-timeshare-readout strong { color: var(--market-red); font-size: 16px; }
+.market-timeshare-readout b { color: var(--market-ink); font-weight: 700; }
 .market-price-chart line { stroke: #eceef1; stroke-width: 1; }
 .market-price-chart text { fill: #8c9199; font: 11px ui-monospace, SFMono-Regular, monospace; }
 .market-chart-line { fill: none; stroke: #e2232e; stroke-width: 2.4; vector-effect: non-scaling-stroke; }
 .market-chart-area { fill: rgba(226,35,46,.07); stroke: none; }
+.market-price-chart .market-timeshare-cursor-x,
+.market-price-chart .market-timeshare-cursor-y { stroke: #747b84; stroke-width: 1; stroke-dasharray: 4 4; vector-effect: non-scaling-stroke; }
+.market-timeshare-active-point { fill: white; stroke: var(--market-red); stroke-width: 3; vector-effect: non-scaling-stroke; }
 .candle-up line, .candle-up rect { stroke: var(--market-red); fill: white; vector-effect: non-scaling-stroke; }
 .candle-down line, .candle-down rect { stroke: var(--market-green); fill: var(--market-green); vector-effect: non-scaling-stroke; }
 .market-intraday-stack {
@@ -274,6 +290,8 @@ button { cursor: pointer; }
   .market-period-tabs { overflow-x: auto; padding: 0 4px; }
   .market-period-tabs button { padding: 0 13px; }
   .market-price-chart { min-height: 235px; }
+  .market-timeshare-chart figcaption { align-items: flex-start; flex-wrap: wrap; gap: 6px; padding: 9px 10px 7px; }
+  .market-timeshare-readout { width: 100%; justify-content: flex-start; }
   .market-intraday-stack > header { align-items: flex-start; flex-wrap: wrap; gap: 6px; padding: 11px 10px; }
   .market-intraday-stack > header small { width: 100%; }
   .market-intraday-list .intraday-chart { padding: 10px 8px 12px; }

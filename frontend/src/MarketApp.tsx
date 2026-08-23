@@ -2,7 +2,7 @@ import { FormEvent, useEffect, useMemo, useRef, useState } from 'react'
 import { ApiError } from './api'
 import { DailyKChart, type DailyKSelection } from './DailyKChart'
 import { IntradayMacdChart, IntradayMetricChart } from './IntradayMetricChart'
-import { intradayAxisTicks, intradayPointRatio } from './intraday-axis'
+import { intradayAxisTicks, intradayPointIndexForTime, intradayPointRatio, intradayTimeRatio, nearestIntradayPointIndex } from './intraday-axis'
 import {
   marketApi,
   marketStreamUrl,
@@ -58,10 +58,33 @@ function percentChange(close: string | null, previousClose: string | null): stri
   return `${value > 0 ? '+' : ''}${value.toFixed(2)}%`
 }
 
-function LineChart({ name, points }: { name: string, points: TimesharePoint[] }) {
-  const data = points
-    .map((point, index) => ({ index, point, value: Number(point.price) }))
-    .filter((item) => Number.isFinite(item.value))
+export function nextIntradaySelectedTime(
+  current: string | undefined,
+  previousLatest: string | undefined,
+  times: string[],
+): string | undefined {
+  const latest = times.at(-1)
+  if (latest === undefined) return current
+  const previousLatestRatio = previousLatest === undefined ? null : intradayTimeRatio(previousLatest)
+  const latestRatio = intradayTimeRatio(latest)
+  const latestMovedBackward = previousLatestRatio !== null && latestRatio !== null && latestRatio < previousLatestRatio
+  return current === undefined || current === previousLatest || !times.includes(current) || latestMovedBackward
+    ? latest
+    : current
+}
+
+function LineChart({ name, points, selectedTime, onSelectionChange }: {
+  name: string,
+  points: TimesharePoint[],
+  selectedTime?: string,
+  onSelectionChange: (time: string) => void,
+}) {
+  const priceValues = points.map((point) => {
+    if (point.price === null || point.price === '') return null
+    const value = Number(point.price)
+    return Number.isFinite(value) ? value : null
+  })
+  const data = priceValues.flatMap((value, index) => value === null ? [] : [{ index, value }])
   if (data.length === 0) return <div className="market-empty-chart">暂无 App 内部分时数据</div>
   const width = 900
   const height = 360
@@ -73,20 +96,101 @@ function LineChart({ name, points }: { name: string, points: TimesharePoint[] })
   min -= spread * 0.08
   max += spread * 0.08
   const plotWidth = width - pad.left - pad.right
+  const plotHeight = height - pad.top - pad.bottom
   const x = (index: number) => pad.left + intradayPointRatio(points[index].time, index, points.length) * plotWidth
-  const y = (value: number) => pad.top + (max - value) / (max - min) * (height - pad.top - pad.bottom)
-  const path = data.map((item, index) => `${index === 0 ? 'M' : 'L'}${x(item.index).toFixed(2)},${y(item.value).toFixed(2)}`).join(' ')
-  const area = `${path} L${x(data.at(-1)!.index)},${height - pad.bottom} L${x(data[0].index)},${height - pad.bottom} Z`
-  return <svg className="market-price-chart" viewBox={`0 0 ${width} ${height}`} role="img" aria-label={`${name}分时价格图`}>
-    {[0, 1, 2, 3, 4].map((tick) => {
-      const py = pad.top + tick / 4 * (height - pad.top - pad.bottom)
-      const value = max - tick / 4 * (max - min)
-      return <g key={tick}><line x1={pad.left} y1={py} x2={width - pad.right} y2={py} /><text x={pad.left - 9} y={py + 4} textAnchor="end">{value.toFixed(2)}</text></g>
-    })}
-    <path className="market-chart-area" d={area} />
-    <path className="market-chart-line" d={path} />
-    {intradayAxisTicks.map((tick) => <text className="market-intraday-x-axis-label" key={tick.label} x={pad.left + tick.ratio * plotWidth} y={height - 12} textAnchor={tick.anchor}>{tick.label}</text>)}
-  </svg>
+  const y = (value: number) => pad.top + (max - value) / (max - min) * plotHeight
+  let path = ''
+  let segmentOpen = false
+  priceValues.forEach((value, index) => {
+    if (value === null) {
+      segmentOpen = false
+      return
+    }
+    path += `${segmentOpen ? ' L' : 'M'}${x(index).toFixed(2)},${y(value).toFixed(2)}`
+    segmentOpen = true
+  })
+  const area = priceValues.every((value) => value !== null)
+    ? `${path} L${x(data.at(-1)!.index)},${height - pad.bottom} L${x(data[0].index)},${height - pad.bottom} Z`
+    : null
+  const selectedIndex = intradayPointIndexForTime(points, selectedTime)
+  const selectedPoint = points[selectedIndex]
+  const selectedPrice = selectedPoint.price === null || selectedPoint.price === ''
+    ? null
+    : Number(selectedPoint.price)
+  const selectedX = x(selectedIndex)
+  const selectedY = selectedPrice !== null && Number.isFinite(selectedPrice) ? y(selectedPrice) : null
+  const selectAtClientX = (element: SVGSVGElement, clientX: number) => {
+    const bounds = element.getBoundingClientRect()
+    if (bounds.width === 0) return
+    const scaledX = ((clientX - bounds.left) / bounds.width) * width
+    const ratio = Math.max(0, Math.min(1, (scaledX - pad.left) / plotWidth))
+    onSelectionChange(points[nearestIntradayPointIndex(points, ratio)].time)
+  }
+  return <figure className="market-timeshare-chart">
+    <figcaption>
+      <div><span>当日分时</span><h3>{name}</h3></div>
+      <div className="market-timeshare-readout" aria-live="polite">
+        <time>{selectedPoint.time}</time>
+        <span>价格</span><strong>{fixed(selectedPoint.price)}</strong>
+        {selectedPoint.average_price !== null && <><span>均价</span><b>{fixed(selectedPoint.average_price)}</b></>}
+        {selectedPoint.volume !== null && <><span>量</span><b>{compact(selectedPoint.volume, '股')}</b></>}
+      </div>
+    </figcaption>
+    <div className="market-timeshare-chart-frame">
+    <svg
+      className="market-price-chart market-timeshare-price-chart"
+      viewBox={`0 0 ${width} ${height}`}
+      role="img"
+      aria-label={`${name}分时价格图`}
+      tabIndex={0}
+      onKeyDown={(event) => {
+        if (event.key === 'ArrowLeft') {
+          event.preventDefault()
+          onSelectionChange(points[Math.max(0, selectedIndex - 1)].time)
+        } else if (event.key === 'ArrowRight') {
+          event.preventDefault()
+          onSelectionChange(points[Math.min(points.length - 1, selectedIndex + 1)].time)
+        } else if (event.key === 'Home') {
+          event.preventDefault()
+          onSelectionChange(points[0].time)
+        } else if (event.key === 'End') {
+          event.preventDefault()
+          onSelectionChange(points.at(-1)!.time)
+        }
+      }}
+      onPointerMove={(event) => {
+        selectAtClientX(event.currentTarget, event.clientX)
+      }}
+      onPointerDown={(event) => {
+        event.currentTarget.setPointerCapture?.(event.pointerId)
+        selectAtClientX(event.currentTarget, event.clientX)
+      }}
+      onPointerUp={(event) => {
+        if (event.currentTarget.hasPointerCapture?.(event.pointerId)) {
+          event.currentTarget.releasePointerCapture(event.pointerId)
+        }
+      }}
+      onPointerLeave={(event) => {
+        if (event.pointerType === 'mouse') onSelectionChange(points.at(-1)!.time)
+      }}
+    >
+      <title>{name}分时价格图，可移动十字线并同步查看下方全部指标</title>
+      {[0, 1, 2, 3, 4].map((tick) => {
+        const py = pad.top + tick / 4 * plotHeight
+        const value = max - tick / 4 * (max - min)
+        return <g key={tick}><line x1={pad.left} y1={py} x2={width - pad.right} y2={py} /><text x={pad.left - 9} y={py + 4} textAnchor="end">{value.toFixed(2)}</text></g>
+      })}
+      {area !== null && <path className="market-chart-area" d={area} />}
+      <path className="market-chart-line" d={path} />
+      <line className="market-timeshare-cursor-x" x1={selectedX} x2={selectedX} y1={pad.top} y2={pad.top + plotHeight} />
+      {selectedY !== null && <>
+        <line className="market-timeshare-cursor-y" x1={pad.left} x2={width - pad.right} y1={selectedY} y2={selectedY} />
+        <circle className="market-timeshare-active-point" cx={selectedX} cy={selectedY} r="5" />
+      </>}
+      {intradayAxisTicks.map((tick) => <text className="market-intraday-x-axis-label" key={tick.label} x={pad.left + tick.ratio * plotWidth} y={height - 12} textAnchor={tick.anchor}>{tick.label}</text>)}
+    </svg>
+    </div>
+  </figure>
 }
 
 function CandleChart({ name, bars }: { name: string, bars: KlineBar[] }) {
@@ -237,20 +341,22 @@ const marketIntradayCharts = [
   ['retail_count', '散户数量', false, 2],
 ] as const
 
-function MarketIntradayCharts({ symbol, series }: {
+function MarketIntradayCharts({ symbol, series, selectedTime }: {
   symbol: string,
   series: MarketSnapshot['intraday_series'],
+  selectedTime?: string,
 }) {
   return <section className="market-intraday-stack" aria-label="App 内部指标分时">
     <header>
       <div><span>APP INTERNAL</span><h3>当日指标分时</h3></div>
-      <small>悬停、触摸或使用方向键查看时点</small>
+      <small>随上方分时十字线同步</small>
     </header>
     <div className="market-intraday-list">
       {marketIntradayCharts.map(([key, title, directional, precision]) => <IntradayMetricChart
         directional={directional}
         key={`${symbol}-${key}`}
         precision={precision}
+        selectedTime={selectedTime}
         series={series[key] ?? { unit: key === 'large_order_amount' ? '万' : null, points: [] }}
         title={title}
       />)}
@@ -259,6 +365,7 @@ function MarketIntradayCharts({ symbol, series }: {
         dea={series.macd_dea ?? { unit: null, points: [] }}
         dif={series.macd_dif ?? { unit: null, points: [] }}
         macd={series.macdfs ?? { unit: null, points: [] }}
+        selectedTime={selectedTime}
       />
     </div>
   </section>
@@ -275,6 +382,17 @@ function Detail({ item, snapshot, period, setPeriod, series, dailyLoading, daily
   onRetryDaily: () => void,
 }) {
   const quote = snapshot?.quote ?? {}
+  const latestIntradayTime = snapshot?.timeshare.at(-1)?.time
+  const intradayTimes = snapshot?.timeshare.map((point) => point.time) ?? []
+  const intradayTimesKey = intradayTimes.join('|')
+  const [intradaySelectedTime, setIntradaySelectedTime] = useState<string>()
+  const previousLatestIntradayTime = useRef<string | undefined>(undefined)
+  useEffect(() => {
+    if (latestIntradayTime === undefined) return
+    const previousLatest = previousLatestIntradayTime.current
+    setIntradaySelectedTime((current) => nextIntradaySelectedTime(current, previousLatest, intradayTimes))
+    previousLatestIntradayTime.current = latestIntradayTime
+  }, [intradayTimesKey, latestIntradayTime])
   const [dailySelection, setDailySelection] = useState<DailyKSelection | null>(null)
   useEffect(() => {
     setDailySelection(null)
@@ -323,8 +441,8 @@ function Detail({ item, snapshot, period, setPeriod, series, dailyLoading, daily
       <nav className="market-period-tabs" aria-label="图表周期">{chartPeriods.map(([value, label]) => <button type="button" key={value} className={period === value ? 'active' : ''} onClick={() => setPeriod(value)}>{label}</button>)}</nav>
       {period === 'timeshare'
         ? <>
-          <LineChart name={snapshot?.name ?? item.name} points={snapshot?.timeshare ?? []} />
-          <MarketIntradayCharts symbol={snapshot?.symbol ?? item.symbol} series={snapshot?.intraday_series ?? {}} />
+          <LineChart name={snapshot?.name ?? item.name} points={snapshot?.timeshare ?? []} selectedTime={intradaySelectedTime} onSelectionChange={setIntradaySelectedTime} />
+          <MarketIntradayCharts symbol={snapshot?.symbol ?? item.symbol} series={snapshot?.intraday_series ?? {}} selectedTime={intradaySelectedTime} />
         </>
         : period === 'day'
           ? <DailyKPanel name={snapshot?.name ?? item.name} page={series} loading={dailyLoading} error={dailyError} onSelectionChange={setDailySelection} onRetry={onRetryDaily} />
@@ -528,14 +646,14 @@ export function MarketApp() {
         <div className="market-symbol-list">{activeGroup?.items.length ? activeGroup.items.map((item) => {
           const snapshot = snapshots[item.symbol]
           return <button type="button" key={item.symbol} className={selected === item.symbol ? 'active' : ''} onClick={() => { setSelected(item.symbol); setPeriod('timeshare') }} aria-label={`${item.name} ${item.symbol}`}>
-            <span><strong>{item.name}</strong><small>{item.symbol}</small></span><span className={`market-number-${tone(snapshot?.quote.change_percent)}`}><strong>{display(snapshot?.quote.price)}</strong><small>{display(snapshot?.quote.change_percent)}</small></span>
+            <span><strong className="market-symbol-name">{item.name}</strong><small>{item.symbol}</small></span><span className={`market-number-${tone(snapshot?.quote.change_percent)}`}><strong>{display(snapshot?.quote.price)}</strong><small>{display(snapshot?.quote.change_percent)}</small></span>
           </button>
         }) : <div className="market-watchlist-empty"><strong>还没有自选股</strong><span>在顶部输入代码，股票会先通过 App 精确确认。</span></div>}</div>
         <footer>每位用户最多 50 只自选股</footer>
       </aside>
       <div className="market-main-pane">
         {message && <div className="market-message" role="status">{message}<button type="button" onClick={() => setMessage('')}>关闭</button></div>}
-        {selectedItem ? <Detail item={selectedItem} snapshot={snapshots[selectedItem.symbol]} period={period} setPeriod={setPeriod} series={period === 'day' ? dailySeries[selectedItem.symbol] : legacySeries} dailyLoading={dailyLoading[selectedItem.symbol] === true} dailyError={dailyErrors[selectedItem.symbol]} onRetryDaily={() => retryDailySeries(selectedItem.symbol)} /> : <section className="market-no-selection"><div className="market-brand-mark">顺</div><h1>从自选中选择一只股票</h1><p>行情会通过当前登录的同花顺 App 内部接口动态更新。</p></section>}
+        {selectedItem ? <Detail key={selectedItem.symbol} item={selectedItem} snapshot={snapshots[selectedItem.symbol]} period={period} setPeriod={setPeriod} series={period === 'day' ? dailySeries[selectedItem.symbol] : legacySeries} dailyLoading={dailyLoading[selectedItem.symbol] === true} dailyError={dailyErrors[selectedItem.symbol]} onRetryDaily={() => retryDailySeries(selectedItem.symbol)} /> : <section className="market-no-selection"><div className="market-brand-mark">顺</div><h1>从自选中选择一只股票</h1><p>行情会通过当前登录的同花顺 App 内部接口动态更新。</p></section>}
       </div>
     </div>
   </main>

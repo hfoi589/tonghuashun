@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { cleanup, render, screen, waitFor, within } from '@testing-library/react'
+import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
-import { MarketApp } from './MarketApp'
+import { MarketApp, nextIntradaySelectedTime } from './MarketApp'
 
 vi.mock('./DailyKChart', () => ({
   DailyKChart: ({ name, page, onSelectionChange }: {
@@ -27,6 +27,12 @@ afterEach(() => {
 })
 
 describe('MarketApp', () => {
+  it('resets an obsolete intraday selection when a new trading-day stream starts', () => {
+    expect(nextIntradaySelectedTime('14:00', '15:00', ['09:30'])).toBe('09:30')
+    expect(nextIntradaySelectedTime('10:00', '10:30', ['09:30', '10:00', '10:31'])).toBe('10:00')
+    expect(nextIntradaySelectedTime('10:30', '10:30', ['09:30', '10:30', '10:31'])).toBe('10:31')
+  })
+
   it('shows the ordinary-user login when no market session exists', async () => {
     vi.stubGlobal('fetch', vi.fn(async () => jsonResponse({ detail: 'market authentication required' }, 401)))
 
@@ -80,6 +86,7 @@ describe('MarketApp', () => {
         quote: { price: '8.33', previous_close: '8.16', change_percent: '2.08%', turnover_rate: '1.42%' },
         timeshare: [
           { time: '09:30', price: '8.20', average_price: null, volume: '1200' },
+          { time: '10:00', price: null, average_price: null, volume: null },
           { time: '14:56', price: '8.33', average_price: null, volume: '900' },
         ],
         intraday_series: {
@@ -147,7 +154,9 @@ describe('MarketApp', () => {
 
     render(<MarketApp />)
 
-    expect(await screen.findByRole('button', { name: /招商轮船/ })).toBeInTheDocument()
+    const watchlistButton = await screen.findByRole('button', { name: /招商轮船/ })
+    expect(watchlistButton).toBeInTheDocument()
+    expect(within(watchlistButton).getByText('招商轮船')).toHaveClass('market-symbol-name')
     expect((await screen.findAllByText('8.33')).length).toBeGreaterThan(0)
     const priceChart = screen.getByRole('img', { name: '招商轮船分时价格图' })
     const netChart = screen.getByRole('img', { name: '大单净量当日分时图' })
@@ -165,6 +174,42 @@ describe('MarketApp', () => {
     expect(within(priceChart).getByText('11:30/13:00')).toBeInTheDocument()
     expect(within(priceChart).getByText('15:00')).toBeInTheDocument()
     expect(screen.getByText('14:56 更新')).toBeInTheDocument()
+    expect(within(priceChart.closest('figure')!).getByText('14:56', { selector: 'time' })).toBeInTheDocument()
+    expect(within(priceChart.closest('figure')!).getByText('8.33', { selector: '.market-timeshare-readout strong' })).toBeInTheDocument()
+
+    priceChart.focus()
+    await userEvent.keyboard('{ArrowLeft}')
+
+    expect(within(priceChart.closest('figure')!).getByText('10:00', { selector: 'time' })).toBeInTheDocument()
+    expect(within(priceChart.closest('figure')!).getByText('—', { selector: '.market-timeshare-readout strong' })).toBeInTheDocument()
+    for (const chart of [netChart, amountChart, retailChart, macdChart]) {
+      expect(within(chart.closest('figure')!).getByText('10:00', { selector: 'time' })).toBeInTheDocument()
+    }
+    expect(within(netChart.closest('figure')!).getByText('—', { selector: '.chart-readout strong' })).toBeInTheDocument()
+    expect((priceChart.querySelector('.market-chart-line')?.getAttribute('d')?.match(/M/g) ?? [])).toHaveLength(2)
+
+    await userEvent.keyboard('{Home}')
+
+    expect(within(priceChart.closest('figure')!).getByText('09:30', { selector: 'time' })).toBeInTheDocument()
+    expect(within(priceChart.closest('figure')!).getByText('8.20', { selector: '.market-timeshare-readout strong' })).toBeInTheDocument()
+    for (const chart of [netChart, amountChart, retailChart, macdChart]) {
+      expect(within(chart.closest('figure')!).getByText('09:30', { selector: 'time' })).toBeInTheDocument()
+    }
+    expect(within(netChart.closest('figure')!).getByText('-0.03', { selector: '.chart-readout strong' })).toBeInTheDocument()
+    expect(within(amountChart.closest('figure')!).getByText('-3397.0万', { selector: '.chart-readout strong' })).toBeInTheDocument()
+    expect(within(retailChart.closest('figure')!).getByText('21.75', { selector: '.chart-readout strong' })).toBeInTheDocument()
+    expect(within(macdChart.closest('figure')!).getByText('-0.001', { selector: '.macd-readout strong' })).toBeInTheDocument()
+    expect(priceChart.querySelector('.market-timeshare-cursor-x')).toBeInTheDocument()
+    expect(priceChart.querySelector('.market-timeshare-cursor-y')).toBeInTheDocument()
+    expect(macdChart.querySelector('.chart-cursor-line')).toBeInTheDocument()
+
+    await userEvent.keyboard('{End}')
+    Object.defineProperty(priceChart, 'getBoundingClientRect', {
+      configurable: true,
+      value: () => ({ x: 0, y: 0, left: 0, top: 0, right: 900, bottom: 360, width: 900, height: 360, toJSON: () => ({}) }),
+    })
+    fireEvent.pointerDown(priceChart, { clientX: 58, pointerId: 1, pointerType: 'touch' })
+    expect(within(priceChart.closest('figure')!).getByText('09:30', { selector: 'time' })).toBeInTheDocument()
     expect(screen.getAllByRole('button', { name: /^(分时|日K|五日|周K|月K)$/ }).map((button) => button.textContent)).toEqual([
       '分时', '日K', '五日', '周K', '月K',
     ])

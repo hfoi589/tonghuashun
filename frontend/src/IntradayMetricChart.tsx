@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import type { IntradayMetricSeries } from './api'
-import { intradayAxisTicks, intradayPointRatio, nearestIntradayPointIndex } from './intraday-axis'
+import { intradayAxisTicks, intradayPointIndexForTime, intradayPointRatio, intradayTimeRatio, nearestIntradayPointIndex } from './intraday-axis'
 import './intraday-chart.css'
 
 const CHART_WIDTH = 720
@@ -18,12 +18,14 @@ function numericPointValues(series: IntradayMetricSeries): Array<number | null> 
   })
 }
 
-export function IntradayMetricChart({ title, series, directional, precision = 2 }: {
+export function IntradayMetricChart({ title, series, directional, precision = 2, selectedTime }: {
   title: string,
   series: IntradayMetricSeries,
   directional: boolean,
   precision?: number,
+  selectedTime?: string,
 }) {
+  const controlled = selectedTime !== undefined
   const lastIndex = Math.max(0, series.points.length - 1)
   const [selectedIndex, setSelectedIndex] = useState(lastIndex)
   const previousPointCount = useRef(series.points.length)
@@ -77,9 +79,20 @@ export function IntradayMetricChart({ title, series, directional, precision = 2 
     path += `${segmentOpen ? ' L' : 'M'} ${xFor(index).toFixed(2)} ${yFor(value).toFixed(2)}`
     segmentOpen = true
   })
-  const safeIndex = Math.min(selectedIndex, series.points.length - 1)
+  const exactSelectedIndex = controlled
+    ? series.points.findIndex((point) => point.time === selectedTime)
+    : -1
+  const safeIndex = controlled
+    ? Math.max(0, exactSelectedIndex)
+    : Math.min(selectedIndex, series.points.length - 1)
   const selectedPoint = series.points[safeIndex]
-  const selectedValue = values[safeIndex]
+  const selectedPointTime = controlled ? selectedTime! : selectedPoint.time
+  const selectedValue = controlled && exactSelectedIndex < 0 ? null : values[safeIndex]
+  const selectedRawValue = controlled && exactSelectedIndex < 0 ? null : selectedPoint.value
+  const controlledRatio = controlled ? intradayTimeRatio(selectedPointTime) : null
+  const selectedX = controlledRatio === null
+    ? xFor(safeIndex)
+    : CHART_LEFT + controlledRatio * plotWidth
   const latestValue = [...validValues].at(-1) ?? 0
   const tone = latestValue > 0 ? 'up' : latestValue < 0 ? 'down' : 'neutral'
 
@@ -89,9 +102,9 @@ export function IntradayMetricChart({ title, series, directional, precision = 2 
         <span>当日分时</span>
         <h4>{title}</h4>
       </div>
-      <div className="chart-readout" aria-live="polite">
-        <time>{selectedPoint.time}</time>
-        <strong>{selectedPoint.value ?? '—'}{selectedPoint.value !== null ? series.unit : ''}</strong>
+      <div className="chart-readout" aria-live={controlled ? undefined : 'polite'}>
+        <time>{selectedPointTime}</time>
+        <strong>{selectedRawValue ?? '—'}{selectedRawValue !== null ? series.unit : ''}</strong>
       </div>
     </figcaption>
     <div className="intraday-chart-frame">
@@ -99,8 +112,8 @@ export function IntradayMetricChart({ title, series, directional, precision = 2 
         viewBox={`0 0 ${CHART_WIDTH} ${CHART_HEIGHT}`}
         role="img"
         aria-label={`${title}当日分时图`}
-        tabIndex={0}
-        onKeyDown={(event) => {
+        tabIndex={controlled ? undefined : 0}
+        onKeyDown={controlled ? undefined : (event) => {
           if (event.key === 'ArrowLeft') {
             event.preventDefault()
             setSelectedIndex((current) => Math.max(0, current - 1))
@@ -115,7 +128,7 @@ export function IntradayMetricChart({ title, series, directional, precision = 2 
             setSelectedIndex(series.points.length - 1)
           }
         }}
-        onPointerMove={(event) => {
+        onPointerMove={controlled ? undefined : (event) => {
           const bounds = event.currentTarget.getBoundingClientRect()
           if (bounds.width === 0) return
           const scaledX = ((event.clientX - bounds.left) / bounds.width) * CHART_WIDTH
@@ -140,9 +153,9 @@ export function IntradayMetricChart({ title, series, directional, precision = 2 
           y2={yFor(0)}
         />}
         <path className="chart-series-line" d={path} />
+        <line className="chart-cursor-line" x1={selectedX} x2={selectedX} y1={CHART_TOP} y2={CHART_TOP + plotHeight} />
         {selectedValue !== null && <>
-          <line className="chart-cursor-line" x1={xFor(safeIndex)} x2={xFor(safeIndex)} y1={CHART_TOP} y2={CHART_TOP + plotHeight} />
-          <circle className="chart-active-point" cx={xFor(safeIndex)} cy={yFor(selectedValue)} r="5" />
+          <circle className="chart-active-point" cx={selectedX} cy={yFor(selectedValue)} r="5" />
         </>}
         {intradayAxisTicks.map((tick) => <text
           className="chart-axis-label intraday-x-axis-label"
@@ -168,11 +181,13 @@ function seriesValueMap(series: IntradayMetricSeries): Map<string, number | null
   }))
 }
 
-export function IntradayMacdChart({ dif, dea, macd }: {
+export function IntradayMacdChart({ dif, dea, macd, selectedTime: controlledTime }: {
   dif: IntradayMetricSeries,
   dea: IntradayMetricSeries,
   macd: IntradayMetricSeries,
+  selectedTime?: string,
 }) {
+  const controlled = controlledTime !== undefined
   const reference = [macd, dif, dea].find((series) => series.points.length > 0) ?? macd
   const lastIndex = Math.max(0, reference.points.length - 1)
   const [selectedIndex, setSelectedIndex] = useState(lastIndex)
@@ -226,11 +241,13 @@ export function IntradayMacdChart({ dif, dea, macd }: {
     })
     return path
   }
-  const safeIndex = Math.min(selectedIndex, reference.points.length - 1)
-  const selectedTime = reference.points[safeIndex].time
-  const selectedDif = difValues.get(selectedTime) ?? null
-  const selectedDea = deaValues.get(selectedTime) ?? null
-  const selectedMacd = macdValues.get(selectedTime) ?? null
+  const safeIndex = controlled
+    ? intradayPointIndexForTime(reference.points, controlledTime)
+    : Math.min(selectedIndex, reference.points.length - 1)
+  const selectedPointTime = controlled ? controlledTime! : reference.points[safeIndex].time
+  const selectedDif = difValues.get(selectedPointTime) ?? null
+  const selectedDea = deaValues.get(selectedPointTime) ?? null
+  const selectedMacd = macdValues.get(selectedPointTime) ?? null
   const zeroY = yFor(0)
   const barWidth = Math.max(1.5, plotWidth / 240 * .72)
   const valueLabel = (value: number | null) => value === null ? '—' : `${value > 0 ? '+' : ''}${value.toFixed(3)}`
@@ -238,8 +255,8 @@ export function IntradayMacdChart({ dif, dea, macd }: {
   return <figure className="intraday-chart intraday-macd-chart">
     <figcaption>
       <div><span>当日分时</span><h4>MACD</h4></div>
-      <div className="chart-readout macd-readout" aria-live="polite">
-        <time>{selectedTime}</time>
+      <div className="chart-readout macd-readout" aria-live={controlled ? undefined : 'polite'}>
+        <time>{selectedPointTime}</time>
         <b style={{ color: MACD_DIF_COLOR }}>DIF</b><strong style={{ color: MACD_DIF_COLOR }}>{valueLabel(selectedDif)}</strong>
         <b style={{ color: MACD_DEA_COLOR }}>DEA</b><strong style={{ color: MACD_DEA_COLOR }}>{valueLabel(selectedDea)}</strong>
         <b>MACD</b><strong className={selectedMacd === null ? undefined : selectedMacd < 0 ? 'macd-down' : 'macd-up'}>{valueLabel(selectedMacd)}</strong>
@@ -250,8 +267,8 @@ export function IntradayMacdChart({ dif, dea, macd }: {
         viewBox={`0 0 ${CHART_WIDTH} ${CHART_HEIGHT}`}
         role="img"
         aria-label="MACD当日分时图"
-        tabIndex={0}
-        onKeyDown={(event) => {
+        tabIndex={controlled ? undefined : 0}
+        onKeyDown={controlled ? undefined : (event) => {
           if (event.key === 'ArrowLeft') {
             event.preventDefault()
             setSelectedIndex((current) => Math.max(0, current - 1))
@@ -266,7 +283,7 @@ export function IntradayMacdChart({ dif, dea, macd }: {
             setSelectedIndex(reference.points.length - 1)
           }
         }}
-        onPointerMove={(event) => {
+        onPointerMove={controlled ? undefined : (event) => {
           const bounds = event.currentTarget.getBoundingClientRect()
           if (bounds.width === 0) return
           const scaledX = ((event.clientX - bounds.left) / bounds.width) * CHART_WIDTH
@@ -293,6 +310,13 @@ export function IntradayMacdChart({ dif, dea, macd }: {
         })}
         <path className="macd-dif-line" d={linePath(dif)} />
         <path className="macd-dea-line" d={linePath(dea)} />
+        <line
+          className="chart-cursor-line"
+          x1={xFor(selectedPointTime, safeIndex, reference.points.length)}
+          x2={xFor(selectedPointTime, safeIndex, reference.points.length)}
+          y1={CHART_TOP}
+          y2={CHART_TOP + plotHeight}
+        />
         {intradayAxisTicks.map((tick) => <text className="chart-axis-label intraday-x-axis-label" key={tick.label} x={CHART_LEFT + tick.ratio * plotWidth} y={CHART_HEIGHT - 10} textAnchor={tick.anchor}>{tick.label}</text>)}
         <text className="chart-axis-label" x={CHART_LEFT - 8} y={CHART_TOP + 4} textAnchor="end">{maximum.toFixed(3)}</text>
         <text className="chart-axis-label" x={CHART_LEFT - 8} y={CHART_TOP + plotHeight} textAnchor="end">{minimum.toFixed(3)}</text>

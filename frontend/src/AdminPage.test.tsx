@@ -46,6 +46,30 @@ describe('AdminPage', () => {
     expect(fetch).toHaveBeenNthCalledWith(4, '/api/admin/queue', expect.objectContaining({ credentials: 'include' }))
   })
 
+  it('loads and creates ordinary market users from the administrator console', async () => {
+    vi.mocked(fetch)
+      .mockResolvedValueOnce(new Response(null, { status: 204 }))
+      .mockResolvedValueOnce(jsonResponse({ state: 'READY', last_heartbeat: null, queue_paused: false }))
+      .mockResolvedValueOnce(jsonResponse({ locked: false }))
+      .mockResolvedValueOnce(jsonResponse({ paused: false }))
+      .mockResolvedValueOnce(jsonResponse([]))
+      .mockResolvedValueOnce(jsonResponse({ id: 9, username: 'trader', enabled: true, must_change_password: true, created_at: '2026-08-23T00:00:00+00:00' }, 201))
+
+    const user = userEvent.setup()
+    render(<AdminPage />)
+    await user.click(await screen.findByRole('button', { name: '加载行情用户' }))
+    await user.type(screen.getByLabelText('新用户名'), 'trader')
+    await user.type(screen.getByLabelText('临时密码'), 'temporary-pass')
+    await user.click(screen.getByRole('button', { name: '创建行情用户' }))
+
+    expect(await screen.findByText('trader')).toBeInTheDocument()
+    expect(screen.getByText('首次登录需改密')).toBeInTheDocument()
+    expect(fetch).toHaveBeenLastCalledWith('/api/admin/users', expect.objectContaining({
+      method: 'POST',
+      headers: expect.objectContaining({ 'X-CSRF-Token': 'test-csrf' }),
+    }))
+  })
+
   it('does not block an existing cookie session while server validation is pending', () => {
     vi.mocked(fetch).mockReturnValue(new Promise<Response>(() => undefined))
 
@@ -349,6 +373,18 @@ describe('AdminPage', () => {
   })
 
   it('keeps the device viewport active and explains a lock conflict', async () => {
+    class ConnectingWebSocket {
+      static OPEN = 1
+      readyState = 0
+      close = vi.fn()
+      send = vi.fn()
+      onopen: (() => void) | null = null
+      onclose: (() => void) | null = null
+      onerror: (() => void) | null = null
+      onmessage: ((event: MessageEvent) => void) | null = null
+      constructor(_url: string) { /* Remain in CONNECTING for this lock-conflict test. */ }
+    }
+    vi.stubGlobal('WebSocket', ConnectingWebSocket)
     vi.mocked(fetch)
       .mockResolvedValueOnce(new Response(null, { status: 204 }))
       .mockResolvedValueOnce(jsonResponse({ state: 'ADMIN_CONTROL', last_heartbeat: null, queue_paused: true }))

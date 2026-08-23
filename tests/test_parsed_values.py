@@ -287,6 +287,153 @@ def test_direct_read_preserves_the_three_app_intraday_series_with_their_time_axi
     }
 
 
+def test_market_snapshot_uses_the_direct_app_quote_and_timeshare_arrays() -> None:
+    payload = _runtime_payload()
+    payload["quotes"][1].update(
+        {
+            "price": 8.33,
+            "times": [930, 931, 932],
+            "prices": [8.31, 8.34, 8.33],
+            "volumes": [1200, 800, 500],
+            "amounts": [9972, 6672, 4165],
+        }
+    )
+    source = FridaParsedValueSource(
+        "core:27043",
+        request_scope="core_metrics",
+        direct_reader=lambda *_args: payload,
+    )
+
+    snapshot = source.read_market_snapshot("601872", detail=True)
+
+    assert snapshot.symbol == "601872"
+    assert snapshot.market == "17"
+    assert snapshot.name == "招商轮船"
+    assert snapshot.quote["price"] == "8.33"
+    assert snapshot.quote["volume"] == "2500"
+    assert snapshot.source_time == "09:32"
+    assert [point.time for point in snapshot.timeshare] == ["09:30", "09:31", "09:32"]
+    assert [point.price for point in snapshot.timeshare] == ["8.31", "8.34", "8.33"]
+    assert snapshot.capabilities["timeshare"]["available"] is True
+    assert snapshot.capabilities["order_book"] == {
+        "available": False,
+        "reason": "APP_INTERFACE_NOT_CONFIRMED",
+    }
+
+
+def test_market_series_parses_only_an_injected_app_internal_kline_response() -> None:
+    calls: list[tuple[object, ...]] = []
+
+    def series_reader(endpoint, package, timeout, symbol, market, period, cursor, limit):
+        calls.append((endpoint, package, timeout, symbol, market, period, cursor, limit))
+        return {
+            "bars": [
+                {
+                    "time": "2026-08-21",
+                    "open": 8.20,
+                    "high": 8.48,
+                    "low": 8.16,
+                    "close": 8.33,
+                    "volume": 952210,
+                    "amount": 7928451,
+                }
+            ],
+            "indicators": {"ma5": [8.29], "macd": [0.018]},
+            "next_cursor": "app-cursor-2",
+        }
+
+    source = FridaParsedValueSource("core:27043", market_series_reader=series_reader)
+
+    page = source.read_market_series("601872", "day", "app-cursor-1", 120)
+
+    assert calls == [
+        (
+            "core:27043",
+            "com.hexin.plat.android",
+            8,
+            "601872",
+            "17",
+            "day",
+            "app-cursor-1",
+            120,
+        )
+    ]
+    assert page.bars[0].close == "8.33"
+    assert page.indicators["ma5"] == ("8.29",)
+    assert page.next_cursor == "app-cursor-2"
+
+
+def test_market_series_reports_an_explicit_capability_gap_without_ui_fallback() -> None:
+    source = FridaParsedValueSource("core:27043")
+
+    page = source.read_market_series("601872", "day", None, 120)
+
+    assert page.bars == ()
+    assert page.source_error == "DIRECT_KLINE_UNAVAILABLE"
+
+
+def test_dual_account_market_snapshot_keeps_core_quote_when_fund_interface_fails() -> None:
+    core_payload = _runtime_payload()
+    core_payload["quotes"][1].update({"times": [930], "prices": [19.78]})
+    core = FridaParsedValueSource(
+        "core:27043",
+        request_scope="core_metrics",
+        direct_reader=lambda *_args: core_payload,
+    )
+
+    def fund_failure(*_args):
+        raise DirectRequestError("DIRECT_FUND_FLOW_TIMEOUT")
+
+    fund = FridaParsedValueSource(
+        "fund:27042",
+        request_scope="main_fund_flow",
+        direct_reader=fund_failure,
+    )
+    source = DualAccountParsedValueSource(core, fund)
+
+    snapshot = source.read_market_snapshot("601872", detail=True)
+
+    assert snapshot.quote["price"] == "19.78"
+    assert snapshot.main_fund_flow == {}
+    assert snapshot.source_errors == {
+        "core_metrics": None,
+        "main_fund_flow": "DIRECT_FUND_FLOW_TIMEOUT",
+    }
+
+
+def test_dual_account_market_snapshot_refreshes_fund_flow_on_a_slower_cadence() -> None:
+    core_payload = _runtime_payload()
+    core_payload["quotes"][1].update({"times": [930], "prices": [19.78]})
+    fund_calls = 0
+
+    def fund_reader(*_args):
+        nonlocal fund_calls
+        fund_calls += 1
+        return {
+            "fund_flows": [{
+                "period": "today",
+                "current_unit": "万元",
+                "main_in": "12000",
+                "main_listed": "7000",
+                "main_grey": "5000",
+                "main_retail_investor": "-12000",
+            }]
+        }
+
+    source = DualAccountParsedValueSource(
+        FridaParsedValueSource("core:27043", request_scope="core_metrics", direct_reader=lambda *_args: core_payload),
+        FridaParsedValueSource("fund:27042", request_scope="main_fund_flow", direct_reader=fund_reader),
+        fund_market_interval_seconds=15,
+    )
+
+    first = source.read_market_snapshot("601872", detail=True)
+    second = source.read_market_snapshot("601872", detail=True)
+
+    assert first.main_fund_flow["today"]["main_net_inflow"] == "12000.00"
+    assert second.main_fund_flow == first.main_fund_flow
+    assert fund_calls == 1
+
+
 def test_intraday_series_right_aligns_short_values_and_keeps_permission_gaps() -> None:
     """Dropping a sentinel or left-aligning a short computed curve shifts every tooltip."""
     payload = _runtime_payload()

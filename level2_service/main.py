@@ -11,6 +11,8 @@ from typing import Callable, Mapping
 from fastapi import FastAPI
 
 from .api import create_app
+from .market_accounts import RedisMarketSessionStore, SQLiteMarketAccountStore
+from .market_data import MarketDataBroker, is_china_market_open
 from .parsed_values import DualAccountParsedValueSource, FridaParsedValueSource
 from .queue import RedisStreamsStore
 from .runner import ADBDeviceBridge, DailyCheckState, Level2Navigator, Level2Runner, OpenCVTemplateFallback, RunnerControl, TAB_LABELS, long_capture_has_net_heading
@@ -39,6 +41,7 @@ class DeploymentSettings:
     fund_adb_serial: str | None
     fund_frida_server_endpoint: str | None
     daily_check_state_file: Path
+    market_database_path: Path
 
     @classmethod
     def from_environ(cls, environ: Mapping[str, str] | None = None) -> "DeploymentSettings":
@@ -88,6 +91,7 @@ class DeploymentSettings:
                 raise ValueError("ADB_SERIAL is required")
         template_root_value = values.get("TEMPLATE_ROOT", "").strip()
         frontend_root_value = values.get("FRONTEND_ROOT", "").strip()
+        capture_root = Path(values.get("CAPTURE_ROOT", "/data/captures")).resolve()
         cookie_secure_value = values.get("ADMIN_COOKIE_SECURE", "1").strip().lower()
         if cookie_secure_value in {"1", "true", "yes", "on"}:
             admin_cookie_secure = True
@@ -97,7 +101,7 @@ class DeploymentSettings:
             raise ValueError("ADMIN_COOKIE_SECURE must be a boolean value")
         return cls(
             redis_url=values.get("REDIS_URL", "redis://redis:6379/0"),
-            capture_root=Path(values.get("CAPTURE_ROOT", "/data/captures")).resolve(),
+            capture_root=capture_root,
             admin_password_hash=password_hash,
             admin_password_file=password_file,
             admin_session_secret=session_secret,
@@ -116,6 +120,12 @@ class DeploymentSettings:
             fund_frida_server_endpoint=dual_values["FUND_FRIDA_SERVER_ENDPOINT"] or None,
             daily_check_state_file=Path(
                 values.get("DAILY_CHECK_STATE_FILE", "/data/admin/daily-check.json")
+            ).expanduser().resolve(),
+            market_database_path=Path(
+                values.get(
+                    "MARKET_DATABASE_PATH",
+                    str(capture_root.parent / "market" / "market.db"),
+                )
             ).expanduser().resolve(),
         )
 
@@ -256,6 +266,13 @@ def create_production_app(
         daily_check_state=DailyCheckState(config.daily_check_state_file),
         long_capture_validator=long_capture_has_net_heading,
     )
+    market_accounts = SQLiteMarketAccountStore(config.market_database_path)
+    market_sessions = RedisMarketSessionStore(redis_client)
+    market_broker = (
+        MarketDataBroker(parsed_value_source, is_market_open=is_china_market_open)
+        if parsed_value_source is not None
+        else None
+    )
     app = create_app(
         store=store,
         admin_password_hash=config.admin_password_hash,
@@ -272,6 +289,9 @@ def create_production_app(
         secure_admin_cookies=config.admin_cookie_secure,
         symbol_lookup=parsed_value_source.lookup_symbol if parsed_value_source is not None else None,
         symbol_lookup_cache=RedisSymbolLookupCache(redis_client),
+        market_account_store=market_accounts,
+        market_session_store=market_sessions,
+        market_data_broker=market_broker,
     )
     app.state.deployment_settings = config
     app.state.runner = runner

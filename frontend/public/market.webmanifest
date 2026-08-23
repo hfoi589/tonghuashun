@@ -1,0 +1,11 @@
+{
+  "name": "同花顺行情中心",
+  "short_name": "行情中心",
+  "start_url": "/market",
+  "display": "standalone",
+  "background_color": "#f4f5f7",
+  "theme_color": "#17191d",
+  "icons": [
+    { "src": "/market-icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" }
+  ]
+}

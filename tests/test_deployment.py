@@ -8,6 +8,8 @@ from argon2 import PasswordHasher
 from fastapi.testclient import TestClient
 
 from level2_service.main import DeploymentSettings, create_production_app
+from level2_service.market_accounts import RedisMarketSessionStore, SQLiteMarketAccountStore
+from level2_service.market_data import MarketDataBroker
 from level2_service.parsed_values import DualAccountParsedValueSource
 from level2_service.runner import DailyCheckState, OpenCVTemplateFallback, long_capture_has_net_heading
 from level2_service.symbol_cache import RedisSymbolLookupCache
@@ -26,6 +28,7 @@ class FakeRedis:
     def sadd(self, *_args): pass
     def scard(self, *_args): return 0
     def set(self, *_args): pass
+    def setex(self, *_args): pass
     def smembers(self, *_args): return set()
     def srem(self, *_args): pass
     def xadd(self, *_args): pass
@@ -129,6 +132,34 @@ def test_production_factory_wires_the_configured_frida_runtime_source(tmp_path: 
     assert isinstance(app.state.symbol_lookup_cache, RedisSymbolLookupCache)
 
 
+def test_production_factory_wires_persistent_market_accounts_sessions_and_broker(tmp_path: Path) -> None:
+    database_path = tmp_path / "market" / "market.db"
+    settings = DeploymentSettings.from_environ(
+        {
+            "ADMIN_PASSWORD_HASH": "$argon2id$example",
+            "ADMIN_SESSION_SECRET": "s" * 32,
+            "CAPTURE_ROOT": str(tmp_path / "captures"),
+            "MARKET_DATABASE_PATH": str(database_path),
+            "ADB_SERIAL": "emulator-5556",
+            "FRIDA_SERVER_ENDPOINT": "host.docker.internal:27043",
+        }
+    )
+
+    app = create_production_app(
+        settings=settings,
+        redis_client_factory=lambda _url: FakeRedis(),
+        bridge_factory=FakeBridge,
+        runner_factory=FakeRunner,
+    )
+
+    assert settings.market_database_path == database_path.resolve()
+    assert database_path.is_file()
+    assert isinstance(app.state.market_account_store, SQLiteMarketAccountStore)
+    assert isinstance(app.state.market_session_store, RedisMarketSessionStore)
+    assert isinstance(app.state.market_data_broker, MarketDataBroker)
+    assert app.state.market_data_broker.source is app.state.runner.parsed_value_source
+
+
 def test_settings_require_all_four_dual_account_device_variables() -> None:
     base = {
         "ADMIN_PASSWORD_HASH": "$argon2id$example",
@@ -211,6 +242,8 @@ def test_production_factory_propagates_frontend_root_and_http_cookie_security(tm
     frontend_root = tmp_path / "frontend"
     frontend_root.mkdir()
     (frontend_root / "index.html").write_text("<html>production frontend</html>", encoding="utf-8")
+    (frontend_root / "market.webmanifest").write_text('{"start_url":"/market"}', encoding="utf-8")
+    (frontend_root / "market-sw.js").write_text("self.addEventListener('fetch', () => {})", encoding="utf-8")
     settings = DeploymentSettings.from_environ(
         {
             "ADMIN_PASSWORD_HASH": PasswordHasher().hash("admin-secret"),
@@ -230,6 +263,9 @@ def test_production_factory_propagates_frontend_root_and_http_cookie_security(tm
 
     with TestClient(app, base_url="http://testserver") as client:
         assert client.get("/").text == "<html>production frontend</html>"
+        assert client.get("/market").text == "<html>production frontend</html>"
+        assert client.get("/market.webmanifest").json()["start_url"] == "/market"
+        assert "fetch" in client.get("/market-sw.js").text
         login = client.post("/api/admin/session", json={"password": "admin-secret"})
         assert login.status_code == 204
         assert all("; Secure" not in value for value in login.headers.get_list("set-cookie"))

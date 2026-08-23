@@ -19,6 +19,7 @@ from starlette.websockets import WebSocketState
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 from .models import CaptureKind, CaptureStatus, TaskRecord, TaskStatus, ValueSource, utc_now
+from .market_api import install_market_routes
 from .parsed_values import (
     DirectRequestError,
     SymbolLookup,
@@ -223,6 +224,9 @@ def create_app(
     secure_admin_cookies: bool = True,
     symbol_lookup: Callable[[str], SymbolLookup] | None = None,
     symbol_lookup_cache: SymbolLookupCache | None = None,
+    market_account_store: object | None = None,
+    market_session_store: object | None = None,
+    market_data_broker: object | None = None,
 ) -> FastAPI:
     """Build an isolated application instance for one service process."""
     if cleanup_interval_seconds <= 0:
@@ -257,9 +261,23 @@ def create_app(
                 except TimeoutError:
                     continue
 
+        async def market_loop() -> None:
+            while not stop.is_set():
+                try:
+                    await app.state.market_data_broker.poll_due()
+                except Exception:
+                    pass
+                try:
+                    await wait_for(stop.wait(), timeout=0.25)
+                except TimeoutError:
+                    continue
+
         app.state.cleanup_stop = stop
         app.state.cleanup_task = create_task(retention_loop())
         app.state.runner_task = create_task(runner_loop()) if runner is not None else None
+        app.state.market_task = (
+            create_task(market_loop()) if app.state.market_data_broker is not None else None
+        )
         try:
             yield
         finally:
@@ -267,6 +285,8 @@ def create_app(
             await app.state.cleanup_task
             if app.state.runner_task is not None:
                 await app.state.runner_task
+            if app.state.market_task is not None:
+                await app.state.market_task
 
     app = FastAPI(title="THS Level2 Capture Service", lifespan=lifespan)
     app.state.store = store or InMemoryStreams()
@@ -290,6 +310,9 @@ def create_app(
     app.state.symbol_verification_enabled = symbol_lookup is not None or symbol_lookup_cache is not None
     app.state.symbol_lookup_cache = symbol_lookup_cache or InMemorySymbolLookupCache()
     app.state.symbol_lookup_cache_lock = RLock()
+    app.state.market_account_store = market_account_store
+    app.state.market_session_store = market_session_store
+    app.state.market_data_broker = market_data_broker
     set_capture_root = getattr(app.state.store, "set_capture_root", None)
     if callable(set_capture_root):
         set_capture_root(app.state.capture_root)
@@ -688,12 +711,38 @@ def create_app(
     async def device_stream(websocket: WebSocket, role: str) -> None:
         await stream_device_role(websocket, role, include_device_health=True)
 
+    install_market_routes(
+        app,
+        require_admin=require_admin,
+        require_admin_csrf=require_csrf,
+        resolve_symbol=resolve_symbol,
+        secure_cookies=secure_admin_cookies,
+    )
+
     if app.state.frontend_root is not None:
         index_file = app.state.frontend_root / "index.html"
         assets_root = app.state.frontend_root / "assets"
         if index_file.is_file():
             if assets_root.is_dir():
                 app.mount("/assets", StaticFiles(directory=assets_root), name="frontend-assets")
+
+            def frontend_public_file(filename: str, media_type: str):
+                path = app.state.frontend_root / filename
+                if not path.is_file():
+                    raise HTTPException(status_code=404, detail="Not Found")
+                return FileResponse(path, media_type=media_type)
+
+            @app.get("/market.webmanifest", include_in_schema=False)
+            def market_manifest():
+                return frontend_public_file("market.webmanifest", "application/manifest+json")
+
+            @app.get("/market-sw.js", include_in_schema=False)
+            def market_service_worker():
+                return frontend_public_file("market-sw.js", "text/javascript")
+
+            @app.get("/market-icon.svg", include_in_schema=False)
+            def market_icon():
+                return frontend_public_file("market-icon.svg", "image/svg+xml")
 
             @app.api_route("/{frontend_path:path}", methods=["GET", "HEAD"], include_in_schema=False)
             def frontend_fallback(frontend_path: str):

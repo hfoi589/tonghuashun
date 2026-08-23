@@ -1,5 +1,5 @@
 import { FormEvent, KeyboardEvent, PointerEvent, useCallback, useEffect, useRef, useState } from 'react'
-import { ApiError, api, readCsrfToken, type QueueState, type RunnerHealth } from './api'
+import { ApiError, api, readCsrfToken, type MarketAdminUser, type QueueState, type RunnerHealth } from './api'
 import { parseDeviceServerMessage, type DeviceInputEvent, type DeviceStatus } from './device-protocol'
 import { DeviceInputAdapter } from './device-stream'
 
@@ -167,6 +167,9 @@ export function AdminPage({ deviceStreamUrl }: { deviceStreamUrl?: string }) {
   const [waitingTaskId, setWaitingTaskId] = useState('')
   const [failedTaskId, setFailedTaskId] = useState('')
   const [message, setMessage] = useState('')
+  const [marketUsers, setMarketUsers] = useState<MarketAdminUser[] | null>(null)
+  const [marketUsername, setMarketUsername] = useState('')
+  const [marketTemporaryPassword, setMarketTemporaryPassword] = useState('')
   const invalidateAdminControl = useCallback((reason: unknown) => {
     const sessionInvalid = (reason instanceof ApiError && reason.status === 401) || (reason instanceof Error && reason.message.includes('authentication'))
     if (sessionInvalid) {
@@ -271,6 +274,30 @@ export function AdminPage({ deviceStreamUrl }: { deviceStreamUrl?: string }) {
       setMessage('失败任务已重新加入队列')
     } catch (reason) { invalidateAdminControl(reason) }
   }
+  async function loadMarketUsers() {
+    setMessage('')
+    try { setMarketUsers(await api.marketUsers()) }
+    catch (reason) { invalidateAdminControl(reason) }
+  }
+  async function createMarketUser(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    setMessage('')
+    try {
+      const created = await api.createMarketUser(marketUsername, marketTemporaryPassword, readCsrfToken())
+      setMarketUsers((current) => [...(current ?? []), created])
+      setMarketUsername('')
+      setMarketTemporaryPassword('')
+      setMessage('行情用户已创建')
+    } catch (reason) { invalidateAdminControl(reason) }
+  }
+  async function toggleMarketUser(target: MarketAdminUser) {
+    setMessage('')
+    try {
+      const updated = await api.updateMarketUser(target.id, { enabled: !target.enabled }, readCsrfToken())
+      setMarketUsers((current) => current?.map((item) => item.id === updated.id ? updated : item) ?? null)
+      setMessage(updated.enabled ? '行情用户已启用' : '行情用户已停用')
+    } catch (reason) { invalidateAdminControl(reason) }
+  }
   useEffect(() => {
     if (!hadSessionCookie.current) return
     let active = true
@@ -311,6 +338,22 @@ export function AdminPage({ deviceStreamUrl }: { deviceStreamUrl?: string }) {
     <section className="admin-controls"><div><h2>恢复等待任务</h2><p>完成设备登录、验证或权限处理后，输入任务 ID 重新排入 FIFO 队列。</p></div><form className="button-row" onSubmit={resumeWaitingJob}><label htmlFor="waiting-task">等待任务 ID</label><input id="waiting-task" value={waitingTaskId} onChange={(event) => setWaitingTaskId(event.target.value)} autoComplete="off" /><button className="secondary" type="submit" disabled={!waitingTaskId.trim()}>恢复等待任务</button></form></section>
     <section className="admin-controls"><div><h2>重试失败任务</h2><p>设备恢复后，输入失败任务 ID 重新排入 FIFO 队列；已有合格截图会保留。</p></div><form className="button-row" onSubmit={retryFailedJob}><label htmlFor="failed-task">失败任务 ID</label><input id="failed-task" value={failedTaskId} onChange={(event) => setFailedTaskId(event.target.value)} autoComplete="off" /><button className="secondary" type="submit" disabled={!failedTaskId.trim()}>重试失败任务</button></form></section>
     <section className="admin-controls"><div><h2>修改管理员密码</h2><p>修改后当前会话会退出，使用新密码重新登录。</p></div><form className="password-change-form" onSubmit={changePassword} data-1p-ignore="true" data-lpignore="true"><label htmlFor="current-admin-password">当前管理员密码</label><input id="current-admin-password" type="password" autoComplete="current-password" data-1p-ignore="true" data-lpignore="true" value={currentPassword} onChange={(event) => setCurrentPassword(event.target.value)} required /><label htmlFor="new-admin-password">新管理员密码</label><input id="new-admin-password" type="password" autoComplete="new-password" data-1p-ignore="true" data-lpignore="true" value={newPassword} onChange={(event) => setNewPassword(event.target.value)} required /><label htmlFor="confirm-admin-password">确认新管理员密码</label><input id="confirm-admin-password" type="password" autoComplete="new-password" data-1p-ignore="true" data-lpignore="true" value={newPasswordConfirmation} onChange={(event) => setNewPasswordConfirmation(event.target.value)} required /><button className="secondary" type="submit">修改管理员密码</button></form></section>
+    <section className="admin-controls admin-market-users">
+      <div><h2>行情用户</h2><p>创建普通用户、自选空间和临时密码。用户首次登录必须修改密码。</p></div>
+      <div className="admin-market-user-actions">
+        {marketUsers === null ? <button type="button" className="secondary" onClick={loadMarketUsers}>加载行情用户</button> : <>
+          <form className="password-change-form" onSubmit={createMarketUser}>
+            <label htmlFor="new-market-username">新用户名</label><input id="new-market-username" value={marketUsername} onChange={(event) => setMarketUsername(event.target.value)} minLength={3} required />
+            <label htmlFor="new-market-password">临时密码</label><input id="new-market-password" type="password" autoComplete="new-password" value={marketTemporaryPassword} onChange={(event) => setMarketTemporaryPassword(event.target.value)} minLength={8} required />
+            <button type="submit" className="secondary">创建行情用户</button>
+          </form>
+          <div className="admin-market-user-list">{marketUsers.length === 0 ? <p className="minor">还没有行情用户。</p> : marketUsers.map((target) => <div key={target.id}>
+            <span><strong>{target.username}</strong><small>{target.must_change_password ? '首次登录需改密' : '密码已设置'}</small></span>
+            <button type="button" className="secondary" onClick={() => toggleMarketUser(target)}>{target.enabled ? '停用' : '启用'}</button>
+          </div>)}</div>
+        </>}
+      </div>
+    </section>
     {message && <p className={message.includes('获得') || message.includes('交还') || message.includes('重新') ? 'success-message' : 'error'} role="status">{message}</p>}
     <div className="admin-device-grid">
       <DeviceViewport

@@ -698,6 +698,38 @@ button.capture-toggle:active { box-shadow: inset 0 2px 5px rgba(18, 49, 54, .08)
   align-items: start;
   gap: 1rem;
 }
+
+.admin-market-users {
+  align-items: start;
+}
+
+.admin-market-user-actions {
+  min-width: min(100%, 520px);
+  display: grid;
+  gap: 16px;
+}
+
+.admin-market-user-list {
+  border-top: 1px solid var(--line);
+}
+
+.admin-market-user-list > div {
+  padding: 11px 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  border-bottom: 1px solid var(--line);
+}
+
+.admin-market-user-list span {
+  display: grid;
+  gap: 3px;
+}
+
+.admin-market-user-list small {
+  color: var(--muted);
+}
 .admin-device-grid .device-panel { min-width: 0; }
 .device-account-warning {
   margin: .8rem 0 0;

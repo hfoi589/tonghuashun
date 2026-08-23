@@ -120,7 +120,9 @@ docker buildx build --platform linux/amd64,linux/arm64 --target api -t example/t
 ```
 
 Compose persists `capture-data`, `redis-data`, `redroid-data` (Linux only),
-`template-data`, and `admin-data`. Put only manually calibrated,
+`template-data`, `admin-data`, and `market-data`. The last volume contains the
+SQLite user and grouped-watchlist database; ordinary browser sessions remain
+revocable Redis records. Put only manually calibrated,
 non-secret PNG anchors under `template-data` (`search.png` and optional tab
 anchors); the API loads them as an OpenCV fallback after selector checks.
 Capture retention remains the API's 24-hour cleanup policy; queue metadata
@@ -132,6 +134,10 @@ The approved local deployment serves both the React site and API from
 Redroid ADB 5555, and macOS ADB 5037 remain private. The administrator console
 is `http://HOST:8001/#admin`. It shows both devices through independent
 same-origin WebSockets; the fund panel is marked “当前账号，禁止退出”.
+The multi-user market PWA is `http://HOST:8001/market`. Administrators create
+ordinary users and temporary passwords in the “行情用户” section; each user
+must change that password on first login and receives an isolated grouped
+watchlist (50 unique symbols maximum).
 For this HTTP deployment, `ADMIN_COOKIE_SECURE=0` allows the administrator
 session to survive page refreshes.
 
@@ -158,6 +164,19 @@ and a fund, the App result is filtered to the expected fund market and the bond
 market is ignored. Such a result reports `long_capture.status` as `SKIPPED`;
 missing App callback fields make the task `PARTIAL` and never trigger UI,
 screenshot, or OCR fallback.
+
+The market PWA shares one server-side subscription broker across users. During
+weekday A-share sessions it refreshes the selected detail symbol every 2
+seconds and watchlist-only symbols every 15 seconds; outside the configured
+09:30–11:30 and 13:00–15:00 Asia/Shanghai windows it uses a 60-second cadence.
+The independently owned fund-flow account is capped at one request per symbol
+per 15 seconds even while the core quote refreshes faster. These are polling
+cadences, not an exchange tick guarantee: measured App callback latency and
+device availability still determine when a fresh frame arrives. The current
+App response provides 241 one-minute points for the trading-day curves. K-line,
+ten-level order book, and time-and-sales panels stay explicitly unavailable
+until their exact App-internal request contracts are confirmed; the service
+does not substitute an Internet quote, OCR value, or guessed request parameter.
 
 Taking the administrator device lock pauses new Runner work automatically. The
 lock release leaves the queue paused; use the explicit queue-resume control

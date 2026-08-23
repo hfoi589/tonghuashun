@@ -26,6 +26,7 @@ services:
       ADMIN_PASSWORD_HASH: ${ADMIN_PASSWORD_HASH:-}
       ADMIN_SESSION_SECRET: ${ADMIN_SESSION_SECRET:-}
       DAILY_CHECK_STATE_FILE: /data/admin/daily-check.json
+      MARKET_DATABASE_PATH: /data/market/market.db
       RUNNER_POLL_INTERVAL_SECONDS: ${RUNNER_POLL_INTERVAL_SECONDS:-1}
       FRONTEND_ROOT: /app/frontend
       ADMIN_COOKIE_SECURE: ${ADMIN_COOKIE_SECURE:-0}
@@ -39,6 +40,7 @@ services:
       - capture-data:/data/captures
       - template-data:/data/templates
       - admin-data:/data/admin
+      - market-data:/data/market
     extra_hosts:
       - host.docker.internal:host-gateway
     healthcheck:
@@ -106,3 +108,4 @@ volumes:
   redroid-data:
   template-data:
   admin-data:
+  market-data:

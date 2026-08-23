@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+import time
 from threading import RLock
 from typing import Any, Callable, Protocol
 
+from .market_data import KlineBar, MarketSeriesPage, MarketSnapshot, TimesharePoint
 from .models import FUND_FLOW_METRICS, FUND_FLOW_PERIODS, MetricKind, REQUIRED_METRICS
 
 
@@ -144,9 +147,20 @@ FUND_ONLY_METRICS = frozenset(MetricKind) - REQUIRED_METRICS
 class DualAccountParsedValueSource:
     """Query independent App accounts concurrently and merge only owned fields."""
 
-    def __init__(self, core_source: Any, fund_source: Any) -> None:
+    def __init__(
+        self,
+        core_source: Any,
+        fund_source: Any,
+        *,
+        fund_market_interval_seconds: float = 15.0,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
         self.core_source = core_source
         self.fund_source = fund_source
+        self.fund_market_interval_seconds = fund_market_interval_seconds
+        self._market_clock = clock
+        self._fund_market_cache: dict[str, tuple[dict[str, Any], str | None, float]] = {}
+        self._fund_market_lock = RLock()
 
     def read(self, symbol: str) -> dict[MetricKind, str | None]:
         return self.core_source.read(symbol)
@@ -201,6 +215,69 @@ class DualAccountParsedValueSource:
             intraday_series=intraday_series,
         )
 
+    def read_market_snapshot(self, symbol: str, *, detail: bool) -> MarketSnapshot:
+        if not detail:
+            core = self.core_source.read_market_snapshot(symbol, detail=False)
+            return replace(
+                core,
+                main_fund_flow={},
+                source_errors={
+                    "core_metrics": core.source_errors.get("core_metrics"),
+                    "main_fund_flow": None,
+                },
+            )
+        with ThreadPoolExecutor(max_workers=2, thread_name_prefix="ths-market") as executor:
+            core_future = executor.submit(
+                self.core_source.read_market_snapshot,
+                symbol,
+                detail=detail,
+            )
+            fund_future = executor.submit(self._read_cached_fund_market, symbol)
+            try:
+                core = core_future.result()
+            except DirectRequestError:
+                raise
+            except Exception as error:
+                raise DirectRequestError("DIRECT_REQUEST_FAILED", str(error)) from error
+            try:
+                main_fund_flow, fund_error = fund_future.result()
+            except Exception:
+                fund_error, main_fund_flow = "DIRECT_FUND_FLOW_REQUEST_FAILED", {}
+        return replace(
+            core,
+            main_fund_flow=main_fund_flow,
+            source_errors={
+                "core_metrics": core.source_errors.get("core_metrics"),
+                "main_fund_flow": fund_error,
+            },
+        )
+
+    def _read_cached_fund_market(self, symbol: str) -> tuple[dict[str, Any], str | None]:
+        now = self._market_clock()
+        with self._fund_market_lock:
+            cached = self._fund_market_cache.get(symbol)
+            if cached is not None and now - cached[2] < self.fund_market_interval_seconds:
+                return cached[0], cached[1]
+        try:
+            fund = self.fund_source.read_market_snapshot(symbol, detail=False)
+            result = fund.main_fund_flow, fund.source_errors.get("main_fund_flow")
+        except DirectRequestError as error:
+            result = {}, error.error_code
+        except Exception:
+            result = {}, "DIRECT_FUND_FLOW_REQUEST_FAILED"
+        with self._fund_market_lock:
+            self._fund_market_cache[symbol] = (result[0], result[1], now)
+        return result
+
+    def read_market_series(
+        self,
+        symbol: str,
+        period: str,
+        cursor: str | None,
+        limit: int,
+    ) -> MarketSeriesPage:
+        return self.core_source.read_market_series(symbol, period, cursor, limit)
+
 
 class FridaParsedValueSource:
     """Attach for each task and read only objects whose stock code matches."""
@@ -215,6 +292,14 @@ class FridaParsedValueSource:
         runtime_reader: Callable[[str, str, float], dict[str, Any]] | None = None,
         direct_reader: Callable[[str, str, float, str, str], dict[str, Any]] | None = None,
         lookup_reader: Callable[[str, str, float, str], dict[str, Any]] | None = None,
+        market_series_reader: Callable[
+            [str, str, float, str, str, str, str | None, int], dict[str, Any]
+        ]
+        | None = None,
+        market_reader: Callable[
+            [str, str, float, str, str, bool], dict[str, Any]
+        ]
+        | None = None,
     ) -> None:
         if request_scope not in {"all", "core_metrics", "main_fund_flow"}:
             raise ValueError(f"unknown direct request scope: {request_scope}")
@@ -232,6 +317,21 @@ class FridaParsedValueSource:
         else:
             self._direct_reader = self._read_direct_runtime
         self._lookup_reader = lookup_reader or self._lookup_runtime
+        self._market_series_reader = market_series_reader
+        if market_reader is not None:
+            self._market_reader = market_reader
+        elif direct_reader is not None or request_scope == "main_fund_flow":
+            self._market_reader = lambda endpoint, package, timeout, symbol, market, _detail: self._direct_reader(
+                endpoint, package, timeout, symbol, market
+            )
+        elif request_scope == "core_metrics":
+            self._market_reader = self._read_market_runtime
+        else:
+            self._market_reader = lambda endpoint, package, timeout, symbol, market, detail: (
+                self._read_direct_runtime(endpoint, package, timeout, symbol, market)
+                if detail
+                else self._read_market_runtime(endpoint, package, timeout, symbol, market, False)
+            )
         self._frida_lock = RLock()
 
     def read(self, symbol: str) -> dict[MetricKind, str | None]:
@@ -281,6 +381,208 @@ class FridaParsedValueSource:
             values=self._parse_payload(payload, symbol),
             source_errors={"core_metrics": None, "main_fund_flow": None},
             intraday_series=self._parse_intraday_series(payload, symbol),
+        )
+
+    def read_market_snapshot(self, symbol: str, *, detail: bool) -> MarketSnapshot:
+        """Read a market snapshot through the same App-internal direct bridge."""
+        market = market_code_for_symbol(symbol)
+        try:
+            with self._frida_lock:
+                payload = self._market_reader(
+                    self.endpoint,
+                    self.package,
+                    self.timeout_seconds,
+                    symbol,
+                    market,
+                    detail,
+                )
+        except (UnsupportedMarketError, DirectRequestError):
+            raise
+        except Exception as error:
+            bridge_offline = type(error).__name__ in {
+                "ProcessNotFoundError",
+                "ServerNotRunningError",
+                "TransportError",
+            }
+            code = "DIRECT_APP_OFFLINE" if bridge_offline else "DIRECT_REQUEST_FAILED"
+            raise DirectRequestError(code, str(error)) from error
+        error_code = _text(payload.get("error_code"))
+        if error_code is not None:
+            raise DirectRequestError(error_code, _text(payload.get("error_message")))
+        return self._parse_market_snapshot(payload, symbol, market)
+
+    def read_market_series(
+        self,
+        symbol: str,
+        period: str,
+        cursor: str | None,
+        limit: int,
+    ) -> MarketSeriesPage:
+        """Read confirmed K-line fields, or expose an explicit capability gap."""
+        market = market_code_for_symbol(symbol)
+        if self._market_series_reader is None:
+            return MarketSeriesPage(
+                symbol=symbol,
+                period=period,
+                bars=(),
+                source_error="DIRECT_KLINE_UNAVAILABLE",
+            )
+        try:
+            with self._frida_lock:
+                payload = self._market_series_reader(
+                    self.endpoint,
+                    self.package,
+                    self.timeout_seconds,
+                    symbol,
+                    market,
+                    period,
+                    cursor,
+                    limit,
+                )
+        except (UnsupportedMarketError, DirectRequestError):
+            raise
+        except Exception as error:
+            raise DirectRequestError("DIRECT_KLINE_REQUEST_FAILED", str(error)) from error
+        error_code = _text(payload.get("error_code"))
+        if error_code is not None:
+            raise DirectRequestError(error_code, _text(payload.get("error_message")))
+        bars: list[KlineBar] = []
+        for raw_bar in payload.get("bars", ()):
+            if not isinstance(raw_bar, dict):
+                continue
+            raw_time = _text(raw_bar.get("time"))
+            if raw_time is None:
+                continue
+            bars.append(
+                KlineBar(
+                    time=raw_time,
+                    open=_market_number(raw_bar.get("open")),
+                    high=_market_number(raw_bar.get("high")),
+                    low=_market_number(raw_bar.get("low")),
+                    close=_market_number(raw_bar.get("close")),
+                    volume=_market_number(raw_bar.get("volume")),
+                    amount=_market_number(raw_bar.get("amount")),
+                )
+            )
+        indicators: dict[str, tuple[str | None, ...]] = {}
+        raw_indicators = payload.get("indicators", {})
+        if isinstance(raw_indicators, dict):
+            for name, values in raw_indicators.items():
+                if isinstance(values, (list, tuple)):
+                    indicators[str(name)] = tuple(_market_number(value) for value in values)
+        return MarketSeriesPage(
+            symbol=symbol,
+            period=period,
+            bars=tuple(bars),
+            indicators=indicators,
+            next_cursor=_text(payload.get("next_cursor")),
+        )
+
+    @classmethod
+    def _parse_market_snapshot(
+        cls,
+        payload: dict[str, Any],
+        symbol: str,
+        market: str,
+    ) -> MarketSnapshot:
+        values = cls._parse_payload(payload, symbol)
+        candidates = [
+            quote
+            for quote in payload.get("quotes", ())
+            if isinstance(quote, dict) and _symbols_match(quote.get("symbol"), symbol)
+        ]
+        raw_quote = max(candidates, key=_quote_score, default={})
+        times = raw_quote.get("times")
+        prices = raw_quote.get("prices")
+        volumes = raw_quote.get("volumes")
+        amounts = raw_quote.get("amounts")
+        times = list(times) if isinstance(times, (list, tuple)) else []
+        prices = list(prices) if isinstance(prices, (list, tuple)) else []
+        volumes = list(volumes) if isinstance(volumes, (list, tuple)) else []
+        amounts = list(amounts) if isinstance(amounts, (list, tuple)) else []
+        points: list[TimesharePoint] = []
+        valid_prices: list[Decimal] = []
+        for index, raw_time in enumerate(times):
+            point_time = _format_intraday_time(raw_time)
+            if point_time is None:
+                continue
+            price = _interface_decimal(prices[index]) if index < len(prices) else None
+            volume = _interface_decimal(volumes[index]) if index < len(volumes) else None
+            if price is not None:
+                valid_prices.append(price)
+            points.append(
+                TimesharePoint(
+                    time=point_time,
+                    price=_format_number(price, 2),
+                    volume=_market_number(volume),
+                )
+            )
+        total_volume = sum(
+            (value for value in (_interface_decimal(item) for item in volumes) if value is not None),
+            Decimal(0),
+        )
+        total_amount = sum(
+            (value for value in (_interface_decimal(item) for item in amounts) if value is not None),
+            Decimal(0),
+        )
+        quote = {
+            "price": values[MetricKind.CURRENT_PRICE],
+            "previous_close": _format_number(_decimal(raw_quote.get("previous_close")), 2),
+            "change_percent": values[MetricKind.CHANGE_PERCENT],
+            "turnover_rate": values[MetricKind.TURNOVER_RATE],
+            "open": _format_number(valid_prices[0], 2) if valid_prices else None,
+            "high": _format_number(max(valid_prices), 2) if valid_prices else None,
+            "low": _format_number(min(valid_prices), 2) if valid_prices else None,
+            "volume": _market_number(total_volume) if volumes else None,
+            "amount": _market_number(total_amount) if amounts else None,
+            "large_order_net": values[MetricKind.LARGE_ORDER_NET],
+            "large_order_amount": values[MetricKind.LARGE_ORDER_AMOUNT],
+            "retail_count": values[MetricKind.RETAIL_COUNT],
+            "macdfs": values[MetricKind.MACDFS],
+        }
+        main_fund_flow: dict[str, Any] = {}
+        for period, _label, unit_kind in FUND_FLOW_PERIODS:
+            metrics = FUND_FLOW_METRICS[period]
+            if values.get(unit_kind) is None and all(values.get(kind) is None for kind in metrics.values()):
+                continue
+            main_fund_flow[period] = {
+                "unit": values.get(unit_kind),
+                **{name: values.get(kind) for name, kind in metrics.items()},
+            }
+        has_timeshare = bool(points)
+        return MarketSnapshot(
+            symbol=symbol,
+            name=values[MetricKind.STOCK_NAME],
+            market=market,
+            sequence=0,
+            source_time=points[-1].time if points else None,
+            collected_at=datetime.now(timezone.utc),
+            quote=quote,
+            timeshare=tuple(points),
+            intraday_series={
+                kind.value.lower(): series
+                for kind, series in cls._parse_intraday_series(payload, symbol).items()
+            },
+            main_fund_flow=main_fund_flow,
+            capabilities={
+                "timeshare": {
+                    "available": has_timeshare,
+                    "reason": None if has_timeshare else "NO_APP_INTERFACE_DATA",
+                },
+                "kline": {
+                    "available": False,
+                    "reason": "DIRECT_KLINE_UNAVAILABLE",
+                },
+                "order_book": {
+                    "available": False,
+                    "reason": "APP_INTERFACE_NOT_CONFIRMED",
+                },
+                "trades": {
+                    "available": False,
+                    "reason": "APP_INTERFACE_NOT_CONFIRMED",
+                },
+            },
+            source_errors={"core_metrics": None, "main_fund_flow": None},
         )
 
     def lookup_symbol(self, symbol: str) -> SymbolLookup:
@@ -557,6 +859,25 @@ class FridaParsedValueSource:
         )
 
     @staticmethod
+    def _read_market_runtime(
+        endpoint: str,
+        package: str,
+        timeout_seconds: float,
+        symbol: str,
+        market: str,
+        detail: bool,
+    ) -> dict[str, Any]:
+        return FridaParsedValueSource._read_scoped_direct_runtime(
+            endpoint,
+            package,
+            timeout_seconds,
+            symbol,
+            market,
+            "core_metrics" if detail else "market_watchlist",
+            _FRIDA_CORE_DIRECT_SCRIPT,
+        )
+
+    @staticmethod
     def _read_scoped_direct_runtime(
         endpoint: str,
         package: str,
@@ -688,6 +1009,17 @@ def _format_intraday_time(value: object) -> str | None:
         if 0 <= hour <= 23 and 0 <= minute <= 59:
             return f"{hour:02d}:{minute:02d}"
     return text
+
+
+def _market_number(value: object) -> str | None:
+    """Format a direct-interface number without inventing display precision."""
+    number = _interface_decimal(value)
+    if number is None:
+        return None
+    normalized = number.normalize()
+    if normalized == normalized.to_integral():
+        return str(normalized.quantize(Decimal(1)))
+    return format(normalized, "f")
 
 
 def _format_number(
@@ -1084,7 +1416,11 @@ rpc.exports = {
             price: ext(base, 10) || (priceSeries === null ? null : scalar(priceSeries[priceSeries.length - 1])),
             previous_close: ext(base, 6),
             change_percent: ext(base, 34315) || (changeSeries === null ? null : scalar(changeSeries[changeSeries.length - 1])),
-            turnover_rate: ext(base, 34312) || (turnoverSeries === null ? null : scalar(turnoverSeries[turnoverSeries.length - 1]))
+            turnover_rate: ext(base, 34312) || (turnoverSeries === null ? null : scalar(turnoverSeries[turnoverSeries.length - 1])),
+            times: valuesFromCurve(base, 1) || [],
+            prices: priceSeries || [],
+            volumes: valuesFromCurve(base, 13) || [],
+            amounts: valuesFromCurve(base, 19) || []
           };
         }
 
@@ -1316,7 +1652,7 @@ rpc.exports = {
                 return;
               }
             }
-            var fundPromise = requestScope === 'core_metrics'
+            var fundPromise = requestScope === 'core_metrics' || requestScope === 'market_watchlist'
               ? Promise.resolve()
               : requestFundFlows();
             var base;
@@ -1329,7 +1665,7 @@ rpc.exports = {
             }
             var quotePromise = base.then(function (baseCurve) {
               payload.quotes.push(quote(baseCurve));
-              var specs = [
+              var specs = requestScope === 'market_watchlist' ? [] : [
                 [7031, 33007, false],
                 [7032, 33015, false],
                 [7034, 216, true],

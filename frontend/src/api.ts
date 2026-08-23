@@ -122,6 +122,14 @@ export interface QueueState {
   paused: boolean
 }
 
+export interface MarketAdminUser {
+  id: number
+  username: string
+  enabled: boolean
+  must_change_password: boolean
+  created_at: string
+}
+
 export interface SymbolLookup {
   symbol: string
   name: string
@@ -205,6 +213,17 @@ export const api = {
   releaseLock: (csrfToken: string) => request<LockState>('/api/admin/lock/release', {
     method: 'POST',
     headers: { 'X-CSRF-Token': csrfToken },
+  }),
+  marketUsers: () => request<MarketAdminUser[]>('/api/admin/users'),
+  createMarketUser: (username: string, temporaryPassword: string, csrfToken: string) => request<MarketAdminUser>('/api/admin/users', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrfToken },
+    body: JSON.stringify({ username, temporary_password: temporaryPassword }),
+  }),
+  updateMarketUser: (userId: number, update: { enabled?: boolean, temporary_password?: string }, csrfToken: string) => request<MarketAdminUser>(`/api/admin/users/${userId}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrfToken },
+    body: JSON.stringify(update),
   }),
 }
 

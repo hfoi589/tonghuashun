@@ -127,6 +127,32 @@ def test_public_provider_fetches_exact_years_until_indicator_warmup_is_satisfied
     assert {timeout for _url, timeout in calls} == {8.0}
 
 
+def test_public_provider_survives_two_transient_http_failures_by_default() -> None:
+    from level2_service.daily_kline import TonghuashunPublicDailyKlineProvider
+
+    attempts = 0
+
+    def fetch(url: str, _timeout: float) -> str:
+        nonlocal attempts
+        attempts += 1
+        if attempts <= 2:
+            raise OSError("temporary upstream reset")
+        if url.endswith("last.js"):
+            return _jsonp("601872", "last", {"year": {"2026": 1}})
+        return _jsonp(
+            "601872",
+            "2026",
+            {"data": "20260821,18.49,20.10,18.49,19.78,193604931,3808373130.00"},
+        )
+
+    bars = TonghuashunPublicDailyKlineProvider(fetch=fetch).read(
+        "601872", minimum_bars=1
+    )
+
+    assert attempts == 4
+    assert bars[0].time == "2026-08-21"
+
+
 def test_daily_indicators_align_ma_boll_and_macd_with_every_bar() -> None:
     from level2_service.daily_kline import calculate_daily_indicators
     from level2_service.market_data import KlineBar

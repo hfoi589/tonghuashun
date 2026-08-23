@@ -124,21 +124,42 @@ class SQLiteMarketAccountStore:
             ).fetchall()
             for row in user_ids:
                 user_id = int(row["user_id"])
-                existing = self._connection.execute(
-                    "SELECT 1 FROM watchlist_groups WHERE user_id=? AND is_primary=1 LIMIT 1",
-                    (user_id,),
-                ).fetchone()
-                if existing is not None:
-                    continue
                 primary = self._connection.execute(
-                    """SELECT id FROM watchlist_groups WHERE user_id=?
-                       ORDER BY CASE WHEN name='自选' THEN 0 ELSE 1 END,sort_order,id LIMIT 1""",
+                    "SELECT id FROM watchlist_groups WHERE user_id=? AND is_primary=1 LIMIT 1",
                     (user_id,),
                 ).fetchone()
-                if primary is not None:
+                if primary is None:
+                    primary = self._connection.execute(
+                        """SELECT id FROM watchlist_groups WHERE user_id=?
+                           ORDER BY CASE WHEN name='自选' THEN 0 ELSE 1 END,sort_order,id LIMIT 1""",
+                        (user_id,),
+                    ).fetchone()
+                if primary is None:
+                    continue
+                primary_group_id = int(primary["id"])
+                self._connection.execute(
+                    "UPDATE watchlist_groups SET is_primary=1 WHERE id=?",
+                    (primary_group_id,),
+                )
+                existing_items = self._connection.execute(
+                    """SELECT i.symbol,i.name,i.market
+                       FROM watchlist_items i
+                       JOIN watchlist_groups g ON g.id=i.group_id
+                       WHERE g.user_id=? AND g.id<>?
+                       ORDER BY g.sort_order,g.id,i.sort_order,i.symbol""",
+                    (user_id, primary_group_id),
+                ).fetchall()
+                for item in existing_items:
                     self._connection.execute(
-                        "UPDATE watchlist_groups SET is_primary=1 WHERE id=?",
-                        (primary["id"],),
+                        """INSERT OR IGNORE INTO watchlist_items(group_id,symbol,name,market,sort_order)
+                           VALUES(?,?,?,?,COALESCE((SELECT MAX(sort_order)+1 FROM watchlist_items WHERE group_id=?),0))""",
+                        (
+                            primary_group_id,
+                            item["symbol"],
+                            item["name"],
+                            item["market"],
+                            primary_group_id,
+                        ),
                     )
             self._connection.execute(
                 """CREATE UNIQUE INDEX IF NOT EXISTS watchlist_groups_one_primary

@@ -167,6 +167,8 @@ def test_existing_market_database_migrates_an_immutable_primary_group(tmp_path) 
         VALUES(1,'trader','unused','2026-08-24T00:00:00+00:00');
         INSERT INTO watchlist_groups(id,user_id,name,sort_order) VALUES(1,1,'自选',1);
         INSERT INTO watchlist_groups(id,user_id,name,sort_order) VALUES(2,1,'航运',0);
+        INSERT INTO watchlist_items(group_id,symbol,name,market,sort_order)
+        VALUES(2,'601872','招商轮船','17',0);
         """
     )
     connection.close()
@@ -176,6 +178,7 @@ def test_existing_market_database_migrates_an_immutable_primary_group(tmp_path) 
 
     assert groups[1].is_primary is True
     assert groups[2].is_primary is False
+    assert groups[1].items == groups[2].items
 
 
 def test_primary_group_duplication_does_not_consume_the_symbol_limit_twice(tmp_path) -> None:

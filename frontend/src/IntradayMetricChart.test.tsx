@@ -1,4 +1,4 @@
-import { cleanup, render, screen } from '@testing-library/react'
+import { cleanup, render, screen, within } from '@testing-library/react'
 import { afterEach, describe, expect, it } from 'vitest'
 import { IntradayMetricChart } from './IntradayMetricChart'
 import { intradayTimeRatio } from './intraday-axis'
@@ -51,6 +51,7 @@ describe('IntradayMetricChart', () => {
     />)
 
     const chart = screen.getByRole('img', { name: '测试指标当日分时图' })
+    expect(within(chart.closest('figure')!).queryByText('当日分时')).not.toBeInTheDocument()
     expect(chart).not.toHaveAttribute('tabindex')
     expect(screen.getByText('09:30', { selector: 'time' })).toBeInTheDocument()
     expect(screen.getByText('0.10', { selector: '.chart-readout strong' })).toBeInTheDocument()

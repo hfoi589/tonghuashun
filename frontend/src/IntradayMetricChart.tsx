@@ -41,7 +41,7 @@ export function IntradayMetricChart({ title, series, directional, precision = 2,
   if (series.points.length === 0) {
     return <figure className="intraday-chart intraday-chart-empty">
       <figcaption>
-        <div><span>当日分时</span><h4>{title}</h4></div>
+        <h4>{title}</h4>
       </figcaption>
       <p className="intraday-empty-message">暂无分时数据</p>
     </figure>
@@ -98,10 +98,7 @@ export function IntradayMetricChart({ title, series, directional, precision = 2,
 
   return <figure className={`intraday-chart intraday-tone-${tone}`}>
     <figcaption>
-      <div>
-        <span>当日分时</span>
-        <h4>{title}</h4>
-      </div>
+      <h4>{title}</h4>
       <div className="chart-readout" aria-live={controlled ? undefined : 'polite'}>
         <time>{selectedPointTime}</time>
         <strong>{selectedRawValue ?? '—'}{selectedRawValue !== null ? series.unit : ''}</strong>
@@ -203,7 +200,7 @@ export function IntradayMacdChart({ dif, dea, macd, selectedTime: controlledTime
 
   if (reference.points.length === 0) {
     return <figure className="intraday-chart intraday-chart-empty">
-      <figcaption><div><span>当日分时</span><h4>MACD</h4></div></figcaption>
+      <figcaption><h4>MACD</h4></figcaption>
       <p className="intraday-empty-message">暂无分时数据</p>
     </figure>
   }
@@ -254,7 +251,7 @@ export function IntradayMacdChart({ dif, dea, macd, selectedTime: controlledTime
 
   return <figure className="intraday-chart intraday-macd-chart">
     <figcaption>
-      <div><span>当日分时</span><h4>MACD</h4></div>
+      <h4>MACD</h4>
       <div className="chart-readout macd-readout" aria-live={controlled ? undefined : 'polite'}>
         <time>{selectedPointTime}</time>
         <b style={{ color: MACD_DIF_COLOR }}>DIF</b><strong style={{ color: MACD_DIF_COLOR }}>{valueLabel(selectedDif)}</strong>

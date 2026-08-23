@@ -1,7 +1,8 @@
 import { FormEvent, useEffect, useMemo, useRef, useState } from 'react'
 import { ApiError } from './api'
-import { DailyKChart } from './DailyKChart'
-import { IntradayMetricChart } from './IntradayMetricChart'
+import { DailyKChart, type DailyKSelection } from './DailyKChart'
+import { IntradayMacdChart, IntradayMetricChart } from './IntradayMetricChart'
+import { intradayAxisTicks, intradayPointRatio } from './intraday-axis'
 import {
   marketApi,
   marketStreamUrl,
@@ -34,6 +35,29 @@ function display(value: string | null | undefined, suffix = ''): string {
   return value === null || value === undefined || value === '' ? '—' : `${value}${suffix}`
 }
 
+function fixed(value: string | null | undefined, places = 2): string {
+  const number = Number(value)
+  return value === null || value === undefined || value === '' || !Number.isFinite(number)
+    ? '—'
+    : number.toFixed(places)
+}
+
+function compact(value: string | null | undefined, unit: '股' | '元'): string {
+  const number = Number(value)
+  if (value === null || value === undefined || value === '' || !Number.isFinite(number)) return '—'
+  if (Math.abs(number) >= 100_000_000) return `${(number / 100_000_000).toFixed(2)}亿${unit}`
+  if (Math.abs(number) >= 10_000) return `${(number / 10_000).toFixed(2)}万${unit}`
+  return `${number.toFixed(2)}${unit}`
+}
+
+function percentChange(close: string | null, previousClose: string | null): string | null {
+  const closeValue = Number(close)
+  const previousValue = Number(previousClose)
+  if (!Number.isFinite(closeValue) || !Number.isFinite(previousValue) || previousValue === 0) return null
+  const value = (closeValue - previousValue) / previousValue * 100
+  return `${value > 0 ? '+' : ''}${value.toFixed(2)}%`
+}
+
 function LineChart({ name, points }: { name: string, points: TimesharePoint[] }) {
   const data = points
     .map((point, index) => ({ index, point, value: Number(point.price) }))
@@ -48,11 +72,11 @@ function LineChart({ name, points }: { name: string, points: TimesharePoint[] })
   const spread = max - min
   min -= spread * 0.08
   max += spread * 0.08
-  const x = (index: number) => pad.left + index / Math.max(1, points.length - 1) * (width - pad.left - pad.right)
+  const plotWidth = width - pad.left - pad.right
+  const x = (index: number) => pad.left + intradayPointRatio(points[index].time, index, points.length) * plotWidth
   const y = (value: number) => pad.top + (max - value) / (max - min) * (height - pad.top - pad.bottom)
   const path = data.map((item, index) => `${index === 0 ? 'M' : 'L'}${x(item.index).toFixed(2)},${y(item.value).toFixed(2)}`).join(' ')
   const area = `${path} L${x(data.at(-1)!.index)},${height - pad.bottom} L${x(data[0].index)},${height - pad.bottom} Z`
-  const ticks = [...new Set([0, Math.floor((points.length - 1) / 2), points.length - 1])]
   return <svg className="market-price-chart" viewBox={`0 0 ${width} ${height}`} role="img" aria-label={`${name}分时价格图`}>
     {[0, 1, 2, 3, 4].map((tick) => {
       const py = pad.top + tick / 4 * (height - pad.top - pad.bottom)
@@ -61,7 +85,7 @@ function LineChart({ name, points }: { name: string, points: TimesharePoint[] })
     })}
     <path className="market-chart-area" d={area} />
     <path className="market-chart-line" d={path} />
-    {ticks.map((index) => <text key={index} x={x(index)} y={height - 12} textAnchor={index === 0 ? 'start' : index === points.length - 1 ? 'end' : 'middle'}>{points[index]?.time}</text>)}
+    {intradayAxisTicks.map((tick) => <text className="market-intraday-x-axis-label" key={tick.label} x={pad.left + tick.ratio * plotWidth} y={height - 12} textAnchor={tick.anchor}>{tick.label}</text>)}
   </svg>
 }
 
@@ -91,11 +115,12 @@ function CandleChart({ name, bars }: { name: string, bars: KlineBar[] }) {
   </svg>
 }
 
-function DailyKPanel({ name, page, loading, error }: {
+function DailyKPanel({ name, page, loading, error, onSelectionChange }: {
   name: string,
   page?: MarketSeriesPage,
   loading: boolean,
   error?: string,
+  onSelectionChange: (selection: DailyKSelection) => void,
 }) {
   if (loading) return <div className="market-empty-chart">正在加载前复权日 K…</div>
   if (error && !page) return <div className="market-capability-gap"><strong>日 K 加载失败</strong><span>{error}</span></div>
@@ -118,7 +143,7 @@ function DailyKPanel({ name, page, loading, error }: {
       {page.source_error && <span className="warning">{page.source_error}</span>}
       {page.stale && Object.entries(page.source_errors).map(([source, code]) => code && <span className="warning" key={source}>{source}: {code}</span>)}
     </div>
-    <DailyKChart name={name} page={page} />
+    <DailyKChart name={name} onSelectionChange={onSelectionChange} page={page} />
   </div>
 }
 
@@ -208,7 +233,6 @@ const marketIntradayCharts = [
   ['large_order_net', '大单净量', true, 2],
   ['large_order_amount', '大单金额', true, 1],
   ['retail_count', '散户数量', false, 2],
-  ['macdfs', 'MACDFS', true, 3],
 ] as const
 
 function MarketIntradayCharts({ symbol, series }: {
@@ -228,6 +252,12 @@ function MarketIntradayCharts({ symbol, series }: {
         series={series[key] ?? { unit: key === 'large_order_amount' ? '万' : null, points: [] }}
         title={title}
       />)}
+      <IntradayMacdChart
+        key={`${symbol}-macd`}
+        dea={series.macd_dea ?? { unit: null, points: [] }}
+        dif={series.macd_dif ?? { unit: null, points: [] }}
+        macd={series.macdfs ?? { unit: null, points: [] }}
+      />
     </div>
   </section>
 }
@@ -242,16 +272,49 @@ function Detail({ item, snapshot, period, setPeriod, series, dailyLoading, daily
   dailyError?: string,
 }) {
   const quote = snapshot?.quote ?? {}
-  const changeTone = tone(quote.change_percent)
+  const [dailySelection, setDailySelection] = useState<DailyKSelection | null>(null)
+  useEffect(() => {
+    setDailySelection(null)
+  }, [item.symbol])
+  useEffect(() => {
+    if (period !== 'day') setDailySelection(null)
+  }, [period])
+  const selectedDailyBar = period === 'day' ? dailySelection?.bar : undefined
+  const previousDailyClose = selectedDailyBar && dailySelection && dailySelection.index > 0
+    ? series?.bars[dailySelection.index - 1]?.close ?? null
+    : null
+  const selectedDailyChange = selectedDailyBar
+    ? percentChange(selectedDailyBar.close, previousDailyClose)
+    : null
+  const displayedPrice = selectedDailyBar ? fixed(selectedDailyBar.close) : display(quote.price)
+  const displayedChange = selectedDailyBar ? display(selectedDailyChange) : display(quote.change_percent)
+  const changeTone = tone(selectedDailyBar ? selectedDailyChange : quote.change_percent)
   const klineAvailable = snapshot?.capabilities.kline?.available === true
+  const quoteFields = selectedDailyBar
+    ? [
+      ['开盘', fixed(selectedDailyBar.open)],
+      ['最高', fixed(selectedDailyBar.high)],
+      ['最低', fixed(selectedDailyBar.low)],
+      ['收盘', fixed(selectedDailyBar.close)],
+      ['成交量', compact(selectedDailyBar.volume, '股')],
+      ['成交额', compact(selectedDailyBar.amount, '元')],
+    ]
+    : [
+      ['今开', display(quote.open)],
+      ['最高', display(quote.high)],
+      ['最低', display(quote.low)],
+      ['昨收', display(quote.previous_close)],
+      ['换手', display(quote.turnover_rate)],
+      ['成交量', display(quote.volume)],
+    ]
   return <section className="market-detail">
     <header className="market-quote-head">
-      <div><p>{item.symbol} · 实时行情</p><h1>{snapshot?.name ?? item.name}</h1></div>
-      <div className={`market-last-price market-number-${changeTone}`}><strong>{display(quote.price)}</strong><span>{display(quote.change_percent)}</span></div>
-      <div className="market-live-status"><i className={snapshot?.stale ? 'stale' : ''} />{snapshot?.source_time ? `${snapshot.source_time} 更新` : '正在读取 App 接口'}</div>
+      <div><p>{item.symbol} · {selectedDailyBar ? `${selectedDailyBar.time} 日K` : '实时行情'}</p><h1>{snapshot?.name ?? item.name}</h1></div>
+      <div className={`market-last-price market-number-${changeTone}`}><strong>{displayedPrice}</strong><span>{displayedChange}</span></div>
+      <div className="market-live-status"><i className={snapshot?.stale ? 'stale' : ''} />{selectedDailyBar ? '十字线选中日' : snapshot?.source_time ? `${snapshot.source_time} 更新` : '正在读取 App 接口'}</div>
     </header>
     <div className="market-quote-strip">
-      {[['今开', quote.open], ['最高', quote.high], ['最低', quote.low], ['昨收', quote.previous_close], ['换手', quote.turnover_rate], ['成交量', quote.volume]].map(([label, value]) => <div key={label}><span>{label}</span><strong>{display(value)}</strong></div>)}
+      {quoteFields.map(([label, value]) => <div key={label}><span>{label}</span><strong>{value}</strong></div>)}
     </div>
     <section className="market-chart-panel">
       <nav className="market-period-tabs" aria-label="图表周期">{chartPeriods.map(([value, label]) => <button type="button" key={value} className={period === value ? 'active' : ''} onClick={() => setPeriod(value)}>{label}</button>)}</nav>
@@ -261,7 +324,7 @@ function Detail({ item, snapshot, period, setPeriod, series, dailyLoading, daily
           <MarketIntradayCharts symbol={snapshot?.symbol ?? item.symbol} series={snapshot?.intraday_series ?? {}} />
         </>
         : period === 'day'
-          ? <DailyKPanel name={snapshot?.name ?? item.name} page={series} loading={dailyLoading} error={dailyError} />
+          ? <DailyKPanel name={snapshot?.name ?? item.name} page={series} loading={dailyLoading} error={dailyError} onSelectionChange={setDailySelection} />
         : !klineAvailable
           ? <div className="market-capability-gap"><strong>App 内部 K 线接口尚未确认</strong><span>为避免展示错误行情，这里不会使用网页源、OCR 或猜测参数。</span></div>
           : <CandleChart name={snapshot?.name ?? item.name} bars={series?.bars ?? []} />}
@@ -404,6 +467,9 @@ export function MarketApp() {
       setSymbol('')
       await loadWatchlists()
       setSelected(lookup.symbol)
+      const primaryGroup = groups.find((group) => group.is_primary) ?? groups[0]
+      const synchronized = primaryGroup && activeGroup.id !== primaryGroup.id
+      setMessage(`已添加 ${lookup.name}（${lookup.symbol}）到${activeGroup.name}${synchronized ? '，并同步到自选' : ''}`)
     } catch (reason) { setMessage(reason instanceof Error ? reason.message : '添加自选失败') }
   }
 

@@ -48,6 +48,7 @@ class WatchlistGroup:
     id: int
     name: str
     sort_order: int
+    is_primary: bool
     items: tuple[WatchlistItem, ...]
 
 
@@ -91,6 +92,7 @@ class SQLiteMarketAccountStore:
                     user_id INTEGER NOT NULL REFERENCES market_users(id) ON DELETE CASCADE,
                     name TEXT NOT NULL,
                     sort_order INTEGER NOT NULL,
+                    is_primary INTEGER NOT NULL DEFAULT 0,
                     UNIQUE(user_id, name)
                 );
                 CREATE TABLE IF NOT EXISTS watchlist_items (
@@ -106,6 +108,41 @@ class SQLiteMarketAccountStore:
                 CREATE INDEX IF NOT EXISTS watchlist_items_group_order
                     ON watchlist_items(group_id, sort_order);
                 """
+            )
+            columns = {
+                str(row["name"])
+                for row in self._connection.execute(
+                    "PRAGMA table_info(watchlist_groups)"
+                ).fetchall()
+            }
+            if "is_primary" not in columns:
+                self._connection.execute(
+                    "ALTER TABLE watchlist_groups ADD COLUMN is_primary INTEGER NOT NULL DEFAULT 0"
+                )
+            user_ids = self._connection.execute(
+                "SELECT DISTINCT user_id FROM watchlist_groups"
+            ).fetchall()
+            for row in user_ids:
+                user_id = int(row["user_id"])
+                existing = self._connection.execute(
+                    "SELECT 1 FROM watchlist_groups WHERE user_id=? AND is_primary=1 LIMIT 1",
+                    (user_id,),
+                ).fetchone()
+                if existing is not None:
+                    continue
+                primary = self._connection.execute(
+                    """SELECT id FROM watchlist_groups WHERE user_id=?
+                       ORDER BY CASE WHEN name='自选' THEN 0 ELSE 1 END,sort_order,id LIMIT 1""",
+                    (user_id,),
+                ).fetchone()
+                if primary is not None:
+                    self._connection.execute(
+                        "UPDATE watchlist_groups SET is_primary=1 WHERE id=?",
+                        (primary["id"],),
+                    )
+            self._connection.execute(
+                """CREATE UNIQUE INDEX IF NOT EXISTS watchlist_groups_one_primary
+                   ON watchlist_groups(user_id) WHERE is_primary=1"""
             )
 
     @staticmethod
@@ -150,7 +187,7 @@ class SQLiteMarketAccountStore:
                 )
                 user_id = int(cursor.lastrowid)
                 self._connection.execute(
-                    "INSERT INTO watchlist_groups(user_id,name,sort_order) VALUES(?,?,0)",
+                    "INSERT INTO watchlist_groups(user_id,name,sort_order,is_primary) VALUES(?,?,0,1)",
                     (user_id, "自选"),
                 )
         except sqlite3.IntegrityError as error:
@@ -240,7 +277,7 @@ class SQLiteMarketAccountStore:
         self.get_user(user_id)
         with self._lock:
             groups = self._connection.execute(
-                "SELECT id,name,sort_order FROM watchlist_groups WHERE user_id=? ORDER BY sort_order,id",
+                "SELECT id,name,sort_order,is_primary FROM watchlist_groups WHERE user_id=? ORDER BY sort_order,id",
                 (user_id,),
             ).fetchall()
             result: list[WatchlistGroup] = []
@@ -254,6 +291,7 @@ class SQLiteMarketAccountStore:
                         id=int(group["id"]),
                         name=str(group["name"]),
                         sort_order=int(group["sort_order"]),
+                        is_primary=bool(group["is_primary"]),
                         items=tuple(
                             WatchlistItem(
                                 symbol=str(row["symbol"]),
@@ -268,7 +306,7 @@ class SQLiteMarketAccountStore:
 
     def _owned_group(self, user_id: int, group_id: int) -> sqlite3.Row:
         row = self._connection.execute(
-            "SELECT id,name,sort_order FROM watchlist_groups WHERE id=? AND user_id=?",
+            "SELECT id,name,sort_order,is_primary FROM watchlist_groups WHERE id=? AND user_id=?",
             (group_id, user_id),
         ).fetchone()
         if row is None:
@@ -305,7 +343,9 @@ class SQLiteMarketAccountStore:
 
     def delete_group(self, user_id: int, group_id: int) -> None:
         with self._lock, self._connection:
-            self._owned_group(user_id, group_id)
+            group = self._owned_group(user_id, group_id)
+            if bool(group["is_primary"]):
+                raise ValueError("primary watchlist group cannot be deleted")
             count = self._connection.execute(
                 "SELECT COUNT(*) FROM watchlist_groups WHERE user_id=?",
                 (user_id,),
@@ -329,6 +369,13 @@ class SQLiteMarketAccountStore:
     def add_symbol(self, user_id: int, group_id: int, symbol: SymbolLookup) -> WatchlistItem:
         with self._lock, self._connection:
             self._owned_group(user_id, group_id)
+            primary_group = self._connection.execute(
+                "SELECT id FROM watchlist_groups WHERE user_id=? AND is_primary=1 LIMIT 1",
+                (user_id,),
+            ).fetchone()
+            if primary_group is None:
+                raise LookupError("watchlist group not found")
+            primary_group_id = int(primary_group["id"])
             known = self._connection.execute(
                 """SELECT COUNT(DISTINCT i.symbol) FROM watchlist_items i
                    JOIN watchlist_groups g ON g.id=i.group_id WHERE g.user_id=?""",
@@ -347,6 +394,21 @@ class SQLiteMarketAccountStore:
                        VALUES(?,?,?,?,COALESCE((SELECT MAX(sort_order)+1 FROM watchlist_items WHERE group_id=?),0))""",
                     (group_id, symbol.symbol, symbol.name, symbol.market, group_id),
                 )
+                if group_id != primary_group_id:
+                    self._connection.execute(
+                        """INSERT INTO watchlist_items(group_id,symbol,name,market,sort_order)
+                           VALUES(?,?,?,?,COALESCE((SELECT MAX(sort_order)+1 FROM watchlist_items WHERE group_id=?),0))
+                           ON CONFLICT(group_id,symbol) DO UPDATE SET
+                               name=excluded.name,
+                               market=excluded.market""",
+                        (
+                            primary_group_id,
+                            symbol.symbol,
+                            symbol.name,
+                            symbol.market,
+                            primary_group_id,
+                        ),
+                    )
             except sqlite3.IntegrityError as error:
                 raise ValueError("symbol already exists in this group") from error
         return WatchlistItem(symbol=symbol.symbol, name=symbol.name, market=symbol.market)

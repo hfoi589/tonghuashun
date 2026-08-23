@@ -81,7 +81,13 @@ def test_admin_creates_users_and_user_manages_grouped_watchlists(tmp_path) -> No
     )
     assert added.status_code == 201
     assert added.json() == {"symbol": "601872", "name": "招商轮船", "market": "17"}
-    assert client.get("/api/v1/watchlists").json()["groups"][1]["items"][0]["symbol"] == "601872"
+    updated_groups = client.get("/api/v1/watchlists").json()["groups"]
+    assert updated_groups[0]["items"] == [
+        {"symbol": "601872", "name": "招商轮船", "market": "17"}
+    ]
+    assert updated_groups[1]["items"] == [
+        {"symbol": "601872", "name": "招商轮船", "market": "17"}
+    ]
 
 
 def test_market_user_write_routes_require_csrf_and_logout_revokes_session(tmp_path) -> None:

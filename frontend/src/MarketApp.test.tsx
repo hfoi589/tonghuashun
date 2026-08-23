@@ -1,10 +1,17 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { cleanup, render, screen, waitFor } from '@testing-library/react'
+import { cleanup, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { MarketApp } from './MarketApp'
 
 vi.mock('./DailyKChart', () => ({
-  DailyKChart: ({ name, page }: { name: string, page: { symbol: string } }) => <div role="img" aria-label={`${name}前复权日K图`}>{page.symbol}</div>,
+  DailyKChart: ({ name, page, onSelectionChange }: {
+    name: string,
+    page: { symbol: string, bars: Array<Record<string, string | null>> },
+    onSelectionChange?: (selection: { index: number, bar: Record<string, string | null> }) => void,
+  }) => <div>
+    <div role="img" aria-label={`${name}前复权日K图`}>{page.symbol}</div>
+    <button type="button" onClick={() => onSelectionChange?.({ index: 0, bar: page.bars[0] })}>选择前一交易日</button>
+  </div>,
 }))
 
 function jsonResponse(body: unknown, status = 200): Response {
@@ -88,6 +95,14 @@ describe('MarketApp', () => {
             unit: null,
             points: [{ time: '09:30', value: '21.75' }, { time: '14:56', value: '21.23' }],
           },
+          macd_dif: {
+            unit: null,
+            points: [{ time: '09:30', value: '-0.001' }, { time: '14:56', value: '+0.002' }],
+          },
+          macd_dea: {
+            unit: null,
+            points: [{ time: '09:30', value: '-0.006' }, { time: '14:56', value: '-0.005' }],
+          },
           macdfs: {
             unit: null,
             points: [{ time: '09:30', value: '+0.009' }, { time: '14:56', value: '+0.012' }],
@@ -108,11 +123,14 @@ describe('MarketApp', () => {
       if (url.includes('/series?period=day&limit=240')) return jsonResponse({
         symbol: '601872',
         period: 'day',
-        bars: [{ time: '2026-08-21', open: '8.10', high: '8.40', low: '8.00', close: '8.33', volume: '10000', amount: '83300' }],
+        bars: [
+          { time: '2026-08-20', open: '8.00', high: '8.25', low: '7.95', close: '8.10', volume: '5000', amount: '40500' },
+          { time: '2026-08-21', open: '8.10', high: '8.40', low: '8.00', close: '8.33', volume: '10000', amount: '83300' },
+        ],
         indicators: {
-          ma5: ['8.20'], ma13: ['8.10'], ma21: ['8.00'], ma60: [null], ma120: [null], ma250: [null],
-          boll_mid: ['8.10'], boll_upper: ['8.40'], boll_lower: ['7.80'],
-          macd_dif: ['0.10'], macd_dea: ['0.08'], macd_hist: ['0.04'],
+          ma5: ['8.00', '8.20'], ma13: ['7.90', '8.10'], ma21: ['7.80', '8.00'], ma60: [null, null], ma120: [null, null], ma250: [null, null],
+          boll_mid: ['8.00', '8.10'], boll_upper: ['8.30', '8.40'], boll_lower: ['7.70', '7.80'],
+          macd_dif: ['0.09', '0.10'], macd_dea: ['0.07', '0.08'], macd_hist: ['0.03', '0.04'],
         },
         next_cursor: null,
         source_error: null,
@@ -135,11 +153,17 @@ describe('MarketApp', () => {
     const netChart = screen.getByRole('img', { name: '大单净量当日分时图' })
     const amountChart = screen.getByRole('img', { name: '大单金额当日分时图' })
     const retailChart = screen.getByRole('img', { name: '散户数量当日分时图' })
-    const macdfsChart = screen.getByRole('img', { name: 'MACDFS当日分时图' })
+    const macdChart = screen.getByRole('img', { name: 'MACD当日分时图' })
     expect(priceChart.compareDocumentPosition(netChart) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
     expect(netChart.compareDocumentPosition(amountChart) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
     expect(amountChart.compareDocumentPosition(retailChart) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
-    expect(retailChart.compareDocumentPosition(macdfsChart) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+    expect(retailChart.compareDocumentPosition(macdChart) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+    expect(within(macdChart.closest('figure')!).getByText('DIF')).toBeInTheDocument()
+    expect(within(macdChart.closest('figure')!).getByText('DEA')).toBeInTheDocument()
+    expect(within(macdChart.closest('figure')!).getByText('MACD', { selector: '.macd-readout b' })).toBeInTheDocument()
+    expect(within(priceChart).getByText('09:30')).toBeInTheDocument()
+    expect(within(priceChart).getByText('11:30/13:00')).toBeInTheDocument()
+    expect(within(priceChart).getByText('15:00')).toBeInTheDocument()
     expect(screen.getByText('14:56 更新')).toBeInTheDocument()
     expect(screen.getAllByRole('button', { name: /^(分时|日K|五日|周K|月K)$/ }).map((button) => button.textContent)).toEqual([
       '分时', '日K', '五日', '周K', '月K',
@@ -150,9 +174,17 @@ describe('MarketApp', () => {
     ))
     await userEvent.click(screen.getByRole('button', { name: '日K' }))
     expect(await screen.findByRole('img', { name: '招商轮船前复权日K图' })).toBeInTheDocument()
-    expect(screen.queryByRole('img', { name: 'MACDFS当日分时图' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('img', { name: 'MACD当日分时图' })).not.toBeInTheDocument()
     expect(screen.getByText('前复权')).toBeInTheDocument()
     expect(screen.getByText('10jqka 公开源')).toBeInTheDocument()
+    await userEvent.click(screen.getByRole('button', { name: '选择前一交易日' }))
+    expect(screen.getByText('601872 · 2026-08-20 日K')).toBeInTheDocument()
+    for (const [label, expected] of [
+      ['开盘', '8.00'], ['最高', '8.25'], ['最低', '7.95'], ['收盘', '8.10'], ['成交量', '5000.00股'], ['成交额', '4.05万元'],
+    ]) {
+      const labelElement = screen.getByText(label, { selector: '.market-quote-strip span' })
+      expect(within(labelElement.closest('div')!).getByText(expected, { selector: 'strong' })).toBeInTheDocument()
+    }
     expect(fetchMock.mock.calls.filter(([url]) => String(url).includes('/series?period=day')).length).toBe(1)
   })
 

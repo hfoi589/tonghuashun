@@ -15,6 +15,7 @@ class FakeRedis:
         self.values = {}
         self.lists = {}
         self.sets = {}
+        self.hashes = {}
         self.streams = {}
 
     def set(self, key, value): self.values[key] = value
@@ -26,18 +27,58 @@ class FakeRedis:
         values = self.lists.get(key, [])
         stop = None if end == -1 else end + 1
         return values[start:stop]
+    def lrem(self, key, count, value):
+        values = self.lists.get(key, [])
+        original = len(values)
+        if count == 0:
+            self.lists[key] = [item for item in values if item != value]
+        else:
+            remaining = count
+            kept = []
+            for item in values:
+                if item == value and remaining > 0:
+                    remaining -= 1
+                else:
+                    kept.append(item)
+            self.lists[key] = kept
+        return original - len(self.lists[key])
     def sadd(self, key, value): self.sets.setdefault(key, set()).add(value)
     def srem(self, key, value): self.sets.setdefault(key, set()).discard(value)
     def smembers(self, key): return self.sets.get(key, set())
     def scard(self, key): return len(self.sets.get(key, set()))
+    def hset(self, key, field=None, value=None, mapping=None):
+        target = self.hashes.setdefault(key, {})
+        if mapping is not None:
+            target.update(mapping)
+            return len(mapping)
+        target[field] = value
+        return 1
+    def hget(self, key, field): return self.hashes.get(key, {}).get(field)
+    def hgetall(self, key): return dict(self.hashes.get(key, {}))
+    def hdel(self, key, *fields):
+        target = self.hashes.get(key, {})
+        removed = 0
+        for field in fields:
+            if field in target:
+                removed += 1
+                del target[field]
+        return removed
     def xadd(self, key, fields):
         entries = self.streams.setdefault(key, [])
         entries.append((str(len(entries) + 1), fields))
         return entries[-1][0]
     def xrange(self, key, _start, _end): return self.streams.get(key, [])
-    def eval(self, script, _keys, queue_key, prefix, event_stream, *args):
+    def xdel(self, key, *entry_ids):
+        entries = self.streams.get(key, [])
+        original = len(entries)
+        self.streams[key] = [entry for entry in entries if entry[0] not in set(entry_ids)]
+        return original - len(self.streams[key])
+    def eval(self, script, key_count, *values):
+        keys = values[:key_count]
+        args = values[key_count:]
         if "THS_ENQUEUE" in script:
-            index_key, event_stream_name, cap, task_id, payload = (event_stream, *args)
+            queue_key, prefix, index_key, event_stream, symbol_index_key = keys
+            cap, task_id, payload, symbol = args
             pending = 0
             for existing_id in self.sets.get(index_key, set()):
                 raw = self.values.get(prefix + existing_id)
@@ -48,10 +89,52 @@ class FakeRedis:
             self.values[prefix + task_id] = payload
             self.sadd(index_key, task_id)
             self.rpush(queue_key, task_id)
-            self.xadd(event_stream_name, {"event": "status", "task_id": task_id, "data": "QUEUED"})
+            self.xadd(event_stream, {"event": "status", "task_id": task_id, "data": "QUEUED"})
+            self.hset(symbol_index_key, symbol, task_id)
             return True
+        if "THS_SUBMIT_OR_REFRESH" in script:
+            queue_key, prefix, index_key, event_stream, symbol_index_key = keys
+            cap, symbol, new_task_id, new_payload, refresh_payload = args
+            existing_id = self.hget(symbol_index_key, symbol)
+            if existing_id:
+                payload = self.values.get(prefix + existing_id)
+                if payload:
+                    current = json.loads(payload)
+                    if current["status"] in {"QUEUED", "RUNNING", "WAITING_ADMIN"}:
+                        return payload
+                    pending = sum(
+                        json.loads(self.values[prefix + task_id])["status"] in {"QUEUED", "RUNNING", "WAITING_ADMIN"}
+                        for task_id in self.sets.get(index_key, set())
+                        if prefix + task_id in self.values
+                    )
+                    if pending >= int(cap):
+                        return "QUEUE_FULL"
+                    refreshed = json.loads(refresh_payload)
+                    refreshed["task_id"] = existing_id
+                    refreshed["symbol"] = symbol
+                    updated = json.dumps(refreshed)
+                    self.lrem(queue_key, 0, existing_id)
+                    self.values[prefix + existing_id] = updated
+                    self.rpush(queue_key, existing_id)
+                    self.xadd(event_stream, {"event": "status", "task_id": existing_id, "data": "QUEUED"})
+                    return updated
+                self.hdel(symbol_index_key, symbol)
+            pending = sum(
+                json.loads(self.values[prefix + task_id])["status"] in {"QUEUED", "RUNNING", "WAITING_ADMIN"}
+                for task_id in self.sets.get(index_key, set())
+                if prefix + task_id in self.values
+            )
+            if pending >= int(cap):
+                return "QUEUE_FULL"
+            self.values[prefix + new_task_id] = new_payload
+            self.sadd(index_key, new_task_id)
+            self.rpush(queue_key, new_task_id)
+            self.hset(symbol_index_key, symbol, new_task_id)
+            self.xadd(event_stream, {"event": "status", "task_id": new_task_id, "data": "QUEUED"})
+            return new_payload
         if "THS_RECOVER_RUNNING" in script:
-            index_key, event_stream_name, timestamp = (event_stream, *args)
+            queue_key, prefix, index_key, event_stream = keys
+            (timestamp,) = args
             recovered = []
             for task_id in self.sets.get(index_key, set()):
                 key = prefix + task_id
@@ -70,12 +153,37 @@ class FakeRedis:
                 task["updated_at"] = timestamp
                 updated = json.dumps(task)
                 self.values[prefix + task_id] = updated
-                self.xadd(event_stream_name, {"event": "status", "task_id": task_id, "data": "QUEUED"})
+                self.xadd(event_stream, {"event": "status", "task_id": task_id, "data": "QUEUED"})
                 updated_payloads.append(updated)
             for _created_at, task_id, _task in reversed(recovered):
                 self.lpush(queue_key, task_id)
             return updated_payloads
+        if "THS_REFRESH_TASK" in script:
+            queue_key, prefix, event_stream, index_key = keys
+            task_id, updated_payload, cap = args
+            key = prefix + task_id
+            payload = self.values.get(key)
+            if not payload:
+                return False
+            current = json.loads(payload)
+            if current["status"] in {"QUEUED", "RUNNING", "WAITING_ADMIN"}:
+                return payload
+            if current["status"] not in {"COMPLETED", "PARTIAL", "FAILED", "EXPIRED"}:
+                return False
+            pending = sum(
+                json.loads(self.values[prefix + existing_id])["status"] in {"QUEUED", "RUNNING", "WAITING_ADMIN"}
+                for existing_id in self.sets.get(index_key, set())
+                if prefix + existing_id in self.values
+            )
+            if pending >= int(cap):
+                return "QUEUE_FULL"
+            self.values[key] = updated_payload
+            self.sadd(index_key, task_id)
+            self.rpush(queue_key, task_id)
+            self.xadd(event_stream, {"event": "status", "task_id": task_id, "data": "QUEUED"})
+            return updated_payload
         if "task.status ~= 'FAILED'" in script:
+            queue_key, prefix, event_stream = keys
             task_id, timestamp = args
             key = prefix + task_id
             payload = self.values.get(key)
@@ -96,6 +204,7 @@ class FakeRedis:
             self.xadd(event_stream, {"event": "status", "task_id": task_id, "data": "QUEUED"})
             return updated
         if "WAITING_ADMIN" in script:
+            queue_key, prefix, event_stream = keys
             task_id, timestamp = args
             key = prefix + task_id
             payload = self.values.get(key)
@@ -112,6 +221,7 @@ class FakeRedis:
             self.rpush(queue_key, task_id)
             self.xadd(event_stream, {"event": "status", "task_id": task_id, "data": "QUEUED"})
             return updated
+        queue_key, prefix, event_stream = keys
         (timestamp,) = args
         while self.lists.get(queue_key):
             task_id = self.lists[queue_key].pop(0)
@@ -133,8 +243,60 @@ def test_redis_store_exposes_the_full_task_store_contract() -> None:
     """A partial adapter cannot back production routes when Redis is configured."""
     store = RedisStreamsStore(FakeRedis())
 
-    for method in ("enqueue", "get", "transition", "complete_capture", "events_after", "cleanup", "next_queued", "recover_running", "requeue_waiting", "retry_failed"):
+    for method in ("enqueue", "submit_or_refresh", "get", "resolve_task_id", "find_by_symbol", "deduplicate_by_symbol", "refresh_task", "transition", "complete_capture", "events_after", "cleanup", "next_queued", "recover_running", "requeue_waiting", "retry_failed"):
         assert callable(getattr(store, method, None))
+
+
+def test_redis_refresh_reuses_the_task_id_and_clears_the_terminal_payload() -> None:
+    redis = FakeRedis()
+    store = RedisStreamsStore(redis)
+    task = TaskRecord(task_id="refresh", symbol="600938", include_long_capture=False)
+    store.enqueue(task)
+    store.next_queued()
+    store.complete_result(task.task_id, {kind: f"value-{kind.value}" for kind in MetricKind}, None)
+
+    refreshed = store.refresh_task(task.task_id)
+    restored = RedisStreamsStore(redis).get(task.task_id)
+
+    assert refreshed.task_id == "refresh"
+    assert refreshed.status == TaskStatus.QUEUED
+    assert restored is not None
+    assert restored.values[MetricKind.STOCK_NAME] is None
+    assert redis.lists["ths:jobs:pending"] == ["refresh"]
+
+
+def test_redis_deduplication_deletes_old_payload_queue_events_and_keeps_alias() -> None:
+    redis = FakeRedis()
+    store = RedisStreamsStore(redis)
+    older = TaskRecord(task_id="older", symbol="600938", include_long_capture=False)
+    older.created_at = older.created_at.replace(year=2025)
+    older.updated_at = older.created_at
+    newer = TaskRecord(task_id="newer", symbol="600938", include_long_capture=False)
+    store.enqueue(older)
+    store.enqueue(newer)
+
+    result = store.deduplicate_by_symbol()
+
+    assert result == {"total": 2, "kept": 1, "deleted": 1, "aliases": 1}
+    assert "ths:jobs:task:older" not in redis.values
+    assert redis.lists["ths:jobs:pending"] == ["newer"]
+    assert all(fields["task_id"] != "older" for _, fields in redis.streams["ths:jobs:events"])
+    assert store.resolve_task_id("older") == "newer"
+    assert store.get("older").task_id == "newer"
+
+
+def test_redis_submit_or_refresh_uses_one_symbol_index_across_store_instances() -> None:
+    redis = FakeRedis()
+    first = RedisStreamsStore(redis)
+    second = RedisStreamsStore(redis)
+
+    first_result = first.submit_or_refresh(TaskRecord(task_id="first", symbol="601872", include_long_capture=False))
+    second_result = second.submit_or_refresh(TaskRecord(task_id="second", symbol="601872", include_long_capture=False))
+
+    assert first_result.task_id == "first"
+    assert second_result.task_id == "first"
+    assert redis.hashes["ths:jobs:symbols"] == {"601872": "first"}
+    assert redis.sets["ths:jobs:tasks"] == {"first"}
 
 
 def test_redis_store_rejects_an_incomplete_client_before_app_construction() -> None:

@@ -171,10 +171,6 @@ class TaskRecord:
         if not self.include_long_capture and self.long_capture.status == CaptureStatus.PENDING:
             self.long_capture.status = CaptureStatus.SKIPPED
 
-    @property
-    def metadata_expires_at(self) -> datetime:
-        return self.created_at + timedelta(days=7)
-
     def as_public(self) -> dict[str, Any]:
         main_fund_flow: dict[str, dict[str, str | None]] = {}
         main_fund_flow_sources: dict[str, dict[str, str | None]] = {}

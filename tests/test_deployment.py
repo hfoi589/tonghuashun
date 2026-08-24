@@ -23,8 +23,13 @@ class FakeRedis:
     def delete(self, *_args): pass
     def eval(self, *_args): return False
     def get(self, *_args): return None
+    def hdel(self, *_args): pass
+    def hget(self, *_args): return None
+    def hgetall(self, *_args): return {}
+    def hset(self, *_args, **_kwargs): pass
     def lpush(self, *_args): pass
     def lrange(self, *_args): return []
+    def lrem(self, *_args): return 0
     def rpush(self, *_args): pass
     def sadd(self, *_args): pass
     def scard(self, *_args): return 0
@@ -33,6 +38,7 @@ class FakeRedis:
     def smembers(self, *_args): return set()
     def srem(self, *_args): pass
     def xadd(self, *_args): pass
+    def xdel(self, *_args): return 0
     def xrange(self, *_args): return []
 
 

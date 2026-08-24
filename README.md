@@ -125,9 +125,11 @@ SQLite user and grouped-watchlist database; ordinary browser sessions remain
 revocable Redis records. Put only manually calibrated,
 non-secret PNG anchors under `template-data` (`search.png` and optional tab
 anchors); the API loads them as an OpenCV fallback after selector checks.
-Capture retention remains the API's 24-hour cleanup policy; queue metadata
-retention remains seven days. Do not remove any volume as part of an upgrade
-unless its data has been deliberately backed up.
+Capture retention remains the API's 24-hour cleanup policy. Task metadata and
+interface values persist without an automatic expiry, while each browser keeps
+its own permanent stock-tab list in localStorage. Startup migration keeps one
+canonical task per symbol and physically removes older duplicates. Do not remove
+any volume as part of an upgrade unless its data has been deliberately backed up.
 
 The approved local deployment serves both the React site and API from
 `http://HOST:8001/`; set `APP_PORT` to change the host-side port. Redis 6379,

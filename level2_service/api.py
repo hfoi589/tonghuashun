@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 import secrets
 from threading import RLock
@@ -32,6 +33,9 @@ from .queue import InMemoryStreams, QueueFullError, TaskStore
 from .runner import ADBDeviceBridge, DeviceBridge, Level2Runner, RunnerControl, jpeg_base64
 from .security import AdminSessionManager, persist_password_hash
 from .symbol_cache import InMemorySymbolLookupCache, SymbolLookupCache
+
+
+logger = logging.getLogger(__name__)
 
 
 class SubmitTask(BaseModel):
@@ -238,6 +242,19 @@ def create_app(
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         stop = Event()
         app.state.store.recover_running()
+        deduplicate = getattr(app.state.store, "deduplicate_by_symbol", None)
+        app.state.task_migration = (
+            deduplicate()
+            if callable(deduplicate)
+            else {"total": 0, "kept": 0, "deleted": 0, "aliases": 0}
+        )
+        logger.info(
+            "task migration total=%s kept=%s deleted=%s aliases=%s",
+            app.state.task_migration["total"],
+            app.state.task_migration["kept"],
+            app.state.task_migration["deleted"],
+            app.state.task_migration["aliases"],
+        )
 
         async def retention_loop() -> None:
             while not stop.is_set():
@@ -402,10 +419,10 @@ def create_app(
             include_long_capture=payload.include_long_capture,
         )
         try:
-            app.state.store.enqueue(task)
+            submitted = app.state.store.submit_or_refresh(task)
         except QueueFullError:
             raise HTTPException(status_code=429, detail="queue is full") from None
-        return task_response(task)
+        return task_response(submitted)
 
     @app.get("/api/v1/jobs/{public_id}", response_model=TaskResponse)
     def get_task(public_id: str) -> TaskResponse:
@@ -413,6 +430,19 @@ def create_app(
         if task is None:
             raise HTTPException(status_code=404, detail="task not found")
         return task_response(task)
+
+    @app.post("/api/v1/jobs/{public_id}/retry", status_code=202, response_model=TaskResponse)
+    def retry_public_job(public_id: str) -> TaskResponse:
+        task = app.state.store.get(public_id)
+        if task is None:
+            raise HTTPException(status_code=404, detail="task not found")
+        try:
+            retried = app.state.store.refresh_task(task.task_id)
+        except QueueFullError:
+            raise HTTPException(status_code=429, detail="queue is full") from None
+        except ValueError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from None
+        return task_response(retried)
 
     @app.get("/api/v1/jobs/{public_id}/captures/{kind}")
     def get_capture(public_id: str, kind: CaptureKind):
@@ -457,13 +487,14 @@ def create_app(
         task = app.state.store.get(public_id)
         if task is None:
             raise HTTPException(status_code=404, detail="task not found")
+        canonical_id = task.task_id
 
         async def event_stream() -> AsyncIterator[str]:
             event_index = after
             while not await request.is_disconnected():
-                events = app.state.store.events_after(public_id, event_index)
+                events = app.state.store.events_after(canonical_id, event_index)
                 for event in events:
-                    payload = json.dumps({"public_id": public_id, "status": event["data"]})
+                    payload = json.dumps({"public_id": canonical_id, "status": event["data"]})
                     yield f"event: {event['event']}\ndata: {payload}\n\n"
                 event_index += len(events)
                 if once:
@@ -539,7 +570,7 @@ def create_app(
         if task is None:
             raise HTTPException(status_code=404, detail="task not found")
         try:
-            resumed = app.state.store.requeue_waiting(public_id)
+            resumed = app.state.store.requeue_waiting(task.task_id)
         except ValueError as error:
             raise HTTPException(status_code=409, detail=str(error)) from None
         return task_response(resumed)
@@ -550,7 +581,7 @@ def create_app(
         if task is None:
             raise HTTPException(status_code=404, detail="task not found")
         try:
-            retried = app.state.store.retry_failed(public_id)
+            retried = app.state.store.retry_failed(task.task_id)
         except ValueError as error:
             raise HTTPException(status_code=409, detail=str(error)) from None
         return task_response(retried)

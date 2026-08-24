@@ -332,6 +332,9 @@ describe('Level2 web UI', () => {
       },
     }} />)
 
+    expect(screen.queryByRole('img', { name: '大单净量当日分时图' })).not.toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: '展开曲线' }))
+
     const netChart = screen.getByRole('img', { name: '大单净量当日分时图' })
     expect(screen.getByRole('img', { name: '大单金额当日分时图' })).toBeInTheDocument()
     expect(screen.getByRole('img', { name: '散户数量当日分时图' })).toBeInTheDocument()
@@ -344,6 +347,29 @@ describe('Level2 web UI', () => {
 
     expect(within(netChart.closest('figure')!).getByText('09:30', { selector: 'time' })).toBeInTheDocument()
     expect(within(netChart.closest('figure')!).getByText('-0.03', { selector: 'strong' })).toBeInTheDocument()
+  })
+
+  it('collapses the intraday curves again after they are expanded', async () => {
+    const user = userEvent.setup()
+    render(<JobResult task={{
+      ...task,
+      status: 'COMPLETED',
+      values: {
+        ...task.values,
+        intraday_series: {
+          large_order_net: { unit: null, points: [{ time: '09:30', value: '-0.03' }] },
+          large_order_amount: { unit: '万', points: [] },
+          retail_count: { unit: null, points: [] },
+        },
+      },
+    }} />)
+
+    const toggle = screen.getByRole('button', { name: '展开曲线' })
+    await user.click(toggle)
+    expect(screen.getByRole('img', { name: '大单净量当日分时图' })).toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: '收起曲线' }))
+
+    expect(screen.queryByRole('img', { name: '大单净量当日分时图' })).not.toBeInTheDocument()
   })
 
   it('keeps zero, unparseable, missing, price, and turnover values neutral', () => {
@@ -476,7 +502,24 @@ describe('Level2 web UI', () => {
     expect(screen.queryByRole('button', { name: '展开长截图' })).not.toBeInTheDocument()
   })
 
-  it('keeps earlier collection records when a new job is submitted', async () => {
+  it('keeps scalar data visible when only the long capture has expired', () => {
+    render(<JobResult task={{
+      ...task,
+      status: 'COMPLETED',
+      values: {
+        ...task.values,
+        stock_name: '中国海油',
+        current_price: '25.48',
+      },
+      long_capture: { status: 'EXPIRED', url: null, expires_at: null },
+    }} />)
+
+    expect(screen.getByText('中国海油（600938）')).toBeInTheDocument()
+    expect(screen.getByText('25.48')).toBeInTheDocument()
+    expect(screen.getByText('长截图已过期，指标数据仍保留')).toBeInTheDocument()
+  })
+
+  it('keeps earlier stocks as tabs when a new job is submitted', async () => {
     const secondTask = { ...task, public_id: 'public-job-2', symbol: '000001' }
     vi.mocked(fetch)
       .mockResolvedValueOnce(jsonResponse(symbolLookup('600938', '中国海油')))
@@ -498,8 +541,180 @@ describe('Level2 web UI', () => {
     await user.click(screen.getByRole('button', { name: '提交采集任务' }))
 
     await waitFor(() => expect(screen.getByText('任务 public-job-2')).toBeInTheDocument())
+    expect(screen.queryByText('任务 public-job-1')).not.toBeInTheDocument()
+    expect(screen.getByRole('tab', { name: /中国海油/ })).toBeInTheDocument()
+    expect(screen.getByRole('tab', { name: /平安银行/ })).toBeInTheDocument()
+    expect(screen.getByText('股票页签')).toBeInTheDocument()
+  })
+
+  it('selects an earlier stock, refreshes it, and moves its tab to the top', async () => {
+    const firstTask = { ...task, status: 'COMPLETED' as const }
+    const secondTask = { ...task, public_id: 'public-job-2', symbol: '000001', status: 'COMPLETED' as const }
+    const retriedTask = { ...firstTask, status: 'QUEUED' as const, error_code: null }
+    vi.mocked(fetch)
+      .mockResolvedValueOnce(jsonResponse(symbolLookup('600938', '中国海油')))
+      .mockResolvedValueOnce(jsonResponse(firstTask, 202))
+      .mockResolvedValueOnce(jsonResponse(symbolLookup('000001', '平安银行', '33')))
+      .mockResolvedValueOnce(jsonResponse(secondTask, 202))
+      .mockResolvedValueOnce(jsonResponse(retriedTask, 202))
+    const user = userEvent.setup()
+
+    render(<App />)
+    const input = screen.getByLabelText('股票代码')
+    await user.type(input, '600938')
+    await screen.findByText('中国海油（600938）')
+    await user.click(screen.getByRole('button', { name: '提交采集任务' }))
+    await waitFor(() => expect(screen.getByText('任务 public-job-1')).toBeInTheDocument())
+
+    await user.clear(input)
+    await user.type(input, '000001')
+    await screen.findByText('平安银行（000001）')
+    await user.click(screen.getByRole('button', { name: '提交采集任务' }))
+    await waitFor(() => expect(screen.getByText('任务 public-job-2')).toBeInTheDocument())
+
+    await user.click(screen.getByRole('tab', { name: /中国海油/ }))
+
+    await waitFor(() => expect(screen.getByText('已进入队列')).toBeInTheDocument())
+    expect(fetch).toHaveBeenLastCalledWith('/api/v1/jobs/public-job-1/retry', expect.objectContaining({ method: 'POST' }))
+    expect(document.querySelectorAll('.job-result')).toHaveLength(1)
     expect(screen.getByText('任务 public-job-1')).toBeInTheDocument()
-    expect(screen.getByText('采集历史')).toBeInTheDocument()
+    expect(screen.getAllByRole('tab')[0]).toHaveAccessibleName(/中国海油/)
+  })
+
+  it('submits the same stock through the existing task id instead of adding a history row', async () => {
+    const refreshedTask = { ...task, status: 'QUEUED' as const, error_code: null }
+    vi.mocked(fetch)
+      .mockResolvedValueOnce(jsonResponse(symbolLookup('600938', '中国海油')))
+      .mockResolvedValueOnce(jsonResponse(task, 202))
+      .mockResolvedValueOnce(jsonResponse(symbolLookup('600938', '中国海油')))
+      .mockResolvedValueOnce(jsonResponse(refreshedTask, 202))
+    const user = userEvent.setup()
+
+    render(<App />)
+    const input = screen.getByLabelText('股票代码')
+    await user.type(input, '600938')
+    await screen.findByText('中国海油（600938）')
+    await user.click(screen.getByRole('button', { name: '提交采集任务' }))
+    await waitFor(() => expect(screen.getByText('任务 public-job-1')).toBeInTheDocument())
+
+    await user.type(input, '600938')
+    await screen.findByText('中国海油（600938）')
+    await user.click(screen.getByRole('button', { name: '提交采集任务' }))
+
+    await waitFor(() => expect(screen.getAllByText('任务 public-job-1')).toHaveLength(1))
+    expect(document.querySelectorAll('.job-result')).toHaveLength(1)
+  })
+
+  it('repeatedly clicking the selected stock tab triggers a fresh update each time', async () => {
+    const completedTask = { ...task, status: 'COMPLETED' as const, values: { ...task.values, stock_name: '中国海油' } }
+    vi.mocked(fetch)
+      .mockResolvedValueOnce(jsonResponse({ ...completedTask, status: 'QUEUED' }, 202))
+      .mockResolvedValueOnce(jsonResponse({ ...completedTask, status: 'QUEUED' }, 202))
+    const user = userEvent.setup()
+
+    render(<App initialTask={completedTask} />)
+    const tab = screen.getByRole('tab', { name: /中国海油/ })
+    await user.click(tab)
+    await waitFor(() => expect(fetch).toHaveBeenCalledTimes(1))
+    await user.click(tab)
+
+    await waitFor(() => expect(fetch).toHaveBeenCalledTimes(2))
+    expect(fetch).toHaveBeenNthCalledWith(1, '/api/v1/jobs/public-job-1/retry', expect.objectContaining({ method: 'POST' }))
+    expect(fetch).toHaveBeenNthCalledWith(2, '/api/v1/jobs/public-job-1/retry', expect.objectContaining({ method: 'POST' }))
+  })
+
+  it('shows only the active stock result and updates when another tab is selected', async () => {
+    const first = { ...task, status: 'COMPLETED' as const, values: { ...task.values, stock_name: '中国海油', current_price: '25.48' } }
+    const second = { ...task, public_id: 'public-job-2', symbol: '000001', status: 'COMPLETED' as const, values: { ...task.values, stock_name: '平安银行', current_price: '10.88' } }
+    window.localStorage.setItem('ths_level2_stock_tabs_v2', JSON.stringify([
+      { public_id: first.public_id, symbol: first.symbol, name: '中国海油' },
+      { public_id: second.public_id, symbol: second.symbol, name: '平安银行' },
+    ]))
+    window.localStorage.setItem('ths_level2_active_stock_tab', first.public_id)
+    vi.mocked(fetch).mockImplementation((input) => {
+      const url = String(input)
+      if (url.endsWith('/retry')) return Promise.resolve(jsonResponse({ ...second, status: 'QUEUED' }, 202))
+      return Promise.resolve(jsonResponse(url.includes('public-job-2') ? second : first))
+    })
+    const user = userEvent.setup()
+
+    render(<App />)
+    await screen.findByText('25.48')
+    expect(screen.queryByText('10.88')).not.toBeInTheDocument()
+
+    await user.click(screen.getByRole('tab', { name: /平安银行/ }))
+
+    await screen.findByText('10.88')
+    expect(screen.queryByText('25.48')).not.toBeInTheDocument()
+    expect(document.querySelectorAll('.job-result')).toHaveLength(1)
+  })
+
+  it('migrates legacy browser history to one persistent tab per stock', async () => {
+    const canonical = { ...task, public_id: 'canonical-job', status: 'COMPLETED' as const, values: { ...task.values, stock_name: '中国海油' } }
+    window.localStorage.setItem('ths_level2_job_history', JSON.stringify(['old-job', 'canonical-job']))
+    vi.mocked(fetch).mockResolvedValue(jsonResponse(canonical))
+
+    render(<App />)
+
+    await waitFor(() => expect(screen.getAllByRole('tab', { name: /中国海油/ })).toHaveLength(1))
+    expect(JSON.parse(window.localStorage.getItem('ths_level2_stock_tabs_v2')!)).toEqual([
+      { public_id: 'canonical-job', symbol: '600938', name: '中国海油' },
+    ])
+    expect(window.localStorage.getItem('ths_level2_job_history')).toBeNull()
+  })
+
+  it('provides a searchable all-stocks picker when more than five tabs exist', async () => {
+    const storedTabs = Array.from({ length: 6 }, (_, index) => ({
+      public_id: `public-job-${index + 1}`,
+      symbol: `60093${index}`,
+      name: `测试股票${index + 1}`,
+    }))
+    window.localStorage.setItem('ths_level2_stock_tabs_v2', JSON.stringify(storedTabs))
+    vi.mocked(fetch).mockImplementation((input) => {
+      const id = String(input).split('/').at(-1)!
+      const index = Number(id.split('-').at(-1)) - 1
+      return Promise.resolve(jsonResponse({
+        ...task,
+        public_id: id,
+        symbol: storedTabs[index].symbol,
+        status: 'COMPLETED',
+        values: { ...task.values, stock_name: storedTabs[index].name },
+      }))
+    })
+    const user = userEvent.setup()
+
+    render(<App />)
+    const allStocks = await screen.findByRole('button', { name: '全部股票 6' })
+    await user.click(allStocks)
+    await user.type(screen.getByRole('searchbox', { name: '搜索股票页签' }), '测试股票6')
+
+    expect(screen.getByRole('button', { name: /测试股票6/ })).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /测试股票1/ })).not.toBeInTheDocument()
+  })
+
+  it('restores more than fifty persistent stock tabs without truncating them', async () => {
+    const storedTabs = Array.from({ length: 51 }, (_, index) => ({
+      public_id: `persistent-${index}`,
+      symbol: String(600000 + index),
+      name: `永久股票${index}`,
+    }))
+    window.localStorage.setItem('ths_level2_stock_tabs_v2', JSON.stringify(storedTabs))
+    vi.mocked(fetch).mockImplementation((input) => {
+      const id = String(input).split('/').at(-1)!
+      const index = Number(id.split('-').at(-1))
+      return Promise.resolve(jsonResponse({
+        ...task,
+        public_id: id,
+        symbol: storedTabs[index].symbol,
+        status: 'COMPLETED',
+        values: { ...task.values, stock_name: storedTabs[index].name },
+      }))
+    })
+
+    render(<App />)
+
+    await screen.findByRole('button', { name: '全部股票 51' })
+    expect(JSON.parse(window.localStorage.getItem('ths_level2_stock_tabs_v2')!)).toHaveLength(51)
   })
 
   it('restores collection history saved by this browser', async () => {
@@ -513,7 +728,9 @@ describe('Level2 web UI', () => {
     render(<App />)
 
     await waitFor(() => expect(screen.getByText('任务 public-job-2')).toBeInTheDocument())
-    expect(screen.getByText('任务 public-job-1')).toBeInTheDocument()
+    expect(screen.queryByText('任务 public-job-1')).not.toBeInTheDocument()
+    expect(screen.getByRole('tab', { name: /000001/ })).toBeInTheDocument()
+    expect(screen.getByRole('tab', { name: /600938/ })).toBeInTheDocument()
   })
 
   it('clears only the collection history stored in this browser', async () => {

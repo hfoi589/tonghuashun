@@ -58,8 +58,8 @@ def test_one_finished_capture_makes_task_partial_until_all_three_are_ready() -> 
     assert complete.status.value == "COMPLETED"
 
 
-def test_retention_expires_captures_after_24_hours_then_removes_metadata_after_7_days() -> None:
-    """Leaking a capture beyond its retention window exposes market screenshots too long."""
+def test_retention_expires_captures_after_24_hours_but_keeps_task_data_forever() -> None:
+    """Capture cleanup must not remove the browser's persistent stock result."""
     store = InMemoryStreams()
     task = TaskRecord(task_id="task", symbol="600938")
     store.enqueue(task)
@@ -72,9 +72,9 @@ def test_retention_expires_captures_after_24_hours_then_removes_metadata_after_7
     assert task.status.value != "EXPIRED"
     assert store.cleanup(task.created_at + timedelta(hours=47, seconds=1)) == []
     assert task.captures[CaptureKind.LARGE_ORDER_NET].status == CaptureStatus.EXPIRED
-    assert task.status.value == "EXPIRED"
-    assert store.cleanup(task.created_at + timedelta(days=7, seconds=1)) == [task]
-    assert store.get("task") is None
+    assert task.status == TaskStatus.PARTIAL
+    assert store.cleanup(task.created_at + timedelta(days=30)) == []
+    assert store.get("task") is task
 
 
 def test_queue_cap_rejects_a_new_pending_task() -> None:
@@ -338,8 +338,62 @@ def test_retention_expires_and_removes_the_long_capture(tmp_path: Path) -> None:
     store.cleanup(task.created_at + timedelta(hours=25))
 
     assert task.long_capture.status == CaptureStatus.EXPIRED
-    assert task.status == TaskStatus.EXPIRED
+    assert task.status == TaskStatus.COMPLETED
+    assert task.values[MetricKind.STOCK_NAME] == "招商轮船"
     assert not capture.exists()
+
+
+def test_submit_or_refresh_keeps_one_task_id_for_each_symbol() -> None:
+    store = InMemoryStreams()
+
+    first = store.submit_or_refresh(TaskRecord(task_id="first", symbol="600938", include_long_capture=False))
+    second = store.submit_or_refresh(TaskRecord(task_id="second", symbol="600938", include_long_capture=True))
+
+    assert first.task_id == "first"
+    assert second.task_id == "first"
+    assert store.find_by_symbol("600938").task_id == "first"
+    assert store.queue_position("first") == 1
+
+
+def test_deduplicate_by_symbol_physically_removes_older_tasks_and_resolves_aliases(tmp_path: Path) -> None:
+    capture = tmp_path / "older" / "LONG.png"
+    capture.parent.mkdir()
+    capture.write_bytes(b"old capture")
+    store = InMemoryStreams(capture_root=tmp_path)
+    older = TaskRecord(task_id="older", symbol="601872")
+    older.created_at -= timedelta(hours=1)
+    older.updated_at = older.created_at
+    newer = TaskRecord(task_id="newer", symbol="601872", include_long_capture=False)
+    store.enqueue(older)
+    store.next_queued()
+    store.complete_result("older", FULL_VALUES, str(capture))
+    store.enqueue(newer)
+    store.next_queued()
+    store.complete_result("newer", FULL_VALUES, None)
+
+    result = store.deduplicate_by_symbol()
+
+    assert result == {"total": 2, "kept": 1, "deleted": 1, "aliases": 1}
+    assert store.resolve_task_id("older") == "newer"
+    assert store.get("older").task_id == "newer"
+    assert store.find_by_symbol("601872").task_id == "newer"
+    assert not capture.exists()
+
+
+def test_deduplication_keeps_an_active_request_ahead_of_a_newer_terminal_result() -> None:
+    store = InMemoryStreams()
+    active = TaskRecord(task_id="active", symbol="600938")
+    terminal = TaskRecord(task_id="terminal", symbol="600938", include_long_capture=False)
+    store.enqueue(active)
+    store.enqueue(terminal)
+    store.next_queued()
+    store.next_queued()
+    store.complete_result("terminal", FULL_VALUES, None)
+
+    store.deduplicate_by_symbol()
+
+    assert store.find_by_symbol("600938").task_id == "active"
+    assert store.get("terminal").task_id == "active"
 
 
 def test_next_queued_atomically_claims_the_oldest_job() -> None:
@@ -409,3 +463,32 @@ def test_failed_retry_is_requeued_after_already_queued_jobs() -> None:
     store.retry_failed("failed")
 
     assert store.next_queued().task_id == "later"
+
+
+def test_refresh_reuses_a_terminal_task_id_and_clears_stale_result_before_queueing() -> None:
+    store = InMemoryStreams()
+    task = TaskRecord(task_id="refresh", symbol="600938", include_long_capture=False)
+    store.enqueue(task)
+    store.next_queued()
+    store.complete_result(task.task_id, FULL_VALUES, None)
+    original_created_at = task.created_at
+
+    refreshed = store.refresh_task(task.task_id)
+
+    assert refreshed.task_id == "refresh"
+    assert refreshed.status == TaskStatus.QUEUED
+    assert refreshed.created_at > original_created_at
+    assert refreshed.collected_at is None
+    assert all(value is None for value in refreshed.values.values())
+    assert all(source is None for source in refreshed.value_sources.values())
+    assert store.next_queued().task_id == "refresh"
+
+
+def test_find_by_symbol_returns_the_most_recent_task_for_history_reuse() -> None:
+    store = InMemoryStreams()
+    older = TaskRecord(task_id="older", symbol="600938")
+    newer = TaskRecord(task_id="newer", symbol="600938")
+    store.enqueue(older)
+    store.enqueue(newer)
+
+    assert store.find_by_symbol("600938").task_id == "newer"

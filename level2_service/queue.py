@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from collections import deque
+from collections import defaultdict, deque
+from copy import deepcopy
 from datetime import datetime
 import json
 from pathlib import Path
@@ -22,12 +23,17 @@ class InvalidTransitionError(ValueError):
 
 class TaskStore(Protocol):
     def enqueue(self, task: TaskRecord) -> None: ...
+    def submit_or_refresh(self, task: TaskRecord) -> TaskRecord: ...
     def get(self, task_id: str) -> TaskRecord | None: ...
+    def resolve_task_id(self, task_id: str) -> str: ...
+    def find_by_symbol(self, symbol: str) -> TaskRecord | None: ...
+    def deduplicate_by_symbol(self) -> dict[str, int]: ...
     def queue_position(self, task_id: str) -> int | None: ...
     def next_queued(self) -> TaskRecord | None: ...
     def recover_running(self) -> list[TaskRecord]: ...
     def requeue_waiting(self, task_id: str) -> TaskRecord: ...
     def retry_failed(self, task_id: str) -> TaskRecord: ...
+    def refresh_task(self, task_id: str, include_long_capture: bool | None = None) -> TaskRecord: ...
     def transition(self, task_id: str, status: TaskStatus, *, error_code: str | None = None, source_errors: dict[str, str | None] | None = None) -> TaskRecord: ...
     def complete_capture(self, task_id: str, kind: CaptureKind, path: str) -> TaskRecord: ...
     def complete_result(self, task_id: str, values: dict[MetricKind, str | None], path: str | None, *, ocr_metrics: set[MetricKind] | None = None, source_errors: dict[str, str | None] | None = None, intraday_series: dict[MetricKind, dict[str, object]] | None = None) -> TaskRecord: ...
@@ -45,12 +51,66 @@ _ALLOWED_TRANSITIONS = {
     TaskStatus.EXPIRED: set(),
 }
 
+_ACTIVE_STATUSES = {TaskStatus.QUEUED, TaskStatus.RUNNING, TaskStatus.WAITING_ADMIN}
+_REFRESHABLE_STATUSES = {TaskStatus.COMPLETED, TaskStatus.PARTIAL, TaskStatus.FAILED, TaskStatus.EXPIRED}
+
 
 def _normalized_source_errors(
     source_errors: dict[str, str | None] | None,
 ) -> dict[str, str | None]:
     provided = source_errors or {}
     return {key: provided.get(key) for key in SOURCE_ERROR_KEYS}
+
+
+def _reset_task_for_refresh(task: TaskRecord, include_long_capture: bool | None = None) -> None:
+    """Clear a terminal result while keeping its public ID for a fresh run."""
+    now = utc_now()
+    if include_long_capture is not None:
+        task.include_long_capture = include_long_capture
+    task.status = TaskStatus.QUEUED
+    task.created_at = now
+    task.updated_at = now
+    task.completed_at = None
+    task.collected_at = None
+    task.error_code = None
+    task.source_errors = _normalized_source_errors(None)
+    task.captures = {kind: CaptureRecord(kind) for kind in CaptureKind}
+    task.values = {kind: None for kind in MetricKind}
+    task.value_sources = {kind: None for kind in MetricKind}
+    task.intraday_series = normalized_intraday_series(None)
+    task.long_capture = LongCaptureRecord(
+        status=CaptureStatus.PENDING if task.include_long_capture else CaptureStatus.SKIPPED,
+    )
+
+
+def _canonical_task(tasks: list[TaskRecord]) -> TaskRecord:
+    return max(
+        tasks,
+        key=lambda task: (
+            task.status in _ACTIVE_STATUSES,
+            task.created_at,
+            task.updated_at,
+            task.task_id,
+        ),
+    )
+
+
+def _restore_expired_task(task: TaskRecord) -> None:
+    if task.status != TaskStatus.EXPIRED:
+        return
+    required_complete = all(task.values[kind] is not None for kind in REQUIRED_METRICS)
+    fund_error = task.source_errors.get("main_fund_flow")
+    has_result = any(task.values[kind] is not None for kind in REQUIRED_METRICS)
+    if required_complete and fund_error is None:
+        task.status = TaskStatus.COMPLETED
+        task.error_code = None
+    elif has_result:
+        task.status = TaskStatus.PARTIAL
+        task.error_code = fund_error if required_complete else "VALUE_RECOGNITION_FAILED"
+    else:
+        task.status = TaskStatus.FAILED
+        task.error_code = task.error_code or "RESULT_NOT_AVAILABLE"
+    task.updated_at = utc_now()
 
 
 class InMemoryStreams:
@@ -62,9 +122,14 @@ class InMemoryStreams:
         self._tasks: dict[str, TaskRecord] = {}
         self._fifo: deque[str] = deque()
         self._events: dict[str, list[dict[str, str]]] = {}
+        self._aliases: dict[str, str] = {}
         self._claim_lock = Lock()
 
     def enqueue(self, task: TaskRecord) -> None:
+        with self._claim_lock:
+            self._enqueue_locked(task)
+
+    def _enqueue_locked(self, task: TaskRecord) -> None:
         pending = sum(
             item.status in {TaskStatus.QUEUED, TaskStatus.RUNNING, TaskStatus.WAITING_ADMIN}
             for item in self._tasks.values()
@@ -74,6 +139,16 @@ class InMemoryStreams:
         self._tasks[task.task_id] = task
         self._fifo.append(task.task_id)
         self._emit(task)
+
+    def submit_or_refresh(self, task: TaskRecord) -> TaskRecord:
+        with self._claim_lock:
+            existing = self._find_by_symbol_raw(task.symbol)
+            if existing is None:
+                self._enqueue_locked(task)
+                return task
+            if existing.status in _ACTIVE_STATUSES:
+                return existing
+            return self._refresh_locked(existing, task.include_long_capture)
 
     def next_queued(self) -> TaskRecord | None:
         with self._claim_lock:
@@ -87,7 +162,59 @@ class InMemoryStreams:
         return None
 
     def get(self, task_id: str) -> TaskRecord | None:
-        return self._tasks.get(task_id)
+        return self._tasks.get(self.resolve_task_id(task_id))
+
+    def resolve_task_id(self, task_id: str) -> str:
+        resolved = task_id
+        visited = set()
+        while resolved in self._aliases and resolved not in visited:
+            visited.add(resolved)
+            resolved = self._aliases[resolved]
+        return resolved
+
+    def find_by_symbol(self, symbol: str) -> TaskRecord | None:
+        return self._find_by_symbol_raw(symbol)
+
+    def _find_by_symbol_raw(self, symbol: str) -> TaskRecord | None:
+        candidates = [task for task in self._tasks.values() if task.symbol == symbol]
+        return max(
+            candidates,
+            key=lambda task: (task.updated_at, task.created_at, task.task_id),
+            default=None,
+        )
+
+    def deduplicate_by_symbol(self) -> dict[str, int]:
+        with self._claim_lock:
+            groups: dict[str, list[TaskRecord]] = defaultdict(list)
+            for task in self._tasks.values():
+                _restore_expired_task(task)
+                groups[task.symbol].append(task)
+            deleted = 0
+            aliases = 0
+            for tasks in groups.values():
+                canonical = _canonical_task(tasks)
+                duplicate_ids = {task.task_id for task in tasks if task.task_id != canonical.task_id}
+                if not duplicate_ids:
+                    continue
+                for alias, target in list(self._aliases.items()):
+                    if target in duplicate_ids:
+                        self._aliases[alias] = canonical.task_id
+                for duplicate_id in duplicate_ids:
+                    duplicate = self._tasks.pop(duplicate_id)
+                    for capture in duplicate.captures.values():
+                        self._unlink_capture(capture)
+                    self._unlink_capture(duplicate.long_capture)
+                    self._events.pop(duplicate_id, None)
+                    self._aliases[duplicate_id] = canonical.task_id
+                    deleted += 1
+                    aliases += 1
+                self._fifo = deque(task_id for task_id in self._fifo if task_id not in duplicate_ids)
+            return {
+                "total": sum(len(tasks) for tasks in groups.values()),
+                "kept": len(groups),
+                "deleted": deleted,
+                "aliases": aliases,
+            }
 
     def recover_running(self) -> list[TaskRecord]:
         recovered = [
@@ -106,6 +233,7 @@ class InMemoryStreams:
         return recovered
 
     def queue_position(self, task_id: str) -> int | None:
+        task_id = self.resolve_task_id(task_id)
         task = self._tasks.get(task_id)
         if task is None or task.status != TaskStatus.QUEUED:
             return None
@@ -143,6 +271,33 @@ class InMemoryStreams:
         task.completed_at = None
         task.source_errors = _normalized_source_errors(None)
         task.updated_at = utc_now()
+        self._emit(task)
+        return task
+
+    def refresh_task(self, task_id: str, include_long_capture: bool | None = None) -> TaskRecord:
+        with self._claim_lock:
+            task_id = self.resolve_task_id(task_id)
+            task = self._tasks[task_id]
+            if task.status in _ACTIVE_STATUSES:
+                return task
+            if task.status not in _REFRESHABLE_STATUSES:
+                raise InvalidTransitionError(f"{task.status.value} cannot be refreshed")
+            return self._refresh_locked(task, include_long_capture)
+
+    def _refresh_locked(self, task: TaskRecord, include_long_capture: bool | None = None) -> TaskRecord:
+        task_id = task.task_id
+        if task.status in _ACTIVE_STATUSES:
+            return task
+        if task.status not in _REFRESHABLE_STATUSES:
+            raise InvalidTransitionError(f"{task.status.value} cannot be refreshed")
+        pending = sum(item.status in _ACTIVE_STATUSES for item in self._tasks.values())
+        if pending >= self.pending_cap:
+            raise QueueFullError("global pending queue cap reached")
+        for capture in task.captures.values():
+            self._unlink_capture(capture)
+        self._unlink_capture(task.long_capture)
+        _reset_task_for_refresh(task, include_long_capture)
+        self._move_to_fifo_tail(task_id)
         self._emit(task)
         return task
 
@@ -227,28 +382,18 @@ class InMemoryStreams:
         return task
 
     def events_after(self, task_id: str, event_index: int = 0) -> list[dict[str, str]]:
-        return self._events.get(task_id, [])[event_index:]
+        return self._events.get(self.resolve_task_id(task_id), [])[event_index:]
 
     def cleanup(self, now: datetime) -> list[TaskRecord]:
         removed: list[TaskRecord] = []
         for task in list(self._tasks.values()):
-            expired_capture = False
             long_capture = task.long_capture
             if (
                 long_capture.status == CaptureStatus.READY
                 and long_capture.expires_at is not None
                 and now >= long_capture.expires_at
             ):
-                expired_capture = True
-                if long_capture.path is not None:
-                    path = long_capture.path.resolve()
-                    if self.capture_root is not None:
-                        try:
-                            path.relative_to(self.capture_root)
-                        except ValueError:
-                            pass
-                        else:
-                            path.unlink(missing_ok=True)
+                self._unlink_capture(long_capture)
                 long_capture.status = CaptureStatus.EXPIRED
             for capture in task.captures.values():
                 if (
@@ -256,26 +401,8 @@ class InMemoryStreams:
                     and capture.expires_at is not None
                     and now >= capture.expires_at
                 ):
-                    expired_capture = True
-                    if capture.path is not None:
-                        path = capture.path.resolve()
-                        if self.capture_root is not None:
-                            try:
-                                path.relative_to(self.capture_root)
-                            except ValueError:
-                                pass
-                            else:
-                                path.unlink(missing_ok=True)
+                    self._unlink_capture(capture)
                     capture.status = CaptureStatus.EXPIRED
-            if expired_capture and task.status != TaskStatus.EXPIRED:
-                task.status = TaskStatus.EXPIRED
-                task.updated_at = now
-                self._emit(task)
-            if now >= task.metadata_expires_at:
-                removed.append(task)
-                del self._tasks[task.task_id]
-                self._events.pop(task.task_id, None)
-                self._fifo.remove(task.task_id)
         return removed
 
     def _emit(self, task: TaskRecord) -> None:
@@ -285,11 +412,21 @@ class InMemoryStreams:
         self._fifo = deque(item for item in self._fifo if item != task_id)
         self._fifo.append(task_id)
 
+    def _unlink_capture(self, capture: CaptureRecord | LongCaptureRecord) -> None:
+        if capture.path is None or self.capture_root is None:
+            return
+        path = capture.path.resolve()
+        try:
+            path.relative_to(self.capture_root)
+        except ValueError:
+            return
+        path.unlink(missing_ok=True)
+
 
 class RedisStreamsStore:
     """Redis-backed TaskStore using a stream for events and Lua for FIFO claims."""
 
-    _REQUIRED_CLIENT_METHODS = ("delete", "eval", "get", "lrange", "rpush", "sadd", "set", "smembers", "srem", "xadd", "xrange")
+    _REQUIRED_CLIENT_METHODS = ("delete", "eval", "get", "hdel", "hget", "hgetall", "hset", "lrange", "lrem", "rpush", "sadd", "set", "smembers", "srem", "xadd", "xdel", "xrange")
     _ENQUEUE_SCRIPT = """
 -- THS_ENQUEUE
 local pending = 0
@@ -307,7 +444,59 @@ redis.call('SET', KEYS[2] .. ARGV[2], ARGV[3])
 redis.call('SADD', KEYS[3], ARGV[2])
 redis.call('RPUSH', KEYS[1], ARGV[2])
 redis.call('XADD', KEYS[4], '*', 'event', 'status', 'task_id', ARGV[2], 'data', 'QUEUED')
+redis.call('HSET', KEYS[5], ARGV[4], ARGV[2])
 return true
+"""
+    _SUBMIT_OR_REFRESH_SCRIPT = """
+-- THS_SUBMIT_OR_REFRESH
+local existing_id = redis.call('HGET', KEYS[5], ARGV[2])
+if existing_id then
+  local existing_payload = redis.call('GET', KEYS[2] .. existing_id)
+  if existing_payload then
+    local existing = cjson.decode(existing_payload)
+    if existing.status == 'QUEUED' or existing.status == 'RUNNING' or existing.status == 'WAITING_ADMIN' then
+      return existing_payload
+    end
+    local pending = 0
+    for _, task_id in ipairs(redis.call('SMEMBERS', KEYS[3])) do
+      local payload = redis.call('GET', KEYS[2] .. task_id)
+      if payload then
+        local task = cjson.decode(payload)
+        if task.status == 'QUEUED' or task.status == 'RUNNING' or task.status == 'WAITING_ADMIN' then
+          pending = pending + 1
+        end
+      end
+    end
+    if pending >= tonumber(ARGV[1]) then return 'QUEUE_FULL' end
+    local refreshed = cjson.decode(ARGV[5])
+    refreshed.task_id = existing_id
+    refreshed.symbol = ARGV[2]
+    local updated = cjson.encode(refreshed)
+    redis.call('LREM', KEYS[1], 0, existing_id)
+    redis.call('SET', KEYS[2] .. existing_id, updated)
+    redis.call('RPUSH', KEYS[1], existing_id)
+    redis.call('XADD', KEYS[4], '*', 'event', 'status', 'task_id', existing_id, 'data', 'QUEUED')
+    return updated
+  end
+  redis.call('HDEL', KEYS[5], ARGV[2])
+end
+local pending = 0
+for _, task_id in ipairs(redis.call('SMEMBERS', KEYS[3])) do
+  local payload = redis.call('GET', KEYS[2] .. task_id)
+  if payload then
+    local task = cjson.decode(payload)
+    if task.status == 'QUEUED' or task.status == 'RUNNING' or task.status == 'WAITING_ADMIN' then
+      pending = pending + 1
+    end
+  end
+end
+if pending >= tonumber(ARGV[1]) then return 'QUEUE_FULL' end
+redis.call('SET', KEYS[2] .. ARGV[3], ARGV[4])
+redis.call('SADD', KEYS[3], ARGV[3])
+redis.call('RPUSH', KEYS[1], ARGV[3])
+redis.call('HSET', KEYS[5], ARGV[2], ARGV[3])
+redis.call('XADD', KEYS[4], '*', 'event', 'status', 'task_id', ARGV[3], 'data', 'QUEUED')
+return ARGV[4]
 """
     _CLAIM_SCRIPT = """
 local task_id = redis.call('LPOP', KEYS[1])
@@ -395,6 +584,35 @@ redis.call('RPUSH', KEYS[1], ARGV[1])
 redis.call('XADD', KEYS[3], '*', 'event', 'status', 'task_id', ARGV[1], 'data', 'QUEUED')
 return updated
 """
+    _REFRESH_TASK_SCRIPT = """
+-- THS_REFRESH_TASK
+local key = KEYS[2] .. ARGV[1]
+local payload = redis.call('GET', key)
+if not payload then return false end
+local current = cjson.decode(payload)
+if current.status == 'QUEUED' or current.status == 'RUNNING' or current.status == 'WAITING_ADMIN' then
+  return payload
+end
+if current.status ~= 'COMPLETED' and current.status ~= 'PARTIAL' and current.status ~= 'FAILED' and current.status ~= 'EXPIRED' then
+  return false
+end
+local pending = 0
+for _, task_id in ipairs(redis.call('SMEMBERS', KEYS[4])) do
+  local existing = redis.call('GET', KEYS[2] .. task_id)
+  if existing then
+    local task = cjson.decode(existing)
+    if task.status == 'QUEUED' or task.status == 'RUNNING' or task.status == 'WAITING_ADMIN' then
+      pending = pending + 1
+    end
+  end
+end
+if pending >= tonumber(ARGV[3]) then return 'QUEUE_FULL' end
+redis.call('SET', key, ARGV[2])
+redis.call('RPUSH', KEYS[1], ARGV[1])
+redis.call('SADD', KEYS[4], ARGV[1])
+redis.call('XADD', KEYS[3], '*', 'event', 'status', 'task_id', ARGV[1], 'data', 'QUEUED')
+return ARGV[2]
+"""
 
     def __init__(self, client: object, stream: str = "ths:jobs", pending_cap: int = 200, capture_root: Path | None = None) -> None:
         missing = [name for name in self._REQUIRED_CLIENT_METHODS if not callable(getattr(client, name, None))]
@@ -408,6 +626,8 @@ return updated
         self._index_key = f"{stream}:tasks"
         self._prefix = f"{stream}:task:"
         self._event_stream = f"{stream}:events"
+        self._symbol_index_key = f"{stream}:symbols"
+        self._alias_key = f"{stream}:aliases"
 
     def set_capture_root(self, capture_root: Path) -> None:
         self.capture_root = capture_root.resolve()
@@ -415,23 +635,135 @@ return updated
     def enqueue(self, task: TaskRecord) -> None:
         accepted = self.client.eval(
             self._ENQUEUE_SCRIPT,
-            4,
+            5,
             self._queue_key,
             self._prefix,
             self._index_key,
             self._event_stream,
+            self._symbol_index_key,
             self.pending_cap,
             task.task_id,
             self._serialize(task),
+            task.symbol,
         )
         if not accepted:
             raise QueueFullError("global pending queue cap reached")
 
+    def submit_or_refresh(self, task: TaskRecord) -> TaskRecord:
+        payload = self.client.eval(
+            self._SUBMIT_OR_REFRESH_SCRIPT,
+            5,
+            self._queue_key,
+            self._prefix,
+            self._index_key,
+            self._event_stream,
+            self._symbol_index_key,
+            self.pending_cap,
+            task.symbol,
+            task.task_id,
+            self._serialize(task),
+            self._serialize(task),
+        )
+        marker = self._text(payload) if payload else ""
+        if marker == "QUEUE_FULL":
+            raise QueueFullError("global pending queue cap reached")
+        if not payload:
+            raise RuntimeError("task submission failed")
+        return self._deserialize(payload)
+
     def get(self, task_id: str) -> TaskRecord | None:
+        payload = self.client.get(self._key(self.resolve_task_id(task_id)))
+        return self._deserialize(payload) if payload else None
+
+    def _get_raw(self, task_id: str) -> TaskRecord | None:
         payload = self.client.get(self._key(task_id))
         return self._deserialize(payload) if payload else None
 
+    def resolve_task_id(self, task_id: str) -> str:
+        resolved = task_id
+        visited = set()
+        while resolved not in visited:
+            visited.add(resolved)
+            target = self.client.hget(self._alias_key, resolved)
+            if not target:
+                break
+            resolved = self._text(target)
+        return resolved
+
+    def find_by_symbol(self, symbol: str) -> TaskRecord | None:
+        indexed = self.client.hget(self._symbol_index_key, symbol)
+        if indexed:
+            task = self._get_raw(self._text(indexed))
+            if task is not None:
+                return task
+        candidates = []
+        for raw_task_id in self.client.smembers(self._index_key):
+            task = self._get_raw(self._text(raw_task_id))
+            if task is not None and task.symbol == symbol:
+                candidates.append(task)
+        result = max(
+            candidates,
+            key=lambda task: (task.updated_at, task.created_at, task.task_id),
+            default=None,
+        )
+        if result is not None:
+            self.client.hset(self._symbol_index_key, result.symbol, result.task_id)
+        return result
+
+    def deduplicate_by_symbol(self) -> dict[str, int]:
+        groups: dict[str, list[TaskRecord]] = defaultdict(list)
+        for raw_task_id in list(self.client.smembers(self._index_key)):
+            task = self._get_raw(self._text(raw_task_id))
+            if task is None:
+                self.client.srem(self._index_key, self._text(raw_task_id))
+                continue
+            _restore_expired_task(task)
+            groups[task.symbol].append(task)
+        deleted = 0
+        aliases = 0
+        existing_aliases = {
+            self._text(alias): self._text(target)
+            for alias, target in self.client.hgetall(self._alias_key).items()
+        }
+        events = list(self.client.xrange(self._event_stream, "-", "+"))
+        for symbol, tasks in groups.items():
+            canonical = _canonical_task(tasks)
+            self._save(canonical)
+            self.client.hset(self._symbol_index_key, symbol, canonical.task_id)
+            duplicate_ids = {task.task_id for task in tasks if task.task_id != canonical.task_id}
+            if not duplicate_ids:
+                continue
+            for alias, target in existing_aliases.items():
+                if target in duplicate_ids:
+                    self.client.hset(self._alias_key, alias, canonical.task_id)
+            event_ids = []
+            for event_id, fields in events:
+                normalized = {self._text(key): self._text(value) for key, value in fields.items()}
+                if normalized.get("task_id") in duplicate_ids:
+                    event_ids.append(event_id)
+            if event_ids:
+                self.client.xdel(self._event_stream, *event_ids)
+            for duplicate in tasks:
+                if duplicate.task_id == canonical.task_id:
+                    continue
+                for capture in duplicate.captures.values():
+                    self._unlink_capture(capture)
+                self._unlink_capture(duplicate.long_capture)
+                self.client.lrem(self._queue_key, 0, duplicate.task_id)
+                self.client.delete(self._key(duplicate.task_id))
+                self.client.srem(self._index_key, duplicate.task_id)
+                self.client.hset(self._alias_key, duplicate.task_id, canonical.task_id)
+                deleted += 1
+                aliases += 1
+        return {
+            "total": sum(len(tasks) for tasks in groups.values()),
+            "kept": len(groups),
+            "deleted": deleted,
+            "aliases": aliases,
+        }
+
     def queue_position(self, task_id: str) -> int | None:
+        task_id = self.resolve_task_id(task_id)
         task = self.get(task_id)
         if task is None or task.status != TaskStatus.QUEUED:
             return None
@@ -502,6 +834,36 @@ return updated
         if task.status == TaskStatus.QUEUED:
             return task
         raise InvalidTransitionError(f"{task.status.value} cannot be retried")
+
+    def refresh_task(self, task_id: str, include_long_capture: bool | None = None) -> TaskRecord:
+        task_id = self.resolve_task_id(task_id)
+        task = self._required(task_id)
+        if task.status in _ACTIVE_STATUSES:
+            return task
+        if task.status not in _REFRESHABLE_STATUSES:
+            raise InvalidTransitionError(f"{task.status.value} cannot be refreshed")
+        candidate = deepcopy(task)
+        _reset_task_for_refresh(candidate, include_long_capture)
+        payload = self.client.eval(
+            self._REFRESH_TASK_SCRIPT,
+            4,
+            self._queue_key,
+            self._prefix,
+            self._event_stream,
+            self._index_key,
+            task_id,
+            self._serialize(candidate),
+            self.pending_cap,
+        )
+        marker = self._text(payload) if payload else ""
+        if marker == "QUEUE_FULL":
+            raise QueueFullError("global pending queue cap reached")
+        if payload:
+            return self._deserialize(payload)
+        current = self._required(task_id)
+        if current.status in _ACTIVE_STATUSES:
+            return current
+        raise InvalidTransitionError(f"{current.status.value} cannot be refreshed")
 
     def transition(self, task_id: str, status: TaskStatus, *, error_code: str | None = None, source_errors: dict[str, str | None] | None = None) -> TaskRecord:
         task = self._required(task_id)
@@ -584,6 +946,7 @@ return updated
         return task
 
     def events_after(self, task_id: str, event_index: int = 0) -> list[dict[str, str]]:
+        task_id = self.resolve_task_id(task_id)
         events: list[dict[str, str]] = []
         for _, fields in self.client.xrange(self._event_stream, "-", "+"):
             normalized = {self._text(key): self._text(value) for key, value in fields.items()}
@@ -599,25 +962,18 @@ return updated
             if task is None:
                 self.client.srem(self._index_key, task_id)
                 continue
-            expired = False
+            changed = False
             if task.long_capture.status == CaptureStatus.READY and task.long_capture.expires_at and now >= task.long_capture.expires_at:
-                expired = True
+                changed = True
                 self._unlink_capture(task.long_capture)
                 task.long_capture.status = CaptureStatus.EXPIRED
             for capture in task.captures.values():
                 if capture.status == CaptureStatus.READY and capture.expires_at and now >= capture.expires_at:
-                    expired = True
+                    changed = True
                     self._unlink_capture(capture)
                     capture.status = CaptureStatus.EXPIRED
-            if expired and task.status != TaskStatus.EXPIRED:
-                task.status = TaskStatus.EXPIRED
-                task.updated_at = now
+            if changed:
                 self._save(task)
-                self._emit(task)
-            if now >= task.metadata_expires_at:
-                removed.append(task)
-                self.client.delete(self._key(task_id))
-                self.client.srem(self._index_key, task_id)
         return removed
 
     def _required(self, task_id: str) -> TaskRecord:
@@ -632,7 +988,7 @@ return updated
     def _emit(self, task: TaskRecord) -> None:
         self.client.xadd(self._event_stream, {"event": "status", "task_id": task.task_id, "data": task.status.value})
 
-    def _unlink_capture(self, capture: CaptureRecord) -> None:
+    def _unlink_capture(self, capture: CaptureRecord | LongCaptureRecord) -> None:
         if capture.path is None or self.capture_root is None:
             return
         path = capture.path.resolve()

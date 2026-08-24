@@ -1,12 +1,23 @@
-import { FormEvent, useEffect, useRef, useState } from 'react'
+import { FormEvent, KeyboardEvent, useEffect, useMemo, useRef, useState } from 'react'
 import { AdminPage } from './AdminPage'
 import { ApiError, api, type IntradaySeriesValues, type Job, type JobStatus, type JobStreamState, type MainFundFlowPeriod, type SymbolLookup, type ValueSource, subscribeToJob } from './api'
 import { IntradayMetricChart } from './IntradayMetricChart'
 import './styles.css'
 
-const HISTORY_STORAGE_KEY = 'ths_level2_job_history'
-const HISTORY_LIMIT = 50
+const LEGACY_HISTORY_STORAGE_KEY = 'ths_level2_job_history'
+const STOCK_TABS_STORAGE_KEY = 'ths_level2_stock_tabs_v2'
+const ACTIVE_TAB_STORAGE_KEY = 'ths_level2_active_stock_tab'
 const terminalStatuses = new Set<JobStatus>(['COMPLETED', 'PARTIAL', 'FAILED', 'EXPIRED'])
+
+interface StoredStockTab {
+  public_id: string
+  symbol: string
+  name: string
+}
+
+interface StockTab extends StoredStockTab {
+  task: Job
+}
 
 type SymbolLookupState =
   | { status: 'idle' }
@@ -33,23 +44,57 @@ function taskStatusText(task: Job): string {
 
 function readHistoryIds(): string[] {
   try {
-    const value = JSON.parse(window.localStorage.getItem(HISTORY_STORAGE_KEY) ?? '[]')
+    const value = JSON.parse(window.localStorage.getItem(LEGACY_HISTORY_STORAGE_KEY) ?? '[]')
     if (!Array.isArray(value)) return []
     return [...new Set(value.filter((item): item is string => (
       typeof item === 'string' && /^[A-Za-z0-9_-]{1,128}$/.test(item)
-    )))].slice(0, HISTORY_LIMIT)
+    )))]
   } catch {
     return []
   }
 }
 
-function persistHistoryIds(ids: string[]): void {
-  const unique = [...new Set(ids)].slice(0, HISTORY_LIMIT)
-  if (unique.length === 0) {
-    window.localStorage.removeItem(HISTORY_STORAGE_KEY)
+function readStoredTabs(): StoredStockTab[] {
+  try {
+    const value = JSON.parse(window.localStorage.getItem(STOCK_TABS_STORAGE_KEY) ?? '[]')
+    if (!Array.isArray(value)) return []
+    const seenSymbols = new Set<string>()
+    return value.flatMap((item) => {
+      const candidate = item as Record<string, unknown>
+      if (
+        typeof item !== 'object' || item === null
+        || typeof candidate.public_id !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(candidate.public_id)
+        || typeof candidate.symbol !== 'string' || !/^\d{6}$/.test(candidate.symbol)
+        || typeof candidate.name !== 'string'
+        || seenSymbols.has(candidate.symbol)
+      ) return []
+      seenSymbols.add(candidate.symbol)
+      return [{ public_id: candidate.public_id, symbol: candidate.symbol, name: candidate.name }]
+    })
+  } catch {
+    return []
+  }
+}
+
+function persistStockTabs(tabs: StockTab[]): void {
+  if (tabs.length === 0) {
+    window.localStorage.removeItem(STOCK_TABS_STORAGE_KEY)
     return
   }
-  window.localStorage.setItem(HISTORY_STORAGE_KEY, JSON.stringify(unique))
+  window.localStorage.setItem(STOCK_TABS_STORAGE_KEY, JSON.stringify(tabs.map(({ public_id, symbol, name }) => ({
+    public_id,
+    symbol,
+    name,
+  }))))
+}
+
+function persistActiveTab(publicId: string | null): void {
+  if (publicId === null) window.localStorage.removeItem(ACTIVE_TAB_STORAGE_KEY)
+  else window.localStorage.setItem(ACTIVE_TAB_STORAGE_KEY, publicId)
+}
+
+function tabName(task: Job, fallback?: string): string {
+  return task.values.stock_name || fallback || task.symbol
 }
 
 type MarketTone = 'up' | 'down' | 'neutral'
@@ -171,6 +216,7 @@ function FundFlowTable({ task, finished }: { task: Job, finished: boolean }) {
 }
 
 function IntradayCharts({ series, publicId }: { series: IntradaySeriesValues, publicId: string }) {
+  const [open, setOpen] = useState(false)
   const charts = [
     ['large_order_net', '大单净量', true, 2],
     ['large_order_amount', '大单金额', true, 1],
@@ -178,27 +224,41 @@ function IntradayCharts({ series, publicId }: { series: IntradaySeriesValues, pu
   ] as const
 
   if (!charts.some(([key]) => series[key].points.length > 0)) return null
+  const chartsId = `intraday-charts-${publicId}`
   return <section className="intraday-section" aria-labelledby={`intraday-title-${publicId}`}>
     <div className="section-heading intraday-heading">
       <div>
         <p className="eyebrow">App 内部曲线</p>
         <h3 id={`intraday-title-${publicId}`}>当日分时</h3>
       </div>
-      <span className="minor">悬停或使用左右键查看每个时点</span>
+      <button
+        type="button"
+        className="secondary intraday-toggle"
+        aria-controls={chartsId}
+        aria-expanded={open}
+        onClick={() => setOpen((current) => !current)}
+      >
+        {open ? '收起曲线' : '展开曲线'}
+      </button>
     </div>
-    <div className="intraday-chart-list">
+    {open && <div className="intraday-chart-list" id={chartsId}>
       {charts.map(([key, title, directional, precision]) => <IntradayMetricChart
-        directional={directional}
-        key={key}
-        precision={precision}
-        series={series[key]}
-        title={title}
-      />)}
-    </div>
+          directional={directional}
+          key={key}
+          precision={precision}
+          series={series[key]}
+          title={title}
+        />)}
+      </div>}
   </section>
 }
 
-export function JobResult({ task, isLatest = false }: { task: Job, isLatest?: boolean }) {
+export function JobResult({ task, isLatest = false, onRetry, retrying = false }: {
+  task: Job,
+  isLatest?: boolean,
+  onRetry?: () => void,
+  retrying?: boolean,
+}) {
   const [captureOpen, setCaptureOpen] = useState(false)
   const finished = task.status === 'COMPLETED' || task.status === 'PARTIAL'
   const captureReady = task.long_capture.status === 'READY' && Boolean(task.long_capture.url)
@@ -215,7 +275,18 @@ export function JobResult({ task, isLatest = false }: { task: Job, isLatest?: bo
         <p className="job-time">提交时间 {new Date(task.created_at).toLocaleString('zh-CN')}</p>
         {task.collected_at && <p className="job-time">采集时间 {new Date(task.collected_at).toLocaleString('zh-CN')}</p>}
       </div>
-      <span className={`status status-${task.status.toLowerCase()}`}>{taskStatusText(task)}</span>
+      <div className="job-heading-actions">
+        <span className={`status status-${task.status.toLowerCase()}`}>{taskStatusText(task)}</span>
+        {onRetry && <button
+          type="button"
+          className="secondary job-retry"
+          aria-label={`重试 ${task.symbol}`}
+          disabled={retrying || !terminalStatuses.has(task.status)}
+          onClick={onRetry}
+        >
+          {retrying ? '重试中…' : '重试'}
+        </button>}
+      </div>
     </div>
 
     {task.queue_position != null && task.status === 'QUEUED' && <p className="minor queue-position">当前排队位置：第 {task.queue_position} 位</p>}
@@ -263,12 +334,114 @@ export function JobResult({ task, isLatest = false }: { task: Job, isLatest?: bo
         </div>
         <img src={task.long_capture.url!} alt={`${task.symbol} Level2 整页长截图`} loading="lazy" />
       </div>}
-    </section> : task.status !== 'EXPIRED' && (
-      task.long_capture.status === 'SKIPPED' || !task.include_long_capture
-        ? <p className="minor long-capture-skipped">未请求长截图</p>
-        : <p className="minor long-capture-pending">整页长截图尚未生成。</p>
-    )}
+    </section> : task.long_capture.status === 'EXPIRED'
+      ? <p className="minor long-capture-expired">长截图已过期，指标数据仍保留</p>
+      : task.status !== 'EXPIRED' && (
+        task.long_capture.status === 'SKIPPED' || !task.include_long_capture
+          ? <p className="minor long-capture-skipped">未请求长截图</p>
+          : <p className="minor long-capture-pending">整页长截图尚未生成。</p>
+      )}
   </article>
+}
+
+function StockTabs({ tabs, activePublicId, onSelect }: {
+  tabs: StockTab[]
+  activePublicId: string | null
+  onSelect: (publicId: string) => void
+}) {
+  const [pickerOpen, setPickerOpen] = useState(false)
+  const [query, setQuery] = useState('')
+  const tabRefs = useRef(new Map<string, HTMLButtonElement>())
+  const filteredTabs = useMemo(() => {
+    const normalized = query.trim().toLowerCase()
+    if (!normalized) return tabs
+    return tabs.filter((tab) => `${tab.name} ${tab.symbol}`.toLowerCase().includes(normalized))
+  }, [query, tabs])
+
+  useEffect(() => {
+    if (activePublicId === null) return
+    const activeElement = tabRefs.current.get(activePublicId)
+    if (typeof activeElement?.scrollIntoView === 'function') {
+      activeElement.scrollIntoView({ behavior: 'smooth', block: 'nearest', inline: 'center' })
+    }
+  }, [activePublicId, tabs])
+
+  function moveFocus(event: KeyboardEvent<HTMLButtonElement>, currentIndex: number) {
+    let nextIndex: number | null = null
+    if (event.key === 'ArrowLeft') nextIndex = (currentIndex - 1 + tabs.length) % tabs.length
+    if (event.key === 'ArrowRight') nextIndex = (currentIndex + 1) % tabs.length
+    if (event.key === 'Home') nextIndex = 0
+    if (event.key === 'End') nextIndex = tabs.length - 1
+    if (nextIndex === null) return
+    event.preventDefault()
+    tabRefs.current.get(tabs[nextIndex].public_id)?.focus()
+  }
+
+  return <div className="stock-tabs-shell">
+    <div className="stock-tabs-toolbar">
+      <div className="stock-tab-rail" role="tablist" aria-label="股票页签">
+        {tabs.map((tab, index) => <button
+          type="button"
+          role="tab"
+          id={`stock-tab-${tab.public_id}`}
+          aria-controls={`stock-panel-${tab.public_id}`}
+          aria-selected={tab.public_id === activePublicId}
+          className="stock-tab"
+          key={tab.public_id}
+          ref={(element) => {
+            if (element) tabRefs.current.set(tab.public_id, element)
+            else tabRefs.current.delete(tab.public_id)
+          }}
+          onClick={() => onSelect(tab.public_id)}
+          onKeyDown={(event) => moveFocus(event, index)}
+        >
+          <strong>{tab.name}</strong>
+          <span>{tab.symbol}</span>
+        </button>)}
+      </div>
+      {tabs.length > 5 && <button
+        type="button"
+        className="secondary all-stocks-toggle"
+        aria-expanded={pickerOpen}
+        aria-controls="all-stocks-picker"
+        onClick={() => setPickerOpen((open) => !open)}
+      >全部股票 {tabs.length}</button>}
+    </div>
+    {pickerOpen && <div
+      className="all-stocks-picker"
+      id="all-stocks-picker"
+      onKeyDown={(event) => {
+        if (event.key === 'Escape') {
+          setPickerOpen(false)
+          setQuery('')
+        }
+      }}
+    >
+      <label htmlFor="stock-tab-search">搜索股票页签</label>
+      <input
+        id="stock-tab-search"
+        type="search"
+        value={query}
+        onChange={(event) => setQuery(event.target.value)}
+        placeholder="输入股票名称或代码"
+      />
+      <div className="all-stocks-list">
+        {filteredTabs.length === 0 ? <p className="minor">没有匹配的股票</p> : filteredTabs.map((tab) => <button
+          type="button"
+          key={tab.public_id}
+          className={tab.public_id === activePublicId ? 'all-stock-option active' : 'all-stock-option'}
+          onClick={() => {
+            setPickerOpen(false)
+            setQuery('')
+            onSelect(tab.public_id)
+          }}
+        >
+          <strong>{tab.name}</strong>
+          <span>{tab.symbol}</span>
+        </button>)}
+      </div>
+    </div>}
+  </div>
 }
 
 export default function App({ initialTask }: { initialTask?: Job }) {
@@ -276,18 +449,28 @@ export default function App({ initialTask }: { initialTask?: Job }) {
   const [symbol, setSymbol] = useState('')
   const [symbolLookup, setSymbolLookup] = useState<SymbolLookupState>({ status: 'idle' })
   const [includeLongCapture, setIncludeLongCapture] = useState(false)
-  const [tasks, setTasks] = useState<Job[]>(initialTask ? [initialTask] : [])
+  const [tabs, setTabs] = useState<StockTab[]>(initialTask ? [{
+    public_id: initialTask.public_id,
+    symbol: initialTask.symbol,
+    name: tabName(initialTask),
+    task: initialTask,
+  }] : [])
+  const [activePublicId, setActivePublicId] = useState<string | null>(initialTask?.public_id ?? null)
   const [error, setError] = useState('')
   const [submitting, setSubmitting] = useState(false)
   const [restoring, setRestoring] = useState(!initialTask && !isAdmin)
   const [streamState, setStreamState] = useState<JobStreamState | undefined>()
+  const [retryingTaskId, setRetryingTaskId] = useState<string | null>(null)
   const symbolInputRef = useRef<HTMLInputElement>(null)
   const lookupSequence = useRef(0)
+  const retryRequests = useRef(new Map<string, Promise<void>>())
   const verifiedSymbol = symbolLookup.status === 'valid' && symbolLookup.result.symbol === symbol
-  const activeTaskIds = tasks
-    .filter((task) => !terminalStatuses.has(task.status))
-    .map((task) => task.public_id)
+  const activeTaskIds = tabs
+    .filter((tab) => !terminalStatuses.has(tab.task.status))
+    .map((tab) => tab.public_id)
+    .sort()
     .join(',')
+  const activeTab = tabs.find((tab) => tab.public_id === activePublicId) ?? tabs[0]
 
   useEffect(() => {
     if (initialTask || isAdmin) return
@@ -295,7 +478,13 @@ export default function App({ initialTask }: { initialTask?: Job }) {
 
     async function restoreHistory() {
       const linkedId = new URLSearchParams(window.location.search).get('job')
-      const ids = [...new Set([...(linkedId ? [linkedId] : []), ...readHistoryIds()])].slice(0, HISTORY_LIMIT)
+      const storedTabs = readStoredTabs()
+      const storedById = new Map(storedTabs.map((tab) => [tab.public_id, tab]))
+      const ids = [...new Set([
+        ...(linkedId ? [linkedId] : []),
+        ...storedTabs.map((tab) => tab.public_id),
+        ...readHistoryIds(),
+      ])]
       if (ids.length === 0) {
         setRestoring(false)
         return
@@ -315,13 +504,32 @@ export default function App({ initialTask }: { initialTask?: Job }) {
       }))
       if (cancelled) return
 
-      const loaded = results.flatMap((result) => result.task ? [result.task] : [])
-      const retainedIds = results.filter((result) => !result.missing).map((result) => result.publicId)
-      persistHistoryIds(retainedIds)
-      setTasks((current) => [
-        ...current,
-        ...loaded.filter((task) => !current.some((item) => item.public_id === task.public_id)),
-      ].slice(0, HISTORY_LIMIT))
+      const seenSymbols = new Set<string>()
+      const loadedTabs = results.flatMap((result) => {
+        if (!result.task || seenSymbols.has(result.task.symbol)) return []
+        seenSymbols.add(result.task.symbol)
+        const stored = storedById.get(result.publicId)
+        return [{
+          public_id: result.task.public_id,
+          symbol: result.task.symbol,
+          name: tabName(result.task, stored?.name),
+          task: result.task,
+        }]
+      })
+      persistStockTabs(loadedTabs)
+      window.localStorage.removeItem(LEGACY_HISTORY_STORAGE_KEY)
+      setTabs(loadedTabs)
+      const requestedActive = window.localStorage.getItem(ACTIVE_TAB_STORAGE_KEY)
+      const canonicalActive = results.find((result) => result.publicId === requestedActive)?.task?.public_id
+      const nextActive = (
+        canonicalActive && loadedTabs.some((tab) => tab.public_id === canonicalActive)
+          ? canonicalActive
+          : linkedId
+            ? results.find((result) => result.publicId === linkedId)?.task?.public_id
+            : undefined
+      ) ?? loadedTabs[0]?.public_id ?? null
+      setActivePublicId(nextActive)
+      persistActiveTab(nextActive)
       if (results.some((result) => result.failed)) setError('部分本机历史暂时无法加载，请稍后刷新重试。')
       setRestoring(false)
     }
@@ -334,18 +542,37 @@ export default function App({ initialTask }: { initialTask?: Job }) {
     if (initialTask || isAdmin) return
     const unsubscribers = (activeTaskIds ? activeTaskIds.split(',') : []).map((publicId) => subscribeToJob(publicId, () => {
       api.getJob(publicId).then((updated) => {
-        setTasks((current) => current.map((item) => item.public_id === updated.public_id ? updated : item))
+        setTabs((current) => {
+          const next = current.map((tab) => tab.public_id === publicId ? {
+            ...tab,
+            public_id: updated.public_id,
+            symbol: updated.symbol,
+            name: tabName(updated, tab.name),
+            task: updated,
+          } : tab)
+          persistStockTabs(next)
+          return next
+        })
+        if (activePublicId === publicId && updated.public_id !== publicId) {
+          setActivePublicId(updated.public_id)
+          persistActiveTab(updated.public_id)
+        }
       }).catch((reason) => {
         if (!(reason instanceof ApiError) || reason.status !== 404) return
-        setTasks((current) => {
-          const next = current.filter((item) => item.public_id !== publicId)
-          persistHistoryIds(next.map((item) => item.public_id))
+        setTabs((current) => {
+          const next = current.filter((tab) => tab.public_id !== publicId)
+          persistStockTabs(next)
+          if (activePublicId === publicId) {
+            const nextActive = next[0]?.public_id ?? null
+            setActivePublicId(nextActive)
+            persistActiveTab(nextActive)
+          }
           return next
         })
       })
     }, setStreamState))
     return () => unsubscribers.forEach((unsubscribe) => unsubscribe())
-  }, [activeTaskIds, initialTask, isAdmin])
+  }, [activePublicId, activeTaskIds, initialTask, isAdmin])
 
   useEffect(() => {
     if (isAdmin || !/^\d{6}$/.test(symbol)) {
@@ -372,6 +599,57 @@ export default function App({ initialTask }: { initialTask?: Job }) {
     return () => controller.abort()
   }, [isAdmin, symbol])
 
+  function placeTabAtTop(updated: Job, preferredName?: string) {
+    setTabs((current) => {
+      const existing = current.find((tab) => tab.public_id === updated.public_id || tab.symbol === updated.symbol)
+      const nextTab: StockTab = {
+        public_id: updated.public_id,
+        symbol: updated.symbol,
+        name: tabName(updated, preferredName || existing?.name),
+        task: updated,
+      }
+      const next = [nextTab, ...current.filter((tab) => tab.public_id !== updated.public_id && tab.symbol !== updated.symbol)]
+      persistStockTabs(next)
+      return next
+    })
+    setActivePublicId(updated.public_id)
+    persistActiveTab(updated.public_id)
+  }
+
+  function moveTabToTop(publicId: string) {
+    setTabs((current) => {
+      const selected = current.find((tab) => tab.public_id === publicId)
+      if (!selected) return current
+      const next = [selected, ...current.filter((tab) => tab.public_id !== publicId)]
+      persistStockTabs(next)
+      return next
+    })
+    setActivePublicId(publicId)
+    persistActiveTab(publicId)
+  }
+
+  function retryTask(publicId: string): Promise<void> {
+    const pending = retryRequests.current.get(publicId)
+    if (pending) return pending
+    setRetryingTaskId(publicId)
+    setError('')
+    const request = api.retryJob(publicId).then((updated) => {
+      placeTabAtTop(updated)
+    }).catch((reason) => {
+      setError(reason instanceof Error ? reason.message : '重试失败，请稍后重试。')
+    }).finally(() => {
+      retryRequests.current.delete(publicId)
+      setRetryingTaskId((current) => current === publicId ? null : current)
+    })
+    retryRequests.current.set(publicId, request)
+    return request
+  }
+
+  function selectTab(publicId: string) {
+    moveTabToTop(publicId)
+    void retryTask(publicId)
+  }
+
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
     if (!verifiedSymbol || symbolLookup.status !== 'valid') {
@@ -383,11 +661,7 @@ export default function App({ initialTask }: { initialTask?: Job }) {
     setError('')
     try {
       const nextTask = await api.submitJob(normalized, includeLongCapture)
-      setTasks((current) => {
-        const next = [nextTask, ...current.filter((item) => item.public_id !== nextTask.public_id)].slice(0, HISTORY_LIMIT)
-        persistHistoryIds(next.map((item) => item.public_id))
-        return next
-      })
+      placeTabAtTop(nextTask, symbolLookup.result.name)
       setSymbol('')
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : '提交失败，请稍后重试。')
@@ -403,8 +677,11 @@ export default function App({ initialTask }: { initialTask?: Job }) {
 
   function clearHistory() {
     if (!window.confirm('确定清空当前浏览器中的采集记录吗？服务器上的任务保留规则不会改变。')) return
-    window.localStorage.removeItem(HISTORY_STORAGE_KEY)
-    setTasks([])
+    window.localStorage.removeItem(LEGACY_HISTORY_STORAGE_KEY)
+    window.localStorage.removeItem(STOCK_TABS_STORAGE_KEY)
+    window.localStorage.removeItem(ACTIVE_TAB_STORAGE_KEY)
+    setTabs([])
+    setActivePublicId(null)
     setStreamState(undefined)
     window.history.replaceState({}, '', `${window.location.pathname}${window.location.hash}`)
   }
@@ -475,17 +752,31 @@ export default function App({ initialTask }: { initialTask?: Job }) {
       <div className="history-heading">
         <div>
           <p className="eyebrow">当前浏览器</p>
-          <h2 id="history-title">采集历史</h2>
-          <p>任务信息最多可恢复 7 天，长截图链接保留 24 小时。</p>
+          <h2 id="history-title">股票页签</h2>
+          <p>股票和指标结果会永久保存在当前浏览器；长截图链接保留 24 小时。</p>
         </div>
-        {!initialTask && tasks.length > 0 && <button type="button" className="secondary clear-history" onClick={clearHistory}>清空本机记录</button>}
+        {!initialTask && tabs.length > 0 && <button type="button" className="secondary clear-history" onClick={clearHistory}>清空本机记录</button>}
       </div>
 
-      {restoring ? <div className="history-empty" role="status">正在恢复本机记录…</div> : tasks.length === 0 ? <div className="history-empty">
+      {restoring ? <div className="history-empty" role="status">正在恢复本机记录…</div> : tabs.length === 0 ? <div className="history-empty">
         <strong>还没有采集记录</strong>
         <p>提交第一个股票代码后，结果会显示在这里。</p>
-      </div> : <div className="history-list">
-        {tasks.map((task, index) => <JobResult key={task.public_id} task={task} isLatest={index === 0} />)}
+      </div> : <div className="stock-tab-workspace">
+        <StockTabs tabs={tabs} activePublicId={activeTab?.public_id ?? null} onSelect={selectTab} />
+        {activeTab && <div
+          className="stock-tab-panel"
+          role="tabpanel"
+          id={`stock-panel-${activeTab.public_id}`}
+          aria-labelledby={`stock-tab-${activeTab.public_id}`}
+        >
+          <JobResult
+            key={activeTab.public_id}
+            task={activeTab.task}
+            isLatest
+            onRetry={() => void retryTask(activeTab.public_id)}
+            retrying={retryingTaskId === activeTab.public_id}
+          />
+        </div>}
       </div>}
     </section>
 

@@ -168,6 +168,9 @@ export const api = {
     body: JSON.stringify({ symbol, include_long_capture: includeLongCapture }),
   }),
   getJob: (publicId: string) => request<Job>(`/api/v1/jobs/${encodeURIComponent(publicId)}`),
+  retryJob: (publicId: string) => request<Job>(`/api/v1/jobs/${encodeURIComponent(publicId)}/retry`, {
+    method: 'POST',
+  }),
   login: (password: string) => request<void>('/api/admin/session', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },

@@ -1,6 +1,7 @@
 from fastapi.testclient import TestClient
 
 from level2_service.api import create_app
+from level2_service.models import MetricKind, TaskRecord, TaskStatus
 from level2_service.parsed_values import (
     DirectRequestError,
     SymbolLookup,
@@ -182,6 +183,68 @@ def test_public_submission_reuses_the_recent_successful_lookup() -> None:
 
     assert response.status_code == 202
     assert app.state.symbol_lookup.calls == ["600143"]
+
+
+def test_public_submission_reuses_existing_symbol_task_instead_of_creating_a_new_id() -> None:
+    store = InMemoryStreams()
+    existing = TaskRecord(task_id="existing-task", symbol="600143", include_long_capture=False)
+    store.enqueue(existing)
+    store.next_queued()
+    store.complete_result(existing.task_id, {MetricKind.STOCK_NAME: "金发科技"}, None)
+    client = TestClient(app_with_symbol_lookup(store=store))
+
+    response = client.post(
+        "/api/v1/jobs",
+        json={"symbol": "600143", "include_long_capture": True},
+    )
+
+    assert response.status_code == 202
+    body = response.json()
+    assert body["public_id"] == "existing-task"
+    assert body["status"] == "QUEUED"
+    assert body["include_long_capture"] is True
+    assert body["values"]["stock_name"] is None
+    assert store.next_queued().task_id == "existing-task"
+
+
+def test_public_retry_reuses_the_task_id_and_is_available_without_admin_session() -> None:
+    store = InMemoryStreams()
+    existing = TaskRecord(task_id="retry-task", symbol="600143", include_long_capture=False)
+    store.enqueue(existing)
+    store.next_queued()
+    store.transition(existing.task_id, TaskStatus.FAILED, error_code="DIRECT_APP_OFFLINE")
+    client = TestClient(app_with_symbol_lookup(store=store))
+
+    response = client.post("/api/v1/jobs/retry-task/retry")
+
+    assert response.status_code == 202
+    assert response.json()["public_id"] == "retry-task"
+    assert response.json()["status"] == "QUEUED"
+    assert response.json()["error_code"] is None
+
+
+def test_public_status_transparently_migrates_an_old_duplicate_id() -> None:
+    store = InMemoryStreams()
+    older = TaskRecord(task_id="older-task", symbol="600143", include_long_capture=False)
+    older.created_at = older.created_at.replace(year=2025)
+    older.updated_at = older.created_at
+    newer = TaskRecord(task_id="newer-task", symbol="600143", include_long_capture=False)
+    store.enqueue(older)
+    store.enqueue(newer)
+    store.deduplicate_by_symbol()
+    client = TestClient(app_with_symbol_lookup(store=store))
+
+    response = client.get("/api/v1/jobs/older-task")
+
+    assert response.status_code == 200
+    assert response.json()["public_id"] == "newer-task"
+
+    retry = client.post("/api/v1/jobs/older-task/retry")
+    events = client.get("/api/v1/jobs/older-task/events?once=true")
+
+    assert retry.status_code == 202
+    assert retry.json()["public_id"] == "newer-task"
+    assert '"public_id": "newer-task"' in events.text
 
 
 def test_verified_symbol_cache_is_reused_by_a_restarted_app() -> None:

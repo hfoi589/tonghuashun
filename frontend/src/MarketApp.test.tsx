@@ -271,8 +271,8 @@ describe('MarketApp', () => {
     const shipping = { symbol: '601872', name: '招商轮船', market: '17' }
     const battery = { symbol: '300750', name: '宁德时代', market: '33' }
     let groups = [
-      { id: 1, name: '自选', sort_order: 0, is_primary: true, items: [shipping, battery] },
-      { id: 2, name: '航运', sort_order: 1, is_primary: false, items: [shipping] },
+      { id: 2, name: '航运', sort_order: 0, is_primary: false, items: [shipping] },
+      { id: 1, name: '自选', sort_order: 1, is_primary: true, items: [shipping, battery] },
     ]
     const removedSymbols: string[] = []
     const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -350,6 +350,7 @@ describe('MarketApp', () => {
 
     await waitFor(() => expect(removedSymbols).toEqual(['601872']))
     expect(screen.getByRole('button', { name: /^航运/ })).toHaveTextContent('0')
+    expect(screen.getByRole('heading', { name: '宁德时代' })).toBeInTheDocument()
     await userEvent.click(screen.getByRole('button', { name: /^自选/ }))
     expect(screen.queryByRole('button', { name: /招商轮船 601872/ })).not.toBeInTheDocument()
     expect(screen.getByRole('button', { name: /宁德时代 300750/ })).toBeInTheDocument()

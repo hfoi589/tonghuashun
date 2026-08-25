@@ -493,13 +493,14 @@ export function MarketApp() {
   async function loadWatchlists() {
     const result = await marketApi.watchlists()
     setGroups(result.groups)
-    const availableSymbols = new Set(result.groups.flatMap((group) => group.items.map((item) => item.symbol)))
+    const availableItems = result.groups.flatMap((group) => group.items)
+    const availableSymbols = new Set(availableItems.map((item) => item.symbol))
     setGroupId((current) => current !== null && result.groups.some((group) => group.id === current)
       ? current
       : result.groups[0]?.id ?? null)
     setSelected((current) => current !== null && availableSymbols.has(current)
       ? current
-      : result.groups[0]?.items[0]?.symbol ?? null)
+      : availableItems[0]?.symbol ?? null)
   }
 
   useEffect(() => {

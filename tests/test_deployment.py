@@ -136,6 +136,7 @@ def test_production_factory_wires_the_configured_frida_runtime_source(tmp_path: 
 
     assert settings.frida_server_endpoint == "host.docker.internal:27042"
     assert app.state.runner.parsed_value_source.endpoint == "host.docker.internal:27042"
+    assert app.state.symbol_search.__self__ is app.state.runner.parsed_value_source
     assert isinstance(app.state.symbol_lookup_cache, RedisSymbolLookupCache)
 
 
@@ -214,6 +215,7 @@ def test_production_factory_wires_two_independent_bridges_and_frida_sources(tmp_
     assert app.state.runner.parsed_value_source.core_source.endpoint == "host.docker.internal:27043"
     assert app.state.runner.parsed_value_source.core_source.request_scope == "core_metrics"
     assert app.state.runner.parsed_value_source.fund_source.endpoint == "host.docker.internal:27042"
+    assert app.state.symbol_search.__self__ is app.state.runner.parsed_value_source
     assert app.state.runner.parsed_value_source.fund_source.request_scope == "main_fund_flow"
 
 

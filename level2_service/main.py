@@ -296,6 +296,7 @@ def create_production_app(
         frontend_root=config.frontend_root,
         secure_admin_cookies=config.admin_cookie_secure,
         symbol_lookup=parsed_value_source.lookup_symbol if parsed_value_source is not None else None,
+        symbol_search=parsed_value_source.search_symbols if parsed_value_source is not None else None,
         symbol_lookup_cache=RedisSymbolLookupCache(redis_client),
         market_account_store=market_accounts,
         market_session_store=market_sessions,

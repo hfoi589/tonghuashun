@@ -136,6 +136,10 @@ export interface SymbolLookup {
   market: string
 }
 
+export interface SymbolSuggestion extends SymbolLookup {
+  market_label: string | null
+}
+
 export class ApiError extends Error {
   constructor(public readonly status: number, message: string) {
     super(message)
@@ -158,6 +162,10 @@ async function request<T>(url: string, init?: RequestInit): Promise<T> {
 }
 
 export const api = {
+  searchSymbols: (query: string, signal?: AbortSignal) => request<SymbolSuggestion[]>(
+    `/api/v1/symbols?query=${encodeURIComponent(query)}&limit=8`,
+    { signal },
+  ),
   lookupSymbol: (symbol: string, signal?: AbortSignal) => request<SymbolLookup>(
     `/api/v1/symbols/${encodeURIComponent(symbol)}`,
     { signal },

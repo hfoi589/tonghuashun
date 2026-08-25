@@ -13,7 +13,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import AsyncIterator, Callable, Mapping, Optional
 
-from fastapi import Depends, FastAPI, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.websockets import WebSocketState
@@ -210,6 +210,13 @@ class SymbolLookupResponse(BaseModel):
     market: str
 
 
+class SymbolSearchResponse(BaseModel):
+    symbol: str
+    name: str
+    market: str
+    market_label: Optional[str]
+
+
 def create_app(
     *,
     store: TaskStore | None = None,
@@ -227,6 +234,7 @@ def create_app(
     frontend_root: Path | None = None,
     secure_admin_cookies: bool = True,
     symbol_lookup: Callable[[str], SymbolLookup] | None = None,
+    symbol_search: Callable[[str, int], list[SymbolLookup]] | None = None,
     symbol_lookup_cache: SymbolLookupCache | None = None,
     market_account_store: object | None = None,
     market_session_store: object | None = None,
@@ -324,6 +332,7 @@ def create_app(
     app.state.frontend_root = frontend_root.resolve() if frontend_root is not None else None
     app.state.secure_admin_cookies = secure_admin_cookies
     app.state.symbol_lookup = symbol_lookup
+    app.state.symbol_search = symbol_search
     app.state.symbol_verification_enabled = symbol_lookup is not None or symbol_lookup_cache is not None
     app.state.symbol_lookup_cache = symbol_lookup_cache or InMemorySymbolLookupCache()
     app.state.symbol_lookup_cache_lock = RLock()
@@ -399,6 +408,46 @@ def create_app(
             raise HTTPException(
                 status_code=503,
                 detail="symbol lookup temporarily unavailable",
+            ) from error
+
+    @app.get("/api/v1/symbols", response_model=list[SymbolSearchResponse])
+    def search_public_symbols(
+        query: str = Query(min_length=2, max_length=32),
+        limit: int = Query(default=8, ge=1, le=8),
+    ) -> list[SymbolSearchResponse]:
+        normalized = query.strip()
+        if not 2 <= len(normalized) <= 32:
+            raise HTTPException(
+                status_code=422,
+                detail="query must contain 2 to 32 characters",
+            )
+        search = app.state.symbol_search
+        if search is None:
+            raise HTTPException(
+                status_code=503,
+                detail="symbol search temporarily unavailable",
+            )
+        try:
+            return [
+                SymbolSearchResponse(
+                    symbol=result.symbol,
+                    name=result.name,
+                    market=result.market,
+                    market_label=result.market_label,
+                )
+                for result in search(normalized, limit)
+            ]
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+        except DirectRequestError as error:
+            raise HTTPException(
+                status_code=503,
+                detail="symbol search temporarily unavailable",
+            ) from error
+        except Exception as error:
+            raise HTTPException(
+                status_code=503,
+                detail="symbol search temporarily unavailable",
             ) from error
 
     @app.get("/api/v1/symbols/{symbol}", response_model=SymbolLookupResponse)

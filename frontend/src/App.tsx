@@ -1,6 +1,6 @@
 import { FormEvent, KeyboardEvent, useEffect, useMemo, useRef, useState } from 'react'
 import { AdminPage } from './AdminPage'
-import { ApiError, api, type IntradaySeriesValues, type Job, type JobStatus, type JobStreamState, type MainFundFlowPeriod, type SymbolLookup, type ValueSource, subscribeToJob } from './api'
+import { ApiError, api, type IntradaySeriesValues, type Job, type JobStatus, type JobStreamState, type MainFundFlowPeriod, type SymbolLookup, type SymbolSuggestion, type ValueSource, subscribeToJob } from './api'
 import { IntradayMetricChart } from './IntradayMetricChart'
 import './styles.css'
 
@@ -25,6 +25,8 @@ type SymbolLookupState =
   | { status: 'valid', result: SymbolLookup }
   | { status: 'invalid' }
   | { status: 'unavailable' }
+
+type SymbolSuggestionState = 'idle' | 'loading' | 'ready' | 'empty' | 'unavailable'
 
 const statusText: Record<JobStatus, string> = {
   QUEUED: '已进入队列',
@@ -344,10 +346,11 @@ export function JobResult({ task, isLatest = false, onRetry, retrying = false }:
   </article>
 }
 
-function StockTabs({ tabs, activePublicId, onSelect }: {
+function StockTabs({ tabs, activePublicId, onSelect, onRequestDelete }: {
   tabs: StockTab[]
   activePublicId: string | null
   onSelect: (publicId: string) => void
+  onRequestDelete: (publicId: string, trigger: HTMLButtonElement) => void
 }) {
   const [pickerOpen, setPickerOpen] = useState(false)
   const [query, setQuery] = useState('')
@@ -380,24 +383,31 @@ function StockTabs({ tabs, activePublicId, onSelect }: {
   return <div className="stock-tabs-shell">
     <div className="stock-tabs-toolbar">
       <div className="stock-tab-rail" role="tablist" aria-label="股票页签">
-        {tabs.map((tab, index) => <button
-          type="button"
-          role="tab"
-          id={`stock-tab-${tab.public_id}`}
-          aria-controls={`stock-panel-${tab.public_id}`}
-          aria-selected={tab.public_id === activePublicId}
-          className="stock-tab"
-          key={tab.public_id}
-          ref={(element) => {
-            if (element) tabRefs.current.set(tab.public_id, element)
-            else tabRefs.current.delete(tab.public_id)
-          }}
-          onClick={() => onSelect(tab.public_id)}
-          onKeyDown={(event) => moveFocus(event, index)}
-        >
-          <strong>{tab.name}</strong>
-          <span>{tab.symbol}</span>
-        </button>)}
+        {tabs.map((tab, index) => <div className="stock-tab-item" role="presentation" key={tab.public_id}>
+          <button
+            type="button"
+            role="tab"
+            id={`stock-tab-${tab.public_id}`}
+            aria-controls={`stock-panel-${tab.public_id}`}
+            aria-selected={tab.public_id === activePublicId}
+            className="stock-tab"
+            ref={(element) => {
+              if (element) tabRefs.current.set(tab.public_id, element)
+              else tabRefs.current.delete(tab.public_id)
+            }}
+            onClick={() => onSelect(tab.public_id)}
+            onKeyDown={(event) => moveFocus(event, index)}
+          >
+            <strong>{tab.name}</strong>
+            <span>{tab.symbol}</span>
+          </button>
+          <button
+            type="button"
+            className="stock-tab-delete"
+            aria-label={`删除 ${tab.name}（${tab.symbol}）页签`}
+            onClick={(event) => onRequestDelete(tab.public_id, event.currentTarget)}
+          >×</button>
+        </div>)}
       </div>
       {tabs.length > 5 && <button
         type="button"
@@ -448,6 +458,11 @@ export default function App({ initialTask }: { initialTask?: Job }) {
   const isAdmin = window.location.hash === '#admin'
   const [symbol, setSymbol] = useState('')
   const [symbolLookup, setSymbolLookup] = useState<SymbolLookupState>({ status: 'idle' })
+  const [suggestions, setSuggestions] = useState<SymbolSuggestion[]>([])
+  const [suggestionState, setSuggestionState] = useState<SymbolSuggestionState>('idle')
+  const [suggestionsOpen, setSuggestionsOpen] = useState(false)
+  const [activeSuggestionIndex, setActiveSuggestionIndex] = useState(-1)
+  const [composingSymbol, setComposingSymbol] = useState(false)
   const [includeLongCapture, setIncludeLongCapture] = useState(false)
   const [tabs, setTabs] = useState<StockTab[]>(initialTask ? [{
     public_id: initialTask.public_id,
@@ -461,9 +476,16 @@ export default function App({ initialTask }: { initialTask?: Job }) {
   const [restoring, setRestoring] = useState(!initialTask && !isAdmin)
   const [streamState, setStreamState] = useState<JobStreamState | undefined>()
   const [retryingTaskId, setRetryingTaskId] = useState<string | null>(null)
+  const [deleteTabId, setDeleteTabId] = useState<string | null>(null)
   const symbolInputRef = useRef<HTMLInputElement>(null)
+  const symbolEntryRef = useRef<HTMLDivElement>(null)
   const lookupSequence = useRef(0)
+  const suggestionSequence = useRef(0)
   const retryRequests = useRef(new Map<string, Promise<void>>())
+  const removedTabIds = useRef(new Set<string>())
+  const deleteTriggerRef = useRef<HTMLButtonElement | null>(null)
+  const deleteCancelRef = useRef<HTMLButtonElement>(null)
+  const deleteConfirmRef = useRef<HTMLButtonElement>(null)
   const verifiedSymbol = symbolLookup.status === 'valid' && symbolLookup.result.symbol === symbol
   const activeTaskIds = tabs
     .filter((tab) => !terminalStatuses.has(tab.task.status))
@@ -471,6 +493,7 @@ export default function App({ initialTask }: { initialTask?: Job }) {
     .sort()
     .join(',')
   const activeTab = tabs.find((tab) => tab.public_id === activePublicId) ?? tabs[0]
+  const deleteTab = tabs.find((tab) => tab.public_id === deleteTabId)
 
   useEffect(() => {
     if (initialTask || isAdmin) return
@@ -575,6 +598,67 @@ export default function App({ initialTask }: { initialTask?: Job }) {
   }, [activePublicId, activeTaskIds, initialTask, isAdmin])
 
   useEffect(() => {
+    function closeSuggestions(event: PointerEvent) {
+      if (!symbolEntryRef.current?.contains(event.target as Node)) {
+        setSuggestionsOpen(false)
+        setActiveSuggestionIndex(-1)
+      }
+    }
+    document.addEventListener('pointerdown', closeSuggestions)
+    return () => document.removeEventListener('pointerdown', closeSuggestions)
+  }, [])
+
+  useEffect(() => {
+    if (deleteTabId !== null) deleteCancelRef.current?.focus()
+  }, [deleteTabId])
+
+  useEffect(() => {
+    const normalized = symbol.trim()
+    const numericInput = /^\d+$/.test(normalized)
+    if (
+      isAdmin
+      || composingSymbol
+      || /^\d{6}$/.test(normalized)
+      || numericInput
+      || normalized.length < 2
+      || normalized.length > 32
+    ) {
+      suggestionSequence.current += 1
+      setSuggestions([])
+      setSuggestionState('idle')
+      setSuggestionsOpen(false)
+      setActiveSuggestionIndex(-1)
+      return
+    }
+
+    const sequence = ++suggestionSequence.current
+    const controller = new AbortController()
+    setSuggestionState('loading')
+    setSuggestionsOpen(true)
+    setActiveSuggestionIndex(-1)
+    const timer = window.setTimeout(() => {
+      api.searchSymbols(normalized, controller.signal).then((results) => {
+        if (controller.signal.aborted || suggestionSequence.current !== sequence) return
+        setSuggestions(results)
+        setSuggestionState(results.length === 0 ? 'empty' : 'ready')
+        setSuggestionsOpen(true)
+        setActiveSuggestionIndex(-1)
+      }).catch((reason) => {
+        if (controller.signal.aborted || suggestionSequence.current !== sequence) return
+        setSuggestions([])
+        setSuggestionState('unavailable')
+        setSuggestionsOpen(true)
+        setActiveSuggestionIndex(-1)
+      })
+    }, 300)
+
+    return () => {
+      window.clearTimeout(timer)
+      controller.abort()
+    }
+  }, [composingSymbol, isAdmin, symbol])
+
+  useEffect(() => {
     if (isAdmin || !/^\d{6}$/.test(symbol)) {
       lookupSequence.current += 1
       setSymbolLookup({ status: 'idle' })
@@ -634,7 +718,7 @@ export default function App({ initialTask }: { initialTask?: Job }) {
     setRetryingTaskId(publicId)
     setError('')
     const request = api.retryJob(publicId).then((updated) => {
-      placeTabAtTop(updated)
+      if (!removedTabIds.current.has(publicId)) placeTabAtTop(updated)
     }).catch((reason) => {
       setError(reason instanceof Error ? reason.message : '重试失败，请稍后重试。')
     }).finally(() => {
@@ -661,6 +745,7 @@ export default function App({ initialTask }: { initialTask?: Job }) {
     setError('')
     try {
       const nextTask = await api.submitJob(normalized, includeLongCapture)
+      removedTabIds.current.delete(nextTask.public_id)
       placeTabAtTop(nextTask, symbolLookup.result.name)
       setSymbol('')
     } catch (reason) {
@@ -670,8 +755,38 @@ export default function App({ initialTask }: { initialTask?: Job }) {
     }
   }
 
+  function chooseSuggestion(suggestion: SymbolSuggestion) {
+    suggestionSequence.current += 1
+    setSuggestionsOpen(false)
+    setSuggestions([])
+    setSuggestionState('idle')
+    setActiveSuggestionIndex(-1)
+    setSymbol(suggestion.symbol)
+    setError('')
+  }
+
+  function handleSymbolKeyDown(event: KeyboardEvent<HTMLInputElement>) {
+    if (event.key === 'Escape' && suggestionsOpen) {
+      event.preventDefault()
+      setSuggestionsOpen(false)
+      setActiveSuggestionIndex(-1)
+      return
+    }
+    if (!suggestionsOpen || suggestionState !== 'ready' || suggestions.length === 0) return
+    if (event.key === 'ArrowDown') {
+      event.preventDefault()
+      setActiveSuggestionIndex((current) => (current + 1 + suggestions.length) % suggestions.length)
+    } else if (event.key === 'ArrowUp') {
+      event.preventDefault()
+      setActiveSuggestionIndex((current) => (current - 1 + suggestions.length) % suggestions.length)
+    } else if (event.key === 'Enter' && activeSuggestionIndex >= 0) {
+      event.preventDefault()
+      chooseSuggestion(suggestions[activeSuggestionIndex])
+    }
+  }
+
   function changeSymbol(value: string) {
-    setSymbol(value.replace(/\D/g, '').slice(0, 6))
+    setSymbol(value.slice(0, 32))
     setError('')
   }
 
@@ -686,6 +801,65 @@ export default function App({ initialTask }: { initialTask?: Job }) {
     window.history.replaceState({}, '', `${window.location.pathname}${window.location.hash}`)
   }
 
+  function requestTabDelete(publicId: string, trigger: HTMLButtonElement) {
+    deleteTriggerRef.current = trigger
+    setDeleteTabId(publicId)
+  }
+
+  function cancelTabDelete() {
+    const trigger = deleteTriggerRef.current
+    setDeleteTabId(null)
+    window.requestAnimationFrame(() => trigger?.focus())
+  }
+
+  function confirmTabDelete() {
+    if (deleteTabId === null) return
+    const removedIndex = tabs.findIndex((tab) => tab.public_id === deleteTabId)
+    if (removedIndex < 0) {
+      setDeleteTabId(null)
+      return
+    }
+    const nextTabs = tabs.filter((tab) => tab.public_id !== deleteTabId)
+    let nextActive = activePublicId
+    if (activePublicId === deleteTabId) {
+      nextActive = nextTabs[removedIndex]?.public_id
+        ?? nextTabs[removedIndex - 1]?.public_id
+        ?? null
+    }
+    removedTabIds.current.add(deleteTabId)
+    retryRequests.current.delete(deleteTabId)
+    setRetryingTaskId((current) => current === deleteTabId ? null : current)
+    setTabs(nextTabs)
+    persistStockTabs(nextTabs)
+    setActivePublicId(nextActive)
+    persistActiveTab(nextActive)
+    setDeleteTabId(null)
+    if (nextActive !== null) {
+      window.requestAnimationFrame(() => {
+        document.getElementById(`stock-tab-${nextActive}`)?.focus()
+      })
+    }
+  }
+
+  function handleDeleteDialogKeyDown(event: KeyboardEvent<HTMLDivElement>) {
+    if (event.key === 'Escape') {
+      event.preventDefault()
+      cancelTabDelete()
+      return
+    }
+    if (event.key !== 'Tab') return
+    const focusable = [deleteCancelRef.current, deleteConfirmRef.current].filter(
+      (item): item is HTMLButtonElement => item !== null,
+    )
+    if (focusable.length === 0) return
+    const currentIndex = focusable.indexOf(document.activeElement as HTMLButtonElement)
+    const nextIndex = event.shiftKey
+      ? (currentIndex - 1 + focusable.length) % focusable.length
+      : (currentIndex + 1) % focusable.length
+    event.preventDefault()
+    focusable[nextIndex].focus()
+  }
+
   if (isAdmin) return <AdminPage />
 
   return <main className="page-shell">
@@ -696,22 +870,61 @@ export default function App({ initialTask }: { initialTask?: Job }) {
 
     <section className="panel submit-panel" aria-label="提交采集任务">
       <form onSubmit={submit}>
-        <label className="sr-only" htmlFor="symbol">股票代码</label>
+        <label className="sr-only" htmlFor="symbol">股票代码或名称</label>
         <div className="form-row">
-          <input
-            ref={symbolInputRef}
-            id="symbol"
-            name="stock-symbol"
-            type="text"
-            inputMode="numeric"
-            pattern="[0-9]{6}"
-            autoComplete="off"
-            aria-describedby="symbol-lookup-status"
-            value={symbol}
-            onChange={(event) => changeSymbol(event.target.value)}
-            placeholder="例如 600938"
-            maxLength={6}
-          />
+          <div className="symbol-entry-field" ref={symbolEntryRef}>
+            <input
+              ref={symbolInputRef}
+              id="symbol"
+              name="stock-symbol"
+              type="text"
+              inputMode="search"
+              autoComplete="off"
+              role="combobox"
+              aria-autocomplete="list"
+              aria-expanded={suggestionsOpen}
+              aria-controls="symbol-suggestion-list"
+              aria-activedescendant={activeSuggestionIndex >= 0 ? `symbol-suggestion-${activeSuggestionIndex}` : undefined}
+              aria-describedby="symbol-lookup-status"
+              value={symbol}
+              onChange={(event) => changeSymbol(event.target.value)}
+              onKeyDown={handleSymbolKeyDown}
+              onCompositionStart={() => setComposingSymbol(true)}
+              onCompositionEnd={(event) => {
+                setComposingSymbol(false)
+                changeSymbol(event.currentTarget.value)
+              }}
+              onFocus={() => {
+                if (suggestionState !== 'idle') setSuggestionsOpen(true)
+              }}
+              placeholder="输入代码或名称，例如 国盾"
+              maxLength={32}
+            />
+            {suggestionsOpen && <div
+              className="symbol-suggestion-list"
+              id="symbol-suggestion-list"
+              role="listbox"
+              aria-label="股票候选"
+            >
+              {suggestionState === 'loading' && <p role="status">正在搜索股票…</p>}
+              {suggestionState === 'empty' && <p>没有匹配的股票</p>}
+              {suggestionState === 'unavailable' && <p>股票候选查询暂时不可用</p>}
+              {suggestionState === 'ready' && suggestions.map((suggestion, index) => <button
+                type="button"
+                role="option"
+                aria-selected={index === activeSuggestionIndex}
+                id={`symbol-suggestion-${index}`}
+                key={`${suggestion.symbol}-${suggestion.market}`}
+                className="symbol-suggestion-option"
+                onMouseDown={(event) => event.preventDefault()}
+                onClick={() => chooseSuggestion(suggestion)}
+              >
+                <strong>{suggestion.name}</strong>
+                <span>{suggestion.symbol}</span>
+                <small>{suggestion.market_label || suggestion.market}</small>
+              </button>)}
+            </div>}
+          </div>
           <button type="submit" disabled={submitting || !verifiedSymbol}>{submitting ? '正在提交…' : '提交采集任务'}</button>
           <label className="capture-option">
             <input
@@ -728,7 +941,8 @@ export default function App({ initialTask }: { initialTask?: Job }) {
           className={`symbol-lookup symbol-lookup-${symbolLookup.status}`}
           aria-live="polite"
         >
-          {symbolLookup.status === 'idle' && <span>输入满 6 位后自动查询股票名称</span>}
+          {symbolLookup.status === 'idle' && suggestionState === 'idle' && <span>输入六位代码，或至少两个字搜索股票名称</span>}
+          {symbolLookup.status === 'idle' && suggestionState === 'ready' && <span>选择候选后将进行六位代码精确确认</span>}
           {symbolLookup.status === 'loading' && <span>正在查询股票…</span>}
           {symbolLookup.status === 'invalid' && <span>未找到该股票</span>}
           {symbolLookup.status === 'unavailable' && <span>股票查询暂时不可用</span>}
@@ -762,7 +976,12 @@ export default function App({ initialTask }: { initialTask?: Job }) {
         <strong>还没有采集记录</strong>
         <p>提交第一个股票代码后，结果会显示在这里。</p>
       </div> : <div className="stock-tab-workspace">
-        <StockTabs tabs={tabs} activePublicId={activeTab?.public_id ?? null} onSelect={selectTab} />
+        <StockTabs
+          tabs={tabs}
+          activePublicId={activeTab?.public_id ?? null}
+          onSelect={selectTab}
+          onRequestDelete={requestTabDelete}
+        />
         {activeTab && <div
           className="stock-tab-panel"
           role="tabpanel"
@@ -781,6 +1000,27 @@ export default function App({ initialTask }: { initialTask?: Job }) {
     </section>
 
     {streamState === 'RECONNECTING' && <p className="notice stream-notice" role="status">任务状态流暂时断开，正在自动重连。</p>}
+    {deleteTab && <div className="tab-delete-overlay" onMouseDown={(event) => {
+      if (event.target === event.currentTarget) cancelTabDelete()
+    }}>
+      <div
+        className="tab-delete-dialog"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="tab-delete-title"
+        aria-describedby="tab-delete-description"
+        onKeyDown={handleDeleteDialogKeyDown}
+      >
+        <p className="eyebrow">当前浏览器</p>
+        <h2 id="tab-delete-title">删除股票页签</h2>
+        <p id="tab-delete-description">确定从当前浏览器删除 {deleteTab.name}（{deleteTab.symbol}）吗？</p>
+        <p className="minor">服务端任务和其他浏览器不会受到影响。</p>
+        <div className="tab-delete-actions">
+          <button type="button" className="secondary" ref={deleteCancelRef} onClick={cancelTabDelete}>取消</button>
+          <button type="button" className="tab-delete-confirm" ref={deleteConfirmRef} onClick={confirmTabDelete}>删除页签</button>
+        </div>
+      </div>
+    </div>}
     <footer>仅采集已登录设备中可正常访问的页面，不绕过验证或权限限制。</footer>
   </main>
 }

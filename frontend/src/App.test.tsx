@@ -1,4 +1,4 @@
-import { cleanup, render, screen, waitFor, within } from '@testing-library/react'
+import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import App, { JobResult } from './App'
@@ -48,6 +48,20 @@ function symbolLookup(symbol: string, name: string, market = '17'): SymbolLookup
   return { symbol, name, market }
 }
 
+function completedTabTask(publicId: string, symbol: string, name: string, price: string): Job {
+  return {
+    ...task,
+    public_id: publicId,
+    symbol,
+    status: 'COMPLETED',
+    values: {
+      ...task.values,
+      stock_name: name,
+      current_price: price,
+    },
+  }
+}
+
 function deferredResponse() {
   let resolve!: (response: Response) => void
   const promise = new Promise<Response>((next) => { resolve = next })
@@ -76,7 +90,7 @@ describe('Level2 web UI', () => {
     const user = userEvent.setup()
 
     render(<App />)
-    await user.type(screen.getByLabelText('股票代码'), '600938')
+    await user.type(screen.getByLabelText('股票代码或名称'), '600938')
     await screen.findByText('中国海油（600938）')
     expect(screen.getByRole('heading', { name: '同花顺数据采集' })).toBeInTheDocument()
     expect(screen.getByRole('checkbox', { name: '生成整页长截图' })).not.toBeChecked()
@@ -104,7 +118,7 @@ describe('Level2 web UI', () => {
     const user = userEvent.setup()
 
     render(<App />)
-    await user.type(screen.getByLabelText('股票代码'), '601872')
+    await user.type(screen.getByLabelText('股票代码或名称'), '601872')
     await screen.findByText('招商轮船（601872）')
     await user.click(screen.getByRole('checkbox', { name: '生成整页长截图' }))
     await user.click(screen.getByRole('button', { name: '提交采集任务' }))
@@ -134,7 +148,7 @@ describe('Level2 web UI', () => {
     const submit = screen.getByRole('button', { name: '提交采集任务' })
     expect(submit).toBeDisabled()
 
-    await user.type(screen.getByLabelText('股票代码'), '60014')
+    await user.type(screen.getByLabelText('股票代码或名称'), '60014')
 
     expect(fetch).not.toHaveBeenCalled()
     expect(submit).toBeDisabled()
@@ -146,7 +160,7 @@ describe('Level2 web UI', () => {
     const user = userEvent.setup()
 
     render(<App />)
-    await user.type(screen.getByLabelText('股票代码'), '600143')
+    await user.type(screen.getByLabelText('股票代码或名称'), '600143')
 
     await waitFor(() => expect(fetch).toHaveBeenCalledWith(
       '/api/v1/symbols/600143',
@@ -161,6 +175,137 @@ describe('Level2 web UI', () => {
     expect(screen.getByRole('button', { name: '提交采集任务' })).toBeEnabled()
   })
 
+  it('debounces a stock name query and shows App-internal suggestions', async () => {
+    vi.mocked(fetch).mockResolvedValueOnce(jsonResponse([
+      { symbol: '688027', name: '国盾量子', market: '17', market_label: '科创' },
+    ]))
+    const user = userEvent.setup()
+
+    render(<App />)
+    const input = screen.getByLabelText('股票代码或名称')
+    await user.type(input, '国盾')
+
+    expect(fetch).not.toHaveBeenCalled()
+    const option = await screen.findByRole('option', { name: /国盾量子.*688027.*科创/ })
+    expect(option).toBeInTheDocument()
+    expect(fetch).toHaveBeenCalledWith(
+      '/api/v1/symbols?query=%E5%9B%BD%E7%9B%BE&limit=8',
+      expect.objectContaining({ credentials: 'include', signal: expect.any(AbortSignal) }),
+    )
+    expect(screen.getByRole('button', { name: '提交采集任务' })).toBeDisabled()
+  })
+
+  it('exactly confirms a selected suggestion before submitting its six-digit code', async () => {
+    const selectedTask = { ...task, symbol: '688027' }
+    vi.mocked(fetch)
+      .mockResolvedValueOnce(jsonResponse([
+        { symbol: '688027', name: '国盾量子', market: '17', market_label: '科创' },
+      ]))
+      .mockResolvedValueOnce(jsonResponse(symbolLookup('688027', '国盾量子')))
+      .mockResolvedValueOnce(jsonResponse(selectedTask, 202))
+    const user = userEvent.setup()
+
+    render(<App />)
+    const input = screen.getByLabelText('股票代码或名称')
+    await user.type(input, '国盾')
+    await user.click(await screen.findByRole('option', { name: /国盾量子.*688027.*科创/ }))
+
+    expect(await screen.findByText('国盾量子（688027）')).toBeInTheDocument()
+    expect(input).toHaveValue('688027')
+    expect(fetch).toHaveBeenNthCalledWith(2, '/api/v1/symbols/688027', expect.objectContaining({
+      signal: expect.any(AbortSignal),
+    }))
+
+    await user.click(screen.getByRole('button', { name: '提交采集任务' }))
+    expect(fetch).toHaveBeenNthCalledWith(3, '/api/v1/jobs', expect.objectContaining({
+      body: JSON.stringify({ symbol: '688027', include_long_capture: false }),
+    }))
+  })
+
+  it('supports keyboard selection and Escape for the suggestion list', async () => {
+    vi.mocked(fetch)
+      .mockResolvedValueOnce(jsonResponse([
+        { symbol: '688027', name: '国盾量子', market: '17', market_label: '科创' },
+        { symbol: '688981', name: '中芯国际', market: '17', market_label: '科创' },
+      ]))
+      .mockResolvedValueOnce(jsonResponse(symbolLookup('688027', '国盾量子')))
+    const user = userEvent.setup()
+
+    render(<App />)
+    const input = screen.getByLabelText('股票代码或名称')
+    await user.type(input, '国盾')
+    await screen.findByRole('option', { name: /国盾量子/ })
+    await user.keyboard('{ArrowDown}{Enter}')
+
+    expect(await screen.findByText('国盾量子（688027）')).toBeInTheDocument()
+
+    await user.clear(input)
+    vi.mocked(fetch).mockResolvedValueOnce(jsonResponse([
+      { symbol: '688981', name: '中芯国际', market: '17', market_label: '科创' },
+    ]))
+    await user.type(input, '中芯')
+    await screen.findByRole('option', { name: /中芯国际/ })
+    await user.keyboard('{Escape}')
+    expect(screen.queryByRole('option', { name: /中芯国际/ })).not.toBeInTheDocument()
+  })
+
+  it.each([
+    [[], '没有匹配的股票'],
+    [{ detail: 'symbol search temporarily unavailable' }, '股票候选查询暂时不可用', 503],
+  ])('shows a distinct suggestion result state', async (body, message, status = 200) => {
+    vi.mocked(fetch).mockResolvedValueOnce(jsonResponse(body, status))
+    const user = userEvent.setup()
+
+    render(<App />)
+    await user.type(screen.getByLabelText('股票代码或名称'), '国盾')
+
+    expect(await screen.findByText(message)).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: '提交采集任务' })).toBeDisabled()
+  })
+
+  it('does not let an older suggestion response replace a newer query', async () => {
+    const first = deferredResponse()
+    const second = deferredResponse()
+    vi.mocked(fetch)
+      .mockReturnValueOnce(first.promise)
+      .mockReturnValueOnce(second.promise)
+    const user = userEvent.setup()
+
+    render(<App />)
+    const input = screen.getByLabelText('股票代码或名称')
+    await user.type(input, '国盾')
+    await waitFor(() => expect(fetch).toHaveBeenCalledTimes(1), { timeout: 1000 })
+    await user.clear(input)
+    await user.type(input, '中芯')
+    await waitFor(() => expect(fetch).toHaveBeenCalledTimes(2), { timeout: 1000 })
+
+    second.resolve(jsonResponse([
+      { symbol: '688981', name: '中芯国际', market: '17', market_label: '科创' },
+    ]))
+    expect(await screen.findByRole('option', { name: /中芯国际/ })).toBeInTheDocument()
+
+    first.resolve(jsonResponse([
+      { symbol: '688027', name: '国盾量子', market: '17', market_label: '科创' },
+    ]))
+    await waitFor(() => expect(screen.queryByRole('option', { name: /国盾量子/ })).not.toBeInTheDocument())
+  })
+
+  it('waits for IME composition to finish before searching by name', async () => {
+    vi.mocked(fetch).mockResolvedValueOnce(jsonResponse([
+      { symbol: '688027', name: '国盾量子', market: '17', market_label: '科创' },
+    ]))
+    render(<App />)
+    const input = screen.getByLabelText('股票代码或名称')
+
+    fireEvent.compositionStart(input)
+    fireEvent.change(input, { target: { value: '国盾' } })
+    await new Promise((resolve) => window.setTimeout(resolve, 350))
+    expect(fetch).not.toHaveBeenCalled()
+
+    fireEvent.compositionEnd(input, { data: '国盾' })
+    expect(await screen.findByRole('option', { name: /国盾量子/ })).toBeInTheDocument()
+  })
+
   it.each([
     [404, '未找到该股票'],
     [503, '股票查询暂时不可用'],
@@ -169,7 +314,7 @@ describe('Level2 web UI', () => {
     const user = userEvent.setup()
 
     render(<App />)
-    await user.type(screen.getByLabelText('股票代码'), '600142')
+    await user.type(screen.getByLabelText('股票代码或名称'), '600142')
 
     expect(await screen.findByText(message)).toBeInTheDocument()
     expect(screen.getByRole('button', { name: '提交采集任务' })).toBeDisabled()
@@ -180,7 +325,7 @@ describe('Level2 web UI', () => {
     const user = userEvent.setup()
 
     render(<App />)
-    const input = screen.getByLabelText('股票代码')
+    const input = screen.getByLabelText('股票代码或名称')
     await user.type(input, '600143')
     expect(await screen.findByText('金发科技（600143）')).toBeInTheDocument()
 
@@ -199,7 +344,7 @@ describe('Level2 web UI', () => {
     const user = userEvent.setup()
 
     render(<App />)
-    const input = screen.getByLabelText('股票代码')
+    const input = screen.getByLabelText('股票代码或名称')
     await user.type(input, '600143')
     await waitFor(() => expect(fetch).toHaveBeenCalledTimes(1))
     await user.clear(input)
@@ -529,7 +674,7 @@ describe('Level2 web UI', () => {
     const user = userEvent.setup()
 
     render(<App />)
-    const input = screen.getByLabelText('股票代码')
+    const input = screen.getByLabelText('股票代码或名称')
     await user.type(input, '600938')
     await screen.findByText('中国海油（600938）')
     await user.click(screen.getByRole('button', { name: '提交采集任务' }))
@@ -560,7 +705,7 @@ describe('Level2 web UI', () => {
     const user = userEvent.setup()
 
     render(<App />)
-    const input = screen.getByLabelText('股票代码')
+    const input = screen.getByLabelText('股票代码或名称')
     await user.type(input, '600938')
     await screen.findByText('中国海油（600938）')
     await user.click(screen.getByRole('button', { name: '提交采集任务' }))
@@ -591,7 +736,7 @@ describe('Level2 web UI', () => {
     const user = userEvent.setup()
 
     render(<App />)
-    const input = screen.getByLabelText('股票代码')
+    const input = screen.getByLabelText('股票代码或名称')
     await user.type(input, '600938')
     await screen.findByText('中国海油（600938）')
     await user.click(screen.getByRole('button', { name: '提交采集任务' }))
@@ -688,8 +833,9 @@ describe('Level2 web UI', () => {
     await user.click(allStocks)
     await user.type(screen.getByRole('searchbox', { name: '搜索股票页签' }), '测试股票6')
 
-    expect(screen.getByRole('button', { name: /测试股票6/ })).toBeInTheDocument()
-    expect(screen.queryByRole('button', { name: /测试股票1/ })).not.toBeInTheDocument()
+    const picker = document.getElementById('all-stocks-picker')!
+    expect(within(picker).getByRole('button', { name: /测试股票6/ })).toBeInTheDocument()
+    expect(within(picker).queryByRole('button', { name: /测试股票1/ })).not.toBeInTheDocument()
   })
 
   it('restores more than fifty persistent stock tabs without truncating them', async () => {
@@ -715,6 +861,110 @@ describe('Level2 web UI', () => {
 
     await screen.findByRole('button', { name: '全部股票 51' })
     expect(JSON.parse(window.localStorage.getItem('ths_level2_stock_tabs_v2')!)).toHaveLength(51)
+  })
+
+  it('asks for confirmation and can cancel browser-only tab deletion', async () => {
+    const first = completedTabTask('first', '600001', '第一股票', '10.01')
+    const second = completedTabTask('second', '600002', '第二股票', '10.02')
+    window.localStorage.setItem('ths_level2_stock_tabs_v2', JSON.stringify([
+      { public_id: first.public_id, symbol: first.symbol, name: '第一股票' },
+      { public_id: second.public_id, symbol: second.symbol, name: '第二股票' },
+    ]))
+    vi.mocked(fetch).mockImplementation((input) => Promise.resolve(
+      jsonResponse(String(input).endsWith('/second') ? second : first),
+    ))
+    const user = userEvent.setup()
+
+    render(<App />)
+    await screen.findByRole('tab', { name: /第一股票/ })
+    await user.click(screen.getByRole('button', { name: '删除 第一股票（600001）页签' }))
+
+    expect(screen.getByRole('dialog', { name: '删除股票页签' })).toBeInTheDocument()
+    expect(screen.getByText('确定从当前浏览器删除 第一股票（600001）吗？')).toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: '取消' }))
+
+    expect(screen.queryByRole('dialog', { name: '删除股票页签' })).not.toBeInTheDocument()
+    expect(screen.getByRole('tab', { name: /第一股票/ })).toBeInTheDocument()
+    expect(JSON.parse(window.localStorage.getItem('ths_level2_stock_tabs_v2')!)).toHaveLength(2)
+    expect(fetch).toHaveBeenCalledTimes(2)
+  })
+
+  it('deletes the active tab locally and activates its right neighbor without refreshing', async () => {
+    const left = completedTabTask('left', '600001', '左侧股票', '10.01')
+    const middle = completedTabTask('middle', '600002', '中间股票', '10.02')
+    const right = completedTabTask('right', '600003', '右侧股票', '10.03')
+    const jobs = { left, middle, right }
+    window.localStorage.setItem('ths_level2_stock_tabs_v2', JSON.stringify([
+      { public_id: 'left', symbol: '600001', name: '左侧股票' },
+      { public_id: 'middle', symbol: '600002', name: '中间股票' },
+      { public_id: 'right', symbol: '600003', name: '右侧股票' },
+    ]))
+    window.localStorage.setItem('ths_level2_active_stock_tab', 'middle')
+    vi.mocked(fetch).mockImplementation((input) => {
+      const id = String(input).split('/').at(-1) as keyof typeof jobs
+      return Promise.resolve(jsonResponse(jobs[id]))
+    })
+    const user = userEvent.setup()
+
+    render(<App />)
+    await screen.findByText('10.02')
+    await user.click(screen.getByRole('button', { name: '删除 中间股票（600002）页签' }))
+    await user.click(screen.getByRole('button', { name: '删除页签' }))
+
+    expect(screen.queryByRole('tab', { name: /中间股票/ })).not.toBeInTheDocument()
+    expect(screen.getByRole('tab', { name: /右侧股票/ })).toHaveAttribute('aria-selected', 'true')
+    expect(screen.getByText('10.03')).toBeInTheDocument()
+    expect(fetch).toHaveBeenCalledTimes(3)
+    expect(JSON.parse(window.localStorage.getItem('ths_level2_stock_tabs_v2')!)).toEqual([
+      { public_id: 'left', symbol: '600001', name: '左侧股票' },
+      { public_id: 'right', symbol: '600003', name: '右侧股票' },
+    ])
+  })
+
+  it('deletes a non-active tab without changing the active result', async () => {
+    const first = completedTabTask('first', '600001', '第一股票', '10.01')
+    const second = completedTabTask('second', '600002', '第二股票', '10.02')
+    window.localStorage.setItem('ths_level2_stock_tabs_v2', JSON.stringify([
+      { public_id: first.public_id, symbol: first.symbol, name: '第一股票' },
+      { public_id: second.public_id, symbol: second.symbol, name: '第二股票' },
+    ]))
+    window.localStorage.setItem('ths_level2_active_stock_tab', 'first')
+    vi.mocked(fetch).mockImplementation((input) => Promise.resolve(
+      jsonResponse(String(input).endsWith('/second') ? second : first),
+    ))
+    const user = userEvent.setup()
+
+    render(<App />)
+    await screen.findByText('10.01')
+    await user.click(screen.getByRole('button', { name: '删除 第二股票（600002）页签' }))
+    await user.click(screen.getByRole('button', { name: '删除页签' }))
+
+    expect(screen.getByRole('tab', { name: /第一股票/ })).toHaveAttribute('aria-selected', 'true')
+    expect(screen.getByText('10.01')).toBeInTheDocument()
+    expect(fetch).toHaveBeenCalledTimes(2)
+  })
+
+  it('deletes the final local tab and supports Escape cancellation with focus return', async () => {
+    const only = completedTabTask('only', '600001', '唯一股票', '10.01')
+    window.localStorage.setItem('ths_level2_stock_tabs_v2', JSON.stringify([
+      { public_id: only.public_id, symbol: only.symbol, name: '唯一股票' },
+    ]))
+    vi.mocked(fetch).mockResolvedValue(jsonResponse(only))
+    const user = userEvent.setup()
+
+    render(<App />)
+    const deleteButton = await screen.findByRole('button', { name: '删除 唯一股票（600001）页签' })
+    await user.click(deleteButton)
+    expect(screen.getByRole('button', { name: '取消' })).toHaveFocus()
+    await user.keyboard('{Escape}')
+    await waitFor(() => expect(deleteButton).toHaveFocus())
+
+    await user.click(deleteButton)
+    await user.click(screen.getByRole('button', { name: '删除页签' }))
+
+    expect(screen.getByText('还没有采集记录')).toBeInTheDocument()
+    expect(window.localStorage.getItem('ths_level2_stock_tabs_v2')).toBeNull()
+    expect(window.localStorage.getItem('ths_level2_active_stock_tab')).toBeNull()
   })
 
   it('restores collection history saved by this browser', async () => {
@@ -812,7 +1062,7 @@ describe('job SSE subscription', () => {
     const user = userEvent.setup()
 
     render(<App />)
-    await user.type(screen.getByLabelText('股票代码'), '600938')
+    await user.type(screen.getByLabelText('股票代码或名称'), '600938')
     await screen.findByText('中国海油（600938）')
     await user.click(screen.getByRole('button', { name: '提交采集任务' }))
     await waitFor(() => expect(FakeEventSource.instances).toHaveLength(1))

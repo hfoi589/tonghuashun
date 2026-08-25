@@ -30,8 +30,85 @@ class FakeSymbolLookup:
         )
 
 
+class FakeSymbolSearch:
+    def __init__(self, *, fail: bool = False) -> None:
+        self.fail = fail
+        self.calls: list[tuple[str, int]] = []
+
+    def __call__(self, query: str, limit: int) -> list[SymbolLookup]:
+        self.calls.append((query, limit))
+        if self.fail:
+            raise DirectRequestError("SYMBOL_LOOKUP_TIMEOUT", "App search timed out")
+        if query == "空结果":
+            return []
+        return [
+            SymbolLookup(
+                symbol="688027",
+                name="国盾量子",
+                market="17",
+                market_label="科创",
+                securities_code=None,
+            )
+        ][:limit]
+
+
 def app_with_symbol_lookup(*, store: InMemoryStreams | None = None):
     return create_app(store=store, symbol_lookup=FakeSymbolLookup())
+
+
+def test_public_symbol_search_returns_app_candidates_without_confirming_them() -> None:
+    lookup = FakeSymbolLookup()
+    search = FakeSymbolSearch()
+    app = create_app(symbol_lookup=lookup, symbol_search=search)
+
+    response = TestClient(app).get(
+        "/api/v1/symbols",
+        params={"query": "国盾", "limit": 8},
+    )
+
+    assert response.status_code == 200
+    assert response.json() == [{
+        "symbol": "688027",
+        "name": "国盾量子",
+        "market": "17",
+        "market_label": "科创",
+    }]
+    assert search.calls == [("国盾", 8)]
+    assert lookup.calls == []
+
+
+def test_public_symbol_search_returns_empty_results_and_validates_parameters() -> None:
+    client = TestClient(create_app(symbol_search=FakeSymbolSearch()))
+
+    assert client.get("/api/v1/symbols", params={"query": "空结果"}).json() == []
+    assert client.get("/api/v1/symbols", params={"query": "国"}).status_code == 422
+    assert client.get("/api/v1/symbols", params={"query": "国盾", "limit": 0}).status_code == 422
+    assert client.get("/api/v1/symbols", params={"query": "国盾", "limit": 9}).status_code == 422
+    assert client.get("/api/v1/symbols", params={"query": "  "}).status_code == 422
+
+
+def test_public_symbol_search_reports_app_failure_and_does_not_seed_exact_cache() -> None:
+    cache = InMemorySymbolLookupCache()
+    lookup = FakeSymbolLookup()
+    failing = TestClient(create_app(
+        symbol_lookup=lookup,
+        symbol_search=FakeSymbolSearch(fail=True),
+        symbol_lookup_cache=cache,
+    ))
+
+    response = failing.get("/api/v1/symbols", params={"query": "国盾"})
+
+    assert response.status_code == 503
+    assert cache.get("688027") is None
+
+    successful = TestClient(create_app(
+        symbol_lookup=lookup,
+        symbol_search=FakeSymbolSearch(),
+        symbol_lookup_cache=cache,
+    ))
+    assert successful.get("/api/v1/symbols", params={"query": "国盾"}).status_code == 200
+    assert successful.get("/api/v1/symbols/688027").status_code == 200
+    assert lookup.calls == ["688027"]
 
 
 def test_public_submission_accepts_a_six_digit_a_share_symbol() -> None:

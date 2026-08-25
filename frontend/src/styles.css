@@ -223,6 +223,69 @@ button.symbol-edit:not(:disabled):hover {
   min-width: 0;
 }
 
+.symbol-entry-field {
+  position: relative;
+  min-width: 0;
+}
+
+.symbol-entry-field > input { width: 100%; }
+
+.symbol-suggestion-list {
+  position: absolute;
+  z-index: 20;
+  top: calc(100% + .45rem);
+  left: 0;
+  width: min(520px, 100%);
+  max-height: 330px;
+  overflow-y: auto;
+  border: 1px solid var(--border-strong);
+  border-radius: 12px;
+  background: var(--surface);
+  padding: .4rem;
+  box-shadow: 0 18px 48px rgba(24, 54, 59, .16);
+}
+
+.symbol-suggestion-list > p {
+  margin: 0;
+  color: var(--text-muted);
+  padding: .8rem .75rem;
+  font-size: .88rem;
+}
+
+button.symbol-suggestion-option {
+  display: grid;
+  width: 100%;
+  min-height: 46px;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: .7rem;
+  border-color: transparent;
+  background: transparent;
+  color: var(--text);
+  padding: .62rem .7rem;
+  text-align: left;
+}
+
+button.symbol-suggestion-option strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+button.symbol-suggestion-option span,
+button.symbol-suggestion-option small {
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+button.symbol-suggestion-option[aria-selected="true"],
+button.symbol-suggestion-option:hover {
+  border-color: #9fc1c3;
+  background: var(--primary-soft);
+  color: var(--primary);
+  box-shadow: none;
+}
+
 input {
   min-height: 48px;
   border: 1px solid var(--border-strong);
@@ -289,16 +352,45 @@ input:hover { border-color: #8ea9aa; }
   scroll-behavior: smooth;
 }
 
+.stock-tab-item {
+  position: relative;
+  flex: 0 0 auto;
+}
+
 button.stock-tab {
   display: grid;
   min-height: 46px;
-  flex: 0 0 auto;
+  width: 100%;
   gap: .08rem;
   border-color: var(--border);
   background: var(--surface-muted);
   color: var(--text);
-  padding: .52rem .78rem;
+  padding: .52rem 2.2rem .52rem .78rem;
   text-align: left;
+}
+
+button.stock-tab-delete {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  display: grid;
+  width: 30px;
+  min-height: 30px;
+  place-items: center;
+  border-color: transparent;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text-muted);
+  padding: 0;
+  font-size: 1.05rem;
+  line-height: 1;
+}
+
+button.stock-tab-delete:not(:disabled):hover {
+  border-color: #e5b9ad;
+  background: var(--danger-bg);
+  color: var(--danger);
+  box-shadow: none;
 }
 
 button.stock-tab strong { font-size: .88rem; }
@@ -375,6 +467,39 @@ button.all-stock-option span { flex: 0 0 auto; color: var(--text-muted); font-si
 button.all-stock-option.active { border-color: #79aeb5; background: var(--primary-soft); color: var(--primary); }
 
 .stock-tab-panel { min-width: 0; }
+
+.tab-delete-overlay {
+  position: fixed;
+  z-index: 60;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  background: rgba(12, 30, 36, .42);
+  padding: 1rem;
+}
+
+.tab-delete-dialog {
+  width: min(430px, 100%);
+  border: 1px solid var(--border-strong);
+  border-radius: 16px;
+  background: var(--surface);
+  color: var(--text);
+  padding: 1.25rem;
+  box-shadow: 0 24px 70px rgba(8, 29, 34, .24);
+}
+
+.tab-delete-dialog h2 { margin: 0; color: #17333b; font-size: 1.3rem; }
+.tab-delete-dialog > p:not(.eyebrow) { margin: .75rem 0 0; line-height: 1.55; }
+
+.tab-delete-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: .6rem;
+  margin-top: 1.15rem;
+}
+
+button.tab-delete-confirm { background: var(--danger); }
+button.tab-delete-confirm:not(:disabled):hover { background: #7f2919; }
 
 .history-empty {
   border: 1px dashed #b9cdcd;
@@ -880,6 +1005,7 @@ button.capture-toggle:active { box-shadow: inset 0 2px 5px rgba(18, 49, 54, .08)
   .page-shell, .admin-shell { width: min(100% - 1rem, 1040px); padding-top: 1.35rem; }
   .hero h1 { letter-spacing: -.045em; }
   .form-row { grid-template-columns: 1fr; }
+  .symbol-suggestion-list { width: 100%; max-height: 280px; }
   .form-row button, .capture-option { width: 100%; }
   .capture-option { min-width: 0; }
   .symbol-lookup { align-items: flex-start; flex-direction: column; }
@@ -889,6 +1015,9 @@ button.capture-toggle:active { box-shadow: inset 0 2px 5px rgba(18, 49, 54, .08)
   .clear-history { width: 100%; }
   .stock-tabs-toolbar { gap: .45rem; padding: .45rem; }
   button.stock-tab { padding-inline: .65rem; }
+  button.stock-tab { padding-right: 2.05rem; }
+  .tab-delete-dialog { padding: 1rem; }
+  .tab-delete-actions { display: grid; grid-template-columns: 1fr 1fr; }
   .all-stocks-toggle { min-height: 46px; padding-inline: .7rem; }
   .all-stocks-list { grid-template-columns: 1fr; }
   .value-grid { grid-template-columns: 1fr; gap: .55rem; }

@@ -136,6 +136,8 @@ class ParsedValueSource(Protocol):
 
     def lookup_symbol(self, symbol: str) -> SymbolLookup: ...
 
+    def search_symbols(self, query: str, limit: int = 8) -> list[SymbolLookup]: ...
+
 
 def empty_metric_values() -> dict[MetricKind, str | None]:
     return {kind: None for kind in MetricKind}
@@ -167,6 +169,9 @@ class DualAccountParsedValueSource:
 
     def lookup_symbol(self, symbol: str) -> SymbolLookup:
         return self.core_source.lookup_symbol(symbol)
+
+    def search_symbols(self, query: str, limit: int = 8) -> list[SymbolLookup]:
+        return self.core_source.search_symbols(query, limit)
 
     def read_direct(self, symbol: str) -> DirectReadOutcome:
         with ThreadPoolExecutor(max_workers=2, thread_name_prefix="ths-direct") as executor:
@@ -585,29 +590,9 @@ class FridaParsedValueSource:
     def lookup_symbol(self, symbol: str) -> SymbolLookup:
         normalized = str(symbol).strip()
         expected_market = market_code_for_symbol(normalized)
-        try:
-            with self._frida_lock:
-                payload = self._lookup_reader(
-                    self.endpoint,
-                    self.package,
-                    self.timeout_seconds,
-                    normalized,
-                )
-        except (UnsupportedMarketError, SymbolLookupNotFoundError, SymbolLookupAmbiguousError):
-            raise
-        except DirectRequestError:
-            raise
-        except Exception as error:
-            raise DirectRequestError("SYMBOL_LOOKUP_FAILED", str(error)) from error
-
-        error_code = _text(payload.get("error_code"))
-        if error_code is not None:
-            raise DirectRequestError(error_code, _text(payload.get("error_message")))
+        results = self._read_symbol_candidates(normalized)
 
         matches: list[SymbolLookup] = []
-        results = payload.get("results", ())
-        if not isinstance(results, (list, tuple)):
-            raise DirectRequestError("SYMBOL_LOOKUP_INVALID", "App search result is not a list")
         for item in results:
             if not isinstance(item, dict):
                 continue
@@ -631,6 +616,75 @@ class FridaParsedValueSource:
         if len(matches) != 1:
             raise SymbolLookupAmbiguousError(normalized)
         return matches[0]
+
+    def search_symbols(self, query: str, limit: int = 8) -> list[SymbolLookup]:
+        normalized = str(query).strip()
+        if not 2 <= len(normalized) <= 32:
+            raise ValueError("query must contain 2 to 32 characters")
+        if not 1 <= limit <= 8:
+            raise ValueError("limit must be between 1 and 8")
+
+        matches: list[SymbolLookup] = []
+        seen: set[tuple[str, str]] = set()
+        for item in self._read_symbol_candidates(normalized):
+            if not isinstance(item, dict):
+                continue
+            stock_code = _text(item.get("stock_code"))
+            market = _text(item.get("market_id"))
+            name = _text(item.get("stock_name"))
+            if (
+                stock_code is None
+                or market is None
+                or name is None
+                or len(stock_code) != 6
+                or not stock_code.isdigit()
+            ):
+                continue
+            try:
+                expected_market = market_code_for_symbol(stock_code)
+            except UnsupportedMarketError:
+                continue
+            identity = (stock_code, market)
+            if market != expected_market or identity in seen:
+                continue
+            seen.add(identity)
+            matches.append(
+                SymbolLookup(
+                    symbol=stock_code,
+                    name=name,
+                    market=market,
+                    market_label=_text(item.get("market_label")),
+                    securities_code=_text(item.get("securities_code")),
+                )
+            )
+            if len(matches) >= limit:
+                break
+        return matches
+
+    def _read_symbol_candidates(self, query: str) -> list[Any]:
+        try:
+            with self._frida_lock:
+                payload = self._lookup_reader(
+                    self.endpoint,
+                    self.package,
+                    self.timeout_seconds,
+                    query,
+                )
+        except (UnsupportedMarketError, SymbolLookupNotFoundError, SymbolLookupAmbiguousError):
+            raise
+        except DirectRequestError:
+            raise
+        except Exception as error:
+            raise DirectRequestError("SYMBOL_LOOKUP_FAILED", str(error)) from error
+
+        error_code = _text(payload.get("error_code"))
+        if error_code is not None:
+            raise DirectRequestError(error_code, _text(payload.get("error_message")))
+
+        results = payload.get("results", ())
+        if not isinstance(results, (list, tuple)):
+            raise DirectRequestError("SYMBOL_LOOKUP_INVALID", "App search result is not a list")
+        return list(results)
 
     @staticmethod
     def _parse_payload(payload: dict[str, Any], symbol: str) -> dict[MetricKind, str | None]:

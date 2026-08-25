@@ -177,8 +177,9 @@ button { cursor: pointer; }
 .market-period-tabs button { height: 45px; padding: 0 17px; border: 0; border-bottom: 2px solid transparent; background: transparent; color: var(--market-muted); font-size: 13px; }
 .market-period-tabs button.active { color: var(--market-red); border-color: var(--market-red); font-weight: 750; }
 .market-price-chart { display: block; width: 100%; height: auto; max-height: 430px; padding: 10px; overflow: visible; }
-.market-timeshare-chart-frame { padding: 10px; }
+.market-timeshare-chart-frame { padding: 0; }
 .market-timeshare-price-chart { padding: 0; touch-action: pan-y; }
+.market-price-chart.market-timeshare-price-chart { min-height: 0; }
 .market-timeshare-chart { margin: 0; min-width: 0; }
 .market-timeshare-chart figcaption { min-height: 58px; padding: 10px 16px 7px; display: flex; align-items: center; justify-content: space-between; gap: 16px; border-bottom: 1px solid var(--market-line); }
 .market-timeshare-chart figcaption > div:first-child { display: grid; gap: 2px; }
@@ -209,7 +210,7 @@ button { cursor: pointer; }
   --intraday-axis: #858a92;
   display: grid;
 }
-.market-intraday-list .intraday-chart { min-width: 0; padding: 8px 12px 10px; border-top: 1px solid var(--market-line); }
+.market-intraday-list .intraday-chart { min-width: 0; padding: 0 2px; border-top: 1px solid var(--market-line); }
 .market-intraday-list .intraday-empty-message { min-height: 150px; display: grid; place-items: center; }
 .market-empty-chart,
 .market-capability-gap { min-height: 300px; display: grid; place-content: center; text-align: center; color: var(--market-muted); }
@@ -297,7 +298,7 @@ button { cursor: pointer; }
   .market-price-chart { min-height: 235px; }
   .market-timeshare-chart figcaption { align-items: flex-start; flex-wrap: wrap; gap: 6px; padding: 9px 10px 7px; }
   .market-timeshare-readout { width: 100%; justify-content: flex-start; }
-  .market-intraday-list .intraday-chart { padding: 7px 8px 8px; }
+  .market-intraday-list .intraday-chart { padding: 0 2px; }
   .market-empty-chart, .market-capability-gap { min-height: 230px; padding: 20px; }
   .daily-k-readout { min-height: 118px; padding: 9px 8px; gap: 6px; font-size: 11px; }
   .daily-k-readout-row { gap: 5px 10px; }

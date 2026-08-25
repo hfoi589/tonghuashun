@@ -349,19 +349,23 @@ function MarketIntradayCharts({ symbol, series, selectedTime }: {
 }) {
   return <div className="market-intraday-list">
     {marketIntradayCharts.map(([key, title, directional, precision]) => <IntradayMetricChart
+      compact
       directional={directional}
       key={`${symbol}-${key}`}
       precision={precision}
       selectedTime={selectedTime}
+      showXAxis={false}
       series={series[key] ?? { unit: key === 'large_order_amount' ? '万' : null, points: [] }}
       title={title}
     />)}
     <IntradayMacdChart
+      compact
       key={`${symbol}-macd`}
       dea={series.macd_dea ?? { unit: null, points: [] }}
       dif={series.macd_dif ?? { unit: null, points: [] }}
       macd={series.macdfs ?? { unit: null, points: [] }}
       selectedTime={selectedTime}
+      showXAxis={false}
     />
   </div>
 }

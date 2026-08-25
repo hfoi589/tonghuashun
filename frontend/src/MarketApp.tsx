@@ -324,7 +324,7 @@ function FundFlow({ values }: { values: MarketSnapshot['main_fund_flow'] }) {
   const periods = [['today', '当日'], ['three_day', '3日'], ['five_day', '5日']] as const
   const rows = [['main_net_inflow', '主力净流入'], ['main_visible_inflow', '主力明盘'], ['main_hidden_inflow', '主力暗盘'], ['retail_inflow', '散户流入']] as const
   if (Object.keys(values).length === 0) return null
-  return <section className="market-section">
+  return <section className="market-section market-fund-flow">
     <div className="market-section-title"><div><span>CAPITAL FLOW</span><h3>主力流向</h3></div><small>App 内部接口</small></div>
     <table className="market-fund-table"><thead><tr><th>指标</th>{periods.map(([, label]) => <th key={label}>{label}</th>)}</tr></thead>
       <tbody>{rows.map(([field, label]) => <tr key={field}><th>{label}</th>{periods.map(([period]) => {
@@ -438,6 +438,12 @@ function Detail({ item, snapshot, period, setPeriod, series, dailyLoading, daily
     </div>
     <section className="market-chart-panel">
       <nav className="market-period-tabs" aria-label="图表周期">{chartPeriods.map(([value, label]) => <button type="button" key={value} className={period === value ? 'active' : ''} onClick={() => setPeriod(value)}>{label}</button>)}</nav>
+      <section className="market-metric-grid">
+        {[
+          ['大单净量', quote.large_order_net], ['大单金额', quote.large_order_amount], ['散户数量', quote.retail_count], ['MACDFS', quote.macdfs],
+        ].map(([label, value]) => <article key={label}><span>{label}</span><strong className={`market-number-${tone(value)}`}>{display(value)}</strong></article>)}
+      </section>
+      {snapshot && <FundFlow values={snapshot.main_fund_flow} />}
       {period === 'timeshare'
         ? <>
           <LineChart name={snapshot?.name ?? item.name} points={snapshot?.timeshare ?? []} selectedTime={intradaySelectedTime} onSelectionChange={setIntradaySelectedTime} />
@@ -449,12 +455,6 @@ function Detail({ item, snapshot, period, setPeriod, series, dailyLoading, daily
           ? <div className="market-capability-gap"><strong>App 内部 K 线接口尚未确认</strong><span>为避免展示错误行情，这里不会使用网页源、OCR 或猜测参数。</span></div>
           : <CandleChart name={snapshot?.name ?? item.name} bars={series?.bars ?? []} />}
     </section>
-    <section className="market-metric-grid">
-      {[
-        ['大单净量', quote.large_order_net], ['大单金额', quote.large_order_amount], ['散户数量', quote.retail_count], ['MACDFS', quote.macdfs],
-      ].map(([label, value]) => <article key={label}><span>{label}</span><strong className={`market-number-${tone(value)}`}>{display(value)}</strong></article>)}
-    </section>
-    {snapshot && <FundFlow values={snapshot.main_fund_flow} />}
     <section className="market-section market-level2">
       <div className="market-section-title"><div><span>LEVEL 2</span><h3>盘口与逐笔</h3></div></div>
       <div className="market-capability-grid">

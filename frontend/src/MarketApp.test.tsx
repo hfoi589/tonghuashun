@@ -138,7 +138,29 @@ describe('MarketApp', () => {
         },
         order_book: [],
         trades: [],
-        main_fund_flow: {},
+        main_fund_flow: {
+          today: {
+            unit: '万元',
+            main_net_inflow: '-1983.50',
+            main_visible_inflow: '-3711.70',
+            main_hidden_inflow: '1728.20',
+            retail_inflow: '1983.50',
+          },
+          three_day: {
+            unit: '亿元',
+            main_net_inflow: '-8.02',
+            main_visible_inflow: '-6.99',
+            main_hidden_inflow: '-1.03',
+            retail_inflow: '8.02',
+          },
+          five_day: {
+            unit: '亿元',
+            main_net_inflow: '-14.63',
+            main_visible_inflow: '-12.36',
+            main_hidden_inflow: '-2.27',
+            retail_inflow: '14.63',
+          },
+        },
         capabilities: {
           timeshare: { available: true, reason: null },
           kline: { available: false, reason: 'DIRECT_KLINE_UNAVAILABLE' },
@@ -184,7 +206,15 @@ describe('MarketApp', () => {
     const amountChart = screen.getByRole('img', { name: '大单金额当日分时图' })
     const retailChart = screen.getByRole('img', { name: '散户数量当日分时图' })
     const macdChart = screen.getByRole('img', { name: 'MACD当日分时图' })
-    const unifiedChartPanel = priceChart.closest('.market-chart-panel')
+    const unifiedChartPanel = priceChart.closest<HTMLElement>('.market-chart-panel')!
+    const metricGrid = screen.getByText('大单净量', { selector: '.market-metric-grid span' }).closest<HTMLElement>('.market-metric-grid')!
+    const fundFlow = screen.getByRole('heading', { name: '主力流向' }).closest<HTMLElement>('.market-section')!
+    expect(unifiedChartPanel).toContainElement(metricGrid)
+    expect(unifiedChartPanel).toContainElement(fundFlow)
+    expect(metricGrid.compareDocumentPosition(fundFlow) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+    expect(fundFlow.compareDocumentPosition(priceChart) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+    expect(Number.parseFloat(getComputedStyle(unifiedChartPanel).marginTop)).toBe(0)
+    expect(Number.parseFloat(getComputedStyle(metricGrid).marginTop)).toBe(0)
     expect(unifiedChartPanel).toContainElement(netChart)
     expect(unifiedChartPanel).toContainElement(amountChart)
     expect(unifiedChartPanel).toContainElement(retailChart)

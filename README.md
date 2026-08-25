@@ -149,6 +149,12 @@ service is later published through a trusted external HTTPS reverse proxy, set
 `ADMIN_COOKIE_SECURE=1` and restrict direct access to port 8001.
 
 Public submissions accept `{"symbol":"601872","include_long_capture":true}`.
+The collection form also accepts a stock-name prefix. `GET /api/v1/symbols`
+queries the core Tonghuashun App's internal association list, while choosing a
+candidate still calls `GET /api/v1/symbols/{symbol}` for exact six-digit code,
+market, and name confirmation before submission. Removing an individual stock
+tab affects only that browser's localStorage; it never deletes or cancels the
+server-side canonical task.
 The screenshot option defaults to `true` for existing clients. Set it to
 `false` to request the eight required values plus optional three-period fund
 flow without any App UI navigation or image creation. Core metrics and symbol

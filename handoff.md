@@ -50,12 +50,19 @@
 ```sh
 curl -fsS http://127.0.0.1:8001/api/v1/symbols/601872
 
+curl -fsS 'http://127.0.0.1:8001/api/v1/symbols?query=国盾&limit=8'
+
 curl -fsS -X POST http://127.0.0.1:8001/api/v1/jobs \
   -H 'Content-Type: application/json' \
   -d '{"symbol":"601872","include_long_capture":false}'
 
 curl -fsS http://127.0.0.1:8001/api/v1/jobs/PUBLIC_ID
 ```
+
+采集输入框接受六位代码或至少两个字符的股票名称关键词。名称候选只来自
+`core_metrics` App 内部联想接口；选择候选后仍必须调用六位代码精确确认接口，
+确认成功后才能提交。单个股票页签的删除只移除当前浏览器 `localStorage` 记录，
+不会删除、取消或改变服务端唯一任务。
 
 Runner 对外仍只有一个 `read_direct(symbol)` 数据入口，内部并行连接两台 App：
 

@@ -183,6 +183,29 @@ describe('MarketApp', () => {
     expect(within(macdChart.closest('figure')!).getByText('DIF')).toBeInTheDocument()
     expect(within(macdChart.closest('figure')!).getByText('DEA')).toBeInTheDocument()
     expect(within(macdChart.closest('figure')!).getByText('MACD', { selector: '.macd-readout b' })).toBeInTheDocument()
+    expect(Number.parseFloat(getComputedStyle(priceChart).minHeight)).toBe(0)
+    expect(Number.parseFloat(getComputedStyle(priceChart.closest('.market-timeshare-chart-frame')!).paddingTop)).toBe(0)
+    expect(Number.parseFloat(getComputedStyle(priceChart.closest('.market-timeshare-chart-frame')!).paddingBottom)).toBe(0)
+    for (const chart of [netChart, amountChart, retailChart, macdChart]) {
+      const figure = chart.closest('figure')!
+      const overlay = figure.querySelector('figcaption')!
+      const watermark = figure.querySelector('h4')!
+      const readout = figure.querySelector('.chart-readout')!
+      const frame = figure.querySelector('.intraday-chart-frame')!
+      expect(figure).toHaveClass('intraday-chart-compact')
+      expect(overlay).toHaveClass('intraday-chart-overlay')
+      expect(watermark).toHaveClass('intraday-chart-watermark')
+      expect(readout).toHaveClass('intraday-chart-corner-readout')
+      expect(getComputedStyle(watermark).opacity).toBe('0.6')
+      expect(getComputedStyle(readout).opacity).toBe('0.6')
+      expect(getComputedStyle(readout).right).toBe('3%')
+      expect(getComputedStyle(overlay).zIndex).toBe('0')
+      expect(getComputedStyle(frame).zIndex).toBe('1')
+      expect(Number.parseFloat(getComputedStyle(figure).paddingBottom)).toBe(0)
+      expect(chart).toHaveAttribute('viewBox', '0 0 720 128')
+      expect(chart.querySelector('.chart-grid-line')).toHaveAttribute('y1', '8')
+      expect(chart.querySelectorAll('.intraday-x-axis-label')).toHaveLength(0)
+    }
     expect(within(priceChart).getByText('09:30')).toBeInTheDocument()
     expect(within(priceChart).getByText('11:30/13:00')).toBeInTheDocument()
     expect(within(priceChart).getByText('15:00')).toBeInTheDocument()

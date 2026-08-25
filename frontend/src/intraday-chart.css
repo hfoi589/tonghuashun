@@ -19,6 +19,58 @@
 
 .intraday-chart h4 { margin: 0; color: var(--intraday-ink, #213c43); font-size: .88rem; }
 
+.intraday-chart-compact {
+  position: relative;
+  overflow: hidden;
+}
+
+.intraday-chart-compact .intraday-chart-overlay {
+  position: absolute;
+  z-index: 0;
+  inset: 0;
+  display: block;
+  min-width: 0;
+  min-height: 0;
+  padding: 0;
+  pointer-events: none;
+}
+
+.intraday-chart-compact .intraday-chart-watermark {
+  position: absolute;
+  top: 50%;
+  right: 2.5%;
+  left: 8.1%;
+  margin: 0;
+  transform: translateY(-50%);
+  color: var(--intraday-muted, #6a7e83);
+  font-size: .76rem;
+  font-weight: 700;
+  line-height: 1.2;
+  text-align: center;
+  opacity: .6;
+}
+
+.intraday-chart-compact .intraday-chart-corner-readout {
+  position: absolute;
+  top: 2px;
+  right: 3%;
+  min-width: 0;
+  max-width: 89.4%;
+  margin-left: 0;
+  justify-content: flex-end;
+  gap: .25rem;
+  white-space: nowrap;
+  opacity: .6;
+}
+
+.intraday-chart-compact .chart-readout time { font-size: .65rem; }
+.intraday-chart-compact .chart-readout strong { font-size: .76rem; }
+.intraday-chart-compact .macd-readout { flex-wrap: nowrap; gap: .2rem .28rem; }
+.intraday-chart-compact .macd-readout b { font-size: .6rem; }
+.intraday-chart-compact .macd-readout strong { font-size: .68rem; }
+.intraday-chart-compact .intraday-chart-frame { position: relative; z-index: 1; padding-top: 0; }
+.intraday-chart-compact .intraday-empty-message { min-height: 74px; padding: 1.4rem .5rem .45rem; font-size: .72rem; }
+
 .chart-readout {
   display: flex;
   align-items: baseline;

@@ -9,6 +9,9 @@ const CHART_LEFT = 58
 const CHART_RIGHT = 18
 const CHART_TOP = 18
 const CHART_BOTTOM = 34
+const COMPACT_CHART_HEIGHT = 128
+const COMPACT_CHART_TOP = 8
+const COMPACT_CHART_BOTTOM = 4
 
 function numericPointValues(series: IntradayMetricSeries): Array<number | null> {
   return series.points.map((point) => {
@@ -18,12 +21,14 @@ function numericPointValues(series: IntradayMetricSeries): Array<number | null> 
   })
 }
 
-export function IntradayMetricChart({ title, series, directional, precision = 2, selectedTime }: {
+export function IntradayMetricChart({ title, series, directional, precision = 2, selectedTime, compact = false, showXAxis = true }: {
   title: string,
   series: IntradayMetricSeries,
   directional: boolean,
   precision?: number,
   selectedTime?: string,
+  compact?: boolean,
+  showXAxis?: boolean,
 }) {
   const controlled = selectedTime !== undefined
   const lastIndex = Math.max(0, series.points.length - 1)
@@ -39,9 +44,9 @@ export function IntradayMetricChart({ title, series, directional, precision = 2,
   }, [lastIndex, series.points.length])
 
   if (series.points.length === 0) {
-    return <figure className="intraday-chart intraday-chart-empty">
-      <figcaption>
-        <h4>{title}</h4>
+    return <figure className={`intraday-chart intraday-chart-empty${compact ? ' intraday-chart-compact' : ''}`}>
+      <figcaption className={compact ? 'intraday-chart-overlay' : undefined}>
+        <h4 className={compact ? 'intraday-chart-watermark' : undefined}>{title}</h4>
       </figcaption>
       <p className="intraday-empty-message">暂无分时数据</p>
     </figure>
@@ -61,14 +66,17 @@ export function IntradayMetricChart({ title, series, directional, precision = 2,
     minimum -= padding
     maximum += padding
   }
+  const chartHeight = compact ? COMPACT_CHART_HEIGHT : CHART_HEIGHT
+  const chartTop = compact ? COMPACT_CHART_TOP : CHART_TOP
+  const chartBottom = compact ? COMPACT_CHART_BOTTOM : CHART_BOTTOM
   const plotWidth = CHART_WIDTH - CHART_LEFT - CHART_RIGHT
-  const plotHeight = CHART_HEIGHT - CHART_TOP - CHART_BOTTOM
+  const plotHeight = chartHeight - chartTop - chartBottom
   const xFor = (index: number) => CHART_LEFT + intradayPointRatio(
     series.points[index].time,
     index,
     series.points.length,
   ) * plotWidth
-  const yFor = (value: number) => CHART_TOP + ((maximum - value) / (maximum - minimum)) * plotHeight
+  const yFor = (value: number) => chartTop + ((maximum - value) / (maximum - minimum)) * plotHeight
   let path = ''
   let segmentOpen = false
   values.forEach((value, index) => {
@@ -96,17 +104,17 @@ export function IntradayMetricChart({ title, series, directional, precision = 2,
   const latestValue = [...validValues].at(-1) ?? 0
   const tone = latestValue > 0 ? 'up' : latestValue < 0 ? 'down' : 'neutral'
 
-  return <figure className={`intraday-chart intraday-tone-${tone}`}>
-    <figcaption>
-      <h4>{title}</h4>
-      <div className="chart-readout" aria-live={controlled ? undefined : 'polite'}>
+  return <figure className={`intraday-chart intraday-tone-${tone}${compact ? ' intraday-chart-compact' : ''}`}>
+    <figcaption className={compact ? 'intraday-chart-overlay' : undefined}>
+      <h4 className={compact ? 'intraday-chart-watermark' : undefined}>{title}</h4>
+      <div className={`chart-readout${compact ? ' intraday-chart-corner-readout' : ''}`} aria-live={controlled ? undefined : 'polite'}>
         <time>{selectedPointTime}</time>
         <strong>{selectedRawValue ?? '—'}{selectedRawValue !== null ? series.unit : ''}</strong>
       </div>
     </figcaption>
     <div className="intraday-chart-frame">
       <svg
-        viewBox={`0 0 ${CHART_WIDTH} ${CHART_HEIGHT}`}
+        viewBox={`0 0 ${CHART_WIDTH} ${chartHeight}`}
         role="img"
         aria-label={`${title}当日分时图`}
         tabIndex={controlled ? undefined : 0}
@@ -139,8 +147,8 @@ export function IntradayMetricChart({ title, series, directional, precision = 2,
           key={ratio}
           x1={CHART_LEFT}
           x2={CHART_WIDTH - CHART_RIGHT}
-          y1={CHART_TOP + ratio * plotHeight}
-          y2={CHART_TOP + ratio * plotHeight}
+          y1={chartTop + ratio * plotHeight}
+          y2={chartTop + ratio * plotHeight}
         />)}
         {minimum <= 0 && maximum >= 0 && <line
           className="chart-zero-line"
@@ -150,19 +158,19 @@ export function IntradayMetricChart({ title, series, directional, precision = 2,
           y2={yFor(0)}
         />}
         <path className="chart-series-line" d={path} />
-        <line className="chart-cursor-line" x1={selectedX} x2={selectedX} y1={CHART_TOP} y2={CHART_TOP + plotHeight} />
+        <line className="chart-cursor-line" x1={selectedX} x2={selectedX} y1={chartTop} y2={chartTop + plotHeight} />
         {selectedValue !== null && <>
           <circle className="chart-active-point" cx={selectedX} cy={yFor(selectedValue)} r="5" />
         </>}
-        {intradayAxisTicks.map((tick) => <text
+        {showXAxis && intradayAxisTicks.map((tick) => <text
           className="chart-axis-label intraday-x-axis-label"
           key={tick.label}
           x={CHART_LEFT + tick.ratio * plotWidth}
-          y={CHART_HEIGHT - 10}
+          y={chartHeight - 10}
           textAnchor={tick.anchor}
         >{tick.label}</text>)}
-        <text className="chart-axis-label" x={CHART_LEFT - 8} y={CHART_TOP + 4} textAnchor="end">{maximum.toFixed(precision)}</text>
-        <text className="chart-axis-label" x={CHART_LEFT - 8} y={CHART_TOP + plotHeight} textAnchor="end">{minimum.toFixed(precision)}</text>
+        <text className="chart-axis-label" x={CHART_LEFT - 8} y={chartTop + 4} textAnchor="end">{maximum.toFixed(precision)}</text>
+        <text className="chart-axis-label" x={CHART_LEFT - 8} y={chartTop + plotHeight} textAnchor="end">{minimum.toFixed(precision)}</text>
       </svg>
     </div>
   </figure>
@@ -178,11 +186,13 @@ function seriesValueMap(series: IntradayMetricSeries): Map<string, number | null
   }))
 }
 
-export function IntradayMacdChart({ dif, dea, macd, selectedTime: controlledTime }: {
+export function IntradayMacdChart({ dif, dea, macd, selectedTime: controlledTime, compact = false, showXAxis = true }: {
   dif: IntradayMetricSeries,
   dea: IntradayMetricSeries,
   macd: IntradayMetricSeries,
   selectedTime?: string,
+  compact?: boolean,
+  showXAxis?: boolean,
 }) {
   const controlled = controlledTime !== undefined
   const reference = [macd, dif, dea].find((series) => series.points.length > 0) ?? macd
@@ -199,8 +209,8 @@ export function IntradayMacdChart({ dif, dea, macd, selectedTime: controlledTime
   }, [lastIndex, reference.points.length])
 
   if (reference.points.length === 0) {
-    return <figure className="intraday-chart intraday-chart-empty">
-      <figcaption><h4>MACD</h4></figcaption>
+    return <figure className={`intraday-chart intraday-chart-empty${compact ? ' intraday-chart-compact' : ''}`}>
+      <figcaption className={compact ? 'intraday-chart-overlay' : undefined}><h4 className={compact ? 'intraday-chart-watermark' : undefined}>MACD</h4></figcaption>
       <p className="intraday-empty-message">暂无分时数据</p>
     </figure>
   }
@@ -220,10 +230,13 @@ export function IntradayMacdChart({ dif, dea, macd, selectedTime: controlledTime
     minimum -= padding
     maximum += padding
   }
+  const chartHeight = compact ? COMPACT_CHART_HEIGHT : CHART_HEIGHT
+  const chartTop = compact ? COMPACT_CHART_TOP : CHART_TOP
+  const chartBottom = compact ? COMPACT_CHART_BOTTOM : CHART_BOTTOM
   const plotWidth = CHART_WIDTH - CHART_LEFT - CHART_RIGHT
-  const plotHeight = CHART_HEIGHT - CHART_TOP - CHART_BOTTOM
+  const plotHeight = chartHeight - chartTop - chartBottom
   const xFor = (time: string, index: number, count: number) => CHART_LEFT + intradayPointRatio(time, index, count) * plotWidth
-  const yFor = (value: number) => CHART_TOP + ((maximum - value) / (maximum - minimum)) * plotHeight
+  const yFor = (value: number) => chartTop + ((maximum - value) / (maximum - minimum)) * plotHeight
   const linePath = (series: IntradayMetricSeries) => {
     let path = ''
     let segmentOpen = false
@@ -249,10 +262,10 @@ export function IntradayMacdChart({ dif, dea, macd, selectedTime: controlledTime
   const barWidth = Math.max(1.5, plotWidth / 240 * .72)
   const valueLabel = (value: number | null) => value === null ? '—' : `${value > 0 ? '+' : ''}${value.toFixed(3)}`
 
-  return <figure className="intraday-chart intraday-macd-chart">
-    <figcaption>
-      <h4>MACD</h4>
-      <div className="chart-readout macd-readout" aria-live={controlled ? undefined : 'polite'}>
+  return <figure className={`intraday-chart intraday-macd-chart${compact ? ' intraday-chart-compact' : ''}`}>
+    <figcaption className={compact ? 'intraday-chart-overlay' : undefined}>
+      <h4 className={compact ? 'intraday-chart-watermark' : undefined}>MACD</h4>
+      <div className={`chart-readout macd-readout${compact ? ' intraday-chart-corner-readout' : ''}`} aria-live={controlled ? undefined : 'polite'}>
         <time>{selectedPointTime}</time>
         <b style={{ color: MACD_DIF_COLOR }}>DIF</b><strong style={{ color: MACD_DIF_COLOR }}>{valueLabel(selectedDif)}</strong>
         <b style={{ color: MACD_DEA_COLOR }}>DEA</b><strong style={{ color: MACD_DEA_COLOR }}>{valueLabel(selectedDea)}</strong>
@@ -261,7 +274,7 @@ export function IntradayMacdChart({ dif, dea, macd, selectedTime: controlledTime
     </figcaption>
     <div className="intraday-chart-frame">
       <svg
-        viewBox={`0 0 ${CHART_WIDTH} ${CHART_HEIGHT}`}
+        viewBox={`0 0 ${CHART_WIDTH} ${chartHeight}`}
         role="img"
         aria-label="MACD当日分时图"
         tabIndex={controlled ? undefined : 0}
@@ -289,7 +302,7 @@ export function IntradayMacdChart({ dif, dea, macd, selectedTime: controlledTime
         }}
       >
         <title>MACD当日分时图，包含 DIF、DEA 和 MACD，可使用左右方向键查看各时点数值</title>
-        {[0, .5, 1].map((ratio) => <line className="chart-grid-line" key={ratio} x1={CHART_LEFT} x2={CHART_WIDTH - CHART_RIGHT} y1={CHART_TOP + ratio * plotHeight} y2={CHART_TOP + ratio * plotHeight} />)}
+        {[0, .5, 1].map((ratio) => <line className="chart-grid-line" key={ratio} x1={CHART_LEFT} x2={CHART_WIDTH - CHART_RIGHT} y1={chartTop + ratio * plotHeight} y2={chartTop + ratio * plotHeight} />)}
         <line className="chart-zero-line" x1={CHART_LEFT} x2={CHART_WIDTH - CHART_RIGHT} y1={zeroY} y2={zeroY} />
         {macd.points.map((point, index) => {
           const value = point.value === null ? null : Number(point.value)
@@ -311,12 +324,12 @@ export function IntradayMacdChart({ dif, dea, macd, selectedTime: controlledTime
           className="chart-cursor-line"
           x1={xFor(selectedPointTime, safeIndex, reference.points.length)}
           x2={xFor(selectedPointTime, safeIndex, reference.points.length)}
-          y1={CHART_TOP}
-          y2={CHART_TOP + plotHeight}
+          y1={chartTop}
+          y2={chartTop + plotHeight}
         />
-        {intradayAxisTicks.map((tick) => <text className="chart-axis-label intraday-x-axis-label" key={tick.label} x={CHART_LEFT + tick.ratio * plotWidth} y={CHART_HEIGHT - 10} textAnchor={tick.anchor}>{tick.label}</text>)}
-        <text className="chart-axis-label" x={CHART_LEFT - 8} y={CHART_TOP + 4} textAnchor="end">{maximum.toFixed(3)}</text>
-        <text className="chart-axis-label" x={CHART_LEFT - 8} y={CHART_TOP + plotHeight} textAnchor="end">{minimum.toFixed(3)}</text>
+        {showXAxis && intradayAxisTicks.map((tick) => <text className="chart-axis-label intraday-x-axis-label" key={tick.label} x={CHART_LEFT + tick.ratio * plotWidth} y={chartHeight - 10} textAnchor={tick.anchor}>{tick.label}</text>)}
+        <text className="chart-axis-label" x={CHART_LEFT - 8} y={chartTop + 4} textAnchor="end">{maximum.toFixed(3)}</text>
+        <text className="chart-axis-label" x={CHART_LEFT - 8} y={chartTop + plotHeight} textAnchor="end">{minimum.toFixed(3)}</text>
       </svg>
     </div>
   </figure>

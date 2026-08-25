@@ -1063,6 +1063,137 @@ def test_symbol_lookup_returns_the_only_exact_stock_match() -> None:
     )
 
 
+def test_symbol_search_returns_supported_unique_app_candidates_in_app_order() -> None:
+    source = FridaParsedValueSource(
+        "127.0.0.1:27043",
+        lookup_reader=lambda *_args: {
+            "results": [
+                {
+                    "stock_code": "688027",
+                    "stock_name": "国盾量子",
+                    "market_id": "17",
+                    "market_label": "科创",
+                    "securities_code": None,
+                },
+                {
+                    "stock_code": "123456",
+                    "stock_name": "不支持市场",
+                    "market_id": "17",
+                    "market_label": "其他",
+                    "securities_code": None,
+                },
+                {
+                    "stock_code": "688027",
+                    "stock_name": "国盾量子",
+                    "market_id": "17",
+                    "market_label": "科创",
+                    "securities_code": None,
+                },
+                {
+                    "stock_code": "501018",
+                    "stock_name": "债券碰撞",
+                    "market_id": "35",
+                    "market_label": "债券",
+                    "securities_code": None,
+                },
+                {
+                    "stock_code": "501018",
+                    "stock_name": "南方原油LOF",
+                    "market_id": "20",
+                    "market_label": "沪基",
+                    "securities_code": None,
+                },
+                {
+                    "stock_code": "300750",
+                    "stock_name": "",
+                    "market_id": "33",
+                    "market_label": "创业",
+                    "securities_code": None,
+                },
+            ]
+        },
+    )
+
+    assert source.search_symbols("国盾", limit=8) == [
+        SymbolLookup(
+            symbol="688027",
+            name="国盾量子",
+            market="17",
+            market_label="科创",
+            securities_code=None,
+        ),
+        SymbolLookup(
+            symbol="501018",
+            name="南方原油LOF",
+            market="20",
+            market_label="沪基",
+            securities_code=None,
+        ),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("query", "limit"),
+    [("", 8), ("国", 8), ("x" * 33, 8), ("科技", 0), ("科技", 9)],
+)
+def test_symbol_search_rejects_invalid_query_or_limit(query: str, limit: int) -> None:
+    source = FridaParsedValueSource(
+        "127.0.0.1:27043",
+        lookup_reader=lambda *_args: {"results": []},
+    )
+
+    with pytest.raises(ValueError):
+        source.search_symbols(query, limit=limit)
+
+
+def test_symbol_search_limits_results_and_preserves_app_error_code() -> None:
+    candidates = [
+        {
+            "stock_code": symbol,
+            "stock_name": f"候选{symbol}",
+            "market_id": "17",
+            "market_label": "沪A",
+            "securities_code": None,
+        }
+        for symbol in ("600000", "600001", "600002")
+    ]
+    source = FridaParsedValueSource(
+        "127.0.0.1:27043",
+        lookup_reader=lambda *_args: {"results": candidates},
+    )
+
+    assert [item.symbol for item in source.search_symbols("候选", limit=2)] == [
+        "600000",
+        "600001",
+    ]
+
+    failing = FridaParsedValueSource(
+        "127.0.0.1:27043",
+        lookup_reader=lambda *_args: {
+            "error_code": "SYMBOL_LOOKUP_TIMEOUT",
+            "error_message": "timeout",
+        },
+    )
+    with pytest.raises(DirectRequestError) as captured:
+        failing.search_symbols("科技")
+    assert captured.value.error_code == "SYMBOL_LOOKUP_TIMEOUT"
+
+
+def test_dual_account_symbol_search_uses_only_the_core_account() -> None:
+    core = types.SimpleNamespace(
+        search_symbols=lambda query, limit=8: [
+            SymbolLookup("688027", "国盾量子", "17", "科创", None)
+        ]
+    )
+    fund = types.SimpleNamespace(
+        search_symbols=lambda *_args: (_ for _ in ()).throw(
+            AssertionError("fund account must not search symbols")
+        )
+    )
+
+    assert DualAccountParsedValueSource(core, fund).search_symbols("国盾", 8)[0].symbol == "688027"
+
+
 def test_symbol_lookup_rejects_an_empty_exact_result() -> None:
     """An empty App response must not be presented as a valid stock."""
     source = FridaParsedValueSource(

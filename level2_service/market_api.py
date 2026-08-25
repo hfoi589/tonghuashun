@@ -386,6 +386,20 @@ def install_market_routes(
         except LookupError:
             raise HTTPException(status_code=404, detail="watchlist symbol not found") from None
 
+    @app.delete("/api/v1/watchlists/symbols/{symbol}", status_code=204)
+    def remove_watchlist_symbol_everywhere(
+        symbol: str,
+        user=Depends(require_ready_csrf),
+    ) -> None:
+        normalized = symbol.strip()
+        if not re.fullmatch(r"[0-9]{6}", normalized):
+            raise HTTPException(status_code=422, detail="symbol must be a six-digit stock code")
+        accounts, _sessions = stores()
+        try:
+            accounts.remove_symbol_everywhere(user.id, normalized)
+        except LookupError:
+            raise HTTPException(status_code=404, detail="watchlist symbol not found") from None
+
     @app.put("/api/v1/watchlists/groups/{group_id}/symbols/order", status_code=204)
     def reorder_watchlist_symbols(
         group_id: int,

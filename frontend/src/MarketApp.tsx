@@ -12,6 +12,7 @@ import {
   type MarketUser,
   type TimesharePoint,
   type WatchlistGroup,
+  type WatchlistItem,
 } from './market-api'
 import './market.css'
 
@@ -475,6 +476,7 @@ export function MarketApp() {
   const [dailyRetryVersion, setDailyRetryVersion] = useState(0)
   const [symbol, setSymbol] = useState('')
   const [message, setMessage] = useState('')
+  const [removingSymbol, setRemovingSymbol] = useState<string | null>(null)
   const [connection, setConnection] = useState<'live' | 'reconnecting' | 'unavailable'>('unavailable')
   const socket = useRef<WebSocket | null>(null)
   const requestedDailySeries = useRef(new Set<string>())
@@ -491,8 +493,13 @@ export function MarketApp() {
   async function loadWatchlists() {
     const result = await marketApi.watchlists()
     setGroups(result.groups)
-    setGroupId((current) => current ?? result.groups[0]?.id ?? null)
-    setSelected((current) => current ?? result.groups[0]?.items[0]?.symbol ?? null)
+    const availableSymbols = new Set(result.groups.flatMap((group) => group.items.map((item) => item.symbol)))
+    setGroupId((current) => current !== null && result.groups.some((group) => group.id === current)
+      ? current
+      : result.groups[0]?.id ?? null)
+    setSelected((current) => current !== null && availableSymbols.has(current)
+      ? current
+      : result.groups[0]?.items[0]?.symbol ?? null)
   }
 
   useEffect(() => {
@@ -615,6 +622,22 @@ export function MarketApp() {
     } catch (reason) { setMessage(reason instanceof Error ? reason.message : '创建分组失败') }
   }
 
+  async function removeSymbol(item: WatchlistItem, group: WatchlistGroup) {
+    const confirmed = window.confirm(`从自选和所有分组删除 ${item.name}（${item.symbol}）？`)
+    if (!confirmed) return
+    setMessage('')
+    setRemovingSymbol(item.symbol)
+    try {
+      await marketApi.removeSymbolEverywhere(item.symbol)
+      await loadWatchlists()
+      setMessage(`已从自选和所有分组删除 ${item.name}（${item.symbol}）`)
+    } catch (reason) {
+      setMessage(reason instanceof Error ? reason.message : `从${group.name}删除失败`)
+    } finally {
+      setRemovingSymbol(null)
+    }
+  }
+
   async function logout() {
     try { await marketApi.logout() } catch { /* Session may already be gone. */ }
     socket.current?.close()
@@ -634,14 +657,24 @@ export function MarketApp() {
     </header>
     <div className="market-workspace">
       <aside className="market-watchlist">
-        <div className="market-watchlist-head"><div><span>WATCHLIST</span><h2>我的自选</h2></div><button type="button" onClick={createGroup} aria-label="新建自选分组">＋</button></div>
+        <div className="market-watchlist-head"><div><span>WATCHLIST</span><h2>我的自选</h2></div><button type="button" onClick={createGroup} aria-label="新建自选分组" title="添加分组">＋</button></div>
         <nav className="market-group-tabs" aria-label="自选分组">{groups.map((group) => <button type="button" key={group.id} className={activeGroup?.id === group.id ? 'active' : ''} onClick={() => setGroupId(group.id)}>{group.name}<small>{group.items.length}</small></button>)}</nav>
         <div className="market-list-label"><span>名称 / 代码</span><span>最新 / 涨幅</span></div>
         <div className="market-symbol-list">{activeGroup?.items.length ? activeGroup.items.map((item) => {
           const snapshot = snapshots[item.symbol]
-          return <button type="button" key={item.symbol} className={selected === item.symbol ? 'active' : ''} onClick={() => { setSelected(item.symbol); setPeriod('timeshare') }} aria-label={`${item.name} ${item.symbol}`}>
-            <span><strong className="market-symbol-name">{item.name}</strong><small>{item.symbol}</small></span><span className={`market-number-${tone(snapshot?.quote.change_percent)}`}><strong>{display(snapshot?.quote.price)}</strong><small>{display(snapshot?.quote.change_percent)}</small></span>
-          </button>
+          const removing = removingSymbol === item.symbol
+          return <div key={item.symbol} className={`market-symbol-row${selected === item.symbol ? ' active' : ''}`}>
+            <button type="button" className="market-symbol-select" onClick={() => { setSelected(item.symbol); setPeriod('timeshare') }} aria-label={`${item.name} ${item.symbol}`}>
+              <span><strong className="market-symbol-name">{item.name}</strong><small>{item.symbol}</small></span><span className={`market-number-${tone(snapshot?.quote.change_percent)}`}><strong>{display(snapshot?.quote.price)}</strong><small>{display(snapshot?.quote.change_percent)}</small></span>
+            </button>
+            <button
+              type="button"
+              className="market-symbol-remove"
+              disabled={removing}
+              onClick={() => void removeSymbol(item, activeGroup)}
+              aria-label={`删除 ${item.symbol}（从${activeGroup.name}和所有分组）`}
+            >{removing ? '删除中' : '删除'}</button>
+          </div>
         }) : <div className="market-watchlist-empty"><strong>还没有自选股</strong><span>在顶部输入代码，股票会先通过 App 精确确认。</span></div>}</div>
         <footer>每位用户最多 50 只自选股</footer>
       </aside>

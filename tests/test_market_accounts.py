@@ -215,6 +215,40 @@ def test_primary_watchlist_group_cannot_be_deleted(tmp_path) -> None:
     assert next(group for group in store.list_watchlists(user.id) if group.id == primary.id).is_primary is True
 
 
+def test_removing_a_symbol_everywhere_keeps_primary_and_custom_groups_synchronized(tmp_path) -> None:
+    store = SQLiteMarketAccountStore(tmp_path / "market.db")
+    user = store.create_user("trader", "temporary-123")
+    primary = store.list_watchlists(user.id)[0]
+    shipping = store.create_group(user.id, "航运")
+    focus = store.create_group(user.id, "观察")
+    target = SymbolLookup(symbol="601872", name="招商轮船", market="17")
+    survivor = SymbolLookup(symbol="300750", name="宁德时代", market="33")
+    store.add_symbol(user.id, shipping.id, target)
+    store.add_symbol(user.id, focus.id, target)
+    store.add_symbol(user.id, primary.id, survivor)
+
+    store.remove_symbol_everywhere(user.id, "601872")
+
+    groups = {group.id: group for group in store.list_watchlists(user.id)}
+    assert [item.symbol for item in groups[primary.id].items] == ["300750"]
+    assert groups[shipping.id].items == ()
+    assert groups[focus.id].items == ()
+
+
+def test_removing_a_symbol_everywhere_is_scoped_to_the_authenticated_user(tmp_path) -> None:
+    store = SQLiteMarketAccountStore(tmp_path / "market.db")
+    first = store.create_user("first", "temporary-123")
+    second = store.create_user("second", "temporary-123")
+    lookup = SymbolLookup(symbol="601872", name="招商轮船", market="17")
+    store.add_symbol(first.id, store.list_watchlists(first.id)[0].id, lookup)
+    store.add_symbol(second.id, store.list_watchlists(second.id)[0].id, lookup)
+
+    store.remove_symbol_everywhere(first.id, "601872")
+
+    assert store.list_watchlists(first.id)[0].items == ()
+    assert [item.symbol for item in store.list_watchlists(second.id)[0].items] == ["601872"]
+
+
 def test_market_sessions_expire_and_can_be_revoked_per_user() -> None:
     now = datetime(2026, 8, 23, tzinfo=timezone.utc)
     sessions = InMemoryMarketSessionStore(

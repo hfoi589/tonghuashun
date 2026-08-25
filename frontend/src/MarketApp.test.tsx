@@ -27,6 +27,27 @@ afterEach(() => {
 })
 
 describe('MarketApp', () => {
+  it('gives the new-group button readable foreground and background colors', () => {
+    const root = document.documentElement
+    const previousRed = root.style.getPropertyValue('--market-red')
+    root.style.setProperty('--market-red', '#e2232e')
+    const header = document.createElement('div')
+    header.className = 'market-watchlist-head'
+    const button = document.createElement('button')
+    header.append(button)
+    document.body.append(header)
+
+    try {
+      const style = getComputedStyle(button)
+      expect(style.backgroundColor).toBe('rgb(226, 35, 46)')
+      expect(style.color).toBe('rgb(255, 255, 255)')
+    } finally {
+      header.remove()
+      if (previousRed) root.style.setProperty('--market-red', previousRed)
+      else root.style.removeProperty('--market-red')
+    }
+  })
+
   it('resets an obsolete intraday selection when a new trading-day stream starts', () => {
     expect(nextIntradaySelectedTime('14:00', '15:00', ['09:30'])).toBe('09:30')
     expect(nextIntradaySelectedTime('10:00', '10:30', ['09:30', '10:00', '10:31'])).toBe('10:00')
@@ -244,6 +265,100 @@ describe('MarketApp', () => {
       expect(within(labelElement.closest('div')!).getByText(expected, { selector: 'strong' })).toBeInTheDocument()
     }
     expect(fetchMock.mock.calls.filter(([url]) => String(url).includes('/series?period=day')).length).toBe(1)
+  })
+
+  it('deletes stocks from custom and primary lists while keeping every group synchronized', async () => {
+    const shipping = { symbol: '601872', name: '招商轮船', market: '17' }
+    const battery = { symbol: '300750', name: '宁德时代', market: '33' }
+    let groups = [
+      { id: 1, name: '自选', sort_order: 0, is_primary: true, items: [shipping, battery] },
+      { id: 2, name: '航运', sort_order: 1, is_primary: false, items: [shipping] },
+    ]
+    const removedSymbols: string[] = []
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input)
+      if (url === '/api/v1/session') return jsonResponse({
+        id: 7,
+        username: 'wilson',
+        enabled: true,
+        must_change_password: false,
+        created_at: '2026-08-23T00:00:00+00:00',
+      })
+      if (url === '/api/v1/watchlists') return jsonResponse({ groups })
+      if (url.startsWith('/api/v1/watchlists/symbols/') && init?.method === 'DELETE') {
+        const symbol = decodeURIComponent(url.split('/').at(-1)!)
+        removedSymbols.push(symbol)
+        groups = groups.map((group) => ({
+          ...group,
+          items: group.items.filter((item) => item.symbol !== symbol),
+        }))
+        return new Response(null, { status: 204 })
+      }
+      const snapshotMatch = url.match(/\/symbols\/(\d{6})\/snapshot/)
+      if (snapshotMatch) {
+        const item = [shipping, battery].find((candidate) => candidate.symbol === snapshotMatch[1])!
+        return jsonResponse({
+          symbol: item.symbol,
+          name: item.name,
+          market: item.market,
+          sequence: 1,
+          source_time: null,
+          collected_at: '2026-08-25T01:30:00+00:00',
+          stale: false,
+          age_seconds: 0,
+          quote: { price: '10.00', previous_close: '10.00', change_percent: '0.00%' },
+          timeshare: [],
+          intraday_series: {},
+          order_book: [],
+          trades: [],
+          main_fund_flow: {},
+          capabilities: {
+            timeshare: { available: false },
+            kline: { available: false },
+            daily_kline: { available: true, adjustment: 'qfq' },
+            order_book: { available: false },
+            trades: { available: false },
+          },
+          source_errors: { core_metrics: null, main_fund_flow: null },
+        })
+      }
+      const seriesMatch = url.match(/\/symbols\/(\d{6})\/series/)
+      if (seriesMatch) return jsonResponse({
+        symbol: seriesMatch[1],
+        period: 'day',
+        bars: [],
+        indicators: {},
+        next_cursor: null,
+        source_error: 'KLINE_SOURCES_UNAVAILABLE',
+        adjustment: 'qfq',
+        source: null,
+        cached: false,
+        stale: false,
+        source_errors: { public_kline: null, app_kline: null },
+      })
+      throw new Error(`unexpected request: ${url}`)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    vi.stubGlobal('WebSocket', undefined)
+    vi.stubGlobal('confirm', vi.fn(() => true))
+
+    render(<MarketApp />)
+
+    await screen.findByRole('button', { name: '新建自选分组' })
+    await userEvent.click(screen.getByRole('button', { name: /^航运/ }))
+    await userEvent.click(screen.getByRole('button', { name: /删除 601872.*航运和所有分组/ }))
+
+    await waitFor(() => expect(removedSymbols).toEqual(['601872']))
+    expect(screen.getByRole('button', { name: /^航运/ })).toHaveTextContent('0')
+    await userEvent.click(screen.getByRole('button', { name: /^自选/ }))
+    expect(screen.queryByRole('button', { name: /招商轮船 601872/ })).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /宁德时代 300750/ })).toBeInTheDocument()
+
+    await userEvent.click(screen.getByRole('button', { name: /删除 300750.*自选和所有分组/ }))
+
+    await waitFor(() => expect(removedSymbols).toEqual(['601872', '300750']))
+    expect(screen.getByText('还没有自选股')).toBeInTheDocument()
+    expect(screen.getByRole('heading', { name: '从自选中选择一只股票' })).toBeInTheDocument()
   })
 
   it('keeps a slow previous daily response from replacing the selected stock', async () => {

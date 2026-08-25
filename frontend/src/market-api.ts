@@ -137,6 +137,10 @@ export const marketApi = {
     `/api/v1/watchlists/groups/${groupId}/symbols/${encodeURIComponent(symbol)}`,
     { method: 'DELETE', headers: { 'X-CSRF-Token': readMarketCsrfToken() } },
   ),
+  removeSymbolEverywhere: (symbol: string) => request<void>(
+    `/api/v1/watchlists/symbols/${encodeURIComponent(symbol)}`,
+    { method: 'DELETE', headers: { 'X-CSRF-Token': readMarketCsrfToken() } },
+  ),
   lookupSymbol: (symbol: string) => request<SymbolLookup>(`/api/v1/symbols/${encodeURIComponent(symbol)}`),
   snapshot: (symbol: string) => request<MarketSnapshot>(`/api/v1/market/symbols/${encodeURIComponent(symbol)}/snapshot`),
   series: (symbol: string, period: string) => request<MarketSeriesPage>(

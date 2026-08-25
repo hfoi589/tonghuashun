@@ -89,6 +89,15 @@ def test_admin_creates_users_and_user_manages_grouped_watchlists(tmp_path) -> No
         {"symbol": "601872", "name": "招商轮船", "market": "17"}
     ]
 
+    removed = client.delete(
+        "/api/v1/watchlists/symbols/601872",
+        headers={"X-CSRF-Token": client.cookies.get("ths_market_csrf")},
+    )
+
+    assert removed.status_code == 204
+    synchronized_groups = client.get("/api/v1/watchlists").json()["groups"]
+    assert all(group["items"] == [] for group in synchronized_groups)
+
 
 def test_market_user_write_routes_require_csrf_and_logout_revokes_session(tmp_path) -> None:
     client, _accounts = _market_client(tmp_path)

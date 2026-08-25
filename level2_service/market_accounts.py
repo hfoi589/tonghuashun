@@ -445,6 +445,28 @@ class SQLiteMarketAccountStore:
                 raise LookupError("watchlist symbol not found")
             self._normalize_item_order(group_id)
 
+    def remove_symbol_everywhere(self, user_id: int, symbol: str) -> None:
+        """Remove one symbol from the primary watchlist and every custom group."""
+        with self._lock, self._connection:
+            group_rows = self._connection.execute(
+                """SELECT DISTINCT g.id FROM watchlist_groups g
+                   JOIN watchlist_items i ON i.group_id=g.id
+                   WHERE g.user_id=? AND i.symbol=?""",
+                (user_id, symbol),
+            ).fetchall()
+            if not group_rows:
+                raise LookupError("watchlist symbol not found")
+            group_ids = [int(row["id"]) for row in group_rows]
+            self._connection.execute(
+                """DELETE FROM watchlist_items
+                   WHERE symbol=? AND group_id IN (
+                       SELECT id FROM watchlist_groups WHERE user_id=?
+                   )""",
+                (symbol, user_id),
+            )
+            for group_id in group_ids:
+                self._normalize_item_order(group_id)
+
     def reorder_symbols(self, user_id: int, group_id: int, symbols: list[str]) -> None:
         with self._lock, self._connection:
             self._owned_group(user_id, group_id)

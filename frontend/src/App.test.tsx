@@ -48,6 +48,20 @@ function symbolLookup(symbol: string, name: string, market = '17'): SymbolLookup
   return { symbol, name, market }
 }
 
+function completedTabTask(publicId: string, symbol: string, name: string, price: string): Job {
+  return {
+    ...task,
+    public_id: publicId,
+    symbol,
+    status: 'COMPLETED',
+    values: {
+      ...task.values,
+      stock_name: name,
+      current_price: price,
+    },
+  }
+}
+
 function deferredResponse() {
   let resolve!: (response: Response) => void
   const promise = new Promise<Response>((next) => { resolve = next })
@@ -819,8 +833,9 @@ describe('Level2 web UI', () => {
     await user.click(allStocks)
     await user.type(screen.getByRole('searchbox', { name: '搜索股票页签' }), '测试股票6')
 
-    expect(screen.getByRole('button', { name: /测试股票6/ })).toBeInTheDocument()
-    expect(screen.queryByRole('button', { name: /测试股票1/ })).not.toBeInTheDocument()
+    const picker = document.getElementById('all-stocks-picker')!
+    expect(within(picker).getByRole('button', { name: /测试股票6/ })).toBeInTheDocument()
+    expect(within(picker).queryByRole('button', { name: /测试股票1/ })).not.toBeInTheDocument()
   })
 
   it('restores more than fifty persistent stock tabs without truncating them', async () => {
@@ -846,6 +861,110 @@ describe('Level2 web UI', () => {
 
     await screen.findByRole('button', { name: '全部股票 51' })
     expect(JSON.parse(window.localStorage.getItem('ths_level2_stock_tabs_v2')!)).toHaveLength(51)
+  })
+
+  it('asks for confirmation and can cancel browser-only tab deletion', async () => {
+    const first = completedTabTask('first', '600001', '第一股票', '10.01')
+    const second = completedTabTask('second', '600002', '第二股票', '10.02')
+    window.localStorage.setItem('ths_level2_stock_tabs_v2', JSON.stringify([
+      { public_id: first.public_id, symbol: first.symbol, name: '第一股票' },
+      { public_id: second.public_id, symbol: second.symbol, name: '第二股票' },
+    ]))
+    vi.mocked(fetch).mockImplementation((input) => Promise.resolve(
+      jsonResponse(String(input).endsWith('/second') ? second : first),
+    ))
+    const user = userEvent.setup()
+
+    render(<App />)
+    await screen.findByRole('tab', { name: /第一股票/ })
+    await user.click(screen.getByRole('button', { name: '删除 第一股票（600001）页签' }))
+
+    expect(screen.getByRole('dialog', { name: '删除股票页签' })).toBeInTheDocument()
+    expect(screen.getByText('确定从当前浏览器删除 第一股票（600001）吗？')).toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: '取消' }))
+
+    expect(screen.queryByRole('dialog', { name: '删除股票页签' })).not.toBeInTheDocument()
+    expect(screen.getByRole('tab', { name: /第一股票/ })).toBeInTheDocument()
+    expect(JSON.parse(window.localStorage.getItem('ths_level2_stock_tabs_v2')!)).toHaveLength(2)
+    expect(fetch).toHaveBeenCalledTimes(2)
+  })
+
+  it('deletes the active tab locally and activates its right neighbor without refreshing', async () => {
+    const left = completedTabTask('left', '600001', '左侧股票', '10.01')
+    const middle = completedTabTask('middle', '600002', '中间股票', '10.02')
+    const right = completedTabTask('right', '600003', '右侧股票', '10.03')
+    const jobs = { left, middle, right }
+    window.localStorage.setItem('ths_level2_stock_tabs_v2', JSON.stringify([
+      { public_id: 'left', symbol: '600001', name: '左侧股票' },
+      { public_id: 'middle', symbol: '600002', name: '中间股票' },
+      { public_id: 'right', symbol: '600003', name: '右侧股票' },
+    ]))
+    window.localStorage.setItem('ths_level2_active_stock_tab', 'middle')
+    vi.mocked(fetch).mockImplementation((input) => {
+      const id = String(input).split('/').at(-1) as keyof typeof jobs
+      return Promise.resolve(jsonResponse(jobs[id]))
+    })
+    const user = userEvent.setup()
+
+    render(<App />)
+    await screen.findByText('10.02')
+    await user.click(screen.getByRole('button', { name: '删除 中间股票（600002）页签' }))
+    await user.click(screen.getByRole('button', { name: '删除页签' }))
+
+    expect(screen.queryByRole('tab', { name: /中间股票/ })).not.toBeInTheDocument()
+    expect(screen.getByRole('tab', { name: /右侧股票/ })).toHaveAttribute('aria-selected', 'true')
+    expect(screen.getByText('10.03')).toBeInTheDocument()
+    expect(fetch).toHaveBeenCalledTimes(3)
+    expect(JSON.parse(window.localStorage.getItem('ths_level2_stock_tabs_v2')!)).toEqual([
+      { public_id: 'left', symbol: '600001', name: '左侧股票' },
+      { public_id: 'right', symbol: '600003', name: '右侧股票' },
+    ])
+  })
+
+  it('deletes a non-active tab without changing the active result', async () => {
+    const first = completedTabTask('first', '600001', '第一股票', '10.01')
+    const second = completedTabTask('second', '600002', '第二股票', '10.02')
+    window.localStorage.setItem('ths_level2_stock_tabs_v2', JSON.stringify([
+      { public_id: first.public_id, symbol: first.symbol, name: '第一股票' },
+      { public_id: second.public_id, symbol: second.symbol, name: '第二股票' },
+    ]))
+    window.localStorage.setItem('ths_level2_active_stock_tab', 'first')
+    vi.mocked(fetch).mockImplementation((input) => Promise.resolve(
+      jsonResponse(String(input).endsWith('/second') ? second : first),
+    ))
+    const user = userEvent.setup()
+
+    render(<App />)
+    await screen.findByText('10.01')
+    await user.click(screen.getByRole('button', { name: '删除 第二股票（600002）页签' }))
+    await user.click(screen.getByRole('button', { name: '删除页签' }))
+
+    expect(screen.getByRole('tab', { name: /第一股票/ })).toHaveAttribute('aria-selected', 'true')
+    expect(screen.getByText('10.01')).toBeInTheDocument()
+    expect(fetch).toHaveBeenCalledTimes(2)
+  })
+
+  it('deletes the final local tab and supports Escape cancellation with focus return', async () => {
+    const only = completedTabTask('only', '600001', '唯一股票', '10.01')
+    window.localStorage.setItem('ths_level2_stock_tabs_v2', JSON.stringify([
+      { public_id: only.public_id, symbol: only.symbol, name: '唯一股票' },
+    ]))
+    vi.mocked(fetch).mockResolvedValue(jsonResponse(only))
+    const user = userEvent.setup()
+
+    render(<App />)
+    const deleteButton = await screen.findByRole('button', { name: '删除 唯一股票（600001）页签' })
+    await user.click(deleteButton)
+    expect(screen.getByRole('button', { name: '取消' })).toHaveFocus()
+    await user.keyboard('{Escape}')
+    await waitFor(() => expect(deleteButton).toHaveFocus())
+
+    await user.click(deleteButton)
+    await user.click(screen.getByRole('button', { name: '删除页签' }))
+
+    expect(screen.getByText('还没有采集记录')).toBeInTheDocument()
+    expect(window.localStorage.getItem('ths_level2_stock_tabs_v2')).toBeNull()
+    expect(window.localStorage.getItem('ths_level2_active_stock_tab')).toBeNull()
   })
 
   it('restores collection history saved by this browser', async () => {

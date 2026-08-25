@@ -346,10 +346,11 @@ export function JobResult({ task, isLatest = false, onRetry, retrying = false }:
   </article>
 }
 
-function StockTabs({ tabs, activePublicId, onSelect }: {
+function StockTabs({ tabs, activePublicId, onSelect, onRequestDelete }: {
   tabs: StockTab[]
   activePublicId: string | null
   onSelect: (publicId: string) => void
+  onRequestDelete: (publicId: string, trigger: HTMLButtonElement) => void
 }) {
   const [pickerOpen, setPickerOpen] = useState(false)
   const [query, setQuery] = useState('')
@@ -382,24 +383,31 @@ function StockTabs({ tabs, activePublicId, onSelect }: {
   return <div className="stock-tabs-shell">
     <div className="stock-tabs-toolbar">
       <div className="stock-tab-rail" role="tablist" aria-label="股票页签">
-        {tabs.map((tab, index) => <button
-          type="button"
-          role="tab"
-          id={`stock-tab-${tab.public_id}`}
-          aria-controls={`stock-panel-${tab.public_id}`}
-          aria-selected={tab.public_id === activePublicId}
-          className="stock-tab"
-          key={tab.public_id}
-          ref={(element) => {
-            if (element) tabRefs.current.set(tab.public_id, element)
-            else tabRefs.current.delete(tab.public_id)
-          }}
-          onClick={() => onSelect(tab.public_id)}
-          onKeyDown={(event) => moveFocus(event, index)}
-        >
-          <strong>{tab.name}</strong>
-          <span>{tab.symbol}</span>
-        </button>)}
+        {tabs.map((tab, index) => <div className="stock-tab-item" role="presentation" key={tab.public_id}>
+          <button
+            type="button"
+            role="tab"
+            id={`stock-tab-${tab.public_id}`}
+            aria-controls={`stock-panel-${tab.public_id}`}
+            aria-selected={tab.public_id === activePublicId}
+            className="stock-tab"
+            ref={(element) => {
+              if (element) tabRefs.current.set(tab.public_id, element)
+              else tabRefs.current.delete(tab.public_id)
+            }}
+            onClick={() => onSelect(tab.public_id)}
+            onKeyDown={(event) => moveFocus(event, index)}
+          >
+            <strong>{tab.name}</strong>
+            <span>{tab.symbol}</span>
+          </button>
+          <button
+            type="button"
+            className="stock-tab-delete"
+            aria-label={`删除 ${tab.name}（${tab.symbol}）页签`}
+            onClick={(event) => onRequestDelete(tab.public_id, event.currentTarget)}
+          >×</button>
+        </div>)}
       </div>
       {tabs.length > 5 && <button
         type="button"
@@ -468,11 +476,16 @@ export default function App({ initialTask }: { initialTask?: Job }) {
   const [restoring, setRestoring] = useState(!initialTask && !isAdmin)
   const [streamState, setStreamState] = useState<JobStreamState | undefined>()
   const [retryingTaskId, setRetryingTaskId] = useState<string | null>(null)
+  const [deleteTabId, setDeleteTabId] = useState<string | null>(null)
   const symbolInputRef = useRef<HTMLInputElement>(null)
   const symbolEntryRef = useRef<HTMLDivElement>(null)
   const lookupSequence = useRef(0)
   const suggestionSequence = useRef(0)
   const retryRequests = useRef(new Map<string, Promise<void>>())
+  const removedTabIds = useRef(new Set<string>())
+  const deleteTriggerRef = useRef<HTMLButtonElement | null>(null)
+  const deleteCancelRef = useRef<HTMLButtonElement>(null)
+  const deleteConfirmRef = useRef<HTMLButtonElement>(null)
   const verifiedSymbol = symbolLookup.status === 'valid' && symbolLookup.result.symbol === symbol
   const activeTaskIds = tabs
     .filter((tab) => !terminalStatuses.has(tab.task.status))
@@ -480,6 +493,7 @@ export default function App({ initialTask }: { initialTask?: Job }) {
     .sort()
     .join(',')
   const activeTab = tabs.find((tab) => tab.public_id === activePublicId) ?? tabs[0]
+  const deleteTab = tabs.find((tab) => tab.public_id === deleteTabId)
 
   useEffect(() => {
     if (initialTask || isAdmin) return
@@ -595,6 +609,10 @@ export default function App({ initialTask }: { initialTask?: Job }) {
   }, [])
 
   useEffect(() => {
+    if (deleteTabId !== null) deleteCancelRef.current?.focus()
+  }, [deleteTabId])
+
+  useEffect(() => {
     const normalized = symbol.trim()
     const numericInput = /^\d+$/.test(normalized)
     if (
@@ -700,7 +718,7 @@ export default function App({ initialTask }: { initialTask?: Job }) {
     setRetryingTaskId(publicId)
     setError('')
     const request = api.retryJob(publicId).then((updated) => {
-      placeTabAtTop(updated)
+      if (!removedTabIds.current.has(publicId)) placeTabAtTop(updated)
     }).catch((reason) => {
       setError(reason instanceof Error ? reason.message : '重试失败，请稍后重试。')
     }).finally(() => {
@@ -727,6 +745,7 @@ export default function App({ initialTask }: { initialTask?: Job }) {
     setError('')
     try {
       const nextTask = await api.submitJob(normalized, includeLongCapture)
+      removedTabIds.current.delete(nextTask.public_id)
       placeTabAtTop(nextTask, symbolLookup.result.name)
       setSymbol('')
     } catch (reason) {
@@ -780,6 +799,65 @@ export default function App({ initialTask }: { initialTask?: Job }) {
     setActivePublicId(null)
     setStreamState(undefined)
     window.history.replaceState({}, '', `${window.location.pathname}${window.location.hash}`)
+  }
+
+  function requestTabDelete(publicId: string, trigger: HTMLButtonElement) {
+    deleteTriggerRef.current = trigger
+    setDeleteTabId(publicId)
+  }
+
+  function cancelTabDelete() {
+    const trigger = deleteTriggerRef.current
+    setDeleteTabId(null)
+    window.requestAnimationFrame(() => trigger?.focus())
+  }
+
+  function confirmTabDelete() {
+    if (deleteTabId === null) return
+    const removedIndex = tabs.findIndex((tab) => tab.public_id === deleteTabId)
+    if (removedIndex < 0) {
+      setDeleteTabId(null)
+      return
+    }
+    const nextTabs = tabs.filter((tab) => tab.public_id !== deleteTabId)
+    let nextActive = activePublicId
+    if (activePublicId === deleteTabId) {
+      nextActive = nextTabs[removedIndex]?.public_id
+        ?? nextTabs[removedIndex - 1]?.public_id
+        ?? null
+    }
+    removedTabIds.current.add(deleteTabId)
+    retryRequests.current.delete(deleteTabId)
+    setRetryingTaskId((current) => current === deleteTabId ? null : current)
+    setTabs(nextTabs)
+    persistStockTabs(nextTabs)
+    setActivePublicId(nextActive)
+    persistActiveTab(nextActive)
+    setDeleteTabId(null)
+    if (nextActive !== null) {
+      window.requestAnimationFrame(() => {
+        document.getElementById(`stock-tab-${nextActive}`)?.focus()
+      })
+    }
+  }
+
+  function handleDeleteDialogKeyDown(event: KeyboardEvent<HTMLDivElement>) {
+    if (event.key === 'Escape') {
+      event.preventDefault()
+      cancelTabDelete()
+      return
+    }
+    if (event.key !== 'Tab') return
+    const focusable = [deleteCancelRef.current, deleteConfirmRef.current].filter(
+      (item): item is HTMLButtonElement => item !== null,
+    )
+    if (focusable.length === 0) return
+    const currentIndex = focusable.indexOf(document.activeElement as HTMLButtonElement)
+    const nextIndex = event.shiftKey
+      ? (currentIndex - 1 + focusable.length) % focusable.length
+      : (currentIndex + 1) % focusable.length
+    event.preventDefault()
+    focusable[nextIndex].focus()
   }
 
   if (isAdmin) return <AdminPage />
@@ -898,7 +976,12 @@ export default function App({ initialTask }: { initialTask?: Job }) {
         <strong>还没有采集记录</strong>
         <p>提交第一个股票代码后，结果会显示在这里。</p>
       </div> : <div className="stock-tab-workspace">
-        <StockTabs tabs={tabs} activePublicId={activeTab?.public_id ?? null} onSelect={selectTab} />
+        <StockTabs
+          tabs={tabs}
+          activePublicId={activeTab?.public_id ?? null}
+          onSelect={selectTab}
+          onRequestDelete={requestTabDelete}
+        />
         {activeTab && <div
           className="stock-tab-panel"
           role="tabpanel"
@@ -917,6 +1000,27 @@ export default function App({ initialTask }: { initialTask?: Job }) {
     </section>
 
     {streamState === 'RECONNECTING' && <p className="notice stream-notice" role="status">任务状态流暂时断开，正在自动重连。</p>}
+    {deleteTab && <div className="tab-delete-overlay" onMouseDown={(event) => {
+      if (event.target === event.currentTarget) cancelTabDelete()
+    }}>
+      <div
+        className="tab-delete-dialog"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="tab-delete-title"
+        aria-describedby="tab-delete-description"
+        onKeyDown={handleDeleteDialogKeyDown}
+      >
+        <p className="eyebrow">当前浏览器</p>
+        <h2 id="tab-delete-title">删除股票页签</h2>
+        <p id="tab-delete-description">确定从当前浏览器删除 {deleteTab.name}（{deleteTab.symbol}）吗？</p>
+        <p className="minor">服务端任务和其他浏览器不会受到影响。</p>
+        <div className="tab-delete-actions">
+          <button type="button" className="secondary" ref={deleteCancelRef} onClick={cancelTabDelete}>取消</button>
+          <button type="button" className="tab-delete-confirm" ref={deleteConfirmRef} onClick={confirmTabDelete}>删除页签</button>
+        </div>
+      </div>
+    </div>}
     <footer>仅采集已登录设备中可正常访问的页面，不绕过验证或权限限制。</footer>
   </main>
 }

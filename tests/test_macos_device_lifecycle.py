@@ -66,9 +66,9 @@ def running_device_runner(serial: str) -> FakeCommandRunner:
 
 
 def make_manager(runner: FakeCommandRunner, **kwargs: object):
+    kwargs.setdefault("emulator_bin", "emulator")
     return module.DeviceLifecycleManager(
         runner,
-        emulator_bin="emulator",
         boot_timeout_seconds=0.1,
         poll_interval_seconds=0.001,
         **kwargs,
@@ -102,6 +102,35 @@ def test_manager_accepts_only_fixed_roles_and_actions() -> None:
     with pytest.raises(module.LifecycleRequestError) as unknown_action:
         manager.submit("core_metrics", "shell")
     assert unknown_action.value.error_code == "DEVICE_ACTION_INVALID"
+
+
+@pytest.mark.parametrize(
+    "configs",
+    [
+        {
+            **module.FIXED_CONFIGS,
+            "core_metrics": module.DeviceConfig(
+                "core_metrics", "OTHER_AVD", "emulator-5556", 5556, 27043, True
+            ),
+        },
+        {
+            **module.FIXED_CONFIGS,
+            "unapproved": module.DeviceConfig(
+                "unapproved", "THS_OTHER", "emulator-5558", 5558, 27045
+            ),
+        },
+    ],
+)
+def test_manager_rejects_caller_controlled_role_configurations(configs) -> None:
+    with pytest.raises(module.LifecycleRequestError) as invalid_config:
+        make_manager(FakeCommandRunner(), configs=configs)
+    assert invalid_config.value.error_code == "DEVICE_LIFECYCLE_UNCONFIGURED"
+
+
+def test_manager_rejects_untrusted_emulator_executable() -> None:
+    with pytest.raises(module.LifecycleRequestError) as invalid_executable:
+        make_manager(FakeCommandRunner(), emulator_bin="/tmp/untrusted-emulator")
+    assert invalid_executable.value.error_code == "DEVICE_LIFECYCLE_UNCONFIGURED"
 
 
 @pytest.mark.parametrize(
@@ -178,6 +207,57 @@ def test_stopped_start_uses_fixed_commands_and_reaches_running() -> None:
     assert (
         str(SCRIPT.parent / "watch-macos-device-bridge.sh"), "--once", serial, "27043", "adb"
     ) in runner.calls
+
+
+@pytest.mark.parametrize(
+    "failed_command",
+    [
+        (str(SCRIPT.parent / "configure-macos-core-display.sh"), "emulator-5556", "adb"),
+        (
+            str(SCRIPT.parent / "watch-macos-device-bridge.sh"), "--once",
+            "emulator-5556", "27043", "adb",
+        ),
+    ],
+)
+def test_required_start_setup_failure_is_sanitized_and_never_launches_app(
+    failed_command: tuple[str, ...],
+) -> None:
+    runner = running_device_runner("emulator-5556")
+    runner.responses[failed_command] = result(failed_command, 1, stderr=b"host details")
+    manager = make_manager(runner)
+    operation = wait_for_terminal(manager, manager.submit("core_metrics", "start_and_launch_app").operation_id)
+    assert operation.state is module.LifecycleState.ERROR
+    assert operation.error_code == "DEVICE_LIFECYCLE_FAILED"
+    assert (
+        "adb", "-s", "emulator-5556", "shell", "am", "start", "-n",
+        "com.hexin.plat.android/com.hexin.plat.android.LogoEmptyActivity",
+    ) not in runner.calls
+    assert "host details" not in str(operation.public_dict())
+
+
+def test_starting_device_waits_for_existing_boot_without_duplicate_emulator_launch() -> None:
+    serial = "emulator-5556"
+    runner = FakeCommandRunner(lifecycle_responses(serial, booted=False, process=True))
+    state_call = ("adb", "-s", serial, "get-state")
+    boot_call = ("adb", "-s", serial, "shell", "getprop", "sys.boot_completed")
+    runner.sequences[state_call] = [result(state_call, 0, b"offline\n"), result(state_call, 0, b"device\n")]
+    runner.responses[boot_call] = result(boot_call, 0, b"1\n")
+    manager = make_manager(runner)
+    operation = wait_for_terminal(manager, manager.submit("core_metrics", "start_and_launch_app").operation_id)
+    assert operation.state is module.LifecycleState.RUNNING
+    assert not any(call[:2] == ("launchctl", "submit") for call in runner.calls)
+
+
+def test_unknown_start_state_fails_without_launching_an_emulator() -> None:
+    serial = "emulator-5556"
+    runner = FakeCommandRunner(lifecycle_responses(serial, booted=False, process=False))
+    ps_call = ("ps", "-axo", "pid=,command=")
+    runner.responses[ps_call] = result(ps_call, 1, stderr=b"host details")
+    manager = make_manager(runner)
+    operation = wait_for_terminal(manager, manager.submit("core_metrics", "start_and_launch_app").operation_id)
+    assert operation.state is module.LifecycleState.ERROR
+    assert operation.error_code == "DEVICE_LIFECYCLE_FAILED"
+    assert not any(call[:2] == ("launchctl", "submit") for call in runner.calls)
 
 
 def test_concurrent_action_for_same_role_is_rejected() -> None:

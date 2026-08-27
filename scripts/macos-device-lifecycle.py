@@ -116,6 +116,12 @@ FIXED_CONFIGS = {
         "main_fund_flow", "THS_API_33_ARM64", "emulator-5554", 5554, 27042, False
     ),
 }
+TRUSTED_EMULATOR_BINS = frozenset(
+    {
+        "emulator",
+        "/opt/homebrew/share/android-commandlinetools/emulator/emulator",
+    }
+)
 
 
 class DeviceLifecycleManager:
@@ -130,9 +136,13 @@ class DeviceLifecycleManager:
         command_timeout_seconds: float = 10.0,
         poll_interval_seconds: float = 1.0,
     ) -> None:
+        if configs is not None and dict(configs) != FIXED_CONFIGS:
+            raise LifecycleRequestError("DEVICE_LIFECYCLE_UNCONFIGURED")
+        if emulator_bin not in TRUSTED_EMULATOR_BINS:
+            raise LifecycleRequestError("DEVICE_LIFECYCLE_UNCONFIGURED")
         self._runner = runner
         self._emulator_bin = emulator_bin
-        self._configs = dict(configs or FIXED_CONFIGS)
+        self._configs = dict(FIXED_CONFIGS)
         self._boot_timeout_seconds = boot_timeout_seconds
         self._shutdown_timeout_seconds = shutdown_timeout_seconds
         self._command_timeout_seconds = command_timeout_seconds
@@ -213,18 +223,27 @@ class DeviceLifecycleManager:
             self._role_busy[operation.role] = False
 
     def _start_and_launch_app(self, config: DeviceConfig) -> LifecycleState:
-        if self._detect_state(config) is not LifecycleState.RUNNING:
+        initial_state = self._detect_state(config)
+        if initial_state is LifecycleState.STOPPED:
             self._require_avd(config)
-            self._run(
+            self._run_required(
                 (
                     "launchctl", "submit", "-l", f"com.ths.avd.{config.emulator_port}", "--",
                     self._emulator_bin, "-avd", config.avd_name, "-port", str(config.emulator_port),
                     "-no-snapshot", "-no-audio", "-gpu", "host", "-memory", "2048", "-cores", "4",
-                )
+                ),
+                "DEVICE_LIFECYCLE_FAILED",
             )
             self._wait_for_boot(config, time.monotonic() + self._boot_timeout_seconds)
+        elif initial_state is LifecycleState.STARTING:
+            self._wait_for_boot(config, time.monotonic() + self._boot_timeout_seconds)
+        elif initial_state is LifecycleState.UNKNOWN:
+            raise LifecycleFailure("DEVICE_LIFECYCLE_FAILED")
         if config.calibrate_display:
-            self._run((str(SCRIPT_DIRECTORY / "configure-macos-core-display.sh"), config.serial, "adb"))
+            self._run_required(
+                (str(SCRIPT_DIRECTORY / "configure-macos-core-display.sh"), config.serial, "adb"),
+                "DEVICE_LIFECYCLE_FAILED",
+            )
         self._repair_bridge(config)
         self._launch_app(config)
         if not self._app_is_running(config):
@@ -250,11 +269,12 @@ class DeviceLifecycleManager:
         raise LifecycleFailure("DEVICE_BOOT_TIMEOUT")
 
     def _repair_bridge(self, config: DeviceConfig) -> None:
-        self._run(
+        self._run_required(
             (
                 str(SCRIPT_DIRECTORY / "watch-macos-device-bridge.sh"), "--once",
                 config.serial, str(config.frida_host_port), "adb",
-            )
+            ),
+            "DEVICE_LIFECYCLE_FAILED",
         )
 
     def _launch_app(self, config: DeviceConfig) -> None:
@@ -301,6 +321,14 @@ class DeviceLifecycleManager:
 
     def _run(self, args: tuple[str, ...]) -> subprocess.CompletedProcess[bytes]:
         return self._runner.run(args, self._command_timeout_seconds)
+
+    def _run_required(
+        self, args: tuple[str, ...], error_code: str
+    ) -> subprocess.CompletedProcess[bytes]:
+        response = self._run(args)
+        if response.returncode != 0:
+            raise LifecycleFailure(error_code)
+        return response
 
     @staticmethod
     def _text(value: bytes | str | None) -> str:

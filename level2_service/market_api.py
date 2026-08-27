@@ -92,17 +92,37 @@ def _user_response(user: MarketUser) -> MarketUserResponse:
     return MarketUserResponse.model_validate(user, from_attributes=True)
 
 
-def _item_response(item: WatchlistItem) -> WatchlistItemResponse:
+def _item_response(
+    item: WatchlistItem,
+    resolve_symbol: Callable[[str], SymbolLookup] | None = None,
+) -> WatchlistItemResponse:
+    if resolve_symbol is not None:
+        try:
+            current = resolve_symbol(item.symbol)
+        except Exception:
+            current = None
+        if current is not None:
+            return WatchlistItemResponse(
+                symbol=current.symbol,
+                name=current.name,
+                market=current.market,
+            )
     return WatchlistItemResponse.model_validate(item, from_attributes=True)
 
 
-def _group_response(group: WatchlistGroup) -> WatchlistGroupResponse:
+def _group_response(
+    group: WatchlistGroup,
+    resolve_symbol: Callable[[str], SymbolLookup] | None = None,
+) -> WatchlistGroupResponse:
     return WatchlistGroupResponse(
         id=group.id,
         name=group.name,
         sort_order=group.sort_order,
         is_primary=group.is_primary,
-        items=[_item_response(item) for item in group.items],
+        items=[
+            _item_response(item, resolve_symbol)
+            for item in group.items
+        ],
     )
 
 
@@ -304,7 +324,12 @@ def install_market_routes(
     @app.get("/api/v1/watchlists", response_model=WatchlistsResponse)
     def get_watchlists(user=Depends(require_ready_user)) -> WatchlistsResponse:
         accounts, _sessions = stores()
-        return WatchlistsResponse(groups=[_group_response(group) for group in accounts.list_watchlists(user.id)])
+        return WatchlistsResponse(
+            groups=[
+                _group_response(group, resolve_symbol)
+                for group in accounts.list_watchlists(user.id)
+            ]
+        )
 
     @app.post("/api/v1/watchlists/groups", status_code=201, response_model=WatchlistGroupResponse)
     def create_watchlist_group(
@@ -313,7 +338,10 @@ def install_market_routes(
     ) -> WatchlistGroupResponse:
         accounts, _sessions = stores()
         try:
-            return _group_response(accounts.create_group(user.id, payload.name))
+            return _group_response(
+                accounts.create_group(user.id, payload.name),
+                resolve_symbol,
+            )
         except ValueError as error:
             raise HTTPException(status_code=409, detail=str(error)) from None
 
@@ -325,7 +353,10 @@ def install_market_routes(
     ) -> WatchlistGroupResponse:
         accounts, _sessions = stores()
         try:
-            return _group_response(accounts.rename_group(user.id, group_id, payload.name))
+            return _group_response(
+                accounts.rename_group(user.id, group_id, payload.name),
+                resolve_symbol,
+            )
         except LookupError:
             raise HTTPException(status_code=404, detail="watchlist group not found") from None
         except ValueError as error:
@@ -368,7 +399,10 @@ def install_market_routes(
         lookup = resolve_symbol(normalized)
         accounts, _sessions = stores()
         try:
-            return _item_response(accounts.add_symbol(user.id, group_id, lookup))
+            return _item_response(
+                accounts.add_symbol(user.id, group_id, lookup),
+                resolve_symbol,
+            )
         except LookupError:
             raise HTTPException(status_code=404, detail="watchlist group not found") from None
         except ValueError as error:

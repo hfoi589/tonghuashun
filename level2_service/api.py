@@ -9,9 +9,10 @@ import secrets
 from threading import RLock
 from asyncio import FIRST_COMPLETED, CancelledError, Event, TimeoutError, create_task, gather, get_running_loop, sleep, to_thread, wait, wait_for
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import AsyncIterator, Callable, Mapping, Optional
+from zoneinfo import ZoneInfo
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, StreamingResponse
@@ -38,7 +39,7 @@ from .parsed_values import (
 from .queue import InMemoryStreams, QueueFullError, TaskStore
 from .runner import ADBDeviceBridge, DeviceBridge, Level2Runner, RunnerControl, jpeg_base64
 from .security import AdminSessionManager, persist_password_hash
-from .symbol_cache import InMemorySymbolLookupCache, SymbolLookupCache
+from .symbol_cache import SymbolLookupCache
 
 
 logger = logging.getLogger(__name__)
@@ -291,6 +292,11 @@ def create_app(
     symbol_lookup: Callable[[str], SymbolLookup] | None = None,
     symbol_search: Callable[[str, int], list[SymbolLookup]] | None = None,
     symbol_lookup_cache: SymbolLookupCache | None = None,
+    symbol_catalog: object | None = None,
+    symbol_catalog_refresh_hour: int = 16,
+    symbol_catalog_refresh_minute: int = 20,
+    core_prewarmer: Callable[[str | None], None] | None = None,
+    core_session_invalidator: Callable[[], None] | None = None,
     market_account_store: object | None = None,
     market_session_store: object | None = None,
     market_data_broker: object | None = None,
@@ -306,6 +312,12 @@ def create_app(
         raise ValueError("cleanup_interval_seconds must be positive")
     if runner_poll_interval_seconds <= 0:
         raise ValueError("runner_poll_interval_seconds must be positive")
+    if not 0 <= symbol_catalog_refresh_hour <= 23:
+        raise ValueError("symbol_catalog_refresh_hour must be between 0 and 23")
+    if not 0 <= symbol_catalog_refresh_minute <= 59:
+        raise ValueError(
+            "symbol_catalog_refresh_minute must be between 0 and 59"
+        )
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
@@ -365,11 +377,59 @@ def create_app(
                 except TimeoutError:
                     continue
 
+        async def symbol_catalog_loop() -> None:
+            catalog = app.state.symbol_catalog
+            if catalog is None:
+                return
+            refresh = getattr(catalog, "refresh", None)
+            needs_startup_refresh = getattr(
+                catalog,
+                "startup_refresh_required",
+                None,
+            )
+            if callable(refresh) and (
+                not callable(needs_startup_refresh)
+                or needs_startup_refresh()
+            ):
+                try:
+                    await to_thread(refresh)
+                except Exception:
+                    pass
+            while not stop.is_set():
+                local_now = datetime.now(ZoneInfo("Asia/Shanghai"))
+                next_refresh = local_now.replace(
+                    hour=symbol_catalog_refresh_hour,
+                    minute=symbol_catalog_refresh_minute,
+                    second=0,
+                    microsecond=0,
+                )
+                if next_refresh <= local_now:
+                    next_refresh += timedelta(days=1)
+                delay = max(
+                    1.0,
+                    (next_refresh - local_now).total_seconds(),
+                )
+                try:
+                    await wait_for(stop.wait(), timeout=delay)
+                    continue
+                except TimeoutError:
+                    pass
+                if callable(refresh):
+                    try:
+                        await to_thread(refresh)
+                    except Exception:
+                        pass
+
         app.state.cleanup_stop = stop
         app.state.cleanup_task = create_task(retention_loop())
         app.state.runner_task = create_task(runner_loop()) if runner is not None else None
         app.state.market_task = (
             create_task(market_loop()) if app.state.market_data_broker is not None else None
+        )
+        app.state.symbol_catalog_task = (
+            create_task(symbol_catalog_loop())
+            if app.state.symbol_catalog is not None
+            else None
         )
         try:
             yield
@@ -381,6 +441,8 @@ def create_app(
                 await app.state.runner_task
             if app.state.market_task is not None:
                 await app.state.market_task
+            if app.state.symbol_catalog_task is not None:
+                await app.state.symbol_catalog_task
 
     app = FastAPI(title="THS Level2 Capture Service", lifespan=lifespan)
     app.state.store = store or InMemoryStreams()
@@ -404,8 +466,11 @@ def create_app(
     app.state.symbol_lookup = symbol_lookup
     app.state.symbol_search = symbol_search
     app.state.symbol_verification_enabled = symbol_lookup is not None or symbol_lookup_cache is not None
-    app.state.symbol_lookup_cache = symbol_lookup_cache or InMemorySymbolLookupCache()
+    app.state.symbol_lookup_cache = symbol_lookup_cache
     app.state.symbol_lookup_cache_lock = RLock()
+    app.state.symbol_catalog = symbol_catalog
+    app.state.core_prewarmer = core_prewarmer
+    app.state.core_session_invalidator = core_session_invalidator
     app.state.market_account_store = market_account_store
     app.state.market_session_store = market_session_store
     app.state.market_data_broker = market_data_broker
@@ -439,6 +504,15 @@ def create_app(
         if task.status == TaskStatus.QUEUED:
             app.state.runner_wake.notify()
 
+    def trigger_core_prewarm(symbol: str | None) -> None:
+        prewarm = app.state.core_prewarmer
+        if not callable(prewarm):
+            return
+        try:
+            prewarm(symbol)
+        except Exception:
+            pass
+
     def resolve_symbol(symbol: str) -> SymbolLookup:
         try:
             expected_market = market_code_for_symbol(symbol)
@@ -446,37 +520,49 @@ def create_app(
             raise HTTPException(status_code=422, detail=str(error)) from error
 
         try:
-            with app.state.symbol_lookup_cache_lock:
-                cached = app.state.symbol_lookup_cache.get(symbol)
+            cache = app.state.symbol_lookup_cache
+            cached = None
+            if cache is not None:
+                with app.state.symbol_lookup_cache_lock:
+                    cached = cache.get(symbol)
                 if cached is not None:
                     if cached.symbol != symbol or cached.market != expected_market:
                         raise DirectRequestError(
                             "SYMBOL_LOOKUP_INVALID",
-                            "cached App search returned a mismatched stock",
+                            "cached symbol lookup returned a mismatched stock",
                         )
+                    trigger_core_prewarm(symbol)
                     return cached
-                lookup = app.state.symbol_lookup
-                if lookup is None:
-                    raise HTTPException(
-                        status_code=503,
-                        detail="symbol lookup temporarily unavailable",
-                    )
-                result = lookup(symbol)
-                if result.symbol != symbol or result.market != expected_market:
-                    raise DirectRequestError(
-                        "SYMBOL_LOOKUP_INVALID",
-                        "App search returned a mismatched stock",
-                    )
-                app.state.symbol_lookup_cache.set(result)
-                return result
+            lookup = app.state.symbol_lookup
+            if lookup is None:
+                raise HTTPException(
+                    status_code=503,
+                    detail="symbol lookup temporarily unavailable",
+                )
+            result = lookup(symbol)
+            if result.symbol != symbol or result.market != expected_market:
+                raise DirectRequestError(
+                    "SYMBOL_LOOKUP_INVALID",
+                    "symbol lookup returned a mismatched stock",
+                )
+            if cache is not None:
+                with app.state.symbol_lookup_cache_lock:
+                    cache.set(result)
+            trigger_core_prewarm(symbol)
+            return result
         except SymbolLookupNotFoundError as error:
             raise HTTPException(status_code=404, detail="symbol not found") from error
         except SymbolLookupAmbiguousError as error:
             raise HTTPException(status_code=409, detail="symbol lookup is ambiguous") from error
         except DirectRequestError as error:
+            detail = (
+                error.error_code
+                if error.error_code.startswith("SYMBOL_CATALOG_")
+                else "symbol lookup temporarily unavailable"
+            )
             raise HTTPException(
                 status_code=503,
-                detail="symbol lookup temporarily unavailable",
+                detail=detail,
             ) from error
         except HTTPException:
             raise
@@ -516,9 +602,14 @@ def create_app(
         except ValueError as error:
             raise HTTPException(status_code=422, detail=str(error)) from error
         except DirectRequestError as error:
+            detail = (
+                error.error_code
+                if error.error_code.startswith("SYMBOL_CATALOG_")
+                else "symbol search temporarily unavailable"
+            )
             raise HTTPException(
                 status_code=503,
-                detail="symbol search temporarily unavailable",
+                detail=detail,
             ) from error
         except Exception as error:
             raise HTTPException(
@@ -722,6 +813,11 @@ def create_app(
                     "account session refresher returned a mismatched role",
                 )
             provider.put(bundle)
+            if role == "core_metrics":
+                invalidator = app.state.core_session_invalidator
+                if callable(invalidator):
+                    invalidator()
+                trigger_core_prewarm(None)
         except DirectRequestError as error:
             provider.mark_error(
                 role,

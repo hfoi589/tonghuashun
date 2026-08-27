@@ -207,6 +207,22 @@ def test_public_symbol_lookup_returns_the_exact_app_name_and_market() -> None:
     }
 
 
+def test_symbol_lookup_without_a_cache_reads_current_catalog_and_prewarms() -> None:
+    lookup = FakeSymbolLookup()
+    prewarmed: list[str] = []
+    app = create_app(
+        symbol_lookup=lookup,
+        core_prewarmer=prewarmed.append,
+    )
+    client = TestClient(app)
+
+    assert client.get("/api/v1/symbols/600143").status_code == 200
+    assert client.get("/api/v1/symbols/600143").status_code == 200
+
+    assert lookup.calls == ["600143", "600143"]
+    assert prewarmed == ["600143", "600143"]
+
+
 def test_public_symbol_lookup_returns_not_found_for_an_empty_app_result() -> None:
     """The browser must keep submit disabled when the App finds no exact stock."""
     client = TestClient(app_with_symbol_lookup())
@@ -250,8 +266,8 @@ def test_public_submission_requires_a_verified_symbol_even_when_lookup_was_bypas
     assert app.state.symbol_lookup.calls == ["600142"]
 
 
-def test_public_submission_reuses_the_recent_successful_lookup() -> None:
-    """Submitting after inline validation must not repeat the App call."""
+def test_public_submission_reconfirms_against_the_current_catalog() -> None:
+    """Submission rechecks the active catalog instead of trusting browser state."""
     app = app_with_symbol_lookup()
     client = TestClient(app)
 
@@ -259,7 +275,7 @@ def test_public_submission_reuses_the_recent_successful_lookup() -> None:
     response = client.post("/api/v1/jobs", json={"symbol": "600143"})
 
     assert response.status_code == 202
-    assert app.state.symbol_lookup.calls == ["600143"]
+    assert app.state.symbol_lookup.calls == ["600143", "600143"]
 
 
 def test_public_submission_reuses_existing_symbol_task_instead_of_creating_a_new_id() -> None:

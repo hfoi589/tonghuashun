@@ -34,7 +34,7 @@ from .parsed_values import DualAccountParsedValueSource, FridaParsedValueSource
 from .queue import RedisStreamsStore
 from .runner import ADBDeviceBridge, DailyCheckState, Level2Navigator, Level2Runner, OpenCVTemplateFallback, RunnerControl, TAB_LABELS, long_capture_has_net_heading
 from .security import persist_password_hash
-from .symbol_cache import RedisSymbolLookupCache
+from .symbol_catalog import SinaSymbolCatalogSource, SQLiteSymbolCatalog
 
 
 @dataclass(frozen=True)
@@ -59,6 +59,7 @@ class DeploymentSettings:
     fund_frida_server_endpoint: str | None
     daily_check_state_file: Path
     market_database_path: Path
+    symbol_catalog_path: Path
     core_metrics_transport: str
     fund_flow_transport: str
     ths_session_encryption_key: str | None = field(repr=False)
@@ -146,6 +147,12 @@ class DeploymentSettings:
             admin_cookie_secure = False
         else:
             raise ValueError("ADMIN_COOKIE_SECURE must be a boolean value")
+        market_database_path = Path(
+            values.get(
+                "MARKET_DATABASE_PATH",
+                str(capture_root.parent / "market" / "market.db"),
+            )
+        ).expanduser().resolve()
         return cls(
             redis_url=values.get("REDIS_URL", "redis://redis:6379/0"),
             capture_root=capture_root,
@@ -168,10 +175,11 @@ class DeploymentSettings:
             daily_check_state_file=Path(
                 values.get("DAILY_CHECK_STATE_FILE", "/data/admin/daily-check.json")
             ).expanduser().resolve(),
-            market_database_path=Path(
+            market_database_path=market_database_path,
+            symbol_catalog_path=Path(
                 values.get(
-                    "MARKET_DATABASE_PATH",
-                    str(capture_root.parent / "market" / "market.db"),
+                    "SYMBOL_CATALOG_PATH",
+                    str(market_database_path.with_name("symbol-catalog.db")),
                 )
             ).expanduser().resolve(),
             core_metrics_transport=transport_modes["CORE_METRICS_TRANSPORT"],
@@ -227,12 +235,20 @@ def create_production_app(
     redis_client_factory: Callable[[str], object] = _redis_client_from_url,
     bridge_factory: Callable[..., ADBDeviceBridge] = ADBDeviceBridge,
     runner_factory: Callable[..., Level2Runner] = Level2Runner,
+    symbol_catalog_source: object | None = None,
+    symbol_catalog_factory: Callable[[Path, object], SQLiteSymbolCatalog] = (
+        SQLiteSymbolCatalog
+    ),
 ) -> FastAPI:
     """Create the only app mode that enables the real Android worker."""
     config = settings or DeploymentSettings.from_environ()
     config.capture_root.mkdir(parents=True, exist_ok=True)
     redis_client = redis_client_factory(config.redis_url)
     store = RedisStreamsStore(redis_client, capture_root=config.capture_root)
+    symbol_catalog = symbol_catalog_factory(
+        config.symbol_catalog_path,
+        symbol_catalog_source or SinaSymbolCatalogSource(),
+    )
     adb_environment = os.environ.copy()
     if config.adb_server_socket:
         adb_environment["ADB_SERVER_SOCKET"] = config.adb_server_socket
@@ -292,6 +308,7 @@ def create_production_app(
     account_session_provider = None
     account_session_refreshers: dict[str, Callable] = {}
     market_parsed_value_source = None
+    direct_core_source = None
     if config.dual_account_mode:
         assert config.core_frida_server_endpoint is not None
         assert config.fund_frida_server_endpoint is not None
@@ -360,7 +377,7 @@ def create_production_app(
         parsed_value_source = DualAccountParsedValueSource(
             core_source,
             fund_source,
-            symbol_source=frida_core_source,
+            symbol_source=symbol_catalog,
         )
         market_parsed_value_source = (
             parsed_value_source
@@ -415,9 +432,20 @@ def create_production_app(
         runner_poll_interval_seconds=config.runner_poll_interval_seconds,
         frontend_root=config.frontend_root,
         secure_admin_cookies=config.admin_cookie_secure,
-        symbol_lookup=parsed_value_source.lookup_symbol if parsed_value_source is not None else None,
-        symbol_search=parsed_value_source.search_symbols if parsed_value_source is not None else None,
-        symbol_lookup_cache=RedisSymbolLookupCache(redis_client),
+        symbol_search=symbol_catalog.search,
+        symbol_lookup=symbol_catalog.lookup,
+        symbol_lookup_cache=None,
+        symbol_catalog=symbol_catalog,
+        core_prewarmer=(
+            direct_core_source.prewarm
+            if direct_core_source is not None
+            else None
+        ),
+        core_session_invalidator=(
+            direct_core_source.invalidate
+            if direct_core_source is not None
+            else None
+        ),
         market_account_store=market_accounts,
         market_session_store=market_sessions,
         market_data_broker=market_broker,

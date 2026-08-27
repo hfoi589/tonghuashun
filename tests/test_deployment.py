@@ -26,7 +26,7 @@ from level2_service.parsed_values import (
     FridaParsedValueSource,
 )
 from level2_service.runner import DailyCheckState, OpenCVTemplateFallback, long_capture_has_net_heading
-from level2_service.symbol_cache import RedisSymbolLookupCache
+from level2_service.symbol_catalog import SQLiteSymbolCatalog
 from scripts.preflight import PreflightError, validate_apk, validate_host_profile
 
 
@@ -76,6 +76,22 @@ class FakeRunner:
     def run_once(self) -> None:
         self.calls += 1
         self.control.heartbeat("READY")
+
+
+class StaticCatalogSource:
+    @staticmethod
+    def fetch_symbols():
+        from level2_service.parsed_values import SymbolLookup
+
+        return [SymbolLookup("601872", "招商轮船", "17")]
+
+
+def static_catalog_factory(path, source):
+    return SQLiteSymbolCatalog(
+        path,
+        source,
+        minimum_security_count=1,
+    )
 
 
 def test_settings_reject_missing_production_secrets() -> None:
@@ -149,8 +165,40 @@ def test_production_factory_wires_the_configured_frida_runtime_source(tmp_path: 
 
     assert settings.frida_server_endpoint == "host.docker.internal:27042"
     assert app.state.runner.parsed_value_source.endpoint == "host.docker.internal:27042"
-    assert app.state.symbol_search.__self__ is app.state.runner.parsed_value_source
-    assert isinstance(app.state.symbol_lookup_cache, RedisSymbolLookupCache)
+    assert app.state.symbol_search.__self__ is app.state.symbol_catalog
+    assert app.state.symbol_lookup.__self__ is app.state.symbol_catalog
+    assert app.state.symbol_lookup_cache is None
+
+
+def test_production_symbol_lookup_uses_the_public_catalog_not_frida(
+    tmp_path: Path,
+) -> None:
+    settings = DeploymentSettings.from_environ(
+        {
+            "ADMIN_PASSWORD_HASH": "$argon2id$example",
+            "ADMIN_SESSION_SECRET": "s" * 32,
+            "CAPTURE_ROOT": str(tmp_path / "captures"),
+            "SYMBOL_CATALOG_PATH": str(tmp_path / "symbols.db"),
+            "ADB_SERIAL": "emulator-5556",
+            "FRIDA_SERVER_ENDPOINT": "host.docker.internal:27043",
+        }
+    )
+    app = create_production_app(
+        settings=settings,
+        redis_client_factory=lambda _url: FakeRedis(),
+        bridge_factory=FakeBridge,
+        runner_factory=FakeRunner,
+        symbol_catalog_source=StaticCatalogSource(),
+        symbol_catalog_factory=static_catalog_factory,
+    )
+    app.state.symbol_catalog.refresh()
+
+    result = app.state.symbol_lookup("601872")
+
+    assert result.name == "招商轮船"
+    assert app.state.symbol_lookup.__self__ is app.state.symbol_catalog
+    assert app.state.symbol_search.__self__ is app.state.symbol_catalog
+    assert app.state.symbol_lookup_cache is None
 
 
 def test_production_factory_wires_persistent_market_accounts_sessions_and_broker(tmp_path: Path) -> None:
@@ -361,7 +409,7 @@ def test_production_factory_wires_two_independent_bridges_and_frida_sources(tmp_
     assert app.state.runner.parsed_value_source.core_source.endpoint == "host.docker.internal:27043"
     assert app.state.runner.parsed_value_source.core_source.request_scope == "core_metrics"
     assert app.state.runner.parsed_value_source.fund_source.endpoint == "host.docker.internal:27042"
-    assert app.state.symbol_search.__self__ is app.state.runner.parsed_value_source
+    assert app.state.symbol_search.__self__ is app.state.symbol_catalog
     assert app.state.runner.parsed_value_source.fund_source.request_scope == "main_fund_flow"
 
 
@@ -422,7 +470,10 @@ def test_production_factory_propagates_frontend_root_and_http_cookie_security(tm
         redis_client_factory=lambda url: FakeRedis(),
         bridge_factory=FakeBridge,
         runner_factory=FakeRunner,
+        symbol_catalog_source=StaticCatalogSource(),
+        symbol_catalog_factory=static_catalog_factory,
     )
+    app.state.symbol_catalog.refresh()
 
     with TestClient(app, base_url="http://testserver") as client:
         assert client.get("/").text == "<html>production frontend</html>"
@@ -453,7 +504,10 @@ def test_production_factory_wires_one_control_for_api_and_runner(tmp_path: Path)
         redis_client_factory=lambda url: FakeRedis(),
         bridge_factory=FakeBridge,
         runner_factory=FakeRunner,
+        symbol_catalog_source=StaticCatalogSource(),
+        symbol_catalog_factory=static_catalog_factory,
     )
+    app.state.symbol_catalog.refresh()
 
     assert app.state.runner.control is app.state.runner_control
     assert app.state.runner.long_capture_validator is long_capture_has_net_heading

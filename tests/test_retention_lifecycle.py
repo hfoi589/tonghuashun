@@ -44,6 +44,26 @@ def test_job_submission_wakes_runner_before_the_poll_interval() -> None:
         assert next_call.wait(1)
 
 
+def test_app_lifespan_refreshes_an_uninitialized_symbol_catalog() -> None:
+    refreshed = Event()
+
+    class Catalog:
+        @staticmethod
+        def startup_refresh_required() -> bool:
+            return True
+
+        @staticmethod
+        def refresh() -> None:
+            refreshed.set()
+
+    app = create_app(symbol_catalog=Catalog())
+
+    with TestClient(app):
+        assert refreshed.wait(1)
+
+    assert app.state.symbol_catalog_task.done()
+
+
 def test_app_lifespan_runs_retention_and_stops_its_background_task(tmp_path: Path) -> None:
     """Screenshot retention must run without expiring the persistent task result."""
     capture = tmp_path / "net.png"

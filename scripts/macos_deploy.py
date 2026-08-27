@@ -678,7 +678,11 @@ class LoopbackDataOnlyAcceptance:
             },
         )
         public_id = submitted.get("public_id")
-        if not isinstance(public_id, str) or not _SAFE_OPERATION_ID.fullmatch(public_id):
+        if (
+            not isinstance(public_id, str)
+            or not _SAFE_OPERATION_ID.fullmatch(public_id)
+            or submitted.get("symbol") != _ACCEPTANCE_SYMBOL
+        ):
             raise DeploymentError("DATA_ONLY_ACCEPTANCE_FAILED")
         deadline = time.monotonic() + self._timeout_seconds
         while True:

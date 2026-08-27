@@ -327,3 +327,45 @@ git diff --check
 
 No real host, Docker deployment, SDK, AVD, ADB, lifecycle, admin-session,
 device, App, session-refresh, or market action ran.
+
+## Fix round 3 — submitted symbol binding
+
+### Corrected finding
+
+- The accepted `POST /api/v1/jobs` response must now contain both a safe,
+  nonempty `public_id` and the exact fixed symbol `601872`. A safe task ID paired
+  with another symbol fails immediately, before any `/api/v1/jobs/{public_id}`
+  poll. No journal, lifecycle, session, formatting, frontend, or provisioning
+  behavior changed.
+
+### Exact RED evidence
+
+```text
+/Users/wilson/tonghuashun/.venv/bin/python -m pytest -q \
+  tests/test_macos_one_click_deploy.py -k 'wrong_submitted_symbol'
+1 failed, 127 deselected in 0.11s
+```
+
+The old implementation accepted `{public_id: "safe-public-id", symbol:
+"000001"}`, performed the job poll, and completed without raising.
+
+### Exact GREEN and covering evidence
+
+```text
+# Submitted symbol plus surrounding identity/real-urllib coverage
+8 passed, 120 deselected in 0.61s
+
+# Complete Task 8 backend file
+128 passed in 2.28s
+
+# Full Python regression
+753 passed, 24 existing warnings in 27.71s
+
+# Static checks
+/Users/wilson/tonghuashun/.venv/bin/python -m py_compile scripts/macos_deploy.py
+/bin/sh -n scripts/provision-macos-from-image.sh scripts/deploy-macos-one-click.sh
+git diff --check
+```
+
+No real host, Docker, SDK, AVD, ADB, lifecycle, admin-session, device, App,
+session-refresh, or market action ran.

@@ -2268,7 +2268,11 @@ def test_data_only_acceptance_uses_the_confirmed_fixed_symbol_and_eight_metrics(
     responses = iter(
         [
             {"symbol": "601872", "name": "招商轮船", "market": "17"},
-            {"public_id": "safe-public-id", "status": "QUEUED"},
+            {
+                "public_id": "safe-public-id",
+                "symbol": "601872",
+                "status": "QUEUED",
+            },
             {
                 "public_id": "safe-public-id",
                 "symbol": "601872",
@@ -2335,7 +2339,11 @@ def test_data_only_acceptance_binds_lookup_submission_and_polled_identity(
     """A task or name from a different identity must never satisfy acceptance."""
     module = _load_macos_deploy()
     lookup = {"symbol": "601872", "name": "招商轮船", "market": "17"}
-    submitted = {"public_id": "safe-public-id", "status": "QUEUED"}
+    submitted = {
+        "public_id": "safe-public-id",
+        "symbol": "601872",
+        "status": "QUEUED",
+    }
     running = {
         "public_id": "safe-public-id",
         "symbol": "601872",
@@ -2384,6 +2392,54 @@ def test_data_only_acceptance_binds_lookup_submission_and_polled_identity(
     assert caught.value.error_code == "DATA_ONLY_ACCEPTANCE_FAILED"
 
 
+def test_data_only_acceptance_rejects_a_wrong_submitted_symbol_before_polling() -> None:
+    """A safe task ID must not authorize polling a submission for another symbol."""
+    module = _load_macos_deploy()
+    responses = iter(
+        [
+            {"symbol": "601872", "name": "招商轮船", "market": "17"},
+            {
+                "public_id": "safe-public-id",
+                "symbol": "000001",
+                "status": "QUEUED",
+            },
+            valid_acceptance_task(),
+        ]
+    )
+    requests: list[str] = []
+
+    class Response:
+        def __init__(self, payload: dict[str, object]) -> None:
+            self.payload = payload
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args) -> None:
+            return None
+
+        def read(self) -> bytes:
+            return json.dumps(self.payload).encode()
+
+    def opener(request: Request, *, timeout: float):
+        assert timeout > 0
+        requests.append(request.full_url)
+        return Response(next(responses))
+
+    with pytest.raises(module.DeploymentError) as caught:
+        module.LoopbackDataOnlyAcceptance(
+            opener=opener,
+            timeout_seconds=0.1,
+            poll_interval_seconds=0.0,
+        ).verify()
+
+    assert caught.value.error_code == "DATA_ONLY_ACCEPTANCE_FAILED"
+    assert requests == [
+        "http://127.0.0.1:8001/api/v1/symbols/601872",
+        "http://127.0.0.1:8001/api/v1/jobs",
+    ]
+
+
 def test_data_only_acceptance_uses_real_urlopen_timeout_keyword() -> None:
     """Passing timeout as positional request data breaks the real urllib boundary."""
     module = _load_macos_deploy()
@@ -2410,7 +2466,13 @@ def test_data_only_acceptance_uses_real_urlopen_timeout_keyword() -> None:
             self.send_header("Content-Type", "application/json")
             self.end_headers()
             self.wfile.write(
-                json.dumps({"public_id": "safe-public-id", "status": "QUEUED"}).encode()
+                json.dumps(
+                    {
+                        "public_id": "safe-public-id",
+                        "symbol": "601872",
+                        "status": "QUEUED",
+                    }
+                ).encode()
             )
 
         def log_message(self, _format: str, *_args) -> None:

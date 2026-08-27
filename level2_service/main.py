@@ -31,6 +31,12 @@ from .direct_market import (
 from .market_accounts import RedisMarketSessionStore, SQLiteMarketAccountStore
 from .market_data import MarketDataBroker, is_china_market_open
 from .parsed_values import DualAccountParsedValueSource, FridaParsedValueSource
+from .public_market import (
+    DirectEnrichedMarketDataSource,
+    PublicMarketDataSource,
+    SinaPublicQuoteProvider,
+    TencentPublicMarketProvider,
+)
 from .queue import RedisStreamsStore
 from .runner import ADBDeviceBridge, DailyCheckState, Level2Navigator, Level2Runner, OpenCVTemplateFallback, RunnerControl, TAB_LABELS, long_capture_has_net_heading
 from .security import persist_password_hash
@@ -307,7 +313,6 @@ def create_production_app(
     navigator = Level2Navigator(core_bridge, OpenCVTemplateFallback(templates))
     account_session_provider = None
     account_session_refreshers: dict[str, Callable] = {}
-    market_parsed_value_source = None
     direct_core_source = None
     if config.dual_account_mode:
         assert config.core_frida_server_endpoint is not None
@@ -379,22 +384,12 @@ def create_production_app(
             fund_source,
             symbol_source=symbol_catalog,
         )
-        market_parsed_value_source = (
-            parsed_value_source
-            if config.core_metrics_transport == "frida"
-            else DualAccountParsedValueSource(
-                frida_core_source,
-                fund_source,
-                symbol_source=frida_core_source,
-            )
-        )
     else:
         parsed_value_source = (
             FridaParsedValueSource(config.frida_server_endpoint)
             if config.frida_server_endpoint
             else None
         )
-        market_parsed_value_source = parsed_value_source
     runner = runner_factory(
         store,
         navigator,
@@ -406,17 +401,27 @@ def create_production_app(
     )
     market_accounts = SQLiteMarketAccountStore(config.market_database_path)
     market_sessions = RedisMarketSessionStore(redis_client)
-    market_broker = (
-        MarketDataBroker(
-            DailyKlineMarketDataSource(
-                market_parsed_value_source,
-                TonghuashunPublicDailyKlineProvider(),
-                is_market_open=is_china_market_open,
-            ),
-            is_market_open=is_china_market_open,
-        )
-        if market_parsed_value_source is not None
+    public_market_source = PublicMarketDataSource(
+        symbol_catalog,
+        TencentPublicMarketProvider(),
+        SinaPublicQuoteProvider(),
+    )
+    direct_market_enrichment = (
+        parsed_value_source
+        if config.core_metrics_transport == "direct"
+        and config.fund_flow_transport == "direct"
         else None
+    )
+    market_broker = MarketDataBroker(
+        DailyKlineMarketDataSource(
+            DirectEnrichedMarketDataSource(
+                public_market_source,
+                direct_market_enrichment,
+            ),
+            TonghuashunPublicDailyKlineProvider(),
+            is_market_open=is_china_market_open,
+        ),
+        is_market_open=is_china_market_open,
     )
     app = create_app(
         store=store,

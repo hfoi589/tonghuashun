@@ -25,6 +25,10 @@ from level2_service.parsed_values import (
     DualAccountParsedValueSource,
     FridaParsedValueSource,
 )
+from level2_service.public_market import (
+    DirectEnrichedMarketDataSource,
+    PublicMarketDataSource,
+)
 from level2_service.runner import DailyCheckState, OpenCVTemplateFallback, long_capture_has_net_heading
 from level2_service.symbol_catalog import SQLiteSymbolCatalog
 from scripts.preflight import PreflightError, validate_apk, validate_host_profile
@@ -227,11 +231,14 @@ def test_production_factory_wires_persistent_market_accounts_sessions_and_broker
     assert isinstance(app.state.market_session_store, RedisMarketSessionStore)
     assert isinstance(app.state.market_data_broker, MarketDataBroker)
     assert isinstance(app.state.market_data_broker.source, DailyKlineMarketDataSource)
-    assert app.state.market_data_broker.source.app_source is app.state.runner.parsed_value_source
+    enriched = app.state.market_data_broker.source.base_source
+    assert isinstance(enriched, DirectEnrichedMarketDataSource)
+    assert isinstance(enriched.base_source, PublicMarketDataSource)
+    assert enriched.direct_source is None
     assert app.state.market_data_broker.stats()["daily_kline"] == {
         "cache_entries": 0,
         "public_successes": 0,
-        "app_fallbacks": 0,
+        "fallback_successes": 0,
         "stale_cache_hits": 0,
         "failures": 0,
     }
@@ -362,7 +369,9 @@ def test_production_core_direct_requires_session_material_before_socket_activity
     assert caught.value.error_code == "DIRECT_SESSION_UNAVAILABLE"
 
 
-def test_production_core_direct_keeps_market_snapshots_on_frida(tmp_path: Path) -> None:
+def test_production_core_direct_keeps_market_snapshots_on_public_sources(
+    tmp_path: Path,
+) -> None:
     environment = dual_environment(tmp_path)
     environment["CORE_METRICS_TRANSPORT"] = "direct"
     app = create_production_app(
@@ -372,13 +381,30 @@ def test_production_core_direct_keeps_market_snapshots_on_frida(tmp_path: Path) 
         runner_factory=FakeRunner,
     )
 
-    task_source = app.state.runner.parsed_value_source
-    market_source = app.state.market_data_broker.source.app_source
+    market_source = app.state.market_data_broker.source.base_source
 
-    assert market_source is not task_source
-    assert isinstance(market_source, DualAccountParsedValueSource)
-    assert isinstance(market_source.core_source, FridaParsedValueSource)
-    assert market_source.fund_source is task_source.fund_source
+    assert isinstance(market_source, DirectEnrichedMarketDataSource)
+    assert isinstance(market_source.base_source, PublicMarketDataSource)
+    assert market_source.direct_source is None
+
+
+def test_production_market_enables_l2_only_when_both_transports_are_direct(
+    tmp_path: Path,
+) -> None:
+    environment = dual_environment(tmp_path)
+    environment["CORE_METRICS_TRANSPORT"] = "direct"
+    environment["FUND_FLOW_TRANSPORT"] = "direct"
+    app = create_production_app(
+        settings=DeploymentSettings.from_environ(environment),
+        redis_client_factory=lambda _url: FakeRedis(),
+        bridge_factory=FakeBridge,
+        runner_factory=FakeRunner,
+    )
+
+    market_source = app.state.market_data_broker.source.base_source
+
+    assert isinstance(market_source, DirectEnrichedMarketDataSource)
+    assert market_source.direct_source is app.state.runner.parsed_value_source
 
 
 def test_production_factory_wires_two_independent_bridges_and_frida_sources(tmp_path: Path) -> None:

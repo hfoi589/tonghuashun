@@ -4,14 +4,23 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from dataclasses import replace
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+from threading import RLock
 from typing import Callable
 from urllib.request import Request, urlopen
 
 from .market_data import KlineBar, MarketSeriesPage, MarketSnapshot, TimesharePoint
-from .parsed_values import DirectRequestError, SymbolLookup
+from .models import FUND_FLOW_METRICS, FUND_FLOW_PERIODS, MetricKind
+from .parsed_values import (
+    DirectReadOutcome,
+    DirectRequestError,
+    SymbolLookup,
+    sanitized_direct_error_code,
+)
 
 
 class PublicMarketError(DirectRequestError):
@@ -478,3 +487,186 @@ class PublicMarketDataSource:
             period,
             limit,
         )
+
+
+@dataclass(frozen=True)
+class _EnrichmentEntry:
+    outcome: DirectReadOutcome | None
+    error_code: str | None
+    stored_at: float
+
+
+class DirectEnrichedMarketDataSource:
+    """Merge cached direct L2 fields without owning the public quote."""
+
+    _INTRADAY_NAMES = {
+        MetricKind.LARGE_ORDER_NET: "large_order_net",
+        MetricKind.LARGE_ORDER_AMOUNT: "large_order_amount",
+        MetricKind.RETAIL_COUNT: "retail_count",
+        MetricKind.MACDFS: "macdfs",
+    }
+
+    def __init__(
+        self,
+        base_source: object,
+        direct_source: object | None,
+        *,
+        ttl_seconds: float = 15.0,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        if ttl_seconds <= 0:
+            raise ValueError("ttl_seconds must be positive")
+        self.base_source = base_source
+        self.direct_source = direct_source
+        self.ttl_seconds = ttl_seconds
+        self.clock = clock
+        self._lock = RLock()
+        self._cache: dict[str, _EnrichmentEntry] = {}
+
+    def _read_enrichment(self, symbol: str) -> _EnrichmentEntry:
+        now = self.clock()
+        with self._lock:
+            cached = self._cache.get(symbol)
+            if cached is not None and now - cached.stored_at < self.ttl_seconds:
+                return cached
+        if self.direct_source is None:
+            entry = _EnrichmentEntry(
+                outcome=None,
+                error_code="DIRECT_SESSION_UNAVAILABLE",
+                stored_at=now,
+            )
+        else:
+            read_direct = getattr(self.direct_source, "read_direct", None)
+            try:
+                if not callable(read_direct):
+                    raise DirectRequestError("DIRECT_REQUEST_UNAVAILABLE")
+                outcome = read_direct(symbol)
+                if not isinstance(outcome, DirectReadOutcome):
+                    raise DirectRequestError("DIRECT_REQUEST_FAILED")
+                entry = _EnrichmentEntry(
+                    outcome=outcome,
+                    error_code=None,
+                    stored_at=now,
+                )
+            except DirectRequestError as error:
+                entry = _EnrichmentEntry(
+                    outcome=None,
+                    error_code=sanitized_direct_error_code(
+                        error.error_code,
+                        "DIRECT_REQUEST_FAILED",
+                    ),
+                    stored_at=now,
+                )
+            except Exception:
+                entry = _EnrichmentEntry(
+                    outcome=None,
+                    error_code="DIRECT_REQUEST_FAILED",
+                    stored_at=now,
+                )
+        with self._lock:
+            self._cache[symbol] = entry
+        return entry
+
+    @staticmethod
+    def _without_enrichment(
+        snapshot: MarketSnapshot,
+        error_code: str,
+    ) -> MarketSnapshot:
+        capabilities = dict(snapshot.capabilities)
+        capabilities["l2"] = {
+            "available": False,
+            "reason": error_code,
+        }
+        source_errors = dict(snapshot.source_errors)
+        source_errors["core_metrics"] = error_code
+        return replace(
+            snapshot,
+            capabilities=capabilities,
+            source_errors=source_errors,
+        )
+
+    def _merge(
+        self,
+        snapshot: MarketSnapshot,
+        outcome: DirectReadOutcome,
+    ) -> MarketSnapshot:
+        values = outcome.values
+        quote = dict(snapshot.quote)
+        quote.update(
+            {
+                "large_order_net": values.get(MetricKind.LARGE_ORDER_NET),
+                "large_order_amount": values.get(
+                    MetricKind.LARGE_ORDER_AMOUNT
+                ),
+                "retail_count": values.get(MetricKind.RETAIL_COUNT),
+                "macdfs": values.get(MetricKind.MACDFS),
+            }
+        )
+        intraday_series = dict(snapshot.intraday_series)
+        for kind, series in outcome.intraday_series.items():
+            name = self._INTRADAY_NAMES.get(kind)
+            if name is not None and series.get("points"):
+                intraday_series[name] = series
+        main_fund_flow: dict[str, dict[str, str | None]] = {}
+        for period, _label, unit_kind in FUND_FLOW_PERIODS:
+            metrics = FUND_FLOW_METRICS[period]
+            unit = values.get(unit_kind)
+            period_values = {
+                name: values.get(kind)
+                for name, kind in metrics.items()
+            }
+            if unit is not None or any(
+                value is not None for value in period_values.values()
+            ):
+                main_fund_flow[period] = {
+                    "unit": unit,
+                    **period_values,
+                }
+        capabilities = dict(snapshot.capabilities)
+        capabilities["l2"] = {"available": True, "reason": None}
+        source_errors = dict(snapshot.source_errors)
+        source_errors.update(outcome.source_errors)
+        return replace(
+            snapshot,
+            quote=quote,
+            intraday_series=intraday_series,
+            main_fund_flow=main_fund_flow,
+            capabilities=capabilities,
+            source_errors=source_errors,
+        )
+
+    def read_market_snapshot(
+        self,
+        symbol: str,
+        *,
+        detail: bool,
+    ) -> MarketSnapshot:
+        read_snapshot = getattr(
+            self.base_source,
+            "read_market_snapshot",
+            None,
+        )
+        if not callable(read_snapshot):
+            raise PublicMarketError("MARKET_QUOTE_UNAVAILABLE")
+        snapshot = read_snapshot(symbol, detail=detail)
+        if not detail:
+            return snapshot
+        entry = self._read_enrichment(symbol)
+        if entry.outcome is None:
+            return self._without_enrichment(
+                snapshot,
+                entry.error_code or "DIRECT_REQUEST_FAILED",
+            )
+        return self._merge(snapshot, entry.outcome)
+
+    def read_market_series(
+        self,
+        symbol: str,
+        period: str,
+        cursor: str | None,
+        limit: int,
+    ) -> MarketSeriesPage:
+        read_series = getattr(self.base_source, "read_market_series", None)
+        if not callable(read_series):
+            raise PublicMarketError("PUBLIC_MARKET_PERIOD_UNSUPPORTED")
+        return read_series(symbol, period, cursor, limit)

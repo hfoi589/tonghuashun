@@ -352,11 +352,11 @@ class _DailyCacheEntry:
 
 
 class DailyKlineMarketDataSource:
-    """Add a public-first, App-fallback daily qfq series to a market source."""
+    """Add THS-public-first daily qfq data to a public market source."""
 
     def __init__(
         self,
-        app_source: Any,
+        base_source: Any,
         public_provider: TonghuashunPublicDailyKlineProvider,
         *,
         clock: Callable[[], float] = time.monotonic,
@@ -364,7 +364,7 @@ class DailyKlineMarketDataSource:
         open_cache_seconds: float = 60.0,
         closed_cache_seconds: float = 15 * 60.0,
     ) -> None:
-        self.app_source = app_source
+        self.base_source = base_source
         self.public_provider = public_provider
         self.clock = clock
         self.is_market_open = is_market_open
@@ -375,13 +375,13 @@ class DailyKlineMarketDataSource:
         self._state_lock = threading.RLock()
         self._stats = {
             "public_successes": 0,
-            "app_fallbacks": 0,
+            "fallback_successes": 0,
             "stale_cache_hits": 0,
             "failures": 0,
         }
 
     def read_market_snapshot(self, symbol: str, *, detail: bool) -> MarketSnapshot:
-        snapshot = self.app_source.read_market_snapshot(symbol, detail=detail)
+        snapshot = self.base_source.read_market_snapshot(symbol, detail=detail)
         capabilities = dict(snapshot.capabilities)
         capabilities["daily_kline"] = {"available": True, "adjustment": "qfq"}
         return replace(snapshot, capabilities=capabilities)
@@ -437,7 +437,7 @@ class DailyKlineMarketDataSource:
         limit: int,
     ) -> MarketSeriesPage:
         if period != "day":
-            return self.app_source.read_market_series(symbol, period, cursor, limit)
+            return self.base_source.read_market_series(symbol, period, cursor, limit)
 
         key = (symbol, period)
         with self._lock_for(key):
@@ -453,13 +453,16 @@ class DailyKlineMarketDataSource:
                     cached=True,
                     stale=False,
                     source_error=None,
-                    source_errors={"public_kline": None, "app_kline": None},
+                    source_errors={
+                        "ths_public_kline": None,
+                        "tencent_public_kline": None,
+                    },
                 )
 
             required = max(489, limit + 249)
             source_errors: dict[str, str | None] = {
-                "public_kline": None,
-                "app_kline": None,
+                "ths_public_kline": None,
+                "tencent_public_kline": None,
             }
             entry: _DailyCacheEntry | None = None
             try:
@@ -475,33 +478,36 @@ class DailyKlineMarketDataSource:
                 with self._state_lock:
                     self._stats["public_successes"] += 1
             except Exception as error:
-                source_errors["public_kline"] = self._error_code(error)
+                source_errors["ths_public_kline"] = self._error_code(error)
 
             if entry is None:
                 try:
-                    app_page = self.app_source.read_market_series(
+                    fallback_page = self.base_source.read_market_series(
                         symbol,
                         period,
                         cursor,
                         required,
                     )
-                    if not app_page.bars:
+                    if not fallback_page.bars:
                         raise DailyKlineSourceError(
-                            app_page.source_error or "DIRECT_KLINE_UNAVAILABLE"
+                            fallback_page.source_error
+                            or "PUBLIC_KLINE_UNAVAILABLE"
                         )
                     bars = _validate_bars(
-                        app_page.bars,
-                        error_code="DIRECT_KLINE_RESPONSE_INVALID",
+                        fallback_page.bars,
+                        error_code="PUBLIC_KLINE_RESPONSE_INVALID",
                     )
                     entry = _DailyCacheEntry(
                         bars=bars[-required:],
-                        source="THS_APP",
+                        source=fallback_page.source or "TENCENT_PUBLIC",
                         stored_at=now,
                     )
                     with self._state_lock:
-                        self._stats["app_fallbacks"] += 1
+                        self._stats["fallback_successes"] += 1
                 except Exception as error:
-                    source_errors["app_kline"] = self._error_code(error)
+                    source_errors["tencent_public_kline"] = self._error_code(
+                        error
+                    )
 
             if entry is not None:
                 with self._state_lock:

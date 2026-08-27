@@ -3,7 +3,13 @@ from datetime import datetime, timezone
 
 import pytest
 
-from level2_service.parsed_values import SymbolLookup
+from level2_service.market_data import MarketSnapshot
+from level2_service.models import MetricKind
+from level2_service.parsed_values import (
+    DirectReadOutcome,
+    DirectRequestError,
+    SymbolLookup,
+)
 
 
 def _tencent_quote_fields(
@@ -337,3 +343,119 @@ def test_public_market_rejects_provider_identity_mismatch_with_fixed_error() -> 
 
     assert caught.value.error_code == "PUBLIC_MARKET_RESPONSE_INVALID"
     assert "错误股票" not in str(caught.value)
+
+
+def test_direct_enrichment_merges_only_l2_owned_fields_and_is_cached() -> None:
+    from level2_service.public_market import DirectEnrichedMarketDataSource
+
+    public_snapshot = MarketSnapshot(
+        symbol="601872",
+        name="公开名称",
+        market="17",
+        sequence=0,
+        source_time="15:00",
+        collected_at=datetime.now(timezone.utc),
+        quote={
+            "price": "18.62",
+            "change_percent": "1.31%",
+            "large_order_net": None,
+            "large_order_amount": None,
+            "retail_count": None,
+            "macdfs": None,
+        },
+        source="TENCENT_PUBLIC",
+    )
+
+    class Base:
+        @staticmethod
+        def read_market_snapshot(_symbol: str, *, detail: bool):
+            assert detail is True
+            return public_snapshot
+
+    values = {kind: None for kind in MetricKind}
+    values.update(
+        {
+            MetricKind.STOCK_NAME: "私有名称不得覆盖",
+            MetricKind.CURRENT_PRICE: "99.99",
+            MetricKind.LARGE_ORDER_NET: "-0.16",
+            MetricKind.LARGE_ORDER_AMOUNT: "-22920.5",
+            MetricKind.RETAIL_COUNT: "16.24",
+            MetricKind.MACDFS: "+0.012",
+            MetricKind.MAIN_FLOW_TODAY_UNIT: "亿元",
+            MetricKind.MAIN_FLOW_TODAY_NET: "1.23",
+        }
+    )
+    direct_calls: list[str] = []
+
+    class Direct:
+        @staticmethod
+        def read_direct(symbol: str):
+            direct_calls.append(symbol)
+            return DirectReadOutcome(
+                values=values,
+                source_errors={"core_metrics": None, "main_fund_flow": None},
+                intraday_series={
+                    MetricKind.LARGE_ORDER_NET: {
+                        "unit": None,
+                        "points": [{"time": "15:00", "value": "-0.16"}],
+                    },
+                    MetricKind.MACDFS: {
+                        "unit": None,
+                        "points": [{"time": "15:00", "value": "+0.012"}],
+                    },
+                },
+            )
+
+    source = DirectEnrichedMarketDataSource(
+        Base(),
+        Direct(),
+        ttl_seconds=15,
+        clock=lambda: 100,
+    )
+
+    first = source.read_market_snapshot("601872", detail=True)
+    second = source.read_market_snapshot("601872", detail=True)
+
+    assert first.name == "公开名称"
+    assert first.quote["price"] == "18.62"
+    assert first.quote["large_order_net"] == "-0.16"
+    assert first.intraday_series["large_order_net"]["points"][0]["value"] == "-0.16"
+    assert first.intraday_series["macdfs"]["points"][0]["value"] == "+0.012"
+    assert first.main_fund_flow["today"]["main_net_inflow"] == "1.23"
+    assert first.capabilities["l2"]["available"] is True
+    assert second.quote == first.quote
+    assert direct_calls == ["601872"]
+
+
+def test_direct_enrichment_failure_keeps_the_public_snapshot_available() -> None:
+    from level2_service.public_market import DirectEnrichedMarketDataSource
+
+    snapshot = MarketSnapshot(
+        symbol="601872",
+        name="招商轮船",
+        market="17",
+        sequence=0,
+        source_time="15:00",
+        collected_at=datetime.now(timezone.utc),
+        quote={"price": "18.62"},
+        source="TENCENT_PUBLIC",
+    )
+
+    class Base:
+        @staticmethod
+        def read_market_snapshot(_symbol: str, *, detail: bool):
+            return snapshot
+
+    class Direct:
+        @staticmethod
+        def read_direct(_symbol: str):
+            raise DirectRequestError("DIRECT_SESSION_UNAVAILABLE")
+
+    result = DirectEnrichedMarketDataSource(
+        Base(),
+        Direct(),
+    ).read_market_snapshot("601872", detail=True)
+
+    assert result.quote["price"] == "18.62"
+    assert result.capabilities["l2"]["available"] is False
+    assert result.source_errors["core_metrics"] == "DIRECT_SESSION_UNAVAILABLE"

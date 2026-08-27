@@ -2,6 +2,8 @@
 # Install the loopback lifecycle broker from a project checkout into a stable user location.
 set -eu
 exec 3>&2
+exec 4>&1
+exec 1>/dev/null
 exec 2>/dev/null
 
 usage() {
@@ -169,4 +171,4 @@ launchctl kickstart -k gui/$UID/com.ths.device-lifecycle >/dev/null 2>&1 || fail
 launchctl kickstart -k gui/$UID/com.ths.device-bridge.27042 >/dev/null 2>&1 || fail
 launchctl kickstart -k gui/$UID/com.ths.device-bridge.27043 >/dev/null 2>&1 || fail
 
-printf '%s\n' 'DEVICE_LIFECYCLE_INSTALL_READY'
+printf '%s\n' 'DEVICE_LIFECYCLE_INSTALL_READY' >&4

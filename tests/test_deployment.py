@@ -140,7 +140,10 @@ def fake_lifecycle_environment(
     write_fake_tool(tools / "python3", 'exec "$REAL_PYTHON" "$@"')
     write_fake_tool(tools / "adb", "exit 0")
     if install_fails:
-        write_fake_tool(tools / "install", "printf '%s\\n' 'install internal path=/private/secret' >&2\nexit 25")
+        write_fake_tool(
+            tools / "install",
+            "printf '%s\\n' 'install stdout port=27043'\nprintf '%s\\n' 'install stderr path=/private/secret' >&2\nexit 25",
+        )
     if emulator_fails:
         emulator_body = "printf '%s\\n' 'emulator internal serial=emulator-5554' >&2\nexit 23"
     else:

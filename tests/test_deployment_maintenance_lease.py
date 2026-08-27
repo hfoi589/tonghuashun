@@ -279,6 +279,44 @@ def test_internal_acceptance_endpoint_binds_one_fixed_task_and_is_idempotent() -
     assert store.next_runnable().task_id == first.json()["public_id"]
 
 
+@pytest.mark.parametrize("kind", ["memory", "redis"])
+def test_repeated_binding_requeues_the_same_terminal_acceptance_task(
+    kind: str,
+) -> None:
+    """A retained lease can retry after repair without creating a second task ID."""
+    clock = ManualClock()
+    store = (
+        memory_store(clock)
+        if kind == "memory"
+        else RedisStreamsStore(FakeRedis(clock=clock))
+    )
+    assert store.acquire_deployment_lease(OWNER, 60.0)
+    first = store.bind_deployment_acceptance(
+        OWNER,
+        TaskRecord(
+            task_id="acceptance-one", symbol="601872", include_long_capture=False
+        ),
+    )
+    assert first is not None
+    assert store.next_runnable().task_id == "acceptance-one"
+    store.transition(
+        "acceptance-one", TaskStatus.FAILED, error_code="DIRECT_APP_OFFLINE"
+    )
+
+    rebound = store.bind_deployment_acceptance(
+        OWNER,
+        TaskRecord(
+            task_id="acceptance-two", symbol="601872", include_long_capture=False
+        ),
+    )
+
+    assert rebound is not None
+    assert rebound.task_id == "acceptance-one"
+    assert rebound.status == TaskStatus.QUEUED
+    assert rebound.error_code is None
+    assert store.next_runnable().task_id == "acceptance-one"
+
+
 def test_internal_acceptance_endpoint_fails_closed_without_exposing_owner(
     caplog: pytest.LogCaptureFixture,
 ) -> None:

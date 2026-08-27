@@ -174,12 +174,36 @@ class FakeRedis:
                     if not existing:
                         return False
                     task = json.loads(existing)
-                    return (
-                        existing
-                        if task["symbol"] == "601872"
+                    if not (
+                        task["symbol"] == "601872"
                         and task["include_long_capture"] is False
-                        else False
-                    )
+                    ):
+                        return False
+                    if task["status"] in {"COMPLETED", "FAILED", "EXPIRED"} or (
+                        task["status"] == "PARTIAL"
+                        and task.get("completed_at") is not None
+                    ):
+                        pending = sum(
+                            json.loads(self.get(prefix + existing_id))["status"]
+                            in {"QUEUED", "RUNNING", "WAITING_ADMIN"}
+                            for existing_id in self.sets.get(index_key, set())
+                            if self.get(prefix + existing_id)
+                        )
+                        if pending >= int(cap):
+                            return "QUEUE_FULL"
+                        refreshed = json.loads(payload)
+                        refreshed["task_id"] = bound
+                        updated = json.dumps(refreshed)
+                        self.set(prefix + bound, updated)
+                        self.lrem(queue_key, 0, bound)
+                        self.rpush(queue_key, bound)
+                        self.sadd(index_key, bound)
+                        self.xadd(
+                            event_stream,
+                            {"event": "status", "task_id": bound, "data": "QUEUED"},
+                        )
+                        return updated
+                    return existing
                 if self.get(prefix + task_id):
                     return False
                 pending = sum(

@@ -391,6 +391,11 @@ class InMemoryStreams:
                     or existing.include_long_capture is not False
                 ):
                     return None
+                if existing.status in _REFRESHABLE_STATUSES:
+                    try:
+                        return self._refresh_locked(existing, False)
+                    except QueueFullError:
+                        return None
                 return existing
             if task.task_id in self._tasks:
                 return None
@@ -772,6 +777,28 @@ if lease.bound_task_id and lease.bound_task_id ~= cjson.null then
   local existing_task = cjson.decode(existing)
   if existing_task.symbol ~= '601872' or existing_task.include_long_capture ~= false then
     return false
+  end
+  if existing_task.status == 'COMPLETED' or existing_task.status == 'FAILED' or existing_task.status == 'EXPIRED' or (existing_task.status == 'PARTIAL' and existing_task.completed_at and existing_task.completed_at ~= cjson.null) then
+    local pending = 0
+    for _, task_id in ipairs(redis.call('SMEMBERS', KEYS[4])) do
+      local payload = redis.call('GET', KEYS[3] .. task_id)
+      if payload then
+        local queued = cjson.decode(payload)
+        if queued.status == 'QUEUED' or queued.status == 'RUNNING' or queued.status == 'WAITING_ADMIN' then
+          pending = pending + 1
+        end
+      end
+    end
+    if pending >= tonumber(ARGV[5]) then return 'QUEUE_FULL' end
+    local refreshed = cjson.decode(ARGV[3])
+    refreshed.task_id = lease.bound_task_id
+    local updated = cjson.encode(refreshed)
+    redis.call('SET', KEYS[3] .. lease.bound_task_id, updated)
+    redis.call('LREM', KEYS[2], 0, lease.bound_task_id)
+    redis.call('RPUSH', KEYS[2], lease.bound_task_id)
+    redis.call('SADD', KEYS[4], lease.bound_task_id)
+    redis.call('XADD', KEYS[5], '*', 'event', 'status', 'task_id', lease.bound_task_id, 'data', 'QUEUED')
+    return updated
   end
   return existing
 end

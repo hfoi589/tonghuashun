@@ -183,6 +183,32 @@ def test_api_image_embeds_frontend_without_a_caddy_stage() -> None:
     assert "FROM caddy:" not in dockerfile
 
 
+def test_api_image_embeds_read_only_fixed_host_deployment_helpers() -> None:
+    """A complete private image must carry reviewed helpers without writable host state."""
+    dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+
+    for source, destination in (
+        (
+            "scripts/install-macos-device-lifecycle.sh",
+            "/opt/ths/deployment/install-macos-device-lifecycle.sh",
+        ),
+        (
+            "scripts/macos-device-lifecycle.py",
+            "/opt/ths/deployment/macos-device-lifecycle.py",
+        ),
+        (
+            "scripts/watch-macos-device-bridge.sh",
+            "/opt/ths/deployment/watch-macos-device-bridge.sh",
+        ),
+        (
+            "scripts/configure-macos-core-display.sh",
+            "/opt/ths/deployment/configure-macos-core-display.sh",
+        ),
+    ):
+        assert f"COPY --chmod=0555 {source} {destination}" in dockerfile
+    assert "chmod 0555 /opt/ths/assets /opt/ths/deployment" in dockerfile
+
+
 def test_caddy_configuration_file_is_removed() -> None:
     assert not (ROOT / "deploy" / "Caddyfile").exists()
 

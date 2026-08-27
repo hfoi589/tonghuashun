@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import getpass
 import os
 import secrets
@@ -33,10 +34,16 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Refusing to overwrite existing secret file: {args.env_file}", file=sys.stderr)
         return 2
     password_hash = PasswordHasher(type=Type.ID).hash(password)
+    session_encryption_key = base64.urlsafe_b64encode(os.urandom(32)).decode("ascii")
     # Compose interpolates unquoted `$name` sequences while loading `.env`.
     # Single quotes keep the Argon2id separators literal without persisting
     # the administrator's plaintext password.
-    content = f"ADMIN_PASSWORD_HASH='{password_hash}'\nADMIN_SESSION_SECRET={secrets.token_urlsafe(48)}\n"
+    content = (
+        f"ADMIN_PASSWORD_HASH='{password_hash}'\n"
+        f"ADMIN_SESSION_SECRET={secrets.token_urlsafe(48)}\n"
+        f"THS_SESSION_ENCRYPTION_KEY={session_encryption_key}\n"
+        f"THS_DEVICE_LIFECYCLE_TOKEN={secrets.token_urlsafe(32)}\n"
+    )
     with os.fdopen(descriptor, "w", encoding="utf-8") as output:
         output.write(content)
     os.chmod(args.env_file, 0o600)

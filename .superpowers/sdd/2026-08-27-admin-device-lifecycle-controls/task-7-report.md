@@ -292,3 +292,96 @@ rerun.
 No real `.env`, AVD, ADB device, lifecycle broker, LaunchAgent, Emulator, or
 Android SDK command was touched. The only Docker execution was read-only
 `compose config`; it did not build, start, stop, or mutate containers.
+
+## Fix round 2 — Preserve truly stopped roles with fail-closed port identity
+
+The remaining Important finding was reproduced: the pre-install identity
+check unconditionally required `adb emu avd name`, so the fake “STOPPED” role
+was internally inconsistent and a real stopped role could never reach broker
+startup.
+
+### Exact RED evidence
+
+After separating fake ADB attachment state from broker lifecycle state, the
+required regressions produced three failures while the already-valid attached
+identity cases remained green:
+
+```text
+/Users/wilson/tonghuashun/.venv/bin/python -m pytest -q \
+  tests/test_macos_one_click_deploy.py \
+  -k 'truly_stopped or wrong_or_missing_fixed_serial or wrong_starting_process or rechecks_fixed_serial'
+..FFF                                                                    [100%]
+3 failed, 2 passed, 34 deselected in 0.08s
+```
+
+- The truly stopped role failed at the unconditional pre-install ADB identity
+  call and never reached broker startup.
+- A wrong starting-process AVD returned the generic identity error without
+  ever executing the required `get-state` and host `ps` checks.
+- The post-start mismatch failed before installer/broker activity, proving the
+  fake had incorrectly exposed ADB identity for a supposedly stopped role.
+
+An ambiguity mutation then showed that malformed fixed-port process evidence
+could be ignored until after lifecycle mutation:
+
+```text
+/Users/wilson/tonghuashun/.venv/bin/python -m pytest -q \
+  tests/test_macos_one_click_deploy.py -k ambiguous_starting_process
+.F                                                                       [100%]
+1 failed, 1 passed, 39 deselected in 0.07s
+```
+
+The failing case contained a non-numeric `ps` PID with exact `-port 5556` and
+reached the installer before rejection.
+
+### Fix and exact GREEN evidence
+
+- Pre-install checks now call fixed `adb -s <serial> get-state`.
+  - `device` requires the exact fixed `adb emu avd name` response.
+  - A non-device/absent serial triggers only read-only
+    `ps -axo pid=,command=` inspection.
+  - No process with the fixed port is accepted as truly stopped only when ADB
+    reported the serial absent.
+  - A process claiming the fixed port must contain exactly one matching
+    `-port` and exactly one matching fixed `-avd`; wrong, repeated, malformed,
+    multiple, or ambiguous evidence fails before lifecycle installation.
+- After broker startup/wait reaches `RUNNING`, both roles still unconditionally
+  require the exact ADB `emu avd name` identity.
+
+Required and ambiguity regressions after the fix:
+
+```text
+/Users/wilson/tonghuashun/.venv/bin/python -m pytest -q \
+  tests/test_macos_one_click_deploy.py \
+  -k 'truly_stopped or wrong_or_missing_fixed_serial or wrong_starting_process or ambiguous_starting_process or rechecks_fixed_serial'
+.......                                                                  [100%]
+7 passed, 34 deselected in 0.03s
+```
+
+### Covering verification
+
+```text
+/Users/wilson/tonghuashun/.venv/bin/python -m pytest -q \
+  tests/test_macos_one_click_deploy.py tests/test_deploy_configuration.py
+....................................................................     [100%]
+68 passed in 2.65s
+```
+
+```text
+/Users/wilson/tonghuashun/.venv/bin/python -m pytest -q
+666 passed, 24 existing deprecation warnings in 26.76s
+```
+
+Static verification completed successfully:
+
+```text
+/Users/wilson/tonghuashun/.venv/bin/python -m py_compile \
+  scripts/macos_deploy.py scripts/setup-admin.py
+/bin/sh -n scripts/deploy-macos-one-click.sh \
+  scripts/container-provision-device.sh
+git diff --check
+```
+
+The Dockerfile and image asset layers were unchanged, so no image rebuild or
+asset audit was required. No real device, ADB server, Emulator, lifecycle
+broker, LaunchAgent, Android SDK tool, or deployment env file was touched.

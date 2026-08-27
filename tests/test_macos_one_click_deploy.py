@@ -369,6 +369,8 @@ class FakeCommandRunner:
         apk_sha256: str = APK_SHA256,
         apk_path: str = "/data/app/~~safe/com.hexin.plat.android-safe/base.apk",
         avds: tuple[str, ...] = ("THS_CORE_33_ARM64", "THS_API_33_ARM64"),
+        adb_states: dict[str, str | None] | None = None,
+        process_snapshots: list[str] | None = None,
         avd_identity_sequences: dict[str, list[str | None]] | None = None,
         healthy: bool = True,
         compose_environment: dict[str, str] | None = None,
@@ -378,6 +380,12 @@ class FakeCommandRunner:
         self.apk_sha256 = apk_sha256
         self.apk_path = apk_path
         self.avds = avds
+        self.adb_states = {
+            "emulator-5556": "device",
+            "emulator-5554": "device",
+            **(adb_states or {}),
+        }
+        self.process_snapshots = list(process_snapshots or [])
         self.avd_identity_sequences = {
             serial: list(values)
             for serial, values in (avd_identity_sequences or {}).items()
@@ -412,6 +420,17 @@ class FakeCommandRunner:
             )
         if args == ("emulator", "-list-avds"):
             return _completed(args, stdout=("\n".join(self.avds) + "\n").encode())
+        if len(args) == 4 and args[:2] == ("adb", "-s") and args[3] == "get-state":
+            serial = args[2]
+            state = self.adb_states[serial]
+            self.events.append(f"adb-state:{serial}:{state}")
+            if state is None:
+                return _completed(args, returncode=1, stderr=b"device absent")
+            return _completed(args, stdout=f"{state}\n".encode())
+        if args == ("ps", "-axo", "pid=,command="):
+            snapshot = self.process_snapshots.pop(0) if self.process_snapshots else ""
+            self.events.append(f"process-snapshot:{snapshot}")
+            return _completed(args, stdout=snapshot.encode())
         if len(args) == 6 and args[:2] == ("adb", "-s") and args[3:] == (
             "emu",
             "avd",
@@ -422,6 +441,16 @@ class FakeCommandRunner:
                 "emulator-5556": "THS_CORE_33_ARM64",
                 "emulator-5554": "THS_API_33_ARM64",
             }[serial]
+            role = {
+                "emulator-5556": "core_metrics",
+                "emulator-5554": "main_fund_flow",
+            }[serial]
+            broker_finished = any(
+                event == f"broker-wait:operation-{role}" for event in self.events
+            )
+            if self.adb_states[serial] is None and not broker_finished:
+                self.events.append(f"identity:{serial}:unavailable")
+                return _completed(args, returncode=1, stderr=b"device absent")
             sequence = self.avd_identity_sequences.get(serial, [])
             identity = sequence.pop(0) if sequence else default_identity
             self.events.append(f"identity:{serial}:{identity}")
@@ -517,6 +546,8 @@ def existing_mac_runner(
     apk_sha256: str = APK_SHA256,
     apk_path: str = "/data/app/~~safe/com.hexin.plat.android-safe/base.apk",
     avds: tuple[str, ...] = ("THS_CORE_33_ARM64", "THS_API_33_ARM64"),
+    adb_states: dict[str, str | None] | None = None,
+    process_snapshots: list[str] | None = None,
     avd_identity_sequences: dict[str, list[str | None]] | None = None,
     healthy: bool = True,
     compose_environment: dict[str, str] | None = None,
@@ -527,6 +558,8 @@ def existing_mac_runner(
         apk_sha256=apk_sha256,
         apk_path=apk_path,
         avds=avds,
+        adb_states=adb_states,
+        process_snapshots=process_snapshots,
         avd_identity_sequences=avd_identity_sequences,
         healthy=healthy,
         compose_environment=compose_environment,
@@ -616,6 +649,7 @@ def test_existing_mode_rejects_wrong_or_missing_fixed_serial_identity_before_mut
     module = _load_macos_deploy()
     events: list[str] = []
     runner = existing_mac_runner(
+        adb_states={"emulator-5556": "device"},
         avd_identity_sequences={"emulator-5556": [identity]},
         events=events,
     )
@@ -628,6 +662,55 @@ def test_existing_mode_rejects_wrong_or_missing_fixed_serial_identity_before_mut
     assert "installer" not in events
     assert not any(event.startswith("broker-") for event in events)
     assert not any("pm" in call and "path" in call for call in runner.calls)
+
+
+def test_existing_mode_rejects_wrong_starting_process_avd_before_mutation() -> None:
+    """A process on the fixed port must carry exactly the approved -avd argument."""
+    module = _load_macos_deploy()
+    events: list[str] = []
+    runner = existing_mac_runner(
+        adb_states={"emulator-5556": None},
+        process_snapshots=[
+            "123 /opt/android/emulator -avd THS_API_33_ARM64 -port 5556 -no-audio\n"
+        ],
+        events=events,
+    )
+    broker = FakeLifecycleBroker(events=events)
+
+    with pytest.raises(module.DeploymentError) as caught:
+        make_orchestrator(runner, broker=broker).deploy_existing()
+
+    assert caught.value.error_code == "FIXED_AVD_IDENTITY_MISMATCH"
+    assert ("adb", "-s", "emulator-5556", "get-state") in runner.calls
+    assert ("ps", "-axo", "pid=,command=") in runner.calls
+    assert "installer" not in events
+    assert not any(event.startswith("broker-") for event in events)
+
+
+@pytest.mark.parametrize(
+    "process_line",
+    [
+        "123 /opt/android/emulator -avd THS_CORE_33_ARM64 -port 5556 -port\n",
+        "not-a-pid /opt/android/emulator -avd THS_CORE_33_ARM64 -port 5556\n",
+    ],
+)
+def test_existing_mode_rejects_ambiguous_starting_process_options(
+    process_line: str,
+) -> None:
+    """A malformed repeated fixed-port option must not be treated as safely stopped."""
+    module = _load_macos_deploy()
+    events: list[str] = []
+    runner = existing_mac_runner(
+        adb_states={"emulator-5556": None},
+        process_snapshots=[process_line],
+        events=events,
+    )
+
+    with pytest.raises(module.DeploymentError) as caught:
+        make_orchestrator(runner).deploy_existing()
+
+    assert caught.value.error_code == "FIXED_AVD_IDENTITY_MISMATCH"
+    assert "installer" not in events
 
 
 def test_existing_mode_fails_closed_on_installed_apk_mismatch_before_compose_up() -> None:
@@ -878,11 +961,16 @@ def test_existing_mode_creates_only_a_missing_root_environment(env_exists: bool)
     assert filesystem.read_text(ROOT / ".env") == REQUIRED_ROOT_ENV
 
 
-def test_existing_mode_installs_lifecycle_before_starting_only_stopped_roles() -> None:
-    """Starting through an absent broker or restarting a running role would be unsafe."""
+def test_existing_mode_allows_a_truly_stopped_role_then_starts_it_through_broker() -> None:
+    """No ADB device and no process on the fixed port is a safe stopped role."""
     events: list[str] = []
     filesystem = FakeFileSystem()
-    runner = existing_mac_runner(filesystem=filesystem, events=events)
+    runner = existing_mac_runner(
+        adb_states={"emulator-5556": None},
+        process_snapshots=[""],
+        filesystem=filesystem,
+        events=events,
+    )
     broker = FakeLifecycleBroker(
         {"core_metrics": "STOPPED", "main_fund_flow": "RUNNING"},
         events=events,
@@ -894,7 +982,6 @@ def test_existing_mode_installs_lifecycle_before_starting_only_stopped_roles() -
     assert broker.wait_calls == [
         ("operation-core_metrics", "RUNNING", 180.0),
     ]
-    pre_core = events.index("identity:emulator-5556:THS_CORE_33_ARM64")
     pre_fund = events.index("identity:emulator-5554:THS_API_33_ARM64")
     assert events.index("installer") < events.index("broker-start:core_metrics")
     assert events.index("broker-start:core_metrics") < events.index(
@@ -906,7 +993,10 @@ def test_existing_mode_installs_lifecycle_before_starting_only_stopped_roles() -
     post_fund = len(events) - 1 - events[::-1].index(
         "identity:emulator-5554:THS_API_33_ARM64"
     )
-    assert pre_core < pre_fund < events.index("installer")
+    assert events.index("adb-state:emulator-5556:None") < events.index(
+        "process-snapshot:"
+    )
+    assert events.index("process-snapshot:") < pre_fund < events.index("installer")
     assert events.index("broker-wait:operation-core_metrics") < post_core < post_fund
 
 
@@ -915,8 +1005,10 @@ def test_existing_mode_rechecks_fixed_serial_identity_after_broker_startup() -> 
     module = _load_macos_deploy()
     events: list[str] = []
     runner = existing_mac_runner(
+        adb_states={"emulator-5556": None},
+        process_snapshots=[""],
         avd_identity_sequences={
-            "emulator-5556": ["THS_CORE_33_ARM64", "THS_API_33_ARM64"],
+            "emulator-5556": ["THS_API_33_ARM64"],
         },
         events=events,
     )

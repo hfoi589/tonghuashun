@@ -11,6 +11,7 @@ import json
 import os
 from pathlib import Path, PurePosixPath
 import re
+import shlex
 import shutil
 import stat
 import subprocess
@@ -30,6 +31,10 @@ PACKAGE_NAME = "com.hexin.plat.android"
 FIXED_ROLES = {
     "core_metrics": ("THS_CORE_33_ARM64", "emulator-5556"),
     "main_fund_flow": ("THS_API_33_ARM64", "emulator-5554"),
+}
+FIXED_EMULATOR_PORTS = {
+    "core_metrics": 5556,
+    "main_fund_flow": 5554,
 }
 REQUIRED_COMMANDS = (
     "adb",
@@ -282,7 +287,7 @@ class MacDeploymentOrchestrator:
         self._validate_effective_compose_config()
         self._build_local_image()
         manifest = self._read_image_manifest()
-        self._verify_fixed_avd_identities()
+        self._verify_preinstall_fixed_avd_identities()
         self._install_lifecycle_service()
         self._start_stopped_roles()
         self._verify_fixed_avd_identities()
@@ -544,20 +549,99 @@ class MacDeploymentOrchestrator:
 
     def _verify_fixed_avd_identities(self) -> None:
         for _role, (expected_avd, serial) in FIXED_ROLES.items():
-            result = self._run(
-                ("adb", "-s", serial, "emu", "avd", "name"),
+            self._require_adb_avd_identity(serial, expected_avd)
+
+    def _verify_preinstall_fixed_avd_identities(self) -> None:
+        for role, (expected_avd, serial) in FIXED_ROLES.items():
+            try:
+                state_result = self._runner.run(
+                    ("adb", "-s", serial, "get-state"), 15.0
+                )
+            except Exception:
+                raise DeploymentError("FIXED_AVD_IDENTITY_MISMATCH") from None
+            state = (
+                self._stdout_text(state_result).strip()
+                if state_result.returncode == 0
+                else ""
+            )
+            if state == "device":
+                self._require_adb_avd_identity(serial, expected_avd)
+                continue
+            process_result = self._run(
+                ("ps", "-axo", "pid=,command="),
                 15.0,
                 "FIXED_AVD_IDENTITY_MISMATCH",
             )
-            lines = [
-                line.strip().removesuffix("\r")
-                for line in self._stdout_text(result).splitlines()
-                if line.strip()
-            ]
-            if lines and lines[-1] == "OK":
-                lines.pop()
-            if lines != [expected_avd]:
+            has_starting_process = self._require_starting_process_identity(
+                self._stdout_text(process_result),
+                FIXED_EMULATOR_PORTS[role],
+                expected_avd,
+            )
+            if not has_starting_process and state_result.returncode == 0:
                 raise DeploymentError("FIXED_AVD_IDENTITY_MISMATCH")
+
+    def _require_adb_avd_identity(self, serial: str, expected_avd: str) -> None:
+        result = self._run(
+            ("adb", "-s", serial, "emu", "avd", "name"),
+            15.0,
+            "FIXED_AVD_IDENTITY_MISMATCH",
+        )
+        lines = [
+            line.strip()
+            for line in self._stdout_text(result).splitlines()
+            if line.strip()
+        ]
+        if lines and lines[-1] == "OK":
+            lines.pop()
+        if lines != [expected_avd]:
+            raise DeploymentError("FIXED_AVD_IDENTITY_MISMATCH")
+
+    @classmethod
+    def _require_starting_process_identity(
+        cls, output: str, port: int, expected_avd: str
+    ) -> bool:
+        candidates: list[str] = []
+        port_text = str(port)
+        port_marker = re.compile(
+            rf"(?:^|\s)-port(?:\s+|=){re.escape(port_text)}(?:\s|$)"
+        )
+        for raw_line in output.splitlines():
+            parts = raw_line.strip().split(maxsplit=1)
+            if len(parts) != 2 or not parts[0].isdigit():
+                if port_marker.search(raw_line):
+                    raise DeploymentError("FIXED_AVD_IDENTITY_MISMATCH")
+                continue
+            command = parts[1]
+            try:
+                tokens = shlex.split(command, posix=True)
+            except ValueError:
+                if port_marker.search(command):
+                    raise DeploymentError("FIXED_AVD_IDENTITY_MISMATCH") from None
+                continue
+            port_values = cls._option_values(tokens, "-port")
+            if port_text not in port_values:
+                continue
+            avd_values = cls._option_values(tokens, "-avd")
+            if port_values != [port_text] or len(avd_values) != 1:
+                raise DeploymentError("FIXED_AVD_IDENTITY_MISMATCH")
+            candidates.append(avd_values[0])
+        if not candidates:
+            return False
+        if candidates != [expected_avd]:
+            raise DeploymentError("FIXED_AVD_IDENTITY_MISMATCH")
+        return True
+
+    @staticmethod
+    def _option_values(tokens: list[str], option: str) -> list[str]:
+        values: list[str] = []
+        for index, token in enumerate(tokens):
+            if token == option:
+                if index + 1 >= len(tokens):
+                    raise DeploymentError("FIXED_AVD_IDENTITY_MISMATCH")
+                values.append(tokens[index + 1])
+            elif token.startswith(f"{option}="):
+                values.append(token.removeprefix(f"{option}="))
+        return values
 
     def _start_stopped_roles(self) -> None:
         broker = self._broker

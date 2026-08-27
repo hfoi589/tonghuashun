@@ -1,4 +1,5 @@
 import json
+import re
 from threading import Barrier, RLock, Thread
 from time import monotonic
 
@@ -115,6 +116,118 @@ class FakeRedis:
         original = len(entries)
         self.streams[key] = [entry for entry in entries if entry[0] not in set(entry_ids)]
         return original - len(self.streams[key])
+
+    @staticmethod
+    def _active_status(status):
+        return status in {"QUEUED", "RUNNING", "WAITING_ADMIN"}
+
+    def _ordinary_canonical(self, prefix, index_key, symbol, removed_id):
+        candidates = []
+        for raw_id in self.sets.get(index_key, set()):
+            if raw_id == removed_id:
+                continue
+            payload = self.get(prefix + raw_id)
+            if not payload:
+                continue
+            try:
+                task = json.loads(payload)
+            except (TypeError, ValueError):
+                continue
+            if (
+                task.get("task_id") != raw_id
+                or task.get("symbol") != symbol
+                or task.get("maintenance")
+            ):
+                continue
+            candidates.append(
+                (
+                    self._active_status(task.get("status")),
+                    task.get("created_at") or "",
+                    task.get("updated_at") or "",
+                    raw_id,
+                )
+            )
+        return max(candidates)[-1] if candidates else None
+
+    @staticmethod
+    def _valid_owner_digest(value):
+        return isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value)
+
+    def _validated_maintenance_raw(
+        self,
+        prefix,
+        raw_id,
+        *,
+        owner_digest=None,
+        allow_legacy=False,
+    ):
+        payload = self.get(prefix + raw_id)
+        if not payload:
+            return None
+        try:
+            task = json.loads(payload)
+        except (TypeError, ValueError):
+            return None
+        if not (
+            task.get("task_id") == raw_id
+            and task.get("symbol") == "601872"
+            and task.get("include_long_capture") is False
+        ):
+            return None
+        maintenance = task.get("maintenance")
+        if maintenance:
+            digest = maintenance.get("owner_digest")
+            if not (
+                maintenance.get("namespace") == "deployment_acceptance"
+                and self._valid_owner_digest(digest)
+                and (owner_digest is None or digest == owner_digest)
+            ):
+                return None
+        elif not allow_legacy:
+            return None
+        return payload, task
+
+    def _remove_maintenance_raw(
+        self,
+        *,
+        queue_key,
+        prefix,
+        index_key,
+        event_stream,
+        symbol_index,
+        alias_key,
+        raw_id,
+        payload,
+        task,
+    ):
+        canonical = self._ordinary_canonical(
+            prefix, index_key, task["symbol"], raw_id
+        )
+        aliases = self.hashes.get(alias_key, {})
+        for alias, target in list(aliases.items()):
+            if alias == raw_id:
+                self.hdel(alias_key, alias)
+            elif target == raw_id:
+                if canonical is None:
+                    self.hdel(alias_key, alias)
+                else:
+                    self.hset(alias_key, alias, canonical)
+        if canonical is None:
+            self.hdel(symbol_index, task["symbol"])
+        else:
+            self.hset(symbol_index, task["symbol"], canonical)
+        self.lrem(queue_key, 0, raw_id)
+        self.delete(prefix + raw_id)
+        self.srem(index_key, raw_id)
+        event_ids = [
+            event_id
+            for event_id, fields in self.streams.get(event_stream, [])
+            if fields.get("task_id") == raw_id
+        ]
+        if event_ids:
+            self.xdel(event_stream, *event_ids)
+        return payload
+
     def eval(self, script, key_count, *values):
         keys = values[:key_count]
         args = values[key_count:]
@@ -287,8 +400,109 @@ class FakeRedis:
                     keepttl=True,
                 )
                 return payload
+        if "THS_CLEANUP_EXPIRED_DEPLOYMENT_ACCEPTANCE" in script:
+            (
+                lease_key,
+                queue_key,
+                prefix,
+                index_key,
+                event_stream,
+                symbol_index,
+                alias_key,
+            ) = keys
+            with self._lock:
+                if self.get(lease_key):
+                    return []
+                targets = []
+                for raw_id in list(self.sets.get(index_key, set())):
+                    payload = self.get(prefix + raw_id)
+                    if not payload:
+                        continue
+                    try:
+                        task = json.loads(payload)
+                    except (TypeError, ValueError):
+                        continue
+                    if task.get("maintenance"):
+                        validated = self._validated_maintenance_raw(
+                            prefix, raw_id
+                        )
+                        if validated is None:
+                            return "INVALID"
+                        targets.append((raw_id, *validated))
+                removed = []
+                for raw_id, payload, task in targets:
+                    removed.append(
+                        self._remove_maintenance_raw(
+                            queue_key=queue_key,
+                            prefix=prefix,
+                            index_key=index_key,
+                            event_stream=event_stream,
+                            symbol_index=symbol_index,
+                            alias_key=alias_key,
+                            raw_id=raw_id,
+                            payload=payload,
+                            task=task,
+                        )
+                    )
+                return removed
+        if "THS_HOST_RELEASE_DEPLOYMENT_LEASE" in script:
+            (
+                lease_key,
+                queue_key,
+                prefix,
+                index_key,
+                event_stream,
+                symbol_index,
+                alias_key,
+            ) = keys
+            owner_digest, owner = args
+            with self._lock:
+                payload = self.get(lease_key)
+                if not payload:
+                    return 0
+                try:
+                    lease = json.loads(payload)
+                except (TypeError, ValueError):
+                    return 0
+                if (
+                    lease.get("owner_token") != owner
+                    or not self._valid_owner_digest(owner_digest)
+                    or lease.get("owner_digest", owner_digest) != owner_digest
+                ):
+                    return 0
+                task_id = lease.get("bound_task_id")
+                if task_id:
+                    validated = self._validated_maintenance_raw(
+                        prefix,
+                        task_id,
+                        owner_digest=owner_digest,
+                        allow_legacy=True,
+                    )
+                    if validated is None:
+                        return 0
+                    task_payload, task = validated
+                    self._remove_maintenance_raw(
+                        queue_key=queue_key,
+                        prefix=prefix,
+                        index_key=index_key,
+                        event_stream=event_stream,
+                        symbol_index=symbol_index,
+                        alias_key=alias_key,
+                        raw_id=task_id,
+                        payload=task_payload,
+                        task=task,
+                    )
+                return self.delete(lease_key)
         if "THS_RELEASE_DEPLOYMENT_LEASE" in script:
-            lease_key, queue_key, prefix, index_key, event_stream, symbol_index = keys
+            (
+                lease_key,
+                queue_key,
+                prefix,
+                index_key,
+                event_stream,
+                symbol_index,
+                alias_key,
+            ) = keys
             owner, owner_digest = args
             with self._lock:
                 payload = self.get(lease_key)
@@ -301,34 +515,26 @@ class FakeRedis:
                     return 0
                 task_id = lease.get("bound_task_id")
                 if task_id:
-                    task_payload = self.get(prefix + task_id)
-                    if not task_payload:
+                    validated = self._validated_maintenance_raw(
+                        prefix,
+                        task_id,
+                        owner_digest=owner_digest,
+                        allow_legacy=True,
+                    )
+                    if validated is None:
                         return 0
-                    task = json.loads(task_payload)
-                    if not (
-                        task["task_id"] == task_id
-                        and task["symbol"] == "601872"
-                        and task["include_long_capture"] is False
-                    ):
-                        return 0
-                    maintenance = task.get("maintenance")
-                    if maintenance and not (
-                        maintenance.get("namespace") == "deployment_acceptance"
-                        and maintenance.get("owner_digest") == owner_digest
-                    ):
-                        return 0
-                    self.lrem(queue_key, 0, task_id)
-                    self.delete(prefix + task_id)
-                    self.srem(index_key, task_id)
-                    if self.hget(symbol_index, task["symbol"]) == task_id:
-                        self.hdel(symbol_index, task["symbol"])
-                    event_ids = [
-                        event_id
-                        for event_id, fields in self.streams.get(event_stream, [])
-                        if fields.get("task_id") == task_id
-                    ]
-                    if event_ids:
-                        self.xdel(event_stream, *event_ids)
+                    task_payload, task = validated
+                    self._remove_maintenance_raw(
+                        queue_key=queue_key,
+                        prefix=prefix,
+                        index_key=index_key,
+                        event_stream=event_stream,
+                        symbol_index=symbol_index,
+                        alias_key=alias_key,
+                        raw_id=task_id,
+                        payload=task_payload,
+                        task=task,
+                    )
                 return self.delete(lease_key)
         if "THS_CLAIM_WITH_DEPLOYMENT_LEASE" in script:
             queue_key, prefix, event_stream, lease_key = keys

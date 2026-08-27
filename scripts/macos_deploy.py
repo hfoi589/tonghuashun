@@ -10,6 +10,7 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 import fnmatch
 import getpass
+import hashlib
 import hmac
 from http.cookies import SimpleCookie
 import json
@@ -579,33 +580,97 @@ return redis.call('PEXPIRE', KEYS[1], ARGV[1])
 """
 _HOST_RELEASE_LEASE_SCRIPT = """
 -- THS_HOST_RELEASE_DEPLOYMENT_LEASE
-local payload = redis.call('GET', KEYS[1])
-if not payload then return 0 end
-local lease = cjson.decode(payload)
-if lease.owner_token ~= ARGV[1] then return 0 end
-local task_id = lease.bound_task_id
-if task_id and task_id ~= cjson.null then
-  local task_payload = redis.call('GET', KEYS[3] .. task_id)
-  if not task_payload then return 0 end
-  local task = cjson.decode(task_payload)
-  if task.task_id ~= task_id or task.symbol ~= '601872' or task.include_long_capture ~= false then return 0 end
-  local maintenance = task.maintenance
-  if maintenance and maintenance ~= cjson.null and maintenance.namespace ~= 'deployment_acceptance' then return 0 end
-  redis.call('LREM', KEYS[2], 0, task_id)
-  redis.call('DEL', KEYS[3] .. task_id)
-  redis.call('SREM', KEYS[4], task_id)
-  if redis.call('HGET', KEYS[6], task.symbol) == task_id then
+local function is_active(status)
+  return status == 'QUEUED' or status == 'RUNNING' or status == 'WAITING_ADMIN'
+end
+local function better(candidate_id, candidate, best_id, best)
+  if not best then return true end
+  local candidate_active = is_active(candidate.status)
+  local best_active = is_active(best.status)
+  if candidate_active ~= best_active then return candidate_active end
+  local candidate_created = candidate.created_at or ''
+  local best_created = best.created_at or ''
+  if candidate_created ~= best_created then return candidate_created > best_created end
+  local candidate_updated = candidate.updated_at or ''
+  local best_updated = best.updated_at or ''
+  if candidate_updated ~= best_updated then return candidate_updated > best_updated end
+  return candidate_id > best_id
+end
+local function ordinary_canonical(symbol, removed_id)
+  local best_id = false
+  local best = false
+  for _, raw_id in ipairs(redis.call('SMEMBERS', KEYS[4])) do
+    if raw_id ~= removed_id then
+      local candidate_payload = redis.call('GET', KEYS[3] .. raw_id)
+      if candidate_payload then
+        local ok, candidate = pcall(cjson.decode, candidate_payload)
+        if ok and type(candidate) == 'table' and candidate.task_id == raw_id and candidate.symbol == symbol then
+          local maintenance = candidate.maintenance
+          if not maintenance or maintenance == cjson.null then
+            if better(raw_id, candidate, best_id, best) then
+              best_id = raw_id
+              best = candidate
+            end
+          end
+        end
+      end
+    end
+  end
+  return best_id
+end
+local function remove_task(raw_id, task)
+  local canonical_id = ordinary_canonical(task.symbol, raw_id)
+  local aliases = redis.call('HGETALL', KEYS[7])
+  for index = 1, #aliases, 2 do
+    local alias = aliases[index]
+    local target = aliases[index + 1]
+    if alias == raw_id then
+      redis.call('HDEL', KEYS[7], alias)
+    elseif target == raw_id then
+      if canonical_id then
+        redis.call('HSET', KEYS[7], alias, canonical_id)
+      else
+        redis.call('HDEL', KEYS[7], alias)
+      end
+    end
+  end
+  if canonical_id then
+    redis.call('HSET', KEYS[6], task.symbol, canonical_id)
+  else
     redis.call('HDEL', KEYS[6], task.symbol)
   end
+  redis.call('LREM', KEYS[2], 0, raw_id)
+  redis.call('DEL', KEYS[3] .. raw_id)
+  redis.call('SREM', KEYS[4], raw_id)
   for _, entry in ipairs(redis.call('XRANGE', KEYS[5], '-', '+')) do
     local fields = entry[2]
     for index = 1, #fields, 2 do
-      if fields[index] == 'task_id' and fields[index + 1] == task_id then
+      if fields[index] == 'task_id' and fields[index + 1] == raw_id then
         redis.call('XDEL', KEYS[5], entry[1])
         break
       end
     end
   end
+end
+local payload = redis.call('GET', KEYS[1])
+if not payload then return 0 end
+local lease_ok, lease = pcall(cjson.decode, payload)
+if not lease_ok or type(lease) ~= 'table' then return 0 end
+if string.len(ARGV[1]) ~= 64 or not string.match(ARGV[1], '^[0-9a-f]+$') then return 0 end
+if lease.owner_token ~= ARGV[2] then return 0 end
+if lease.owner_digest and lease.owner_digest ~= cjson.null and lease.owner_digest ~= ARGV[1] then return 0 end
+local task_id = lease.bound_task_id
+if task_id and task_id ~= cjson.null then
+  local task_payload = redis.call('GET', KEYS[3] .. task_id)
+  if not task_payload then return 0 end
+  local task_ok, task = pcall(cjson.decode, task_payload)
+  if not task_ok or type(task) ~= 'table' then return 0 end
+  if task.task_id ~= task_id or task.symbol ~= '601872' or task.include_long_capture ~= false then return 0 end
+  local maintenance = task.maintenance
+  if maintenance and maintenance ~= cjson.null then
+    if maintenance.namespace ~= 'deployment_acceptance' or maintenance.owner_digest ~= ARGV[1] then return 0 end
+  end
+  remove_task(task_id, task)
 end
 return redis.call('DEL', KEYS[1])
 """
@@ -684,9 +749,12 @@ class HostDeploymentMaintenance:
             raise DeploymentError("DEPLOYMENT_MAINTENANCE_LOST")
 
     def release(self) -> None:
+        owner_digest = hashlib.sha256(
+            self.owner_token.encode("ascii")
+        ).hexdigest()
         result = self._lease_eval(
             _HOST_RELEASE_LEASE_SCRIPT,
-            6,
+            7,
             (
                 self._LEASE_KEY,
                 "ths:jobs:pending",
@@ -694,8 +762,9 @@ class HostDeploymentMaintenance:
                 self._TASK_INDEX,
                 "ths:jobs:events",
                 "ths:jobs:symbols",
+                "ths:jobs:aliases",
             ),
-            (),
+            (owner_digest,),
             self.owner_token,
         )
         if result != "1":

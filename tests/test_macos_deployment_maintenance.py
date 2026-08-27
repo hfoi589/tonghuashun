@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+import hashlib
 import json
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -8,6 +9,10 @@ import subprocess
 from threading import Thread
 
 import pytest
+
+from level2_service.models import TaskRecord
+from level2_service.queue import RedisStreamsStore
+from tests.test_redis_store import FakeRedis
 
 from tests.test_macos_one_click_deploy import (
     ROOT,
@@ -157,6 +162,41 @@ class LeaseRunner:
         return _completed(args)
 
 
+class RedisEvalRunner:
+    """Execute the host's redis-cli EVAL contract against the deterministic Redis model."""
+
+    def __init__(self, redis: FakeRedis) -> None:
+        self.redis = redis
+        self.calls: list[tuple[str, ...]] = []
+        self.inputs: list[bytes | None] = []
+
+    def run(
+        self,
+        args: tuple[str, ...],
+        timeout: float,
+        input_data: bytes | None = None,
+    ) -> subprocess.CompletedProcess[bytes]:
+        del timeout
+        self.calls.append(args)
+        self.inputs.append(input_data)
+        eval_index = args.index("EVAL")
+        script = args[eval_index + 1]
+        key_count = int(args[eval_index + 2])
+        tail = list(args[eval_index + 3 :])
+        keys = tail[:key_count]
+        arguments = tail[key_count:]
+        if input_data is not None:
+            arguments.append(input_data.decode("ascii"))
+        result = self.redis.eval(script, key_count, *keys, *arguments)
+        if result is False or result is None:
+            output = b"\n"
+        elif isinstance(result, bytes):
+            output = result + b"\n"
+        else:
+            output = f"{result}\n".encode("utf-8")
+        return _completed(args, stdout=output)
+
+
 class FakeAdminMaintenance:
     def __init__(self) -> None:
         self.passwords: list[str] = []
@@ -247,16 +287,135 @@ def test_host_release_script_cleans_only_the_bound_maintenance_task() -> None:
         for call in runner.calls
         if "THS_HOST_RELEASE_DEPLOYMENT_LEASE" in " ".join(call)
     )
-    assert release_call[release_call.index("EVAL") + 2] == "6"
+    assert release_call[release_call.index("EVAL") + 2] == "7"
     key_start = release_call.index("EVAL") + 3
-    assert release_call[key_start:key_start + 6] == (
+    assert release_call[key_start:key_start + 7] == (
         "ths:jobs:deployment-maintenance",
         "ths:jobs:pending",
         "ths:jobs:task:",
         "ths:jobs:tasks",
         "ths:jobs:events",
         "ths:jobs:symbols",
+        "ths:jobs:aliases",
     )
+    digest_index = key_start + 7
+    assert release_call[digest_index] == hashlib.sha256(OWNER.encode()).hexdigest()
+
+
+def make_host_release_maintenance(redis: FakeRedis, owner: str = OWNER):
+    module = _load_macos_deploy()
+    state = MemoryOwnerState()
+    state.store(owner)
+    runner = RedisEvalRunner(redis)
+    maintenance = module.HostDeploymentMaintenance(
+        runner,
+        compose_prefix,
+        FakeAdminMaintenance(),
+        state,
+        password_reader=lambda: "private-admin-password",
+        owner_factory=lambda: owner,
+        poll_interval_seconds=0.0,
+    )
+    maintenance._owner_token = owner
+    return module, maintenance
+
+
+def test_host_release_repairs_alias_and_symbol_index_to_ordinary_canonical() -> None:
+    """Rollback cleanup has the same public-history repair as the API store release."""
+    redis = FakeRedis()
+    store = RedisStreamsStore(redis)
+    ordinary = TaskRecord(
+        task_id="host-ordinary",
+        symbol="601872",
+        include_long_capture=False,
+    )
+    store.enqueue(ordinary)
+    assert store.acquire_deployment_lease(OWNER, 60.0)
+    bound = store.bind_deployment_acceptance(
+        OWNER,
+        TaskRecord(
+            task_id="host-maintenance",
+            symbol="601872",
+            include_long_capture=False,
+        ),
+    )
+    assert bound is not None
+    redis.hset(store._alias_key, "host-public-alias", bound.task_id)
+    redis.hset(store._symbol_index_key, "601872", bound.task_id)
+    _module, maintenance = make_host_release_maintenance(redis)
+
+    maintenance.release()
+
+    assert store.get(bound.task_id) is None
+    assert store.resolve_task_id("host-public-alias") == ordinary.task_id
+    assert redis.hget(store._symbol_index_key, "601872") == ordinary.task_id
+    assert store.submit_or_refresh(
+        TaskRecord(task_id="host-duplicate", symbol="601872")
+    ).task_id == ordinary.task_id
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    ["namespace", "owner_digest", "task_id", "symbol", "capture"],
+)
+def test_host_release_fails_closed_on_maintenance_marker_corruption(
+    corruption: str,
+) -> None:
+    """The host proves the namespace and SHA-256 owner binding before deletion."""
+    redis = FakeRedis()
+    store = RedisStreamsStore(redis)
+    assert store.acquire_deployment_lease(OWNER, 60.0)
+    bound = store.bind_deployment_acceptance(
+        OWNER,
+        TaskRecord(
+            task_id="host-corrupt",
+            symbol="601872",
+            include_long_capture=False,
+        ),
+    )
+    assert bound is not None
+    raw = json.loads(redis.get(store._key(bound.task_id)))
+    if corruption == "namespace":
+        raw["maintenance"]["namespace"] = "ordinary"
+    elif corruption == "owner_digest":
+        raw["maintenance"]["owner_digest"] = "0" * 64
+    elif corruption == "task_id":
+        raw["task_id"] = "forged-host-id"
+    elif corruption == "symbol":
+        raw["symbol"] = "000001"
+    else:
+        raw["include_long_capture"] = True
+    redis.set(store._key(bound.task_id), json.dumps(raw))
+    module, maintenance = make_host_release_maintenance(redis)
+
+    with pytest.raises(module.DeploymentError) as caught:
+        maintenance.release()
+
+    assert caught.value.error_code == "DEPLOYMENT_MAINTENANCE_RELEASE_FAILED"
+    assert redis.get(store._key(bound.task_id)) is not None
+    assert store.deployment_lease_status() is not None
+
+
+def test_host_release_preserves_legacy_unmarked_bound_task_compatibility() -> None:
+    """A pre-marker task named by the owner lease remains safely releasable."""
+    redis = FakeRedis()
+    store = RedisStreamsStore(redis)
+    assert store.acquire_deployment_lease(OWNER, 60.0)
+    legacy = TaskRecord(
+        task_id="host-legacy",
+        symbol="601872",
+        include_long_capture=False,
+    )
+    store.enqueue(legacy)
+    lease = json.loads(redis.get(store._deployment_lease_key))
+    lease["bound_task_id"] = legacy.task_id
+    redis.set(store._deployment_lease_key, json.dumps(lease), keepttl=True)
+    _module, maintenance = make_host_release_maintenance(redis)
+
+    maintenance.release()
+
+    assert redis.get(store._key(legacy.task_id)) is None
+    assert store.deployment_lease_status() is None
 
 
 def test_host_maintenance_rejects_busy_or_conflicting_lease_without_mutation() -> None:

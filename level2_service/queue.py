@@ -111,6 +111,16 @@ def _valid_legacy_bound_acceptance(
     )
 
 
+def _terminal_acceptance_retryable(task: TaskRecord) -> bool:
+    return task.status in {
+        TaskStatus.COMPLETED,
+        TaskStatus.FAILED,
+        TaskStatus.EXPIRED,
+    } or (
+        task.status == TaskStatus.PARTIAL and task.completed_at is not None
+    )
+
+
 class TaskStore(Protocol):
     def enqueue(self, task: TaskRecord) -> None: ...
     def submit_or_refresh(self, task: TaskRecord) -> TaskRecord: ...
@@ -334,11 +344,7 @@ class InMemoryStreams:
             and not _has_maintenance_metadata(task)
             and task.task_id != bound_task_id
         ]
-        return max(
-            candidates,
-            key=lambda task: (task.updated_at, task.created_at, task.task_id),
-            default=None,
-        )
+        return _canonical_task(candidates) if candidates else None
 
     def deduplicate_by_symbol(self) -> dict[str, int]:
         with self._claim_lock:
@@ -478,6 +484,7 @@ class InMemoryStreams:
     ) -> TaskRecord | None:
         if not _valid_acceptance_task(task):
             return None
+        candidate = deepcopy(task)
         with self._claim_lock:
             lease = self._active_deployment_lease_locked()
             if lease is None or not hmac.compare_digest(
@@ -509,21 +516,21 @@ class InMemoryStreams:
                     _mark_deployment_acceptance(existing, owner_token)
                 else:
                     return None
-                if existing.status in _REFRESHABLE_STATUSES:
+                if _terminal_acceptance_retryable(existing):
                     try:
                         return self._refresh_locked(existing, False)
                     except QueueFullError:
                         return None
                 return existing
-            if task.task_id in self._tasks:
+            if candidate.task_id in self._tasks:
                 return None
-            _mark_deployment_acceptance(task, owner_token)
+            _mark_deployment_acceptance(candidate, owner_token)
             try:
-                self._enqueue_locked(task, maintenance=True)
+                self._enqueue_locked(candidate, maintenance=True)
             except QueueFullError:
                 return None
-            lease["bound_task_id"] = task.task_id
-            return task
+            lease["bound_task_id"] = candidate.task_id
+            return candidate
 
     def release_deployment_lease(self, owner_token: str) -> bool:
         with self._claim_lock:
@@ -554,7 +561,15 @@ class InMemoryStreams:
                     task, bound_task_id=bound_task_id
                 ):
                     return False
-                self._remove_maintenance_task_locked(bound_task_id)
+                if (
+                    self._remove_maintenance_task_locked(
+                        bound_task_id,
+                        owner_digest=owner_digest,
+                        allow_legacy=True,
+                    )
+                    is None
+                ):
+                    return False
             self._deployment_lease = None
             return True
 
@@ -749,21 +764,17 @@ class InMemoryStreams:
             bound_task_id = (
                 lease.get("bound_task_id") if lease is not None else None
             )
-            owner_digest = lease.get("owner_digest") if lease is not None else None
-            for task in list(self._tasks.values()):
+            for raw_task_id, task in list(self._tasks.items()):
                 if _has_maintenance_metadata(task):
-                    if (
-                        isinstance(bound_task_id, str)
-                        and isinstance(owner_digest, str)
-                        and _valid_bound_acceptance(
-                            task,
-                            bound_task_id=bound_task_id,
-                            owner_digest=owner_digest,
-                        )
-                    ):
+                    if isinstance(bound_task_id, str) and raw_task_id == bound_task_id:
                         continue
-                    removed.append(task)
-                    self._remove_maintenance_task_locked(task.task_id)
+                    removed_task = self._remove_maintenance_task_locked(
+                        raw_task_id,
+                        owner_digest=None,
+                        allow_legacy=False,
+                    )
+                    if removed_task is not None:
+                        removed.append(removed_task)
                     continue
                 long_capture = task.long_capture
                 if (
@@ -789,15 +800,54 @@ class InMemoryStreams:
         lease = self._active_deployment_lease_locked()
         return lease is not None and lease.get("bound_task_id") == task.task_id
 
-    def _remove_maintenance_task_locked(self, task_id: str) -> None:
-        task = self._tasks.pop(task_id, None)
-        if task is None:
-            return
+    def _remove_maintenance_task_locked(
+        self,
+        raw_task_id: str,
+        *,
+        owner_digest: str | None,
+        allow_legacy: bool,
+    ) -> TaskRecord | None:
+        task = self._tasks.get(raw_task_id)
+        if task is None or task.task_id != raw_task_id:
+            return None
+        if _has_maintenance_metadata(task):
+            expected_digest = owner_digest or task.maintenance_owner_digest
+            if not isinstance(expected_digest, str) or not _valid_bound_acceptance(
+                task,
+                bound_task_id=raw_task_id,
+                owner_digest=expected_digest,
+            ):
+                return None
+        elif not allow_legacy or not _valid_legacy_bound_acceptance(
+            task, bound_task_id=raw_task_id
+        ):
+            return None
+        ordinary_candidates = [
+            candidate
+            for candidate_raw_id, candidate in self._tasks.items()
+            if candidate_raw_id != raw_task_id
+            and candidate.task_id == candidate_raw_id
+            and candidate.symbol == task.symbol
+            and not _has_maintenance_metadata(candidate)
+        ]
+        canonical = (
+            _canonical_task(ordinary_candidates) if ordinary_candidates else None
+        )
+        for alias, target in list(self._aliases.items()):
+            if alias == raw_task_id:
+                self._aliases.pop(alias, None)
+            elif target == raw_task_id:
+                if canonical is None:
+                    self._aliases.pop(alias, None)
+                else:
+                    self._aliases[alias] = canonical.task_id
+        self._tasks.pop(raw_task_id, None)
         for capture in task.captures.values():
             self._unlink_capture(capture)
         self._unlink_capture(task.long_capture)
-        self._fifo = deque(item for item in self._fifo if item != task_id)
-        self._events.pop(task_id, None)
+        self._fifo = deque(item for item in self._fifo if item != raw_task_id)
+        self._events.pop(raw_task_id, None)
+        return task
 
     def _emit(self, task: TaskRecord) -> None:
         self._events.setdefault(task.task_id, []).append({"event": "status", "data": task.status.value})
@@ -1064,38 +1114,197 @@ return ARGV[4]
 """
     _RELEASE_DEPLOYMENT_LEASE_SCRIPT = """
 -- THS_RELEASE_DEPLOYMENT_LEASE
-local payload = redis.call('GET', KEYS[1])
-if not payload then return 0 end
-local lease = cjson.decode(payload)
-if lease.owner_token ~= ARGV[1] then return 0 end
-if lease.owner_digest and lease.owner_digest ~= cjson.null and lease.owner_digest ~= ARGV[2] then return 0 end
-local task_id = lease.bound_task_id
-if task_id and task_id ~= cjson.null then
-  local task_payload = redis.call('GET', KEYS[3] .. task_id)
-  if not task_payload then return 0 end
-  local task = cjson.decode(task_payload)
-  if task.task_id ~= task_id or task.symbol ~= '601872' or task.include_long_capture ~= false then return 0 end
-  local maintenance = task.maintenance
-  if maintenance and maintenance ~= cjson.null then
-    if maintenance.namespace ~= 'deployment_acceptance' or maintenance.owner_digest ~= ARGV[2] then return 0 end
+local function is_active(status)
+  return status == 'QUEUED' or status == 'RUNNING' or status == 'WAITING_ADMIN'
+end
+local function better(candidate_id, candidate, best_id, best)
+  if not best then return true end
+  local candidate_active = is_active(candidate.status)
+  local best_active = is_active(best.status)
+  if candidate_active ~= best_active then return candidate_active end
+  local candidate_created = candidate.created_at or ''
+  local best_created = best.created_at or ''
+  if candidate_created ~= best_created then return candidate_created > best_created end
+  local candidate_updated = candidate.updated_at or ''
+  local best_updated = best.updated_at or ''
+  if candidate_updated ~= best_updated then return candidate_updated > best_updated end
+  return candidate_id > best_id
+end
+local function ordinary_canonical(symbol, removed_id)
+  local best_id = false
+  local best = false
+  for _, raw_id in ipairs(redis.call('SMEMBERS', KEYS[4])) do
+    if raw_id ~= removed_id then
+      local candidate_payload = redis.call('GET', KEYS[3] .. raw_id)
+      if candidate_payload then
+        local ok, candidate = pcall(cjson.decode, candidate_payload)
+        if ok and type(candidate) == 'table' and candidate.task_id == raw_id and candidate.symbol == symbol then
+          local maintenance = candidate.maintenance
+          if not maintenance or maintenance == cjson.null then
+            if better(raw_id, candidate, best_id, best) then
+              best_id = raw_id
+              best = candidate
+            end
+          end
+        end
+      end
+    end
   end
-  redis.call('LREM', KEYS[2], 0, task_id)
-  redis.call('DEL', KEYS[3] .. task_id)
-  redis.call('SREM', KEYS[4], task_id)
-  if redis.call('HGET', KEYS[6], task.symbol) == task_id then
+  return best_id
+end
+local function remove_task(raw_id, task)
+  local canonical_id = ordinary_canonical(task.symbol, raw_id)
+  local aliases = redis.call('HGETALL', KEYS[7])
+  for index = 1, #aliases, 2 do
+    local alias = aliases[index]
+    local target = aliases[index + 1]
+    if alias == raw_id then
+      redis.call('HDEL', KEYS[7], alias)
+    elseif target == raw_id then
+      if canonical_id then
+        redis.call('HSET', KEYS[7], alias, canonical_id)
+      else
+        redis.call('HDEL', KEYS[7], alias)
+      end
+    end
+  end
+  if canonical_id then
+    redis.call('HSET', KEYS[6], task.symbol, canonical_id)
+  else
     redis.call('HDEL', KEYS[6], task.symbol)
   end
+  redis.call('LREM', KEYS[2], 0, raw_id)
+  redis.call('DEL', KEYS[3] .. raw_id)
+  redis.call('SREM', KEYS[4], raw_id)
   for _, entry in ipairs(redis.call('XRANGE', KEYS[5], '-', '+')) do
     local fields = entry[2]
     for index = 1, #fields, 2 do
-      if fields[index] == 'task_id' and fields[index + 1] == task_id then
+      if fields[index] == 'task_id' and fields[index + 1] == raw_id then
         redis.call('XDEL', KEYS[5], entry[1])
         break
       end
     end
   end
 end
+local payload = redis.call('GET', KEYS[1])
+if not payload then return 0 end
+local lease_ok, lease = pcall(cjson.decode, payload)
+if not lease_ok or type(lease) ~= 'table' then return 0 end
+if lease.owner_token ~= ARGV[1] then return 0 end
+if string.len(ARGV[2]) ~= 64 or not string.match(ARGV[2], '^[0-9a-f]+$') then return 0 end
+if lease.owner_digest and lease.owner_digest ~= cjson.null and lease.owner_digest ~= ARGV[2] then return 0 end
+local task_id = lease.bound_task_id
+if task_id and task_id ~= cjson.null then
+  local task_payload = redis.call('GET', KEYS[3] .. task_id)
+  if not task_payload then return 0 end
+  local task_ok, task = pcall(cjson.decode, task_payload)
+  if not task_ok or type(task) ~= 'table' then return 0 end
+  if task.task_id ~= task_id or task.symbol ~= '601872' or task.include_long_capture ~= false then return 0 end
+  local maintenance = task.maintenance
+  if maintenance and maintenance ~= cjson.null then
+    if maintenance.namespace ~= 'deployment_acceptance' or maintenance.owner_digest ~= ARGV[2] then return 0 end
+  end
+  remove_task(task_id, task)
+end
 return redis.call('DEL', KEYS[1])
+"""
+    _CLEANUP_EXPIRED_DEPLOYMENT_ACCEPTANCE_SCRIPT = """
+-- THS_CLEANUP_EXPIRED_DEPLOYMENT_ACCEPTANCE
+if redis.call('GET', KEYS[1]) then return {} end
+local function is_active(status)
+  return status == 'QUEUED' or status == 'RUNNING' or status == 'WAITING_ADMIN'
+end
+local function better(candidate_id, candidate, best_id, best)
+  if not best then return true end
+  local candidate_active = is_active(candidate.status)
+  local best_active = is_active(best.status)
+  if candidate_active ~= best_active then return candidate_active end
+  local candidate_created = candidate.created_at or ''
+  local best_created = best.created_at or ''
+  if candidate_created ~= best_created then return candidate_created > best_created end
+  local candidate_updated = candidate.updated_at or ''
+  local best_updated = best.updated_at or ''
+  if candidate_updated ~= best_updated then return candidate_updated > best_updated end
+  return candidate_id > best_id
+end
+local function ordinary_canonical(symbol, removed_id)
+  local best_id = false
+  local best = false
+  for _, raw_id in ipairs(redis.call('SMEMBERS', KEYS[4])) do
+    if raw_id ~= removed_id then
+      local candidate_payload = redis.call('GET', KEYS[3] .. raw_id)
+      if candidate_payload then
+        local ok, candidate = pcall(cjson.decode, candidate_payload)
+        if ok and type(candidate) == 'table' and candidate.task_id == raw_id and candidate.symbol == symbol then
+          local maintenance = candidate.maintenance
+          if not maintenance or maintenance == cjson.null then
+            if better(raw_id, candidate, best_id, best) then
+              best_id = raw_id
+              best = candidate
+            end
+          end
+        end
+      end
+    end
+  end
+  return best_id
+end
+local function remove_task(raw_id, task)
+  local canonical_id = ordinary_canonical(task.symbol, raw_id)
+  local aliases = redis.call('HGETALL', KEYS[7])
+  for index = 1, #aliases, 2 do
+    local alias = aliases[index]
+    local target = aliases[index + 1]
+    if alias == raw_id then
+      redis.call('HDEL', KEYS[7], alias)
+    elseif target == raw_id then
+      if canonical_id then
+        redis.call('HSET', KEYS[7], alias, canonical_id)
+      else
+        redis.call('HDEL', KEYS[7], alias)
+      end
+    end
+  end
+  if canonical_id then
+    redis.call('HSET', KEYS[6], task.symbol, canonical_id)
+  else
+    redis.call('HDEL', KEYS[6], task.symbol)
+  end
+  redis.call('LREM', KEYS[2], 0, raw_id)
+  redis.call('DEL', KEYS[3] .. raw_id)
+  redis.call('SREM', KEYS[4], raw_id)
+  for _, entry in ipairs(redis.call('XRANGE', KEYS[5], '-', '+')) do
+    local fields = entry[2]
+    for index = 1, #fields, 2 do
+      if fields[index] == 'task_id' and fields[index + 1] == raw_id then
+        redis.call('XDEL', KEYS[5], entry[1])
+        break
+      end
+    end
+  end
+end
+local targets = {}
+for _, raw_id in ipairs(redis.call('SMEMBERS', KEYS[4])) do
+  local task_payload = redis.call('GET', KEYS[3] .. raw_id)
+  if task_payload then
+    local task_ok, task = pcall(cjson.decode, task_payload)
+    if task_ok and type(task) == 'table' then
+      local maintenance = task.maintenance
+      if maintenance and maintenance ~= cjson.null then
+        if task.task_id ~= raw_id or task.symbol ~= '601872' or task.include_long_capture ~= false or maintenance.namespace ~= 'deployment_acceptance' or type(maintenance.owner_digest) ~= 'string' or string.len(maintenance.owner_digest) ~= 64 or not string.match(maintenance.owner_digest, '^[0-9a-f]+$') then
+          return 'INVALID'
+        end
+        targets[#targets + 1] = {raw_id = raw_id, payload = task_payload, task = task}
+      end
+    end
+  end
+end
+local removed = {}
+for index, entry in ipairs(targets) do
+  remove_task(entry.raw_id, entry.task)
+  removed[index] = entry.payload
+end
+return removed
 """
     _RECOVER_RUNNING_SCRIPT = """
 -- THS_RECOVER_RUNNING
@@ -1326,11 +1535,7 @@ return ARGV[2]
                 and task.task_id != bound_task_id
             ):
                 candidates.append(task)
-        result = max(
-            candidates,
-            key=lambda task: (task.updated_at, task.created_at, task.task_id),
-            default=None,
-        )
+        result = _canonical_task(candidates) if candidates else None
         if result is not None:
             self.client.hset(self._symbol_index_key, result.symbol, result.task_id)
         return result
@@ -1576,13 +1781,14 @@ return ARGV[2]
             return False
         result = self.client.eval(
             self._RELEASE_DEPLOYMENT_LEASE_SCRIPT,
-            6,
+            7,
             self._deployment_lease_key,
             self._queue_key,
             self._prefix,
             self._index_key,
             self._event_stream,
             self._symbol_index_key,
+            self._alias_key,
             owner_token,
             _maintenance_owner_digest(owner_token),
         )
@@ -1756,32 +1962,32 @@ return ARGV[2]
 
     def cleanup(self, now: datetime) -> list[TaskRecord]:
         removed: list[TaskRecord] = []
-        lease = self.deployment_lease_status()
-        bound_task_id = lease.bound_task_id if lease is not None else None
-        owner_digest = (
-            _maintenance_owner_digest(lease.owner_token)
-            if lease is not None
-            else None
+        maintenance_payloads = self.client.eval(
+            self._CLEANUP_EXPIRED_DEPLOYMENT_ACCEPTANCE_SCRIPT,
+            7,
+            self._deployment_lease_key,
+            self._queue_key,
+            self._prefix,
+            self._index_key,
+            self._event_stream,
+            self._symbol_index_key,
+            self._alias_key,
         )
+        if maintenance_payloads and self._text(maintenance_payloads) == "INVALID":
+            maintenance_payloads = []
+        if isinstance(maintenance_payloads, (list, tuple)):
+            for payload in maintenance_payloads:
+                try:
+                    removed.append(self._deserialize(payload))
+                except (KeyError, TypeError, ValueError):
+                    return []
         for raw_task_id in list(self.client.smembers(self._index_key)):
             task_id = self._text(raw_task_id)
-            task = self.get(task_id)
+            task = self._get_raw(task_id)
             if task is None:
                 self.client.srem(self._index_key, task_id)
                 continue
-            if _has_maintenance_metadata(task):
-                if (
-                    isinstance(bound_task_id, str)
-                    and isinstance(owner_digest, str)
-                    and _valid_bound_acceptance(
-                        task,
-                        bound_task_id=bound_task_id,
-                        owner_digest=owner_digest,
-                    )
-                ):
-                    continue
-                removed.append(task)
-                self._remove_maintenance_task(task)
+            if task.task_id != task_id or _has_maintenance_metadata(task):
                 continue
             changed = False
             if task.long_capture.status == CaptureStatus.READY and task.long_capture.expires_at and now >= task.long_capture.expires_at:
@@ -1802,29 +2008,6 @@ return ARGV[2]
             return True
         lease = self.deployment_lease_status()
         return lease is not None and lease.bound_task_id == task.task_id
-
-    def _remove_maintenance_task(self, task: TaskRecord) -> None:
-        for capture in task.captures.values():
-            self._unlink_capture(capture)
-        self._unlink_capture(task.long_capture)
-        self.client.lrem(self._queue_key, 0, task.task_id)
-        self.client.delete(self._key(task.task_id))
-        self.client.srem(self._index_key, task.task_id)
-        indexed = self.client.hget(self._symbol_index_key, task.symbol)
-        if indexed and self._text(indexed) == task.task_id:
-            self.client.hdel(self._symbol_index_key, task.symbol)
-        event_ids = []
-        for event_id, fields in self.client.xrange(
-            self._event_stream, "-", "+"
-        ):
-            normalized = {
-                self._text(key): self._text(value)
-                for key, value in fields.items()
-            }
-            if normalized.get("task_id") == task.task_id:
-                event_ids.append(event_id)
-        if event_ids:
-            self.client.xdel(self._event_stream, *event_ids)
 
     def _required(self, task_id: str) -> TaskRecord:
         task = self.get(task_id)

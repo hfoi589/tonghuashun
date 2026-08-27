@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 import json
-from threading import Barrier, Thread
+from threading import Barrier, Event, Thread, current_thread
 
 from argon2 import PasswordHasher
 from fastapi.testclient import TestClient
@@ -84,6 +84,19 @@ def bind_legacy_task_id(store, backing, task_id: str) -> None:
         json.dumps(lease, separators=(",", ":")),
         keepttl=True,
     )
+
+
+def seed_alias(store, backing, alias: str, target: str) -> None:
+    if isinstance(store, InMemoryStreams):
+        store._aliases[alias] = target
+        return
+    backing.hset(store._alias_key, alias, target)
+
+
+def raw_task_exists(store, backing, task_id: str) -> bool:
+    if isinstance(store, InMemoryStreams):
+        return task_id in store._tasks
+    return backing.get(store._key(task_id)) is not None
 
 
 @pytest.mark.parametrize("kind", ["memory", "redis"])
@@ -198,6 +211,73 @@ def test_binding_is_idempotent_and_rejects_wrong_owner_or_mismatched_task(
         )
         is None
     )
+
+
+@pytest.mark.parametrize("kind", ["memory", "redis"])
+def test_binding_never_mutates_the_candidate_and_it_is_reusable_by_a_new_owner(
+    kind: str,
+) -> None:
+    """The store owns its maintenance copy; caller state stays an ordinary queued task."""
+    clock = ManualClock()
+    store, _backing = store_for_kind(kind, clock)
+    candidate = TaskRecord(
+        task_id="reusable-candidate",
+        symbol="601872",
+        include_long_capture=False,
+    )
+    assert store.acquire_deployment_lease(OWNER, 60.0)
+
+    first = store.bind_deployment_acceptance(OWNER, candidate)
+
+    assert first is not None and first.task_id == candidate.task_id
+    assert candidate.maintenance_namespace is None
+    assert candidate.maintenance_owner_digest is None
+    assert candidate.status == TaskStatus.QUEUED
+    assert store.bind_deployment_acceptance(OWNER, candidate).task_id == first.task_id
+    assert store.release_deployment_lease(OWNER)
+    assert store.acquire_deployment_lease(OTHER_OWNER, 60.0)
+    second = store.bind_deployment_acceptance(OTHER_OWNER, candidate)
+    assert second is not None and second.task_id == candidate.task_id
+    assert second.maintenance_owner_digest != first.maintenance_owner_digest
+    assert candidate.maintenance_namespace is None
+    assert candidate.maintenance_owner_digest is None
+
+
+@pytest.mark.parametrize("kind", ["memory", "redis"])
+def test_owner_rebind_does_not_requeue_intermediate_partial_acceptance(
+    kind: str,
+) -> None:
+    """A PARTIAL task without completed_at is still active and cannot be reset."""
+    clock = ManualClock()
+    store, _backing = store_for_kind(kind, clock)
+    assert store.acquire_deployment_lease(OWNER, 60.0)
+    bound = store.bind_deployment_acceptance(
+        OWNER,
+        TaskRecord(
+            task_id="intermediate-partial",
+            symbol="601872",
+            include_long_capture=False,
+        ),
+    )
+    assert bound is not None
+    assert store.next_runnable().task_id == bound.task_id
+    partial = store.transition(bound.task_id, TaskStatus.PARTIAL)
+    assert partial.completed_at is None
+
+    rebound = store.bind_deployment_acceptance(
+        OWNER,
+        TaskRecord(
+            task_id="ignored-partial-id",
+            symbol="601872",
+            include_long_capture=False,
+        ),
+    )
+
+    assert rebound is not None
+    assert rebound.task_id == bound.task_id
+    assert rebound.status == TaskStatus.PARTIAL
+    assert rebound.completed_at is None
+    assert store.next_runnable() is None
 
 
 @pytest.mark.parametrize("kind", ["memory", "redis"])
@@ -496,6 +576,213 @@ def test_maintenance_cleanup_removes_only_the_bound_task(
     assert store.get("public-history") is not None
     assert store.find_by_symbol("601872").task_id == public.task_id
     assert store.next_runnable().task_id == "public-history"
+
+
+@pytest.mark.parametrize("kind", ["memory", "redis"])
+@pytest.mark.parametrize("cleanup_mode", ["release", "expired"])
+def test_maintenance_cleanup_repairs_aliases_and_rebuilds_canonical_symbol_reuse(
+    kind: str,
+    cleanup_mode: str,
+) -> None:
+    """Every public alias/index moves to the same surviving ordinary canonical task."""
+    clock = ManualClock()
+    store, backing = store_for_kind(kind, clock)
+    active = TaskRecord(
+        task_id="ordinary-active",
+        symbol="601872",
+        include_long_capture=False,
+    )
+    active.created_at = active.created_at.replace(year=2024)
+    active.updated_at = active.created_at
+    terminal = TaskRecord(
+        task_id="ordinary-terminal",
+        symbol="601872",
+        include_long_capture=True,
+        status=TaskStatus.COMPLETED,
+    )
+    terminal.created_at = terminal.created_at.replace(year=2026)
+    terminal.updated_at = terminal.created_at
+    terminal.completed_at = terminal.updated_at
+    store.enqueue(active)
+    store.enqueue(terminal)
+    assert store.acquire_deployment_lease(OWNER, 10.0)
+    bound = store.bind_deployment_acceptance(
+        OWNER,
+        TaskRecord(
+            task_id="maintenance-alias-target",
+            symbol="601872",
+            include_long_capture=False,
+        ),
+    )
+    assert bound is not None
+    seed_alias(store, backing, "old-public-id", bound.task_id)
+    seed_alias(store, backing, "older-public-id", bound.task_id)
+    seed_alias(store, backing, bound.task_id, active.task_id)
+    if isinstance(store, RedisStreamsStore):
+        backing.hset(store._symbol_index_key, "601872", bound.task_id)
+
+    if cleanup_mode == "release":
+        assert store.release_deployment_lease(OWNER)
+    else:
+        backing.advance(11.0)
+        store.cleanup(NOW)
+
+    assert store.resolve_task_id("old-public-id") == active.task_id
+    assert store.resolve_task_id("older-public-id") == active.task_id
+    assert store.resolve_task_id(bound.task_id) == bound.task_id
+    assert store.get("old-public-id").task_id == active.task_id
+    assert store.find_by_symbol("601872").task_id == active.task_id
+    if isinstance(store, RedisStreamsStore):
+        assert backing.hget(store._symbol_index_key, "601872") == active.task_id
+        assert bound.task_id not in backing.hashes[store._alias_key].values()
+    else:
+        assert bound.task_id not in store._aliases.values()
+    submitted = store.submit_or_refresh(
+        TaskRecord(
+            task_id="must-not-duplicate-history",
+            symbol="601872",
+            include_long_capture=True,
+        )
+    )
+    assert submitted.task_id == active.task_id
+    assert not raw_task_exists(store, backing, "must-not-duplicate-history")
+
+
+@pytest.mark.parametrize("kind", ["memory", "redis"])
+def test_release_removes_aliases_when_no_ordinary_symbol_history_survives(
+    kind: str,
+) -> None:
+    """A public alias cannot continue resolving to a deleted maintenance ID."""
+    clock = ManualClock()
+    store, backing = store_for_kind(kind, clock)
+    assert store.acquire_deployment_lease(OWNER, 60.0)
+    bound = store.bind_deployment_acceptance(
+        OWNER,
+        TaskRecord(
+            task_id="maintenance-only",
+            symbol="601872",
+            include_long_capture=False,
+        ),
+    )
+    assert bound is not None
+    seed_alias(store, backing, "orphan-public-id", bound.task_id)
+
+    assert store.release_deployment_lease(OWNER)
+
+    assert store.resolve_task_id("orphan-public-id") == "orphan-public-id"
+    assert store.get("orphan-public-id") is None
+    if isinstance(store, RedisStreamsStore):
+        assert backing.hget(store._alias_key, "orphan-public-id") is None
+        assert backing.hget(store._symbol_index_key, "601872") is None
+    else:
+        assert "orphan-public-id" not in store._aliases
+
+
+@pytest.mark.parametrize("kind", ["memory", "redis"])
+@pytest.mark.parametrize("cleanup_mode", ["release", "expired"])
+def test_maintenance_cleanup_fails_closed_on_raw_payload_id_mismatch(
+    kind: str,
+    cleanup_mode: str,
+) -> None:
+    """Cleanup is keyed by the store's raw ID and never trusts a forged payload task_id."""
+    clock = ManualClock()
+    store, backing = store_for_kind(kind, clock)
+    assert store.acquire_deployment_lease(OWNER, 10.0)
+    bound = store.bind_deployment_acceptance(
+        OWNER,
+        TaskRecord(
+            task_id="raw-maintenance-id",
+            symbol="601872",
+            include_long_capture=False,
+        ),
+    )
+    assert bound is not None
+    persist_task_mutation(
+        store,
+        backing,
+        bound.task_id,
+        lambda task: setattr(task, "task_id", "forged-payload-id"),
+    )
+
+    if cleanup_mode == "release":
+        assert store.release_deployment_lease(OWNER) is False
+    else:
+        backing.advance(11.0)
+        assert store.cleanup(NOW) == []
+
+    assert raw_task_exists(store, backing, "raw-maintenance-id")
+    assert not raw_task_exists(store, backing, "forged-payload-id")
+
+
+def test_redis_expiry_cleanup_cannot_delete_a_concurrently_bound_new_task() -> None:
+    """Lease inspection and orphan cleanup serialize in one Redis operation."""
+
+    class RacingRedis(FakeRedis):
+        def __init__(self, *, clock) -> None:
+            super().__init__(clock=clock)
+            self.cleanup_waiting = Event()
+            self.continue_cleanup = Event()
+            self.atomic_cleanup_seen = False
+
+        def eval(self, script, key_count, *values):
+            if (
+                "THS_CLEANUP_EXPIRED_DEPLOYMENT_ACCEPTANCE" in script
+                and current_thread().name == "cleanup"
+            ):
+                self.atomic_cleanup_seen = True
+                self.cleanup_waiting.set()
+                assert self.continue_cleanup.wait(timeout=2)
+            return super().eval(script, key_count, *values)
+
+        def smembers(self, key):
+            if (
+                not self.atomic_cleanup_seen
+                and key == "ths:jobs:tasks"
+                and current_thread().name == "cleanup"
+            ):
+                self.cleanup_waiting.set()
+                assert self.continue_cleanup.wait(timeout=2)
+            return super().smembers(key)
+
+    clock = ManualClock()
+    redis = RacingRedis(clock=clock)
+    old_store = RedisStreamsStore(redis)
+    assert old_store.acquire_deployment_lease(OWNER, 10.0)
+    assert old_store.bind_deployment_acceptance(
+        OWNER,
+        TaskRecord(
+            task_id="expired-old-task",
+            symbol="601872",
+            include_long_capture=False,
+        ),
+    )
+    redis.advance(11.0)
+    cleanup_result: list[TaskRecord] = []
+
+    cleanup_thread = Thread(
+        name="cleanup",
+        target=lambda: cleanup_result.extend(old_store.cleanup(NOW)),
+    )
+    cleanup_thread.start()
+    assert redis.cleanup_waiting.wait(timeout=2)
+    new_store = RedisStreamsStore(redis)
+    assert new_store.acquire_deployment_lease(OTHER_OWNER, 60.0)
+    new_bound = new_store.bind_deployment_acceptance(
+        OTHER_OWNER,
+        TaskRecord(
+            task_id="newly-bound-task",
+            symbol="601872",
+            include_long_capture=False,
+        ),
+    )
+    assert new_bound is not None
+    redis.continue_cleanup.set()
+    cleanup_thread.join(timeout=2)
+
+    assert not cleanup_thread.is_alive()
+    assert raw_task_exists(new_store, redis, new_bound.task_id)
+    lease = new_store.deployment_lease_status()
+    assert lease is not None and lease.bound_task_id == new_bound.task_id
 
 
 @pytest.mark.parametrize("kind", ["memory", "redis"])

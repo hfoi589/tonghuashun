@@ -124,8 +124,10 @@ class DeviceLifecycleClient:
         try:
             parsed = urlsplit(base_url)
             port = parsed.port
-        except ValueError as error:
-            raise ValueError("device lifecycle URL must be an allowed HTTP URL") from error
+        except ValueError:
+            raise ValueError(
+                "device lifecycle URL must be an allowed HTTP URL"
+            ) from None
         if (
             parsed.scheme != "http"
             or parsed.hostname not in _ALLOWED_HOSTS
@@ -156,6 +158,8 @@ class DeviceLifecycleClient:
         try:
             safe_action = DeviceLifecycleAction(action)
         except (TypeError, ValueError):
+            safe_action = None
+        if safe_action is None:
             raise DeviceLifecycleError("DEVICE_LIFECYCLE_FAILED") from None
         document = self._request(
             "POST",
@@ -217,7 +221,9 @@ class DeviceLifecycleClient:
                         ) from None
         try:
             document = json.loads(raw_body.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError):
+        except (UnicodeDecodeError, ValueError):
+            document = None
+        if document is None:
             self._invalid_response()
         if not isinstance(document, dict):
             self._invalid_response()
@@ -252,10 +258,7 @@ class DeviceLifecycleClient:
         state = value["state"]
         if not isinstance(role, str) or role not in _ALLOWED_ROLES:
             cls._invalid_response()
-        try:
-            parsed_state = DeviceLifecycleState(state)
-        except (TypeError, ValueError):
-            cls._invalid_response()
+        parsed_state = cls._parse_state(state)
         operation_id = cls._optional_operation_id(value.get("operation_id"))
         error_code = cls._optional_error_code(value.get("error_code"))
         updated_at = cls._optional_datetime(value.get("updated_at"))
@@ -283,11 +286,8 @@ class DeviceLifecycleClient:
             cls._invalid_response()
         if not isinstance(role, str) or role not in _ALLOWED_ROLES:
             cls._invalid_response()
-        try:
-            parsed_action = DeviceLifecycleAction(action)
-            parsed_state = DeviceLifecycleState(state)
-        except (TypeError, ValueError):
-            cls._invalid_response()
+        parsed_action = cls._parse_action(action)
+        parsed_state = cls._parse_state(state)
         error_code = cls._optional_error_code(value["error_code"])
         updated_at = cls._optional_datetime(value["updated_at"])
         if updated_at is None:
@@ -326,11 +326,33 @@ class DeviceLifecycleClient:
         try:
             parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
         except ValueError:
+            parsed = None
+        if parsed is None:
             cls._invalid_response()
         if parsed.tzinfo is None:
             cls._invalid_response()
         return parsed
 
+    @classmethod
+    def _parse_action(cls, value: object) -> DeviceLifecycleAction:
+        try:
+            parsed = DeviceLifecycleAction(value)
+        except (TypeError, ValueError):
+            parsed = None
+        if parsed is None:
+            cls._invalid_response()
+        return parsed
+
+    @classmethod
+    def _parse_state(cls, value: object) -> DeviceLifecycleState:
+        try:
+            parsed = DeviceLifecycleState(value)
+        except (TypeError, ValueError):
+            parsed = None
+        if parsed is None:
+            cls._invalid_response()
+        return parsed
+
     @staticmethod
     def _invalid_response() -> None:
-        raise DeviceLifecycleError("DEVICE_LIFECYCLE_FAILED")
+        raise DeviceLifecycleError("DEVICE_LIFECYCLE_FAILED") from None

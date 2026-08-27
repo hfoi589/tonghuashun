@@ -76,12 +76,25 @@ def test_missing_lifecycle_settings_leave_the_feature_disabled() -> None:
     assert settings.device_lifecycle_timeout_seconds == 5.0
 
 
+def test_complete_lifecycle_settings_remain_enabled() -> None:
+    """Removing configured host controls would make the admin lifecycle feature inert."""
+    settings = DeploymentSettings.from_environ(
+        lifecycle_environment(
+            THS_DEVICE_LIFECYCLE_URL="http://host.docker.internal:18765",
+            THS_DEVICE_LIFECYCLE_TOKEN="secret",
+        )
+    )
+
+    assert settings.device_lifecycle_url == "http://host.docker.internal:18765"
+    assert settings.device_lifecycle_token == "secret"
+
+
 def test_compose_injects_lifecycle_settings_without_a_token_default() -> None:
     """A compose fallback token would turn a sample deployment into host access."""
     compose = (ROOT / "deploy" / "compose.yml").read_text(encoding="utf-8")
 
-    assert "THS_DEVICE_LIFECYCLE_URL: ${THS_DEVICE_LIFECYCLE_URL:-http://host.docker.internal:18765}" in compose
-    assert "THS_DEVICE_LIFECYCLE_TOKEN: ${THS_DEVICE_LIFECYCLE_TOKEN}" in compose
+    assert "THS_DEVICE_LIFECYCLE_URL: ${THS_DEVICE_LIFECYCLE_URL:-}" in compose
+    assert "THS_DEVICE_LIFECYCLE_TOKEN: ${THS_DEVICE_LIFECYCLE_TOKEN:-}" in compose
     assert "THS_DEVICE_LIFECYCLE_TIMEOUT_SECONDS: ${THS_DEVICE_LIFECYCLE_TIMEOUT_SECONDS:-5}" in compose
 
 

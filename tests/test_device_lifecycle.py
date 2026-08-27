@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import traceback
 from io import BytesIO
 from socket import timeout as SocketTimeout
 from urllib.error import HTTPError
@@ -215,6 +216,58 @@ def test_client_sanitizes_malformed_json() -> None:
 
     assert failure.value.error_code == "DEVICE_LIFECYCLE_FAILED"
     assert "private" not in repr(failure.value)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        operation_payload(state="token=private command=adb"),
+        operation_payload(action="token=private command=adb"),
+        operation_payload(updated_at="token=private command=adb"),
+    ],
+)
+def test_client_discards_sensitive_context_from_invalid_broker_fields(
+    payload: object,
+) -> None:
+    """A parser ValueError must not remain attached to the public fixed error."""
+    client = DeviceLifecycleClient(
+        "http://localhost:18765", "secret", opener=RecordingOpener(payload)
+    )
+
+    with pytest.raises(DeviceLifecycleError) as failure:
+        client.operation("op-1")
+
+    assert failure.value.error_code == "DEVICE_LIFECYCLE_FAILED"
+    assert failure.value.__cause__ is None
+    assert failure.value.__context__ is None
+    rendered = "".join(traceback.format_exception(failure.value))
+    assert "token=private" not in rendered
+    assert "command=adb" not in rendered
+
+
+def test_client_sanitizes_plain_json_value_errors() -> None:
+    """Oversized JSON integers must not escape as decoder ValueErrors."""
+    class HugeIntegerResponse:
+        status = 200
+
+        def read(self) -> bytes:
+            return b'{"devices":[' + b"9" * 5_000 + b"]}"
+
+        def close(self) -> None:
+            pass
+
+    client = DeviceLifecycleClient(
+        "http://localhost:18765",
+        "secret",
+        opener=lambda _request, _timeout: HugeIntegerResponse(),
+    )
+
+    with pytest.raises(DeviceLifecycleError) as failure:
+        client.devices()
+
+    assert failure.value.error_code == "DEVICE_LIFECYCLE_FAILED"
+    assert failure.value.__cause__ is None
+    assert failure.value.__context__ is None
 
 
 def test_client_sanitizes_response_cleanup_failures() -> None:

@@ -31,6 +31,10 @@ services:
       FRONTEND_ROOT: /app/frontend
       ADMIN_COOKIE_SECURE: ${ADMIN_COOKIE_SECURE:-0}
       FRIDA_SERVER_ENDPOINT: ${FRIDA_SERVER_ENDPOINT:-redroid:27042}
+      CORE_METRICS_TRANSPORT: ${CORE_METRICS_TRANSPORT:-frida}
+      FUND_FLOW_TRANSPORT: ${FUND_FLOW_TRANSPORT:-frida}
+      THS_SESSION_ENCRYPTION_KEY: ${THS_SESSION_ENCRYPTION_KEY:-}
+      THS_SESSION_ROOT: /data/admin/ths-sessions
     depends_on:
       redis:
         condition: service_started

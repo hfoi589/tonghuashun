@@ -19,6 +19,11 @@ from fastapi.staticfiles import StaticFiles
 from starlette.websockets import WebSocketState
 from pydantic import BaseModel, Field, field_validator, model_validator
 
+from .app_sessions import (
+    ACCOUNT_ROLES,
+    AccountSessionBundle,
+    SessionProvider,
+)
 from .models import CaptureKind, CaptureStatus, TaskRecord, TaskStatus, ValueSource, utc_now
 from .market_api import install_market_routes
 from .parsed_values import (
@@ -28,6 +33,7 @@ from .parsed_values import (
     SymbolLookupNotFoundError,
     UnsupportedMarketError,
     market_code_for_symbol,
+    sanitized_direct_error_code,
 )
 from .queue import InMemoryStreams, QueueFullError, TaskStore
 from .runner import ADBDeviceBridge, DeviceBridge, Level2Runner, RunnerControl, jpeg_base64
@@ -204,6 +210,17 @@ class AdminDevicesResponse(BaseModel):
     devices: list[AdminDeviceHealthResponse]
 
 
+class AccountSessionStatusResponse(BaseModel):
+    role: str
+    state: str
+    updated_at: Optional[datetime]
+    error_code: Optional[str]
+
+
+class AccountSessionsResponse(BaseModel):
+    sessions: list[AccountSessionStatusResponse]
+
+
 class SymbolLookupResponse(BaseModel):
     symbol: str
     name: str
@@ -239,6 +256,12 @@ def create_app(
     market_account_store: object | None = None,
     market_session_store: object | None = None,
     market_data_broker: object | None = None,
+    account_session_provider: SessionProvider | None = None,
+    account_session_refreshers: Mapping[
+        str,
+        Callable[[str], AccountSessionBundle],
+    ]
+    | None = None,
 ) -> FastAPI:
     """Build an isolated application instance for one service process."""
     if cleanup_interval_seconds <= 0:
@@ -339,6 +362,8 @@ def create_app(
     app.state.market_account_store = market_account_store
     app.state.market_session_store = market_session_store
     app.state.market_data_broker = market_data_broker
+    app.state.account_session_provider = account_session_provider
+    app.state.account_session_refreshers = dict(account_session_refreshers or {})
     set_capture_root = getattr(app.state.store, "set_capture_root", None)
     if callable(set_capture_root):
         set_capture_root(app.state.capture_root)
@@ -596,6 +621,72 @@ def create_app(
     @app.get("/api/admin/runner")
     def runner_health(_session=Depends(require_admin)) -> RunnerHealthResponse:
         return RunnerHealthResponse.model_validate(app.state.runner_control.health())
+
+    def public_account_session_status(role: str) -> AccountSessionStatusResponse:
+        provider = app.state.account_session_provider
+        if provider is None:
+            raise HTTPException(
+                status_code=503,
+                detail="account session storage unavailable",
+            )
+        return AccountSessionStatusResponse.model_validate(
+            provider.status(role).as_public()
+        )
+
+    @app.get(
+        "/api/admin/account-sessions",
+        response_model=AccountSessionsResponse,
+    )
+    def account_session_statuses(
+        _session=Depends(require_admin),
+    ) -> AccountSessionsResponse:
+        return AccountSessionsResponse(
+            sessions=[public_account_session_status(role) for role in ACCOUNT_ROLES]
+        )
+
+    @app.post(
+        "/api/admin/account-sessions/{role}/refresh",
+        response_model=AccountSessionStatusResponse,
+    )
+    def refresh_account_session(
+        role: str,
+        _session=Depends(require_csrf),
+    ) -> AccountSessionStatusResponse:
+        if role not in ACCOUNT_ROLES:
+            raise HTTPException(status_code=404, detail="account role not found")
+        provider = app.state.account_session_provider
+        refresher = app.state.account_session_refreshers.get(role)
+        if provider is None or refresher is None:
+            raise HTTPException(
+                status_code=503,
+                detail="account session refresh unavailable",
+            )
+        try:
+            bundle = refresher(role)
+            if bundle.role != role:
+                raise DirectRequestError(
+                    "DIRECT_SESSION_UNAVAILABLE",
+                    "account session refresher returned a mismatched role",
+                )
+            provider.put(bundle)
+        except DirectRequestError as error:
+            provider.mark_error(
+                role,
+                sanitized_direct_error_code(
+                    error.error_code, "DIRECT_SESSION_UNAVAILABLE"
+                ),
+            )
+            raise HTTPException(
+                status_code=503,
+                detail="account session refresh failed",
+            ) from None
+        except Exception:
+            provider.mark_error(role, "DIRECT_SESSION_UNAVAILABLE")
+            raise HTTPException(
+                status_code=503,
+                detail="account session refresh failed",
+            ) from None
+        return public_account_session_status(role)
 
     @app.get("/api/admin/lock")
     def lock_state(session=Depends(require_admin)) -> LockResponse:

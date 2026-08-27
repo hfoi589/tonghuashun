@@ -10,6 +10,10 @@ import pytest
 
 
 ROOT = Path(__file__).resolve().parents[1]
+CANONICAL_MACOS_COMPOSE_COMMAND = (
+    "docker --context orbstack compose --env-file .env "
+    "--env-file deploy/macos.env -f deploy/compose.yml up -d --build"
+)
 
 
 @pytest.mark.skipif(shutil.which("docker") is None, reason="Docker is not installed")
@@ -76,6 +80,9 @@ def test_compose_publishes_only_the_fastapi_frontend_and_api() -> None:
     assert api["environment"]["CORE_FRIDA_SERVER_ENDPOINT"] == "host.docker.internal:27043"
     assert api["environment"]["FUND_ADB_SERIAL"] == "emulator-5554"
     assert api["environment"]["FUND_FRIDA_SERVER_ENDPOINT"] == "host.docker.internal:27042"
+    assert api["environment"]["CORE_METRICS_TRANSPORT"] == "frida"
+    assert api["environment"]["FUND_FLOW_TRANSPORT"] == "frida"
+    assert api["environment"]["THS_SESSION_ROOT"] == "/data/admin/ths-sessions"
     assert api["environment"]["DAILY_CHECK_STATE_FILE"] == "/data/admin/daily-check.json"
 
 
@@ -96,7 +103,26 @@ def test_macos_environment_example_contains_no_caddy_settings() -> None:
     assert "APP_PORT=8001" in example
     assert "CORE_ADB_SERIAL=emulator-5556" in example
     assert "FUND_ADB_SERIAL=emulator-5554" in example
+    assert "CORE_METRICS_TRANSPORT=frida" in example
+    assert "FUND_FLOW_TRANSPORT=frida" in example
+    assert "THS_SESSION_ROOT=/data/admin/ths-sessions" in example
     assert "CADDY_" not in example
+
+
+def test_macos_deployment_docs_use_the_binding_orbstack_command() -> None:
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    example = (ROOT / "deploy" / "macos.env.example").read_text(encoding="utf-8")
+
+    assert CANONICAL_MACOS_COMPOSE_COMMAND in readme
+    assert CANONICAL_MACOS_COMPOSE_COMMAND in example
+    assert "docker compose --env-file deploy/macos.env" not in readme
+    assert "docker compose --env-file deploy/macos.env" not in example
+
+
+def test_root_environment_example_documents_the_direct_session_key() -> None:
+    example = (ROOT / ".env.example").read_text(encoding="utf-8")
+
+    assert "THS_SESSION_ENCRYPTION_KEY=" in example
 
 
 def test_api_image_installs_adb_client() -> None:

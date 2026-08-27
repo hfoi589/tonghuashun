@@ -5,6 +5,7 @@ import shutil
 import subprocess
 import sys
 import time
+import traceback
 import types
 from concurrent.futures import ThreadPoolExecutor
 from threading import Barrier, Event, Lock
@@ -955,6 +956,69 @@ def test_direct_read_preserves_the_specific_app_bridge_error_code() -> None:
     assert raised.value.error_code == "DIRECT_MANAGER_UNAVAILABLE"
 
 
+@pytest.mark.parametrize(
+    ("reader", "expected_code"),
+    [
+        (
+            lambda *_args: (_ for _ in ()).throw(
+                DirectRequestError(
+                    "DIRECT_MANAGER_UNAVAILABLE",
+                    "synthetic-frida-direct-secret-marker",
+                )
+            ),
+            "DIRECT_MANAGER_UNAVAILABLE",
+        ),
+        (
+            lambda *_args: (_ for _ in ()).throw(
+                RuntimeError("synthetic-frida-generic-secret-marker")
+            ),
+            "DIRECT_REQUEST_FAILED",
+        ),
+        (
+            lambda *_args: {
+                "error_code": "DIRECT_REQUEST_TIMEOUT",
+                "error_message": "synthetic-frida-payload-secret-marker",
+            },
+            "DIRECT_REQUEST_TIMEOUT",
+        ),
+    ],
+)
+def test_frida_direct_boundary_preserves_only_a_fixed_code_without_secret_traceback(
+    reader,
+    expected_code: str,
+) -> None:
+    source = FridaParsedValueSource("127.0.0.1:27042", direct_reader=reader)
+
+    with pytest.raises(DirectRequestError) as caught:
+        source.read_direct("601872")
+
+    rendered = "".join(
+        traceback.format_exception(
+            type(caught.value), caught.value, caught.value.__traceback__
+        )
+    )
+    assert caught.value.error_code == expected_code
+    assert "synthetic-frida-direct-secret-marker" not in rendered
+    assert "synthetic-frida-generic-secret-marker" not in rendered
+    assert "synthetic-frida-payload-secret-marker" not in rendered
+
+
+def test_frida_direct_boundary_rejects_an_untrusted_payload_error_code() -> None:
+    source = FridaParsedValueSource(
+        "127.0.0.1:27042",
+        direct_reader=lambda *_args: {
+            "error_code": "secret=cookie-marker",
+            "error_message": "synthetic-frida-secret-marker",
+        },
+    )
+
+    with pytest.raises(DirectRequestError) as caught:
+        source.read_direct("601872")
+
+    assert caught.value.error_code == "DIRECT_REQUEST_FAILED"
+    assert "synthetic-frida-secret-marker" not in str(caught.value)
+
+
 def test_direct_read_preserves_a_fund_flow_callback_error_code() -> None:
     source = FridaParsedValueSource(
         "127.0.0.1:27042",
@@ -1194,6 +1258,33 @@ def test_dual_account_symbol_search_uses_only_the_core_account() -> None:
     assert DualAccountParsedValueSource(core, fund).search_symbols("国盾", 8)[0].symbol == "688027"
 
 
+def test_dual_account_can_keep_symbol_lookup_on_a_separate_app_source() -> None:
+    calls: list[tuple[str, str]] = []
+
+    class CoreTransport:
+        def lookup_symbol(self, _symbol: str):
+            raise AssertionError("direct core transport must not own symbol lookup")
+
+    class SymbolSource:
+        def lookup_symbol(self, symbol: str) -> SymbolLookup:
+            calls.append(("lookup", symbol))
+            return SymbolLookup(symbol=symbol, name="招商轮船", market="17")
+
+        def search_symbols(self, query: str, limit: int) -> list[SymbolLookup]:
+            calls.append(("search", query))
+            return [SymbolLookup(symbol="601872", name="招商轮船", market="17")][:limit]
+
+    source = DualAccountParsedValueSource(
+        CoreTransport(),
+        object(),
+        symbol_source=SymbolSource(),
+    )
+
+    assert source.lookup_symbol("601872").name == "招商轮船"
+    assert source.search_symbols("招商", 8)[0].symbol == "601872"
+    assert calls == [("lookup", "601872"), ("search", "招商")]
+
+
 def test_symbol_lookup_rejects_an_empty_exact_result() -> None:
     """An empty App response must not be presented as a valid stock."""
     source = FridaParsedValueSource(
@@ -1273,7 +1364,7 @@ def test_symbol_lookup_ignores_exact_bond_collision_for_a_fund(
 
 
 def test_default_symbol_lookup_reader_calls_the_app_rpc_and_cleans_up(monkeypatch) -> None:
-    """The production reader must pass the exact code to the attached App process."""
+    """The production reader must use the App's UI-independent local search database."""
     calls: dict[str, object] = {}
 
     class FakeExports:
@@ -1302,6 +1393,7 @@ def test_default_symbol_lookup_reader_calls_the_app_rpc_and_cleans_up(monkeypatc
 
     class FakeSession:
         def create_script(self, _source: str):
+            calls["script_source"] = _source
             return FakeScript()
 
         def detach(self) -> None:
@@ -1326,6 +1418,7 @@ def test_default_symbol_lookup_reader_calls_the_app_rpc_and_cleans_up(monkeypatc
     result = source.lookup_symbol("600143")
 
     assert result.name == "金发科技"
+    script_source = calls.pop("script_source")
     assert calls == {
         "endpoint": "127.0.0.1:27042",
         "pid": 26226,
@@ -1334,3 +1427,6 @@ def test_default_symbol_lookup_reader_calls_the_app_rpc_and_cleans_up(monkeypatc
         "unloaded": True,
         "detached": True,
     }
+    assert "SearchStockFromHexinDB" in script_source
+    assert "loadStockFromHexinDB" in script_source
+    assert "AssociateViewModel" not in script_source

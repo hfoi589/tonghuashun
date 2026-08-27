@@ -91,9 +91,10 @@ curl -fsS -X POST "http://127.0.0.1:8001/api/v1/jobs" \
 
 成功接受（`202`）会返回包含不透明 `public_id` 的 `TaskResponse`。
 `202` 只表示任务已经进入 FIFO 队列，不表示数据已经准备好。生产 Runner
-只能调用 `FridaParsedValueSource.read_direct(symbol)` 获取八项指标；该调用
-把股票代码和已确认的市场代码发送给 App 内部请求桥接。不得降级到 `read()`、
-股票页面导航、截图 OCR 或长截图解析。
+默认调用 `FridaParsedValueSource.read_direct(symbol)` 获取八项指标；显式
+启用 `CORE_METRICS_TRANSPORT=direct` 时才允许调用已验证的独立
+`Core9528Client`。两条路径都必须把股票代码和已确认的市场代码用于同一 App
+内部协议，不得降级到 `read()`、股票页面导航、截图 OCR 或长截图解析。
 
 查询任务状态：
 
@@ -182,6 +183,18 @@ GET /api/v1/jobs/{public_id}
 - 双账号变量 `CORE_ADB_SERIAL`、`CORE_FRIDA_SERVER_ENDPOINT`、`FUND_ADB_SERIAL`、`FUND_FRIDA_SERVER_ENDPOINT` 必须四项齐全；旧单设备变量仅用于兼容模式。
 - 重建 API 服务时必须保留 Redis 数据卷以及 Android 模拟器数据和登录状态。
 - 管理页面同时显示两台设备；两个 WebSocket 为 `/api/admin/devices/core_metrics` 和 `/api/admin/devices/main_fund_flow`，旧 `/api/admin/device` 只映射到 `core_metrics`。
+
+## Direct transport exception
+
+When `CORE_METRICS_TRANSPORT` or `FUND_FLOW_TRANSPORT` is explicitly set to
+`direct` or `shadow`, the corresponding server-side client may use only a
+previously verified App-internal wire contract and an encrypted session bundle
+captured after normal human login. It must preserve the same field ownership,
+formatting, missing-value, and original-error rules as `read_direct()`; it may
+never use OCR, UI text, or a guessed public endpoint. The raw cookie, User-Agent,
+auth packet, and protocol keys must not appear in logs, task records, or public
+responses. `frida` remains the default transport and the only allowed fallback
+when a direct client is not selected.
 
 ---
 
@@ -284,11 +297,11 @@ Request body:
 
 Accepted (`202`) returns a `TaskResponse` containing an opaque `public_id`.
 `202` means only that the task entered the FIFO queue; it does not mean the
-data is ready. In production, the task's eight values are obtained only by
-calling `FridaParsedValueSource.read_direct(symbol)`, which sends the symbol
-and its confirmed market code to the App-internal request bridge. It must not
-fall back to `read()`, stock-page navigation, screenshot OCR, or long-screenshot
-parsing.
+data is ready. Production defaults to `FridaParsedValueSource.read_direct(symbol)`;
+with explicit `CORE_METRICS_TRANSPORT=direct`, it may call the verified
+standalone `Core9528Client` instead. Both paths must use the confirmed symbol
+and market code under the same App-internal contract and must not fall back to
+`read()`, stock-page navigation, screenshot OCR, or long-screenshot parsing.
 
 Read the task status:
 
@@ -387,3 +400,15 @@ chart heading is present; it is never a source for any field in `values`.
 - `CORE_ADB_SERIAL`, `CORE_FRIDA_SERVER_ENDPOINT`, `FUND_ADB_SERIAL`, and `FUND_FRIDA_SERVER_ENDPOINT` must be provided together; legacy single-device variables are compatibility-only.
 - Preserve the Redis volume and Android emulator data/login state when rebuilding the API service.
 - The admin page shows both devices concurrently. Its WebSockets are `/api/admin/devices/core_metrics` and `/api/admin/devices/main_fund_flow`; legacy `/api/admin/device` maps only to `core_metrics`.
+
+## Direct transport exception
+
+When `CORE_METRICS_TRANSPORT` or `FUND_FLOW_TRANSPORT` is explicitly set to
+`direct` or `shadow`, the corresponding server-side client may use only a
+previously verified App-internal wire contract and an encrypted session bundle
+captured after normal human login. It must preserve the same field ownership,
+formatting, missing-value, and original-error rules as `read_direct()`; it may
+never use OCR, UI text, or a guessed public endpoint. The raw cookie, User-Agent,
+auth packet, and protocol keys must not appear in logs, task records, or public
+responses. `frida` remains the default transport and the only allowed fallback
+when a direct client is not selected.

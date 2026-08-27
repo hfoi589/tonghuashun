@@ -4,14 +4,29 @@ from __future__ import annotations
 
 import os
 import socket
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from functools import partial
 from pathlib import Path
 from typing import Callable, Mapping
 
 from fastapi import FastAPI
+from cryptography.fernet import Fernet
 
 from .api import create_app
+from .app_sessions import (
+    CoreAccountSessionRefresher,
+    EncryptedFileSessionProvider,
+    FundAccountSessionRefresher,
+    capture_core_session_material,
+    capture_fund_http_session,
+)
 from .daily_kline import DailyKlineMarketDataSource, TonghuashunPublicDailyKlineProvider
+from .direct_market import (
+    Core9528Client,
+    Core9528TemplateProtocol,
+    FundFlowHttpClient,
+    ShadowParsedValueSource,
+)
 from .market_accounts import RedisMarketSessionStore, SQLiteMarketAccountStore
 from .market_data import MarketDataBroker, is_china_market_open
 from .parsed_values import DualAccountParsedValueSource, FridaParsedValueSource
@@ -43,6 +58,10 @@ class DeploymentSettings:
     fund_frida_server_endpoint: str | None
     daily_check_state_file: Path
     market_database_path: Path
+    core_metrics_transport: str
+    fund_flow_transport: str
+    ths_session_encryption_key: str | None = field(repr=False)
+    ths_session_root: Path
 
     @classmethod
     def from_environ(cls, environ: Mapping[str, str] | None = None) -> "DeploymentSettings":
@@ -93,6 +112,32 @@ class DeploymentSettings:
         template_root_value = values.get("TEMPLATE_ROOT", "").strip()
         frontend_root_value = values.get("FRONTEND_ROOT", "").strip()
         capture_root = Path(values.get("CAPTURE_ROOT", "/data/captures")).resolve()
+        transport_modes: dict[str, str] = {}
+        for name in ("CORE_METRICS_TRANSPORT", "FUND_FLOW_TRANSPORT"):
+            mode = values.get(name, "frida").strip().lower() or "frida"
+            if mode not in {"frida", "shadow", "direct"}:
+                raise ValueError(f"{name} must be frida, shadow, or direct")
+            transport_modes[name] = mode
+        direct_transport_enabled = any(
+            mode != "frida" for mode in transport_modes.values()
+        )
+        session_encryption_key = values.get("THS_SESSION_ENCRYPTION_KEY", "").strip()
+        if direct_transport_enabled and not session_encryption_key:
+            raise ValueError(
+                "THS_SESSION_ENCRYPTION_KEY is required for shadow or direct transport"
+            )
+        if direct_transport_enabled:
+            try:
+                Fernet(session_encryption_key.encode("ascii"))
+            except (UnicodeEncodeError, ValueError) as error:
+                raise ValueError(
+                    "THS_SESSION_ENCRYPTION_KEY must be a URL-safe base64 Fernet key"
+                ) from error
+        if direct_transport_enabled and not dual_account_mode:
+            raise ValueError("shadow and direct transports require dual-account mode")
+        session_root = Path(
+            values.get("THS_SESSION_ROOT", "/data/admin/ths-sessions")
+        ).expanduser().resolve()
         cookie_secure_value = values.get("ADMIN_COOKIE_SECURE", "1").strip().lower()
         if cookie_secure_value in {"1", "true", "yes", "on"}:
             admin_cookie_secure = True
@@ -128,6 +173,10 @@ class DeploymentSettings:
                     str(capture_root.parent / "market" / "market.db"),
                 )
             ).expanduser().resolve(),
+            core_metrics_transport=transport_modes["CORE_METRICS_TRANSPORT"],
+            fund_flow_transport=transport_modes["FUND_FLOW_TRANSPORT"],
+            ths_session_encryption_key=session_encryption_key or None,
+            ths_session_root=session_root,
         )
 
 
@@ -239,18 +288,75 @@ def create_production_app(
                     templates[f"tab:{label}"] = candidate
                     break
     navigator = Level2Navigator(core_bridge, OpenCVTemplateFallback(templates))
+    account_session_provider = None
+    account_session_refreshers: dict[str, Callable] = {}
     if config.dual_account_mode:
         assert config.core_frida_server_endpoint is not None
         assert config.fund_frida_server_endpoint is not None
+        frida_core_source = FridaParsedValueSource(
+            config.core_frida_server_endpoint,
+            request_scope="core_metrics",
+        )
+        frida_fund_source = FridaParsedValueSource(
+            config.fund_frida_server_endpoint,
+            request_scope="main_fund_flow",
+        )
+        if (
+            config.core_metrics_transport != "frida"
+            or config.fund_flow_transport != "frida"
+        ):
+            assert config.ths_session_encryption_key is not None
+            account_session_provider = EncryptedFileSessionProvider(
+                config.ths_session_root,
+                config.ths_session_encryption_key,
+            )
+            account_session_refreshers["main_fund_flow"] = FundAccountSessionRefresher(
+                partial(
+                    capture_fund_http_session,
+                    config.fund_frida_server_endpoint,
+                )
+            )
+            account_session_refreshers["core_metrics"] = CoreAccountSessionRefresher(
+                partial(
+                    capture_core_session_material,
+                    config.core_frida_server_endpoint,
+                )
+            )
+        if config.core_metrics_transport == "frida":
+            core_source = frida_core_source
+        else:
+            assert account_session_provider is not None
+            direct_core_source = Core9528Client(
+                account_session_provider,
+                protocol=Core9528TemplateProtocol(),
+            )
+            core_source = (
+                direct_core_source
+                if config.core_metrics_transport == "direct"
+                else ShadowParsedValueSource(
+                    frida_core_source,
+                    direct_core_source,
+                    role="core_metrics",
+                )
+            )
+        if config.fund_flow_transport == "frida":
+            fund_source = frida_fund_source
+        else:
+            assert account_session_provider is not None
+            direct_fund_source = FundFlowHttpClient(account_session_provider)
+            fund_source = (
+                direct_fund_source
+                if config.fund_flow_transport == "direct"
+                else ShadowParsedValueSource(
+                    frida_fund_source,
+                    direct_fund_source,
+                    role="main_fund_flow",
+                )
+            )
         parsed_value_source = DualAccountParsedValueSource(
-            FridaParsedValueSource(
-                config.core_frida_server_endpoint,
-                request_scope="core_metrics",
-            ),
-            FridaParsedValueSource(
-                config.fund_frida_server_endpoint,
-                request_scope="main_fund_flow",
-            ),
+            core_source,
+            fund_source,
+            symbol_source=frida_core_source,
         )
     else:
         parsed_value_source = (
@@ -301,6 +407,8 @@ def create_production_app(
         market_account_store=market_accounts,
         market_session_store=market_sessions,
         market_data_broker=market_broker,
+        account_session_provider=account_session_provider,
+        account_session_refreshers=account_session_refreshers,
     )
     app.state.deployment_settings = config
     app.state.runner = runner

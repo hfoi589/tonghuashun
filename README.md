@@ -90,7 +90,7 @@ claim the VPS is supported.
 
    ```sh
    cp deploy/macos.env.example deploy/macos.env
-   docker compose --env-file deploy/macos.env -f deploy/compose.yml up -d --build
+   docker --context orbstack compose --env-file .env --env-file deploy/macos.env -f deploy/compose.yml up -d --build
    ```
 
 3. The bootstrap keeps `THS_API_33_ARM64 / emulator-5554` and its login
@@ -147,6 +147,24 @@ Plain HTTP does not encrypt the administrator password, session cookie, device
 screen, or input events. Use this mode only on a trusted local network. If the
 service is later published through a trusted external HTTPS reverse proxy, set
 `ADMIN_COOKIE_SECURE=1` and restrict direct access to port 8001.
+
+The market transports default to `frida`. Set `FUND_FLOW_TRANSPORT=direct` to
+send the three main-fund-flow requests directly from the API after a human
+administrator has logged into the protected App account. Set
+`CORE_METRICS_TRANSPORT=direct` only after a verified 9528 protocol session
+bundle is available. `shadow` runs both paths but returns the existing Frida
+result while recording only field-name mismatches. Direct or shadow mode
+requires a Fernet `THS_SESSION_ENCRYPTION_KEY`; raw cookies and auth packets are
+stored only in encrypted files under `/data/admin/ths-sessions`.
+The current direct core transport has the authentication/frame state machine
+and an explicit response-decoder gate; until the `StuffCurveStruct` decoder is
+verified, it returns `DIRECT_PROTOCOL_RESPONSE_UNSUPPORTED` and never publishes
+undecoded binary data as metrics.
+
+After manual login, an authenticated administrator can inspect
+`GET /api/admin/account-sessions` and refresh a role with
+`POST /api/admin/account-sessions/{role}/refresh` plus the existing CSRF header.
+These endpoints never accept account passwords and never return session values.
 
 Public submissions accept `{"symbol":"601872","include_long_capture":true}`.
 The collection form also accepts a stock-name prefix. `GET /api/v1/symbols`

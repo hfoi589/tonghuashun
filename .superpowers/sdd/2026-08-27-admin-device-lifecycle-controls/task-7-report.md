@@ -474,3 +474,105 @@ git diff --check
 The Dockerfile and image layers were unchanged, so no image rebuild or asset
 audit was required. No real device, ADB server, Emulator, lifecycle broker,
 LaunchAgent, Android SDK tool, or deployment env file was touched.
+
+## Fix round 4 — Bind starting-process PID to its actual executable image
+
+The remaining Important finding was reproduced: starting-process validation
+parsed `ps pid,command` but authenticated `tokens[0]`. Because argv0 is
+caller-controlled, both bare `emulator` and the exact trusted absolute path
+could be forged while an unrelated executable reached lifecycle mutation.
+
+### Exact RED evidence
+
+Five injected-resolver regressions covered bare and absolute argv0 spoofing,
+resolver failure, actual executable mismatch, and an exact actual executable
+whose command text deliberately named another program:
+
+```text
+/Users/wilson/tonghuashun/.venv/bin/python -m pytest -q \
+  tests/test_macos_one_click_deploy.py \
+  -k 'spoofed_bare_emulator_argv0 or spoofed_trusted_absolute_argv0 or process_executable_resolution_fails or actual_process_executable_mismatch or exact_actual_process_executable'
+FFFFF                                                                    [100%]
+5 failed, 46 deselected in 0.11s
+```
+
+The four rejection cases reported `DID NOT RAISE DeploymentError`, proving the
+fake resolver was ignored. The exact-actual-executable case failed in the old
+argv0 path because `/usr/bin/python3` command text was rejected even though the
+injected PID resolver identified the trusted Emulator binary.
+
+The production non-Darwin guard also failed open before implementation:
+
+```text
+/Users/wilson/tonghuashun/.venv/bin/python -m pytest -q \
+  tests/test_macos_one_click_deploy.py \
+  -k 'without_darwin_process_resolution'
+F                                                                        [100%]
+1 failed, 52 deselected in 0.08s
+```
+
+### Fix and exact GREEN evidence
+
+- Added an injected `ProcessExecutableResolver` boundary and a production
+  `DarwinProcessExecutableResolver` backed by macOS
+  `/usr/lib/libproc.dylib` `proc_pidpath`.
+- Each exact fixed-port candidate must carry a positive numeric PID. The
+  resolver must return an absolute actual executable path that resolves to the
+  fixed Emulator binary captured during prerequisite validation.
+- Command text is no longer used for executable identity. It is parsed only
+  to require exactly one fixed `-port` and exactly one fixed `-avd` value.
+- Resolver load/call/decoding errors, empty or relative paths, executable
+  mismatch, non-Darwin production, malformed or missing PIDs, duplicate
+  candidates, and other ambiguity all retain the sanitized
+  `FIXED_AVD_IDENTITY_MISMATCH` failure before lifecycle installation.
+
+Required regressions plus the non-Darwin guard after the fix:
+
+```text
+/Users/wilson/tonghuashun/.venv/bin/python -m pytest -q \
+  tests/test_macos_one_click_deploy.py \
+  -k 'spoofed_bare_emulator_argv0 or spoofed_trusted_absolute_argv0 or process_executable_resolution_fails or actual_process_executable_mismatch or exact_actual_process_executable or without_darwin_process_resolution'
+......                                                                   [100%]
+6 passed, 47 deselected in 0.03s
+```
+
+The full Task 7 deployment test file, including stopped-role, malformed PID,
+and multiple-process ambiguity coverage, passed:
+
+```text
+/Users/wilson/tonghuashun/.venv/bin/python -m pytest -q \
+  tests/test_macos_one_click_deploy.py
+.....................................................                    [100%]
+53 passed in 1.09s
+```
+
+### Covering verification
+
+```text
+/Users/wilson/tonghuashun/.venv/bin/python -m pytest -q \
+  tests/test_macos_one_click_deploy.py tests/test_deploy_configuration.py
+........................................................................ [ 90%]
+........                                                                 [100%]
+80 passed in 2.86s
+```
+
+```text
+/Users/wilson/tonghuashun/.venv/bin/python -m pytest -q
+678 passed, 24 existing deprecation warnings in 28.15s
+```
+
+Static and safety verification completed successfully:
+
+```text
+/Users/wilson/tonghuashun/.venv/bin/python -m py_compile \
+  scripts/macos_deploy.py scripts/setup-admin.py
+/bin/sh -n scripts/deploy-macos-one-click.sh \
+  scripts/container-provision-device.sh
+git diff --check
+```
+
+The forbidden-command scan remained empty. Image assets, Dockerfile,
+environment precedence, ADB absence proof, provisioning, and deferred minors
+were unchanged. No real process, device, ADB server, Emulator, lifecycle
+broker, LaunchAgent, Android SDK tool, Docker deployment, or environment file
+was touched.

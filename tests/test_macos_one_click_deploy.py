@@ -531,6 +531,25 @@ class FakeCommandRunner:
         return _completed(args)
 
 
+class FakeProcessExecutableResolver:
+    def __init__(
+        self,
+        outcomes: dict[int, Path | Exception] | None = None,
+        *,
+        default: Path = Path("/fake/emulator"),
+    ) -> None:
+        self.outcomes = dict(outcomes or {})
+        self.default = default
+        self.calls: list[int] = []
+
+    def resolve(self, pid: int) -> Path:
+        self.calls.append(pid)
+        outcome = self.outcomes.get(pid, self.default)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+
 class FakeLifecycleBroker:
     def __init__(
         self,
@@ -598,6 +617,7 @@ def make_orchestrator(
     *,
     filesystem: FakeFileSystem | None = None,
     broker: FakeLifecycleBroker | None = None,
+    process_executable_resolver: FakeProcessExecutableResolver | None = None,
     health_timeout_seconds: float = 0.05,
     env_file: Path = Path(".env"),
 ):
@@ -610,6 +630,9 @@ def make_orchestrator(
         filesystem,
         project_root=ROOT,
         env_file=env_file,
+        process_executable_resolver=(
+            process_executable_resolver or FakeProcessExecutableResolver()
+        ),
         health_timeout_seconds=health_timeout_seconds,
         poll_interval_seconds=0.0,
     )
@@ -781,20 +804,189 @@ def test_existing_mode_rejects_malformed_or_ambiguous_adb_listing(
     assert "installer" not in events
 
 
-def test_existing_mode_rejects_fake_executable_with_correct_avd_and_port() -> None:
-    """Correct-looking arguments cannot authenticate an unknown process executable."""
+def test_existing_mode_rejects_spoofed_bare_emulator_argv0() -> None:
+    """A bare trusted-looking argv0 cannot replace actual PID executable proof."""
     module = _load_macos_deploy()
     events: list[str] = []
     runner = existing_mac_runner(
         adb_states={"emulator-5556": None},
         process_snapshots=[
-            "123 /usr/bin/python3 helper.py -avd THS_CORE_33_ARM64 -port 5556\n"
+            "123 emulator -avd THS_CORE_33_ARM64 -port 5556 -no-audio\n"
         ],
         events=events,
     )
+    broker = FakeLifecycleBroker(
+        {"core_metrics": "STOPPED", "main_fund_flow": "RUNNING"},
+        events=events,
+    )
+    resolver = FakeProcessExecutableResolver({123: Path("/usr/bin/python3")})
 
     with pytest.raises(module.DeploymentError) as caught:
-        make_orchestrator(runner).deploy_existing()
+        make_orchestrator(
+            runner,
+            broker=broker,
+            process_executable_resolver=resolver,
+        ).deploy_existing()
+
+    assert caught.value.error_code == "FIXED_AVD_IDENTITY_MISMATCH"
+    assert resolver.calls == [123]
+    assert "installer" not in events
+
+
+def test_existing_mode_rejects_spoofed_trusted_absolute_argv0() -> None:
+    """The exact trusted path in command text is not proof of the process image."""
+    module = _load_macos_deploy()
+    events: list[str] = []
+    runner = existing_mac_runner(
+        adb_states={"emulator-5556": None},
+        process_snapshots=[
+            "123 /fake/emulator -avd THS_CORE_33_ARM64 -port 5556 -no-audio\n"
+        ],
+        events=events,
+    )
+    broker = FakeLifecycleBroker(
+        {"core_metrics": "STOPPED", "main_fund_flow": "RUNNING"},
+        events=events,
+    )
+    resolver = FakeProcessExecutableResolver({123: Path("/usr/bin/python3")})
+
+    with pytest.raises(module.DeploymentError) as caught:
+        make_orchestrator(
+            runner,
+            broker=broker,
+            process_executable_resolver=resolver,
+        ).deploy_existing()
+
+    assert caught.value.error_code == "FIXED_AVD_IDENTITY_MISMATCH"
+    assert resolver.calls == [123]
+    assert "installer" not in events
+
+
+def test_existing_mode_fails_closed_when_process_executable_resolution_fails() -> None:
+    """Resolver errors cannot turn a process on the fixed port into a stopped role."""
+    module = _load_macos_deploy()
+    events: list[str] = []
+    runner = existing_mac_runner(
+        adb_states={"emulator-5556": None},
+        process_snapshots=[
+            "123 /fake/emulator -avd THS_CORE_33_ARM64 -port 5556 -no-audio\n"
+        ],
+        events=events,
+    )
+    broker = FakeLifecycleBroker(
+        {"core_metrics": "STOPPED", "main_fund_flow": "RUNNING"},
+        events=events,
+    )
+    resolver = FakeProcessExecutableResolver(
+        {123: OSError("process disappeared")}
+    )
+
+    with pytest.raises(module.DeploymentError) as caught:
+        make_orchestrator(
+            runner,
+            broker=broker,
+            process_executable_resolver=resolver,
+        ).deploy_existing()
+
+    assert caught.value.error_code == "FIXED_AVD_IDENTITY_MISMATCH"
+    assert resolver.calls == [123]
+    assert "installer" not in events
+
+
+def test_existing_mode_rejects_actual_process_executable_mismatch() -> None:
+    """A fixed-port PID must resolve to the one trusted Emulator executable."""
+    module = _load_macos_deploy()
+    events: list[str] = []
+    runner = existing_mac_runner(
+        adb_states={"emulator-5556": None},
+        process_snapshots=[
+            "123 /fake/emulator -avd THS_CORE_33_ARM64 -port 5556 -no-audio\n"
+        ],
+        events=events,
+    )
+    broker = FakeLifecycleBroker(
+        {"core_metrics": "STOPPED", "main_fund_flow": "RUNNING"},
+        events=events,
+    )
+    resolver = FakeProcessExecutableResolver(
+        {123: Path("/opt/untrusted/emulator")}
+    )
+
+    with pytest.raises(module.DeploymentError) as caught:
+        make_orchestrator(
+            runner,
+            broker=broker,
+            process_executable_resolver=resolver,
+        ).deploy_existing()
+
+    assert caught.value.error_code == "FIXED_AVD_IDENTITY_MISMATCH"
+    assert resolver.calls == [123]
+    assert "installer" not in events
+
+
+def test_existing_mode_accepts_exact_actual_process_executable() -> None:
+    """Actual executable identity wins even when command argv0 is untrusted text."""
+    events: list[str] = []
+    runner = existing_mac_runner(
+        adb_states={"emulator-5556": None},
+        process_snapshots=[
+            "123 /usr/bin/python3 -avd THS_CORE_33_ARM64 -port 5556 -no-audio\n"
+        ],
+        events=events,
+    )
+    broker = FakeLifecycleBroker(
+        {"core_metrics": "STOPPED", "main_fund_flow": "RUNNING"},
+        events=events,
+    )
+    resolver = FakeProcessExecutableResolver({123: Path("/fake/emulator")})
+
+    result = make_orchestrator(
+        runner,
+        broker=broker,
+        process_executable_resolver=resolver,
+    ).deploy_existing()
+
+    assert result.state == "READY"
+    assert resolver.calls == [123]
+    assert events.index(
+        "process-snapshot:123 /usr/bin/python3 "
+        "-avd THS_CORE_33_ARM64 -port 5556 -no-audio\n"
+    ) < events.index(
+        "installer",
+    )
+
+
+def test_existing_mode_fails_closed_without_darwin_process_resolution(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Production cannot authenticate a PID without the Darwin process API."""
+    module = _load_macos_deploy()
+    events: list[str] = []
+    filesystem = FakeFileSystem()
+    runner = existing_mac_runner(
+        adb_states={"emulator-5556": None},
+        process_snapshots=[
+            "123 /fake/emulator -avd THS_CORE_33_ARM64 -port 5556 -no-audio\n"
+        ],
+        filesystem=filesystem,
+        events=events,
+    )
+    broker = FakeLifecycleBroker(
+        {"core_metrics": "STOPPED", "main_fund_flow": "RUNNING"},
+        events=events,
+    )
+    orchestrator = module.MacDeploymentOrchestrator(
+        runner,
+        broker,
+        filesystem,
+        project_root=ROOT,
+        health_timeout_seconds=0.05,
+        poll_interval_seconds=0.0,
+    )
+    monkeypatch.setattr(module.sys, "platform", "linux")
+
+    with pytest.raises(module.DeploymentError) as caught:
+        orchestrator.deploy_existing()
 
     assert caught.value.error_code == "FIXED_AVD_IDENTITY_MISMATCH"
     assert "installer" not in events
@@ -805,6 +997,10 @@ def test_existing_mode_rejects_fake_executable_with_correct_avd_and_port() -> No
     [
         "123 /fake/emulator -avd THS_CORE_33_ARM64 -port 5556 -port\n",
         "not-a-pid /fake/emulator -avd THS_CORE_33_ARM64 -port 5556\n",
+        (
+            "123 /fake/emulator -avd THS_CORE_33_ARM64 -port 5556\n"
+            "124 /fake/emulator -avd THS_CORE_33_ARM64 -port 5556\n"
+        ),
     ],
 )
 def test_existing_mode_rejects_ambiguous_starting_process_options(

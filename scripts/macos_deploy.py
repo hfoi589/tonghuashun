@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import ctypes
 from dataclasses import asdict, dataclass
 import fnmatch
 import json
@@ -106,6 +107,41 @@ class FileSystem(Protocol):
     def mode(self, path: Path) -> int: ...
 
     def which(self, command: str) -> str | None: ...
+
+
+class ProcessExecutableResolver(Protocol):
+    def resolve(self, pid: int) -> Path: ...
+
+
+class DarwinProcessExecutableResolver:
+    """Resolve a PID to its actual executable image through macOS libproc."""
+
+    _LIBPROC_PATH = "/usr/lib/libproc.dylib"
+    _PROC_PIDPATHINFO_MAXSIZE = 4096
+
+    def resolve(self, pid: int) -> Path:
+        if sys.platform != "darwin" or pid <= 0:
+            raise OSError("proc_pidpath unavailable")
+        libproc = ctypes.CDLL(self._LIBPROC_PATH, use_errno=True)
+        proc_pidpath = libproc.proc_pidpath
+        proc_pidpath.argtypes = [
+            ctypes.c_int,
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+        ]
+        proc_pidpath.restype = ctypes.c_int
+        buffer = ctypes.create_string_buffer(self._PROC_PIDPATHINFO_MAXSIZE)
+        length = proc_pidpath(pid, buffer, len(buffer))
+        if length <= 0 or length > len(buffer):
+            error_number = ctypes.get_errno()
+            raise OSError(error_number, "proc_pidpath failed")
+        raw_path = buffer.raw[:length].split(b"\0", 1)[0]
+        if not raw_path:
+            raise OSError("proc_pidpath returned an empty path")
+        executable = Path(os.fsdecode(raw_path))
+        if not executable.is_absolute():
+            raise OSError("proc_pidpath returned a relative path")
+        return executable
 
 
 class SubprocessCommandRunner:
@@ -248,6 +284,7 @@ class MacDeploymentOrchestrator:
         *,
         project_root: Path,
         env_file: Path = Path(".env"),
+        process_executable_resolver: ProcessExecutableResolver | None = None,
         health_timeout_seconds: float = 180.0,
         poll_interval_seconds: float = 2.0,
     ) -> None:
@@ -266,6 +303,9 @@ class MacDeploymentOrchestrator:
         self._poll_interval_seconds = poll_interval_seconds
         self._root_environment: dict[str, str] = {}
         self._trusted_emulator_path: Path | None = None
+        self._process_executable_resolver = (
+            process_executable_resolver or DarwinProcessExecutableResolver()
+        )
 
     def deploy(self, mode: str = "auto") -> DeploymentResult:
         self._validate_env_file_location()
@@ -654,10 +694,11 @@ class MacDeploymentOrchestrator:
         )
         for raw_line in output.splitlines():
             parts = raw_line.strip().split(maxsplit=1)
-            if len(parts) != 2 or not parts[0].isdigit():
+            if len(parts) != 2 or re.fullmatch(r"[1-9][0-9]*", parts[0]) is None:
                 if port_marker.search(raw_line):
                     raise DeploymentError("FIXED_AVD_IDENTITY_MISMATCH")
                 continue
+            pid = int(parts[0])
             command = parts[1]
             try:
                 tokens = shlex.split(command, posix=True)
@@ -668,30 +709,27 @@ class MacDeploymentOrchestrator:
             port_values = self._option_values(tokens, "-port")
             if port_text not in port_values:
                 continue
-            self._require_trusted_emulator_executable(tokens[0])
             avd_values = self._option_values(tokens, "-avd")
             if port_values != [port_text] or len(avd_values) != 1:
                 raise DeploymentError("FIXED_AVD_IDENTITY_MISMATCH")
+            self._require_trusted_emulator_process(pid)
             candidates.append(avd_values[0])
         if not candidates:
             return
         if candidates != [expected_avd]:
             raise DeploymentError("FIXED_AVD_IDENTITY_MISMATCH")
 
-    def _require_trusted_emulator_executable(self, executable: str) -> None:
+    def _require_trusted_emulator_process(self, pid: int) -> None:
         trusted = self._trusted_emulator_path
         if trusted is None:
             raise DeploymentError("FIXED_AVD_IDENTITY_MISMATCH")
-        if executable == "emulator":
-            resolved = trusted
-        else:
-            candidate = Path(executable)
+        try:
+            candidate = Path(self._process_executable_resolver.resolve(pid))
             if not candidate.is_absolute():
-                raise DeploymentError("FIXED_AVD_IDENTITY_MISMATCH")
-            try:
-                resolved = candidate.resolve()
-            except OSError:
-                raise DeploymentError("FIXED_AVD_IDENTITY_MISMATCH") from None
+                raise ValueError("relative executable path")
+            resolved = candidate.resolve()
+        except Exception:
+            raise DeploymentError("FIXED_AVD_IDENTITY_MISMATCH") from None
         if resolved != trusted:
             raise DeploymentError("FIXED_AVD_IDENTITY_MISMATCH")
 

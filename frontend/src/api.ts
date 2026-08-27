@@ -123,10 +123,35 @@ export interface QueueState {
 }
 
 export interface AccountSessionStatus {
-  role: 'core_metrics' | 'main_fund_flow'
+  role: DeviceRole
   state: string
   updated_at: string | null
   error_code: string | null
+}
+
+export type DeviceRole = 'core_metrics' | 'main_fund_flow'
+export type DeviceLifecycleState =
+  | 'UNCONFIGURED'
+  | 'UNKNOWN'
+  | 'STOPPED'
+  | 'STARTING'
+  | 'RUNNING'
+  | 'STOPPING'
+  | 'ERROR'
+export type DeviceLifecycleAction = 'start_and_launch_app' | 'shutdown'
+
+export interface AdminDeviceHealth {
+  role: DeviceRole
+  label: string
+  adb: string
+  app: string
+  frida: string
+  lifecycle: {
+    state: DeviceLifecycleState
+    operation_id: string | null
+    error_code: string | null
+    updated_at: string | null
+  }
 }
 
 export interface MarketAdminUser {
@@ -208,6 +233,12 @@ export const api = {
   runner: () => request<RunnerHealth>('/api/admin/runner'),
   lock: () => request<LockState>('/api/admin/lock'),
   queue: () => request<QueueState>('/api/admin/queue'),
+  devices: () => request<{ devices: AdminDeviceHealth[] }>('/api/admin/devices'),
+  deviceAction: (role: DeviceRole, action: DeviceLifecycleAction, csrfToken: string) => request<AdminDeviceHealth['lifecycle']>(`/api/admin/devices/${role}/actions`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrfToken },
+    body: JSON.stringify({ action }),
+  }),
   accountSessions: () => request<{ sessions: AccountSessionStatus[] }>('/api/admin/account-sessions'),
   refreshAccountSession: (role: AccountSessionStatus['role'], csrfToken: string) => request<AccountSessionStatus>(`/api/admin/account-sessions/${role}/refresh`, {
     method: 'POST',

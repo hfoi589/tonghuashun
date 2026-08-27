@@ -1,4 +1,4 @@
-import { cleanup, render, screen, waitFor, within } from '@testing-library/react'
+import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { AdminPage, DeviceViewport } from './AdminPage'
@@ -17,9 +17,52 @@ function renderLoggedOutAdmin(deviceStreamUrl?: string) {
   return view
 }
 
+function mockAuthenticatedDashboard(options: {
+  locked?: boolean
+  coreState?: string
+  coreApp?: string
+  fundState?: string
+  fundApp?: string
+} = {}) {
+  const {
+    locked = true,
+    coreState = 'RUNNING',
+    coreApp = 'ONLINE',
+    fundState = 'STOPPED',
+    fundApp = 'OFFLINE',
+  } = options
+  vi.mocked(fetch).mockImplementation(async (input) => {
+    const url = String(input)
+    if (url === '/api/admin/session') return new Response(null, { status: 204 })
+    if (url === '/api/admin/runner') return jsonResponse({ state: 'ADMIN_CONTROL', last_heartbeat: null, queue_paused: true })
+    if (url === '/api/admin/lock') return jsonResponse({ locked })
+    if (url === '/api/admin/queue') return jsonResponse({ paused: true })
+    if (url === '/api/admin/devices') return jsonResponse({ devices: [
+      {
+        role: 'core_metrics', label: '八项账号', adb: 'ONLINE', app: coreApp, frida: 'ONLINE',
+        lifecycle: { state: coreState, operation_id: null, error_code: null, updated_at: null },
+      },
+      {
+        role: 'main_fund_flow', label: '资金账号', adb: 'OFFLINE', app: fundApp, frida: 'OFFLINE',
+        lifecycle: { state: fundState, operation_id: null, error_code: null, updated_at: null },
+      },
+    ] })
+    if (url === '/api/admin/account-sessions') return jsonResponse({ sessions: [
+      { role: 'core_metrics', state: 'READY', updated_at: null, error_code: null },
+      { role: 'main_fund_flow', state: 'READY', updated_at: null, error_code: null },
+    ] })
+    throw new Error(`unexpected request: ${url}`)
+  })
+}
+
 describe('AdminPage', () => {
   beforeEach(() => {
-    vi.stubGlobal('fetch', vi.fn())
+    vi.stubGlobal('fetch', vi.fn(async (input) => {
+      const url = String(input)
+      if (url === '/api/admin/devices') return jsonResponse({ devices: [] })
+      if (url === '/api/admin/account-sessions') return jsonResponse({ sessions: [] })
+      throw new Error(`unexpected request: ${url}`)
+    }))
     Object.defineProperty(document, 'cookie', { writable: true, value: 'ths_csrf=test-csrf' })
   })
 
@@ -27,6 +70,187 @@ describe('AdminPage', () => {
     cleanup()
     vi.unstubAllGlobals()
     vi.restoreAllMocks()
+  })
+
+  it('loads per-device lifecycle and account-session controls into both device cards', async () => {
+    vi.mocked(fetch).mockImplementation(async (input) => {
+      const url = String(input)
+      if (url === '/api/admin/session') return new Response(null, { status: 204 })
+      if (url === '/api/admin/runner') return jsonResponse({ state: 'READY', last_heartbeat: null, queue_paused: false })
+      if (url === '/api/admin/lock') return jsonResponse({ locked: false })
+      if (url === '/api/admin/queue') return jsonResponse({ paused: false })
+      if (url === '/api/admin/devices') return jsonResponse({
+        devices: [
+          {
+            role: 'core_metrics', label: '八项账号', adb: 'ONLINE', app: 'ONLINE', frida: 'ONLINE',
+            lifecycle: { state: 'RUNNING', operation_id: null, error_code: null, updated_at: '2026-08-27T10:00:00+00:00' },
+          },
+          {
+            role: 'main_fund_flow', label: '资金账号', adb: 'OFFLINE', app: 'OFFLINE', frida: 'OFFLINE',
+            lifecycle: { state: 'STOPPED', operation_id: null, error_code: null, updated_at: '2026-08-27T10:00:00+00:00' },
+          },
+        ],
+      })
+      if (url === '/api/admin/account-sessions') return jsonResponse({ sessions: [
+        { role: 'core_metrics', state: 'READY', updated_at: '2026-08-27T10:00:00+00:00', error_code: null },
+        { role: 'main_fund_flow', state: 'MISSING', updated_at: null, error_code: null },
+      ] })
+      throw new Error(`unexpected request: ${url}`)
+    })
+
+    render(<AdminPage />)
+
+    const corePanel = (await screen.findByRole('heading', { name: '八项账号' })).closest('section')!
+    const fundPanel = screen.getByRole('heading', { name: '资金账号' }).closest('section')!
+    await waitFor(() => expect(within(corePanel).getByText('生命周期：运行中')).toBeInTheDocument())
+    expect(within(fundPanel).getByText('生命周期：已关闭')).toBeInTheDocument()
+    for (const panel of [corePanel, fundPanel]) {
+      expect(within(panel).getByRole('button', { name: '启动虚拟机并打开同花顺' })).toBeDisabled()
+      expect(within(panel).getByRole('button', { name: '关闭虚拟机' })).toBeDisabled()
+    }
+    expect(within(corePanel).getByText('账号会话：已就绪')).toBeInTheDocument()
+    expect(within(corePanel).getByRole('button', { name: '刷新八项账号会话' })).toBeInTheDocument()
+    expect(within(fundPanel).getByText('账号会话：未配置')).toBeInTheDocument()
+    expect(within(fundPanel).getByRole('button', { name: '刷新资金账号会话' })).toBeInTheDocument()
+    expect(screen.queryByRole('heading', { name: '资金账号会话' })).not.toBeInTheDocument()
+  })
+
+  it('uses an alertdialog with trapped focus and restores the shutdown trigger on cancel or Escape', async () => {
+    mockAuthenticatedDashboard()
+    const user = userEvent.setup()
+    render(<AdminPage />)
+    const corePanel = (await screen.findByRole('heading', { name: '八项账号' })).closest('section')!
+    const shutdown = within(corePanel).getByRole('button', { name: '关闭虚拟机' })
+    await waitFor(() => expect(shutdown).toBeEnabled())
+
+    await user.click(shutdown)
+    const dialog = screen.getByRole('alertdialog', { name: '确认关闭虚拟机' })
+    const cancel = within(dialog).getByRole('button', { name: '取消' })
+    const confirm = within(dialog).getByRole('button', { name: '确认关闭' })
+    expect(cancel).toHaveFocus()
+    await user.tab({ shift: true })
+    expect(confirm).toHaveFocus()
+    await user.tab()
+    expect(cancel).toHaveFocus()
+    await user.click(cancel)
+    expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument()
+    await waitFor(() => expect(shutdown).toHaveFocus())
+
+    await user.click(shutdown)
+    expect(within(screen.getByRole('alertdialog')).getByRole('button', { name: '取消' })).toHaveFocus()
+    fireEvent.keyDown(screen.getByRole('alertdialog'), { key: 'Escape' })
+    expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument()
+    await waitFor(() => expect(shutdown).toHaveFocus())
+    expect(vi.mocked(fetch).mock.calls.filter(([input]) => String(input).includes('/actions'))).toHaveLength(0)
+  })
+
+  it('routes fixed lifecycle actions with CSRF and keeps pending and errors inside the selected card', async () => {
+    let resolveAction!: (value: Response) => void
+    const actionResponse = new Promise<Response>((resolve) => { resolveAction = resolve })
+    mockAuthenticatedDashboard()
+    const baseImplementation = vi.mocked(fetch).getMockImplementation()!
+    vi.mocked(fetch).mockImplementation((input, init) => {
+      const url = String(input)
+      if (url === '/api/admin/devices/core_metrics/actions') return actionResponse
+      return baseImplementation(input, init)
+    })
+    const user = userEvent.setup()
+    render(<AdminPage />)
+    const corePanel = (await screen.findByRole('heading', { name: '八项账号' })).closest('section')!
+    const fundPanel = screen.getByRole('heading', { name: '资金账号' }).closest('section')!
+    const shutdown = within(corePanel).getByRole('button', { name: '关闭虚拟机' })
+    await waitFor(() => expect(shutdown).toBeEnabled())
+    await user.click(shutdown)
+    await user.click(within(screen.getByRole('alertdialog')).getByRole('button', { name: '确认关闭' }))
+
+    const pendingDialog = screen.getByRole('alertdialog')
+    expect(within(pendingDialog).getByRole('button', { name: '提交中…' })).toBeDisabled()
+    await waitFor(() => expect(pendingDialog).toHaveFocus())
+    expect(within(corePanel).getByText('正在关闭虚拟机…')).toBeInTheDocument()
+    expect(within(corePanel).getByRole('button', { name: '启动虚拟机并打开同花顺' })).toBeDisabled()
+    expect(within(fundPanel).getByRole('button', { name: '启动虚拟机并打开同花顺' })).toBeEnabled()
+    expect(fetch).toHaveBeenCalledWith('/api/admin/devices/core_metrics/actions', expect.objectContaining({
+      method: 'POST',
+      headers: expect.objectContaining({ 'X-CSRF-Token': 'test-csrf' }),
+      body: JSON.stringify({ action: 'shutdown' }),
+    }))
+
+    resolveAction(jsonResponse({ state: 'ERROR', operation_id: 'op-core', error_code: 'DEVICE_SHUTDOWN_FAILED', updated_at: null }))
+    await waitFor(() => expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument())
+    expect(within(corePanel).getByRole('alert')).toHaveTextContent('DEVICE_SHUTDOWN_FAILED')
+    expect(within(fundPanel).queryByRole('alert')).not.toBeInTheDocument()
+    await waitFor(() => expect(shutdown).toHaveFocus())
+  })
+
+  it('routes fund start and both account refreshes to their matching roles with card-local feedback', async () => {
+    mockAuthenticatedDashboard({ coreApp: 'OFFLINE' })
+    const baseImplementation = vi.mocked(fetch).getMockImplementation()!
+    vi.mocked(fetch).mockImplementation(async (input, init) => {
+      const url = String(input)
+      if (url === '/api/admin/devices/main_fund_flow/actions') return jsonResponse({ state: 'STARTING', operation_id: 'op-fund', error_code: null, updated_at: null }, 202)
+      if (url === '/api/admin/account-sessions/core_metrics/refresh') return jsonResponse({ detail: 'DIRECT_APP_OFFLINE' }, 503)
+      if (url === '/api/admin/account-sessions/main_fund_flow/refresh') return jsonResponse({ role: 'main_fund_flow', state: 'READY', updated_at: null, error_code: null })
+      return baseImplementation(input, init)
+    })
+    const user = userEvent.setup()
+    render(<AdminPage />)
+    const corePanel = (await screen.findByRole('heading', { name: '八项账号' })).closest('section')!
+    const fundPanel = screen.getByRole('heading', { name: '资金账号' }).closest('section')!
+    expect(within(fundPanel).getByText('资金账号受保护：该操作不会切号、清数据、重装 App 或执行页面导航。')).toBeInTheDocument()
+
+    const fundStart = within(fundPanel).getByRole('button', { name: '启动虚拟机并打开同花顺' })
+    await waitFor(() => expect(fundStart).toBeEnabled())
+    await user.click(fundStart)
+    await user.click(within(screen.getByRole('alertdialog')).getByRole('button', { name: '确认启动' }))
+    await waitFor(() => expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument())
+    expect(fetch).toHaveBeenCalledWith('/api/admin/devices/main_fund_flow/actions', expect.objectContaining({
+      body: JSON.stringify({ action: 'start_and_launch_app' }),
+    }))
+
+    await user.click(within(corePanel).getByRole('button', { name: '刷新八项账号会话' }))
+    await waitFor(() => expect(within(corePanel).getByRole('alert')).toHaveTextContent('DIRECT_APP_OFFLINE'))
+    expect(within(fundPanel).queryByRole('alert')).not.toBeInTheDocument()
+    await user.click(within(fundPanel).getByRole('button', { name: '刷新资金账号会话' }))
+    await waitFor(() => expect(within(fundPanel).getByText('账号会话：已就绪')).toBeInTheDocument())
+    expect(fetch).toHaveBeenCalledWith('/api/admin/account-sessions/core_metrics/refresh', expect.objectContaining({ headers: expect.objectContaining({ 'X-CSRF-Token': 'test-csrf' }) }))
+    expect(fetch).toHaveBeenCalledWith('/api/admin/account-sessions/main_fund_flow/refresh', expect.objectContaining({ headers: expect.objectContaining({ 'X-CSRF-Token': 'test-csrf' }) }))
+  })
+
+  it('uses lifecycle and live App health to enable only safe per-device actions', async () => {
+    class FakeWebSocket {
+      static instances = new Map<string, FakeWebSocket>()
+      static OPEN = 1
+      readyState = FakeWebSocket.OPEN
+      close = vi.fn()
+      send = vi.fn()
+      onopen: (() => void) | null = null
+      onclose: (() => void) | null = null
+      onerror: (() => void) | null = null
+      onmessage: ((event: MessageEvent) => void) | null = null
+      constructor(public readonly url: string) { FakeWebSocket.instances.set(url, this) }
+    }
+    vi.stubGlobal('WebSocket', FakeWebSocket)
+    const running = { state: 'RUNNING', operation_id: null, error_code: null, updated_at: null } as const
+    const stopped = { ...running, state: 'STOPPED' as const }
+    const unconfigured = { ...running, state: 'UNCONFIGURED' as const }
+    render(<div className="admin-device-grid">
+      <DeviceViewport role="core_metrics" title="运行设备" active locked lifecycle={running} streamUrl="ws://runner/running" />
+      <DeviceViewport role="main_fund_flow" title="关闭设备" active locked lifecycle={stopped} streamUrl="ws://runner/stopped" />
+      <DeviceViewport role="core_metrics" title="未配置设备" active locked lifecycle={unconfigured} streamUrl="ws://runner/unconfigured" />
+    </div>)
+    const runningSocket = FakeWebSocket.instances.get('ws://runner/running')!
+    const runningPanel = screen.getByRole('heading', { name: '运行设备' }).closest('section')!
+    const stoppedPanel = screen.getByRole('heading', { name: '关闭设备' }).closest('section')!
+    const unconfiguredPanel = screen.getByRole('heading', { name: '未配置设备' }).closest('section')!
+    runningSocket.onmessage?.({ data: JSON.stringify({ type: 'device_status', role: 'core_metrics', label: '运行设备', adb: 'ONLINE', app: 'OFFLINE', frida: 'ONLINE' }) } as MessageEvent)
+    await waitFor(() => expect(within(runningPanel).getByRole('button', { name: '启动虚拟机并打开同花顺' })).toBeEnabled())
+    runningSocket.onmessage?.({ data: JSON.stringify({ type: 'device_status', role: 'core_metrics', label: '运行设备', adb: 'ONLINE', app: 'ONLINE', frida: 'ONLINE' }) } as MessageEvent)
+    await waitFor(() => expect(within(runningPanel).getByRole('button', { name: '启动虚拟机并打开同花顺' })).toBeDisabled())
+    expect(within(runningPanel).getByRole('button', { name: '关闭虚拟机' })).toBeEnabled()
+    expect(within(stoppedPanel).getByRole('button', { name: '启动虚拟机并打开同花顺' })).toBeEnabled()
+    expect(within(stoppedPanel).getByRole('button', { name: '关闭虚拟机' })).toBeDisabled()
+    expect(within(unconfiguredPanel).getByRole('button', { name: '启动虚拟机并打开同花顺' })).toBeDisabled()
+    expect(within(unconfiguredPanel).getByRole('button', { name: '关闭虚拟机' })).toBeDisabled()
   })
 
   it('restores a valid cookie session after a page refresh without browser storage', async () => {
@@ -52,6 +276,8 @@ describe('AdminPage', () => {
       .mockResolvedValueOnce(jsonResponse({ state: 'READY', last_heartbeat: null, queue_paused: false }))
       .mockResolvedValueOnce(jsonResponse({ locked: false }))
       .mockResolvedValueOnce(jsonResponse({ paused: false }))
+      .mockResolvedValueOnce(jsonResponse({ devices: [] }))
+      .mockResolvedValueOnce(jsonResponse({ sessions: [] }))
       .mockResolvedValueOnce(jsonResponse([]))
       .mockResolvedValueOnce(jsonResponse({ id: 9, username: 'trader', enabled: true, must_change_password: true, created_at: '2026-08-23T00:00:00+00:00' }, 201))
 
@@ -76,6 +302,8 @@ describe('AdminPage', () => {
       .mockResolvedValueOnce(jsonResponse({ state: 'READY', last_heartbeat: null, queue_paused: false }))
       .mockResolvedValueOnce(jsonResponse({ locked: false }))
       .mockResolvedValueOnce(jsonResponse({ paused: false }))
+      .mockResolvedValueOnce(jsonResponse({ devices: [] }))
+      .mockResolvedValueOnce(jsonResponse({ sessions: [] }))
       .mockResolvedValueOnce(jsonResponse({
         role: 'main_fund_flow',
         state: 'READY',
@@ -88,8 +316,8 @@ describe('AdminPage', () => {
 
     await user.click(await screen.findByRole('button', { name: '刷新资金账号会话' }))
 
-    await waitFor(() => expect(screen.getByText('资金账号会话已刷新')).toBeInTheDocument())
-    expect(screen.getByText('资金账号会话：已就绪')).toBeInTheDocument()
+    const fundPanel = screen.getByRole('heading', { name: '资金账号' }).closest('section')!
+    await waitFor(() => expect(within(fundPanel).getByText('账号会话：已就绪')).toBeInTheDocument())
     expect(screen.queryByText(/private-cookie-marker|private-token-marker|private-user-agent-marker/i)).not.toBeInTheDocument()
     expect(fetch).toHaveBeenLastCalledWith('/api/admin/account-sessions/main_fund_flow/refresh', expect.objectContaining({
       method: 'POST',
@@ -112,6 +340,8 @@ describe('AdminPage', () => {
       .mockResolvedValueOnce(jsonResponse({ state: 'OFFLINE', last_heartbeat: null }))
       .mockResolvedValueOnce(jsonResponse({ locked: false }))
       .mockResolvedValueOnce(jsonResponse({ paused: false }))
+      .mockResolvedValueOnce(jsonResponse({ devices: [] }))
+      .mockResolvedValueOnce(jsonResponse({ sessions: [] }))
       .mockResolvedValueOnce(jsonResponse({ locked: true }))
 
     const user = userEvent.setup()
@@ -137,6 +367,8 @@ describe('AdminPage', () => {
       .mockResolvedValueOnce(jsonResponse({ state: 'OFFLINE', last_heartbeat: null }))
       .mockResolvedValueOnce(jsonResponse({ locked: false }))
       .mockResolvedValueOnce(jsonResponse({ paused: false }))
+      .mockResolvedValueOnce(jsonResponse({ devices: [] }))
+      .mockResolvedValueOnce(jsonResponse({ sessions: [] }))
       .mockResolvedValueOnce(jsonResponse({ paused: true }))
 
     const user = userEvent.setup()
@@ -159,6 +391,8 @@ describe('AdminPage', () => {
       .mockResolvedValueOnce(jsonResponse({ state: 'READY', last_heartbeat: null, queue_paused: false }))
       .mockResolvedValueOnce(jsonResponse({ locked: false }))
       .mockResolvedValueOnce(jsonResponse({ paused: false }))
+      .mockResolvedValueOnce(jsonResponse({ devices: [] }))
+      .mockResolvedValueOnce(jsonResponse({ sessions: [] }))
       .mockResolvedValueOnce(new Response(null, { status: 204 }))
 
     const user = userEvent.setup()
@@ -182,6 +416,8 @@ describe('AdminPage', () => {
       .mockResolvedValueOnce(jsonResponse({ state: 'NEEDS_ADMIN', last_heartbeat: null, queue_paused: false }))
       .mockResolvedValueOnce(jsonResponse({ locked: false }))
       .mockResolvedValueOnce(jsonResponse({ paused: false }))
+      .mockResolvedValueOnce(jsonResponse({ devices: [] }))
+      .mockResolvedValueOnce(jsonResponse({ sessions: [] }))
       .mockResolvedValueOnce(jsonResponse({ public_id: 'waiting-job', symbol: 'SZ.000001', status: 'QUEUED', error_code: null, created_at: '2026-08-21T00:00:00+00:00', captures: [] }))
 
     const user = userEvent.setup()
@@ -204,6 +440,8 @@ describe('AdminPage', () => {
       .mockResolvedValueOnce(jsonResponse({ state: 'READY', last_heartbeat: null, queue_paused: false }))
       .mockResolvedValueOnce(jsonResponse({ locked: false }))
       .mockResolvedValueOnce(jsonResponse({ paused: false }))
+      .mockResolvedValueOnce(jsonResponse({ devices: [] }))
+      .mockResolvedValueOnce(jsonResponse({ sessions: [] }))
       .mockResolvedValueOnce(jsonResponse({ public_id: 'failed-job', symbol: 'SZ.000001', status: 'QUEUED', error_code: null, created_at: '2026-08-21T00:00:00+00:00', captures: [] }))
 
     const user = userEvent.setup()
@@ -239,6 +477,8 @@ describe('AdminPage', () => {
       .mockResolvedValueOnce(jsonResponse({ state: 'ONLINE', last_heartbeat: null }))
       .mockResolvedValueOnce(jsonResponse({ locked: false }))
       .mockResolvedValueOnce(jsonResponse({ paused: false }))
+      .mockResolvedValueOnce(jsonResponse({ devices: [] }))
+      .mockResolvedValueOnce(jsonResponse({ sessions: [] }))
       .mockResolvedValueOnce(jsonResponse({ locked: true }))
       .mockRejectedValueOnce(new Error('admin authentication required'))
 
@@ -260,7 +500,7 @@ describe('AdminPage', () => {
     }
     vi.stubGlobal('WebSocket', InvalidWebSocket)
 
-    render(<DeviceViewport active locked streamUrl="not a websocket URL" />)
+    render(<DeviceViewport role="core_metrics" active locked streamUrl="not a websocket URL" />)
 
     await waitFor(() => expect(screen.getByText('设备画面连接不可用，当前离线')).toBeInTheDocument())
   })
@@ -280,7 +520,7 @@ describe('AdminPage', () => {
     }
     vi.stubGlobal('WebSocket', FakeWebSocket)
 
-    render(<DeviceViewport active locked />)
+    render(<DeviceViewport role="core_metrics" active locked />)
 
     await waitFor(() => expect(FakeWebSocket.instance?.url).toBe(`ws://${window.location.host}/api/admin/device`))
   })
@@ -331,8 +571,8 @@ describe('AdminPage', () => {
     }
     vi.stubGlobal('WebSocket', FakeWebSocket)
     render(<div className="admin-device-grid">
-      <DeviceViewport title="八项账号" active locked streamUrl="ws://runner/core" />
-      <DeviceViewport title="资金账号" active locked streamUrl="ws://runner/fund" />
+      <DeviceViewport role="core_metrics" title="八项账号" active locked streamUrl="ws://runner/core" />
+      <DeviceViewport role="main_fund_flow" title="资金账号" active locked streamUrl="ws://runner/fund" />
     </div>)
     const coreSocket = FakeWebSocket.instances.get('ws://runner/core')!
     const fundSocket = FakeWebSocket.instances.get('ws://runner/fund')!
@@ -376,7 +616,7 @@ describe('AdminPage', () => {
     }
     vi.stubGlobal('WebSocket', FakeWebSocket)
 
-    render(<DeviceViewport active locked />)
+    render(<DeviceViewport role="core_metrics" active locked />)
     await waitFor(() => expect(FakeWebSocket.instance).toBeDefined())
     FakeWebSocket.instance!.onopen?.()
     FakeWebSocket.instance!.onmessage?.({
@@ -417,6 +657,8 @@ describe('AdminPage', () => {
       .mockResolvedValueOnce(jsonResponse({ state: 'ADMIN_CONTROL', last_heartbeat: null, queue_paused: true }))
       .mockResolvedValueOnce(jsonResponse({ locked: false }))
       .mockResolvedValueOnce(jsonResponse({ paused: true }))
+      .mockResolvedValueOnce(jsonResponse({ devices: [] }))
+      .mockResolvedValueOnce(jsonResponse({ sessions: [] }))
       .mockResolvedValueOnce(jsonResponse({ detail: 'runner is locked by another admin' }, 409))
 
     const user = userEvent.setup()
@@ -436,6 +678,8 @@ describe('AdminPage', () => {
       .mockResolvedValueOnce(jsonResponse({ state: 'READY', last_heartbeat: null, queue_paused: false }))
       .mockResolvedValueOnce(jsonResponse({ locked: false }))
       .mockResolvedValueOnce(jsonResponse({ paused: false }))
+      .mockResolvedValueOnce(jsonResponse({ devices: [] }))
+      .mockResolvedValueOnce(jsonResponse({ sessions: [] }))
       .mockResolvedValueOnce(new Response(null, { status: 204 }))
 
     const user = userEvent.setup()

@@ -109,6 +109,7 @@ describe('AdminPage', () => {
       expect(within(panel).getByRole('button', { name: '关闭虚拟机' })).toHaveAttribute('aria-disabled', 'true')
     }
     expect(within(corePanel).getByText('账号会话：已就绪')).toBeInTheDocument()
+    expect(within(corePanel).getByText(/更新时间：/)).toBeInTheDocument()
     expect(within(corePanel).getByRole('button', { name: '刷新八项账号会话' })).toBeInTheDocument()
     expect(within(fundPanel).getByText('账号会话：未配置')).toBeInTheDocument()
     expect(within(fundPanel).getByRole('button', { name: '刷新资金账号会话' })).toBeInTheDocument()
@@ -282,13 +283,15 @@ describe('AdminPage', () => {
   })
 
   it('routes fund start and both account refreshes to their matching roles with card-local feedback', async () => {
+    let resolveCoreRefresh!: (value: Response) => void
+    const coreRefresh = new Promise<Response>((resolve) => { resolveCoreRefresh = resolve })
     mockAuthenticatedDashboard({ coreApp: 'OFFLINE' })
     const baseImplementation = vi.mocked(fetch).getMockImplementation()!
     vi.mocked(fetch).mockImplementation(async (input, init) => {
       const url = String(input)
       if (url === '/api/admin/devices/main_fund_flow/actions') return jsonResponse({ state: 'STARTING', operation_id: 'op-fund', error_code: null, updated_at: null }, 202)
-      if (url === '/api/admin/account-sessions/core_metrics/refresh') return jsonResponse({ detail: 'DIRECT_APP_OFFLINE' }, 503)
-      if (url === '/api/admin/account-sessions/main_fund_flow/refresh') return jsonResponse({ role: 'main_fund_flow', state: 'READY', updated_at: null, error_code: null })
+      if (url === '/api/admin/account-sessions/core_metrics/refresh') return coreRefresh
+      if (url === '/api/admin/account-sessions/main_fund_flow/refresh') return jsonResponse({ role: 'main_fund_flow', state: 'READY', updated_at: '2026-08-27T10:00:00+00:00', error_code: null })
       return baseImplementation(input, init)
     })
     const user = userEvent.setup()
@@ -312,10 +315,14 @@ describe('AdminPage', () => {
     expect(vi.mocked(fetch).mock.calls.filter(([input]) => String(input) === '/api/admin/devices/main_fund_flow/actions')).toHaveLength(1)
 
     await user.click(within(corePanel).getByRole('button', { name: '刷新八项账号会话' }))
+    expect(within(corePanel).getByRole('button', { name: '刷新中…' })).toBeDisabled()
+    expect(within(fundPanel).getByRole('button', { name: '刷新资金账号会话' })).toBeEnabled()
+    resolveCoreRefresh(jsonResponse({ detail: 'DIRECT_APP_OFFLINE' }, 503))
     await waitFor(() => expect(within(corePanel).getByRole('alert')).toHaveTextContent('DIRECT_APP_OFFLINE'))
     expect(within(fundPanel).queryByRole('alert')).not.toBeInTheDocument()
     await user.click(within(fundPanel).getByRole('button', { name: '刷新资金账号会话' }))
     await waitFor(() => expect(within(fundPanel).getByText('账号会话：已就绪')).toBeInTheDocument())
+    expect(within(fundPanel).getByText(/更新时间：/)).toBeInTheDocument()
     expect(fetch).toHaveBeenCalledWith('/api/admin/account-sessions/core_metrics/refresh', expect.objectContaining({ headers: expect.objectContaining({ 'X-CSRF-Token': 'test-csrf' }) }))
     expect(fetch).toHaveBeenCalledWith('/api/admin/account-sessions/main_fund_flow/refresh', expect.objectContaining({ headers: expect.objectContaining({ 'X-CSRF-Token': 'test-csrf' }) }))
   })

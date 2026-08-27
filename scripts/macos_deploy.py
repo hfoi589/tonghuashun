@@ -18,7 +18,7 @@ import stat
 import subprocess
 import sys
 import time
-from typing import Mapping, Protocol
+from typing import Callable, Mapping, Protocol
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -68,6 +68,23 @@ _SAFE_ADB_SERIAL = re.compile(r"[A-Za-z0-9._:-]+")
 _SAFE_ADB_STATES = frozenset(
     {"bootloader", "device", "offline", "recovery", "sideload", "unauthorized"}
 )
+_ACCEPTANCE_SYMBOL = "601872"
+_ACCEPTANCE_REQUIRED_VALUES = (
+    "stock_name",
+    "current_price",
+    "change_percent",
+    "turnover_rate",
+    "large_order_net",
+    "large_order_amount",
+    "retail_count",
+    "macdfs",
+)
+_FIRST_TIME_LOGIN_INSTRUCTIONS = (
+    "Open http://127.0.0.1:8001/#admin.",
+    "Manually log in and complete verification for each newly created role.",
+    "Click the matching role's session refresh.",
+    "Rerun scripts/provision-macos-from-image.sh.",
+)
 
 
 @dataclass(frozen=True)
@@ -75,6 +92,7 @@ class DeploymentResult:
     mode: str
     state: str
     error_code: str | None = None
+    instructions: tuple[str, ...] = ()
 
 
 class DeploymentError(RuntimeError):
@@ -85,7 +103,10 @@ class DeploymentError(RuntimeError):
 
 class CommandRunner(Protocol):
     def run(
-        self, args: tuple[str, ...], timeout: float
+        self,
+        args: tuple[str, ...],
+        timeout: float,
+        input_data: bytes | None = None,
     ) -> subprocess.CompletedProcess[bytes]: ...
 
 
@@ -97,6 +118,10 @@ class LifecycleBroker(Protocol):
     def wait_for_state(
         self, operation_id: str, expected_state: str, timeout_seconds: float
     ) -> None: ...
+
+
+class DataOnlyAcceptance(Protocol):
+    def verify(self) -> None: ...
 
 
 class FileSystem(Protocol):
@@ -154,7 +179,10 @@ class SubprocessCommandRunner:
             self._environment.pop(key, None)
 
     def run(
-        self, args: tuple[str, ...], timeout: float
+        self,
+        args: tuple[str, ...],
+        timeout: float,
+        input_data: bytes | None = None,
     ) -> subprocess.CompletedProcess[bytes]:
         return subprocess.run(
             args,
@@ -163,6 +191,7 @@ class SubprocessCommandRunner:
             shell=False,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
+            input=input_data,
             timeout=timeout,
             check=False,
         )
@@ -275,6 +304,99 @@ class LoopbackLifecycleBroker:
         return document
 
 
+class LoopbackDataOnlyAcceptance:
+    """Verify one fixed, catalog-confirmed data-only task through the public API."""
+
+    def __init__(
+        self,
+        *,
+        opener: Callable[..., object] | None = None,
+        timeout_seconds: float = 180.0,
+        poll_interval_seconds: float = 2.0,
+    ) -> None:
+        self._opener = opener or urlopen
+        self._timeout_seconds = timeout_seconds
+        self._poll_interval_seconds = poll_interval_seconds
+        self._base_url = "http://127.0.0.1:8001"
+
+    def verify(self) -> None:
+        symbol = self._request_json("GET", f"/api/v1/symbols/{_ACCEPTANCE_SYMBOL}")
+        if (
+            symbol.get("symbol") != _ACCEPTANCE_SYMBOL
+            or symbol.get("market") != "17"
+            or not isinstance(symbol.get("name"), str)
+            or not symbol["name"]
+        ):
+            raise DeploymentError("DATA_ONLY_ACCEPTANCE_FAILED")
+        submitted = self._request_json(
+            "POST",
+            "/api/v1/jobs",
+            payload={
+                "symbol": _ACCEPTANCE_SYMBOL,
+                "include_long_capture": False,
+            },
+        )
+        public_id = submitted.get("public_id")
+        if not isinstance(public_id, str) or not _SAFE_OPERATION_ID.fullmatch(public_id):
+            raise DeploymentError("DATA_ONLY_ACCEPTANCE_FAILED")
+        deadline = time.monotonic() + self._timeout_seconds
+        while True:
+            task = self._request_json("GET", f"/api/v1/jobs/{public_id}")
+            status = task.get("status")
+            if status == "COMPLETED":
+                self._validate_completed_task(task)
+                return
+            if status not in {"QUEUED", "RUNNING"}:
+                raise DeploymentError("DATA_ONLY_ACCEPTANCE_FAILED")
+            if time.monotonic() >= deadline:
+                raise DeploymentError("DATA_ONLY_ACCEPTANCE_FAILED")
+            time.sleep(max(0.0, self._poll_interval_seconds))
+
+    @staticmethod
+    def _validate_completed_task(task: dict[str, object]) -> None:
+        values = task.get("values")
+        if (
+            task.get("symbol") != _ACCEPTANCE_SYMBOL
+            or task.get("include_long_capture") is not False
+            or not isinstance(values, dict)
+            or any(
+                not isinstance(values.get(field), str) or not values[field]
+                for field in _ACCEPTANCE_REQUIRED_VALUES
+            )
+        ):
+            raise DeploymentError("DATA_ONLY_ACCEPTANCE_FAILED")
+
+    def _request_json(
+        self,
+        method: str,
+        path: str,
+        *,
+        payload: dict[str, object] | None = None,
+    ) -> dict[str, object]:
+        body = (
+            json.dumps(payload, separators=(",", ":")).encode("utf-8")
+            if payload is not None
+            else None
+        )
+        headers = {"Content-Type": "application/json"} if body is not None else {}
+        request = Request(
+            f"{self._base_url}{path}",
+            data=body,
+            headers=headers,
+            method=method,
+        )
+        request_timeout = max(0.1, min(10.0, self._timeout_seconds))
+        try:
+            with self._opener(request, request_timeout) as response:  # type: ignore[attr-defined]
+                raw = response.read()
+            document = json.loads(raw.decode("utf-8"))
+        except Exception:
+            raise DeploymentError("DATA_ONLY_ACCEPTANCE_FAILED") from None
+        if not isinstance(document, dict):
+            raise DeploymentError("DATA_ONLY_ACCEPTANCE_FAILED")
+        return document
+
+
 class MacDeploymentOrchestrator:
     def __init__(
         self,
@@ -285,7 +407,9 @@ class MacDeploymentOrchestrator:
         project_root: Path,
         env_file: Path = Path(".env"),
         process_executable_resolver: ProcessExecutableResolver | None = None,
+        data_only_acceptance: DataOnlyAcceptance | None = None,
         health_timeout_seconds: float = 180.0,
+        boot_timeout_seconds: float = 180.0,
         poll_interval_seconds: float = 2.0,
     ) -> None:
         self._runner = runner
@@ -300,28 +424,83 @@ class MacDeploymentOrchestrator:
         )
         self._macos_env = (self._project_root / "deploy/macos.env").resolve()
         self._health_timeout_seconds = health_timeout_seconds
+        self._boot_timeout_seconds = boot_timeout_seconds
         self._poll_interval_seconds = poll_interval_seconds
         self._root_environment: dict[str, str] = {}
         self._trusted_emulator_path: Path | None = None
+        self._data_only_acceptance = data_only_acceptance
+        self._initial_missing_roles: frozenset[str] | None = None
         self._process_executable_resolver = (
             process_executable_resolver or DarwinProcessExecutableResolver()
         )
+
+    @property
+    def initial_missing_roles(self) -> frozenset[str]:
+        return self._initial_missing_roles or frozenset()
 
     def deploy(self, mode: str = "auto") -> DeploymentResult:
         self._validate_env_file_location()
         if mode == "existing":
             return self.deploy_existing()
         if mode == "provision":
-            return self.deploy_provision()
+            return self.provision_missing()
         if mode != "auto":
             raise DeploymentError("DEPLOYMENT_MODE_INVALID")
         self._validate_command_presence()
-        if self._fixed_avds_present():
+        initial_missing = self._record_initial_missing_roles(
+            self._missing_fixed_roles()
+        )
+        if not initial_missing:
             return self.deploy_existing()
-        return self.deploy_provision()
+        return self.provision_missing(initial_missing)
 
     def deploy_provision(self) -> DeploymentResult:
-        raise DeploymentError("PROVISIONING_NOT_IMPLEMENTED")
+        return self.provision_missing()
+
+    def provision_missing(
+        self,
+        initial_missing_roles: frozenset[str] | None = None,
+    ) -> DeploymentResult:
+        self._validate_env_file_location()
+        self._validate_command_presence()
+        missing_roles = self._record_initial_missing_roles(
+            initial_missing_roles
+            if initial_missing_roles is not None
+            else self._missing_fixed_roles()
+        )
+        self._validate_host_prerequisites(provision_system_image=True)
+        self._root_environment = self._ensure_root_environment()
+        self._validate_macos_environment()
+        self._validate_effective_compose_config()
+        self._build_local_image()
+        manifest = self._read_image_manifest()
+        preserved_roles = tuple(
+            role for role in FIXED_ROLES if role not in missing_roles
+        )
+        self._verify_preinstall_fixed_avd_identities(preserved_roles)
+        for role in FIXED_ROLES:
+            if role not in missing_roles:
+                continue
+            self._create_fixed_avd(role)
+            self._start_created_avd(role)
+            self._provision_created_avd(role)
+            if role == "core_metrics":
+                self._calibrate_created_core()
+        self._install_lifecycle_service()
+        self._start_and_launch_roles(tuple(FIXED_ROLES))
+        self._verify_fixed_avd_identities()
+        self._verify_installed_apks(manifest["apk"]["sha256"])
+        self._validate_effective_compose_config()
+        self._compose_up()
+        self._wait_for_compose_health()
+        if not self._session_bundles_ready():
+            return DeploymentResult(
+                mode="provision",
+                state="FIRST_TIME_LOGIN_REQUIRED",
+                instructions=_FIRST_TIME_LOGIN_INSTRUCTIONS,
+            )
+        self._verify_data_only_acceptance()
+        return DeploymentResult(mode="provision", state="READY")
 
     def deploy_existing(self) -> DeploymentResult:
         self._validate_env_file_location()
@@ -397,7 +576,9 @@ class MacDeploymentOrchestrator:
         except OSError:
             raise DeploymentError("MISSING_PREREQUISITE") from None
 
-    def _validate_host_prerequisites(self) -> None:
+    def _validate_host_prerequisites(
+        self, *, provision_system_image: bool = False
+    ) -> None:
         self._validate_command_presence()
         system = self._run(("uname", "-s"), 10.0, "UNSUPPORTED_HOST")
         architecture = self._run(("uname", "-m"), 10.0, "UNSUPPORTED_HOST")
@@ -419,17 +600,79 @@ class MacDeploymentOrchestrator:
         sdk = self._run(
             ("sdkmanager", "--list_installed"),
             60.0,
-            "ANDROID_33_ARM64_UNAVAILABLE",
+            (
+                "ANDROID_SYSTEM_IMAGE_UNAVAILABLE"
+                if provision_system_image
+                else "ANDROID_33_ARM64_UNAVAILABLE"
+            ),
         )
         if ANDROID_SYSTEM_IMAGE not in self._stdout_text(sdk):
-            raise DeploymentError("ANDROID_33_ARM64_UNAVAILABLE")
+            if not provision_system_image:
+                raise DeploymentError("ANDROID_33_ARM64_UNAVAILABLE")
+            self._install_android_system_image()
+
+    def _install_android_system_image(self) -> None:
+        command = ("sdkmanager", ANDROID_SYSTEM_IMAGE)
+        try:
+            result = self._runner.run(command, 1800.0, b"")
+        except Exception:
+            raise DeploymentError("ANDROID_SYSTEM_IMAGE_UNAVAILABLE") from None
+        if result.returncode != 0:
+            diagnostic = self._safe_process_diagnostic(result).lower()
+            if "license" in diagnostic and (
+                "not accepted" in diagnostic
+                or "not been accepted" in diagnostic
+                or "accept the sdk license" in diagnostic
+            ):
+                raise DeploymentError("ANDROID_LICENSE_REQUIRED")
+            raise DeploymentError("ANDROID_SYSTEM_IMAGE_UNAVAILABLE")
+        verified = self._run(
+            ("sdkmanager", "--list_installed"),
+            60.0,
+            "ANDROID_SYSTEM_IMAGE_UNAVAILABLE",
+        )
+        if ANDROID_SYSTEM_IMAGE not in self._stdout_text(verified):
+            raise DeploymentError("ANDROID_SYSTEM_IMAGE_UNAVAILABLE")
+
+    @staticmethod
+    def _safe_process_diagnostic(
+        result: subprocess.CompletedProcess[bytes],
+    ) -> str:
+        parts: list[str] = []
+        for raw in (result.stdout, result.stderr):
+            if isinstance(raw, bytes):
+                try:
+                    parts.append(raw.decode("utf-8"))
+                except UnicodeDecodeError:
+                    continue
+        return "\n".join(parts)
 
     def _fixed_avds_present(self) -> bool:
+        return not self._missing_fixed_roles()
+
+    def _missing_fixed_roles(self) -> frozenset[str]:
         result = self._run(
             ("emulator", "-list-avds"), 30.0, "FIXED_AVD_NOT_FOUND"
         )
-        avds = {line.strip() for line in self._stdout_text(result).splitlines() if line.strip()}
-        return {avd for avd, _serial in FIXED_ROLES.values()}.issubset(avds)
+        avds = {
+            line.strip()
+            for line in self._stdout_text(result).splitlines()
+            if line.strip()
+        }
+        return frozenset(
+            role for role, (avd, _serial) in FIXED_ROLES.items() if avd not in avds
+        )
+
+    def _record_initial_missing_roles(
+        self, roles: frozenset[str]
+    ) -> frozenset[str]:
+        if not roles.issubset(FIXED_ROLES):
+            raise DeploymentError("PROVISIONING_STATE_INVALID")
+        if self._initial_missing_roles is None:
+            self._initial_missing_roles = frozenset(roles)
+        elif self._initial_missing_roles != roles:
+            raise DeploymentError("PROVISIONING_STATE_INVALID")
+        return self._initial_missing_roles
 
     def _require_fixed_avds(self) -> None:
         if not self._fixed_avds_present():
@@ -601,12 +844,130 @@ class MacDeploymentOrchestrator:
             "DEVICE_LIFECYCLE_INSTALL_FAILED",
         )
 
-    def _verify_fixed_avd_identities(self) -> None:
-        for _role, (expected_avd, serial) in FIXED_ROLES.items():
+    def _create_fixed_avd(self, role: str) -> None:
+        avd_name, _serial = FIXED_ROLES[role]
+        self._run(
+            (
+                "avdmanager",
+                "create",
+                "avd",
+                "--name",
+                avd_name,
+                "--package",
+                ANDROID_SYSTEM_IMAGE,
+            ),
+            300.0,
+            "AVD_CREATE_FAILED",
+            input_data=b"no\n",
+        )
+
+    def _start_created_avd(self, role: str) -> None:
+        avd_name, _serial = FIXED_ROLES[role]
+        emulator_path = self._trusted_emulator_path
+        if emulator_path is None:
+            raise DeploymentError("MISSING_PREREQUISITE")
+        port = FIXED_EMULATOR_PORTS[role]
+        self._run(
+            (
+                "launchctl",
+                "submit",
+                "-l",
+                f"com.ths.avd.{port}",
+                "--",
+                str(emulator_path),
+                "-avd",
+                avd_name,
+                "-port",
+                str(port),
+                "-no-snapshot",
+                "-no-audio",
+                "-gpu",
+                "host",
+                "-memory",
+                "2048",
+                "-cores",
+                "4",
+            ),
+            30.0,
+            "DEVICE_LAUNCH_FAILED",
+        )
+        self._wait_for_created_avd_boot(role)
+
+    def _wait_for_created_avd_boot(self, role: str) -> None:
+        expected_avd, serial = FIXED_ROLES[role]
+        deadline = time.monotonic() + self._boot_timeout_seconds
+        while True:
+            try:
+                state = self._runner.run(("adb", "-s", serial, "get-state"), 15.0)
+                boot = self._runner.run(
+                    (
+                        "adb",
+                        "-s",
+                        serial,
+                        "shell",
+                        "getprop",
+                        "sys.boot_completed",
+                    ),
+                    15.0,
+                )
+                ready = (
+                    state.returncode == 0
+                    and self._stdout_text(state).strip() == "device"
+                    and boot.returncode == 0
+                    and self._stdout_text(boot).strip() == "1"
+                )
+            except Exception:
+                ready = False
+            if ready:
+                self._require_adb_avd_identity(serial, expected_avd)
+                return
+            if time.monotonic() >= deadline:
+                raise DeploymentError("DEVICE_BOOT_TIMEOUT")
+            time.sleep(max(0.0, self._poll_interval_seconds))
+
+    def _provision_created_avd(self, role: str) -> None:
+        self._run(
+            (
+                "docker",
+                "--context",
+                "orbstack",
+                "run",
+                "--rm",
+                "--add-host",
+                "host.docker.internal:host-gateway",
+                "--env",
+                "ADB_SERVER_SOCKET=tcp:host.docker.internal:5037",
+                "--entrypoint",
+                "container-provision-device",
+                IMAGE_NAME,
+                role,
+            ),
+            300.0,
+            "DEVICE_PROVISION_FAILED",
+        )
+
+    def _calibrate_created_core(self) -> None:
+        calibrator = self._project_root / "scripts/configure-macos-core-display.sh"
+        self._run(
+            (str(calibrator), FIXED_ROLES["core_metrics"][1], "adb"),
+            30.0,
+            "DEVICE_DISPLAY_CALIBRATION_FAILED",
+        )
+
+    def _verify_fixed_avd_identities(
+        self, roles: tuple[str, ...] | None = None
+    ) -> None:
+        selected = tuple(FIXED_ROLES) if roles is None else roles
+        for role in selected:
+            expected_avd, serial = FIXED_ROLES[role]
             self._require_adb_avd_identity(serial, expected_avd)
 
-    def _verify_preinstall_fixed_avd_identities(self) -> None:
-        for role, (expected_avd, serial) in FIXED_ROLES.items():
+    def _verify_preinstall_fixed_avd_identities(
+        self, roles: tuple[str, ...] | None = None
+    ) -> None:
+        selected = tuple(FIXED_ROLES) if roles is None else roles
+        for role in selected:
+            expected_avd, serial = FIXED_ROLES[role]
             try:
                 state_result = self._runner.run(
                     ("adb", "-s", serial, "get-state"), 15.0
@@ -767,6 +1128,22 @@ class MacDeploymentOrchestrator:
         except Exception:
             raise DeploymentError("DEVICE_LIFECYCLE_UNAVAILABLE") from None
 
+    def _start_and_launch_roles(self, roles: tuple[str, ...]) -> None:
+        broker = self._broker
+        if broker is None:
+            broker = LoopbackLifecycleBroker(
+                self._root_environment["THS_DEVICE_LIFECYCLE_TOKEN"]
+            )
+            self._broker = broker
+        try:
+            for role in roles:
+                operation_id = broker.start_and_launch_app(role)
+                broker.wait_for_state(operation_id, "RUNNING", 180.0)
+        except DeploymentError:
+            raise
+        except Exception:
+            raise DeploymentError("DEVICE_LIFECYCLE_UNAVAILABLE") from None
+
     def _verify_installed_apks(self, expected_sha256: object) -> None:
         if expected_sha256 != APK_SHA256:
             raise DeploymentError("IMAGE_ASSET_MANIFEST_INVALID")
@@ -824,6 +1201,37 @@ class MacDeploymentOrchestrator:
             "COMPOSE_REBUILD_FAILED",
         )
 
+    def _session_bundles_ready(self) -> bool:
+        probe = (
+            "from pathlib import Path; "
+            "root=Path('/data/admin/ths-sessions'); "
+            "names=('core_metrics.session','main_fund_flow.session'); "
+            "print('READY' if all((root/name).is_file() for name in names) else 'MISSING')"
+        )
+        result = self._run(
+            self._compose_prefix()
+            + ("exec", "-T", "api", "python", "-c", probe),
+            30.0,
+            "SESSION_STATUS_UNAVAILABLE",
+        )
+        state = self._stdout_text(result).strip()
+        if state == "READY":
+            return True
+        if state == "MISSING":
+            return False
+        raise DeploymentError("SESSION_STATUS_UNAVAILABLE")
+
+    def _verify_data_only_acceptance(self) -> None:
+        acceptance = self._data_only_acceptance or LoopbackDataOnlyAcceptance()
+        try:
+            acceptance.verify()
+        except DeploymentError as error:
+            if error.error_code == "DATA_ONLY_ACCEPTANCE_FAILED":
+                raise
+            raise DeploymentError("DATA_ONLY_ACCEPTANCE_FAILED") from None
+        except Exception:
+            raise DeploymentError("DATA_ONLY_ACCEPTANCE_FAILED") from None
+
     def _wait_for_compose_health(self) -> None:
         deadline = time.monotonic() + self._health_timeout_seconds
         command = self._compose_prefix() + (
@@ -869,10 +1277,15 @@ class MacDeploymentOrchestrator:
         )
 
     def _run(
-        self, args: tuple[str, ...], timeout: float, error_code: str
+        self,
+        args: tuple[str, ...],
+        timeout: float,
+        error_code: str,
+        *,
+        input_data: bytes | None = None,
     ) -> subprocess.CompletedProcess[bytes]:
         try:
-            result = self._runner.run(args, timeout)
+            result = self._runner.run(args, timeout, input_data)
         except Exception:
             raise DeploymentError(error_code) from None
         if result.returncode != 0:

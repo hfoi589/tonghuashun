@@ -21,6 +21,7 @@ FRIDA_BINARY_SHA256 = "4eebf1fbc66ff54aba9a9124c2ef8b32b566616388c60e2caa65148a5
 PROVISIONER = ROOT / "scripts" / "container-provision-device.sh"
 MACOS_DEPLOY = ROOT / "scripts" / "macos_deploy.py"
 ONE_CLICK_WRAPPER = ROOT / "scripts" / "deploy-macos-one-click.sh"
+PROVISION_WRAPPER = ROOT / "scripts" / "provision-macos-from-image.sh"
 _MACOS_DEPLOY_MODULE = None
 
 REQUIRED_ROOT_ENV = (
@@ -376,15 +377,28 @@ class FakeCommandRunner:
         avd_identity_sequences: dict[str, list[str | None]] | None = None,
         healthy: bool = True,
         compose_environment: dict[str, str] | None = None,
+        system_image_installed: bool = True,
+        sdkmanager_install_returncode: int = 0,
+        sdkmanager_install_stderr: bytes = b"",
+        boot_completed: dict[str, str] | None = None,
+        sessions_ready: bool = False,
         filesystem: FakeFileSystem | None = None,
         events: list[str] | None = None,
     ) -> None:
         self.apk_sha256 = apk_sha256
         self.apk_path = apk_path
-        self.avds = avds
+        self.avds = list(avds)
+        present_serials = {
+            serial
+            for avd, serial in (
+                ("THS_CORE_33_ARM64", "emulator-5556"),
+                ("THS_API_33_ARM64", "emulator-5554"),
+            )
+            if avd in avds
+        }
         self.adb_states = {
-            "emulator-5556": "device",
-            "emulator-5554": "device",
+            "emulator-5556": "device" if "emulator-5556" in present_serials else None,
+            "emulator-5554": "device" if "emulator-5554" in present_serials else None,
             **(adb_states or {}),
         }
         self.adb_devices_output = adb_devices_output
@@ -400,15 +414,29 @@ class FakeCommandRunner:
             if compose_environment is None
             else dict(compose_environment)
         )
+        self.system_image_installed = system_image_installed
+        self.sdkmanager_install_returncode = sdkmanager_install_returncode
+        self.sdkmanager_install_stderr = sdkmanager_install_stderr
+        self.boot_completed = {
+            "emulator-5556": "1",
+            "emulator-5554": "1",
+            **(boot_completed or {}),
+        }
+        self.sessions_ready = sessions_ready
         self.filesystem = filesystem
         self.events = events if events is not None else []
         self.calls: list[tuple[str, ...]] = []
+        self.inputs: list[bytes | None] = []
 
     def run(
-        self, args: tuple[str, ...], timeout: float
+        self,
+        args: tuple[str, ...],
+        timeout: float,
+        input_data: bytes | None = None,
     ) -> subprocess.CompletedProcess[bytes]:
         del timeout
         self.calls.append(args)
+        self.inputs.append(input_data)
         if args == ("uname", "-s"):
             return _completed(args, stdout=b"Darwin\n")
         if args == ("uname", "-m"):
@@ -420,10 +448,38 @@ class FakeCommandRunner:
         if args == ("sdkmanager", "--list_installed"):
             return _completed(
                 args,
-                stdout=b"system-images;android-33;google_apis;arm64-v8a\n",
+                stdout=(
+                    b"system-images;android-33;google_apis;arm64-v8a\n"
+                    if self.system_image_installed
+                    else b"Installed packages:\n"
+                ),
+            )
+        if args == ("sdkmanager", "system-images;android-33;google_apis;arm64-v8a"):
+            if self.sdkmanager_install_returncode == 0:
+                self.system_image_installed = True
+            return _completed(
+                args,
+                returncode=self.sdkmanager_install_returncode,
+                stderr=self.sdkmanager_install_stderr,
             )
         if args == ("emulator", "-list-avds"):
             return _completed(args, stdout=("\n".join(self.avds) + "\n").encode())
+        if args[:3] == ("avdmanager", "create", "avd"):
+            avd_name = args[args.index("--name") + 1]
+            if avd_name in self.avds:
+                return _completed(args, returncode=1, stderr=b"AVD already exists")
+            self.avds.append(avd_name)
+            self.events.append(f"avd-created:{avd_name}")
+            return _completed(args)
+        if args[:2] == ("launchctl", "submit"):
+            avd_name = args[args.index("-avd") + 1]
+            serial = {
+                "THS_CORE_33_ARM64": "emulator-5556",
+                "THS_API_33_ARM64": "emulator-5554",
+            }[avd_name]
+            self.adb_states[serial] = "device"
+            self.events.append(f"launchctl:{avd_name}")
+            return _completed(args)
         if len(args) == 4 and args[:2] == ("adb", "-s") and args[3] == "get-state":
             serial = args[2]
             state = self.adb_states[serial]
@@ -431,6 +487,14 @@ class FakeCommandRunner:
             if state is None:
                 return _completed(args, returncode=1, stderr=b"device absent")
             return _completed(args, stdout=f"{state}\n".encode())
+        if len(args) == 6 and args[:2] == ("adb", "-s") and args[3:] == (
+            "shell",
+            "getprop",
+            "sys.boot_completed",
+        ):
+            serial = args[2]
+            self.events.append(f"boot:{serial}:{self.boot_completed[serial]}")
+            return _completed(args, stdout=f"{self.boot_completed[serial]}\n".encode())
         if args == ("adb", "devices"):
             if self.adb_devices_output is None:
                 attached = [
@@ -504,6 +568,9 @@ class FakeCommandRunner:
         if args and args[0].endswith("install-macos-device-lifecycle.sh"):
             self.events.append("installer")
             return _completed(args, stdout=b"DEVICE_LIFECYCLE_INSTALL_READY\n")
+        if args and args[0].endswith("configure-macos-core-display.sh"):
+            self.events.append("display-calibration")
+            return _completed(args)
         if args and args[0].endswith("setup-admin.sh"):
             self.events.append("setup-admin")
             assert self.filesystem is not None
@@ -517,6 +584,19 @@ class FakeCommandRunner:
         if "sha256sum" in args:
             path = args[-1]
             return _completed(args, stdout=f"{self.apk_sha256}  {path}\n".encode())
+        if "container-provision-device" in args:
+            role = args[-1]
+            self.events.append(f"container-provision:{role}")
+            return _completed(args, stdout=b"DEVICE_PROVISION_READY\n")
+        if (
+            "exec" in args
+            and "api" in args
+            and "core_metrics.session" in " ".join(args)
+        ):
+            return _completed(
+                args,
+                stdout=b"READY\n" if self.sessions_ready else b"MISSING\n",
+            )
         if "ps" in args and "--format" in args:
             health = "healthy" if self.healthy else "starting"
             payload = [
@@ -581,6 +661,17 @@ class FakeLifecycleBroker:
         self.wait_calls.append((operation_id, expected_state, timeout_seconds))
 
 
+class FakeDataOnlyAcceptance:
+    def __init__(self, error: Exception | None = None) -> None:
+        self.error = error
+        self.calls = 0
+
+    def verify(self) -> None:
+        self.calls += 1
+        if self.error is not None:
+            raise self.error
+
+
 def existing_mac_runner(
     *,
     apk_sha256: str = APK_SHA256,
@@ -593,6 +684,11 @@ def existing_mac_runner(
     avd_identity_sequences: dict[str, list[str | None]] | None = None,
     healthy: bool = True,
     compose_environment: dict[str, str] | None = None,
+    system_image_installed: bool = True,
+    sdkmanager_install_returncode: int = 0,
+    sdkmanager_install_stderr: bytes = b"",
+    boot_completed: dict[str, str] | None = None,
+    sessions_ready: bool = False,
     filesystem: FakeFileSystem | None = None,
     events: list[str] | None = None,
 ) -> FakeCommandRunner:
@@ -607,6 +703,11 @@ def existing_mac_runner(
         avd_identity_sequences=avd_identity_sequences,
         healthy=healthy,
         compose_environment=compose_environment,
+        system_image_installed=system_image_installed,
+        sdkmanager_install_returncode=sdkmanager_install_returncode,
+        sdkmanager_install_stderr=sdkmanager_install_stderr,
+        boot_completed=boot_completed,
+        sessions_ready=sessions_ready,
         filesystem=filesystem,
         events=events,
     )
@@ -618,7 +719,9 @@ def make_orchestrator(
     filesystem: FakeFileSystem | None = None,
     broker: FakeLifecycleBroker | None = None,
     process_executable_resolver: FakeProcessExecutableResolver | None = None,
+    acceptance: FakeDataOnlyAcceptance | None = None,
     health_timeout_seconds: float = 0.05,
+    boot_timeout_seconds: float = 0.05,
     env_file: Path = Path(".env"),
 ):
     module = _load_macos_deploy()
@@ -633,7 +736,9 @@ def make_orchestrator(
         process_executable_resolver=(
             process_executable_resolver or FakeProcessExecutableResolver()
         ),
+        data_only_acceptance=acceptance or FakeDataOnlyAcceptance(),
         health_timeout_seconds=health_timeout_seconds,
+        boot_timeout_seconds=boot_timeout_seconds,
         poll_interval_seconds=0.0,
     )
 
@@ -1364,6 +1469,422 @@ def test_auto_is_the_default_mode_and_two_fixed_avds_choose_existing() -> None:
 
     assert parser.parse_args([]).mode == "auto"
     assert orchestrator.deploy().mode == "existing"
+
+
+@pytest.mark.parametrize(
+    ("avds", "expected_missing"),
+    [
+        ((), frozenset({"core_metrics", "main_fund_flow"})),
+        (("THS_API_33_ARM64",), frozenset({"core_metrics"})),
+        (("THS_CORE_33_ARM64",), frozenset({"main_fund_flow"})),
+        (
+            ("UNRELATED_TEST_AVD", "THS_API_33_ARM64"),
+            frozenset({"core_metrics"}),
+        ),
+    ],
+)
+def test_auto_provisions_only_the_immutable_initial_missing_role_set(
+    avds: tuple[str, ...], expected_missing: frozenset[str]
+) -> None:
+    """Re-listing after creation could expand provisioning onto a preserved role."""
+    runner = existing_mac_runner(avds=avds)
+    orchestrator = make_orchestrator(runner)
+
+    result = orchestrator.deploy("auto")
+
+    assert result.mode == "provision"
+    assert result.state == "FIRST_TIME_LOGIN_REQUIRED"
+    assert orchestrator.initial_missing_roles == expected_missing
+    created_roles = {
+        {
+            "THS_CORE_33_ARM64": "core_metrics",
+            "THS_API_33_ARM64": "main_fund_flow",
+        }[call[call.index("--name") + 1]]
+        for call in runner.calls
+        if call[:3] == ("avdmanager", "create", "avd")
+    }
+    assert created_roles == expected_missing
+    assert orchestrator.initial_missing_roles == expected_missing
+
+
+def test_provisioning_uses_only_fixed_image_avd_launch_and_asset_commands() -> None:
+    """A dynamic package, AVD, serial, or asset command would cross the fixed-role boundary."""
+    events: list[str] = []
+    runner = existing_mac_runner(
+        avds=(),
+        system_image_installed=False,
+        events=events,
+    )
+    broker = FakeLifecycleBroker(events=events)
+
+    result = make_orchestrator(runner, broker=broker).deploy("auto")
+
+    assert result.state == "FIRST_TIME_LOGIN_REQUIRED"
+    sdk_install = (
+        "sdkmanager",
+        "system-images;android-33;google_apis;arm64-v8a",
+    )
+    assert sdk_install in runner.calls
+    assert runner.inputs[runner.calls.index(sdk_install)] == b""
+    expected_creates = [
+        (
+            "avdmanager",
+            "create",
+            "avd",
+            "--name",
+            "THS_CORE_33_ARM64",
+            "--package",
+            "system-images;android-33;google_apis;arm64-v8a",
+        ),
+        (
+            "avdmanager",
+            "create",
+            "avd",
+            "--name",
+            "THS_API_33_ARM64",
+            "--package",
+            "system-images;android-33;google_apis;arm64-v8a",
+        ),
+    ]
+    assert [
+        call for call in runner.calls if call[:3] == ("avdmanager", "create", "avd")
+    ] == expected_creates
+    for create in expected_creates:
+        create_index = runner.calls.index(create)
+        assert runner.inputs[create_index] == b"no\n"
+        assert "--force" not in create
+    assert (
+        "launchctl",
+        "submit",
+        "-l",
+        "com.ths.avd.5556",
+        "--",
+        "/fake/emulator",
+        "-avd",
+        "THS_CORE_33_ARM64",
+        "-port",
+        "5556",
+        "-no-snapshot",
+        "-no-audio",
+        "-gpu",
+        "host",
+        "-memory",
+        "2048",
+        "-cores",
+        "4",
+    ) in runner.calls
+    assert (
+        "launchctl",
+        "submit",
+        "-l",
+        "com.ths.avd.5554",
+        "--",
+        "/fake/emulator",
+        "-avd",
+        "THS_API_33_ARM64",
+        "-port",
+        "5554",
+        "-no-snapshot",
+        "-no-audio",
+        "-gpu",
+        "host",
+        "-memory",
+        "2048",
+        "-cores",
+        "4",
+    ) in runner.calls
+    container_calls = [
+        call for call in runner.calls if "container-provision-device" in call
+    ]
+    assert [call[-1] for call in container_calls] == [
+        "core_metrics",
+        "main_fund_flow",
+    ]
+    for call in container_calls:
+        assert call == (
+            "docker",
+            "--context",
+            "orbstack",
+            "run",
+            "--rm",
+            "--add-host",
+            "host.docker.internal:host-gateway",
+            "--env",
+            "ADB_SERVER_SOCKET=tcp:host.docker.internal:5037",
+            "--entrypoint",
+            "container-provision-device",
+            "ths-level2-api:local",
+            call[-1],
+        )
+    display_calls = [
+        call
+        for call in runner.calls
+        if call and call[0].endswith("configure-macos-core-display.sh")
+    ]
+    assert display_calls == [
+        (
+            str(ROOT / "scripts/configure-macos-core-display.sh"),
+            "emulator-5556",
+            "adb",
+        )
+    ]
+    assert events.index("container-provision:core_metrics") < events.index("installer")
+    assert events.index("container-provision:main_fund_flow") < events.index("installer")
+    assert events.index("container-provision:core_metrics") < events.index(
+        "avd-created:THS_API_33_ARM64"
+    )
+    assert events.index("installer") < events.index("broker-start:core_metrics")
+    assert events.index("installer") < events.index("broker-start:main_fund_flow")
+    assert broker.start_calls == ["core_metrics", "main_fund_flow"]
+    assert not any(
+        call and call[0] in {"brew", "open", "softwareupdate"}
+        for call in runner.calls
+    )
+
+
+def test_partial_provisioning_preserves_and_validates_the_existing_role() -> None:
+    """A mixed host must not install or push image assets onto its preserved account."""
+    runner = existing_mac_runner(avds=("THS_API_33_ARM64",))
+
+    make_orchestrator(runner).deploy("auto")
+
+    assert [
+        call[-1] for call in runner.calls if "container-provision-device" in call
+    ] == ["core_metrics"]
+    assert [
+        call[call.index("--name") + 1]
+        for call in runner.calls
+        if call[:3] == ("avdmanager", "create", "avd")
+    ] == ["THS_CORE_33_ARM64"]
+    fund_calls = [call for call in runner.calls if "emulator-5554" in call]
+    assert any("pm" in call and "path" in call for call in fund_calls)
+    assert any("sha256sum" in call for call in fund_calls)
+    assert not any(
+        any(token in call for token in ("install", "push", "chmod"))
+        for call in fund_calls
+    )
+
+
+@pytest.mark.parametrize(
+    ("stderr", "expected_error"),
+    [
+        (b"License for package Android SDK Platform 33 not accepted", "ANDROID_LICENSE_REQUIRED"),
+        (b"network download failed with private host details", "ANDROID_SYSTEM_IMAGE_UNAVAILABLE"),
+    ],
+)
+def test_provisioning_sanitizes_system_image_install_failures(
+    stderr: bytes, expected_error: str
+) -> None:
+    """SDK diagnostics and license prompts must collapse to fixed operator-safe errors."""
+    module = _load_macos_deploy()
+    runner = existing_mac_runner(
+        avds=(),
+        system_image_installed=False,
+        sdkmanager_install_returncode=1,
+        sdkmanager_install_stderr=stderr,
+    )
+
+    with pytest.raises(module.DeploymentError) as caught:
+        make_orchestrator(runner).deploy("auto")
+
+    assert caught.value.error_code == expected_error
+    assert str(caught.value) == expected_error
+    sdk_install = (
+        "sdkmanager",
+        "system-images;android-33;google_apis;arm64-v8a",
+    )
+    sdk_install_index = runner.calls.index(sdk_install)
+    assert runner.inputs[sdk_install_index] == b""
+    assert not any(call[:3] == ("avdmanager", "create", "avd") for call in runner.calls)
+    assert not any("--licenses" in call for call in runner.calls)
+    assert b"yes\n" not in runner.inputs
+
+
+def test_provisioning_boot_timeout_preserves_the_created_avd_without_cleanup() -> None:
+    """A failed first boot must remain resumable instead of deleting partial AVD state."""
+    module = _load_macos_deploy()
+    runner = existing_mac_runner(
+        avds=("THS_API_33_ARM64",),
+        boot_completed={"emulator-5556": "0"},
+    )
+
+    with pytest.raises(module.DeploymentError) as caught:
+        make_orchestrator(runner, boot_timeout_seconds=0.001).deploy("auto")
+
+    assert caught.value.error_code == "DEVICE_BOOT_TIMEOUT"
+    assert "THS_CORE_33_ARM64" in runner.avds
+    rendered = "\n".join(" ".join(call) for call in runner.calls)
+    for forbidden in ("delete avd", "avdmanager delete", "wipe-data", "rm -rf", "--force"):
+        assert forbidden not in rendered
+    assert not any("container-provision-device" in call for call in runner.calls)
+
+
+def test_missing_sessions_return_only_safe_human_onboarding_instructions() -> None:
+    """The human gate must be actionable without exposing deployment or account secrets."""
+    acceptance = FakeDataOnlyAcceptance()
+    runner = existing_mac_runner(sessions_ready=False)
+
+    result = make_orchestrator(runner, acceptance=acceptance).deploy("provision")
+
+    assert result.mode == "provision"
+    assert result.state == "FIRST_TIME_LOGIN_REQUIRED"
+    assert result.error_code is None
+    output = json.dumps(result.__dict__, ensure_ascii=False)
+    for required in (
+        "http://127.0.0.1:8001/#admin",
+        "manually log in and complete verification for each newly created role",
+        "click the matching role's session refresh",
+        "rerun scripts/provision-macos-from-image.sh",
+    ):
+        assert required in output.lower()
+    for forbidden in (
+        "lifecycle-secret-value",
+        "session-secret-value",
+        "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=",
+        "cookie",
+        "/.android/avd/",
+        "private compose diagnostics",
+        "account identity",
+    ):
+        assert forbidden.lower() not in output.lower()
+    assert acceptance.calls == 0
+
+
+def test_provisioning_rerun_does_not_recreate_or_reinstall_existing_roles() -> None:
+    """Resuming after manual login must preserve the AVDs created by the prior invocation."""
+    runner = existing_mac_runner(avds=("THS_API_33_ARM64",), sessions_ready=False)
+    first = make_orchestrator(runner).deploy("provision")
+    first_call_count = len(runner.calls)
+
+    second_orchestrator = make_orchestrator(runner)
+    second = second_orchestrator.deploy("provision")
+    resumed_calls = runner.calls[first_call_count:]
+
+    assert first.state == second.state == "FIRST_TIME_LOGIN_REQUIRED"
+    assert second_orchestrator.initial_missing_roles == frozenset()
+    assert not any(
+        call[:3] == ("avdmanager", "create", "avd") for call in resumed_calls
+    )
+    assert not any("container-provision-device" in call for call in resumed_calls)
+
+
+def test_provisioning_becomes_ready_only_after_sessions_and_data_acceptance() -> None:
+    """Session files alone must not bypass the required data-only acceptance task."""
+    acceptance = FakeDataOnlyAcceptance()
+    runner = existing_mac_runner(sessions_ready=True)
+
+    result = make_orchestrator(runner, acceptance=acceptance).deploy("provision")
+
+    assert result.state == "READY"
+    assert acceptance.calls == 1
+    assert not any(call[:3] == ("avdmanager", "create", "avd") for call in runner.calls)
+    assert not any("container-provision-device" in call for call in runner.calls)
+
+
+def test_data_only_acceptance_uses_the_confirmed_fixed_symbol_and_eight_metrics() -> None:
+    """A READY provisioning result must come from a real data-only completed job."""
+    module = _load_macos_deploy()
+    required_values = {
+        "stock_name": "招商轮船",
+        "current_price": "8.12",
+        "change_percent": "+1.25%",
+        "turnover_rate": "0.72%",
+        "large_order_net": "1.23",
+        "large_order_amount": "456.7",
+        "retail_count": "12.34",
+        "macdfs": "+0.123",
+    }
+    responses = iter(
+        [
+            {"symbol": "601872", "name": "招商轮船", "market": "17"},
+            {"public_id": "safe-public-id", "status": "QUEUED"},
+            {"public_id": "safe-public-id", "status": "RUNNING"},
+            {
+                "public_id": "safe-public-id",
+                "symbol": "601872",
+                "include_long_capture": False,
+                "status": "COMPLETED",
+                "values": required_values,
+            },
+        ]
+    )
+    requests: list[Request] = []
+
+    class Response:
+        def __init__(self, payload: dict[str, object]) -> None:
+            self.payload = payload
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args) -> None:
+            return None
+
+        def read(self) -> bytes:
+            return json.dumps(self.payload).encode()
+
+    def opener(request: Request, timeout: float):
+        assert timeout > 0
+        requests.append(request)
+        return Response(next(responses))
+
+    acceptance = module.LoopbackDataOnlyAcceptance(
+        opener=opener,
+        timeout_seconds=0.1,
+        poll_interval_seconds=0.0,
+    )
+
+    acceptance.verify()
+
+    assert [request.get_method() for request in requests] == [
+        "GET",
+        "POST",
+        "GET",
+        "GET",
+    ]
+    assert requests[0].full_url == "http://127.0.0.1:8001/api/v1/symbols/601872"
+    assert json.loads(requests[1].data or b"") == {
+        "symbol": "601872",
+        "include_long_capture": False,
+    }
+    assert requests[2].full_url.endswith("/api/v1/jobs/safe-public-id")
+
+
+def test_provision_wrapper_resolves_the_project_root_and_forces_provision_mode(
+    tmp_path: Path,
+) -> None:
+    """The onboarding wrapper must not expose a mode, interpreter, or checkout ambiguity."""
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    log = tmp_path / "python.log"
+    python3 = fake_bin / "python3"
+    python3.write_text(
+        "#!/bin/sh\n"
+        "printf '%s\\n' \"$PWD\" > \"$PROVISION_WRAPPER_LOG\"\n"
+        "printf '%s\\n' \"$*\" >> \"$PROVISION_WRAPPER_LOG\"\n",
+        encoding="utf-8",
+    )
+    python3.chmod(0o755)
+
+    completed = subprocess.run(
+        [str(PROVISION_WRAPPER), "--env-file", "/tmp/operator.env"],
+        cwd=tmp_path,
+        env=os.environ
+        | {
+            "PATH": f"{fake_bin}:/usr/bin:/bin",
+            "PROVISION_WRAPPER_LOG": str(log),
+        },
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0
+    assert completed.stdout == completed.stderr == ""
+    assert log.read_text(encoding="utf-8").splitlines() == [
+        str(ROOT),
+        "scripts/macos_deploy.py --mode provision --env-file /tmp/operator.env",
+    ]
 
 
 def test_cli_and_wrapper_expose_no_device_or_asset_override_surface() -> None:

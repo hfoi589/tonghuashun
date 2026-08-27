@@ -44,6 +44,44 @@ from .symbol_cache import InMemorySymbolLookupCache, SymbolLookupCache
 logger = logging.getLogger(__name__)
 
 
+class RunnerWake:
+    """Thread-safe wake signal for the lifespan-owned runner loop."""
+
+    def __init__(self) -> None:
+        self._lock = RLock()
+        self._loop = None
+        self._event: Event | None = None
+
+    def bind(self) -> None:
+        with self._lock:
+            self._loop = get_running_loop()
+            self._event = Event()
+
+    def clear(self) -> None:
+        with self._lock:
+            event = self._event
+        if event is not None:
+            event.clear()
+
+    def notify(self) -> None:
+        with self._lock:
+            loop = self._loop
+            event = self._event
+        if loop is None or event is None:
+            return
+        try:
+            loop.call_soon_threadsafe(event.set)
+        except RuntimeError:
+            pass
+
+    async def wait(self, timeout: float) -> None:
+        with self._lock:
+            event = self._event
+        if event is None:
+            raise RuntimeError("runner wake is not bound")
+        await wait_for(event.wait(), timeout=timeout)
+
+
 class SubmitTask(BaseModel):
     symbol: str
     include_long_capture: bool = True
@@ -272,6 +310,7 @@ def create_app(
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         stop = Event()
+        app.state.runner_wake.bind()
         app.state.store.recover_running()
         deduplicate = getattr(app.state.store, "deduplicate_by_symbol", None)
         app.state.task_migration = (
@@ -299,13 +338,19 @@ def create_app(
             """Run the blocking ADB worker off the API event loop until shutdown."""
             assert runner is not None
             while not stop.is_set():
+                app.state.runner_wake.clear()
+                claimed = None
                 try:
-                    await to_thread(runner.run_once)
+                    claimed = await to_thread(runner.run_once)
                 except Exception:
                     # Device failures are surfaced through the authenticated health API.
                     app.state.runner_control.heartbeat("OFFLINE")
+                if claimed is not None:
+                    continue
                 try:
-                    await wait_for(stop.wait(), timeout=runner_poll_interval_seconds)
+                    await app.state.runner_wake.wait(
+                        runner_poll_interval_seconds
+                    )
                 except TimeoutError:
                     continue
 
@@ -330,6 +375,7 @@ def create_app(
             yield
         finally:
             stop.set()
+            app.state.runner_wake.notify()
             await app.state.cleanup_task
             if app.state.runner_task is not None:
                 await app.state.runner_task
@@ -345,6 +391,7 @@ def create_app(
         persist_password_hash=persist,
     )
     app.state.runner_control = runner_control or RunnerControl()
+    app.state.runner_wake = RunnerWake()
     primary_bridge = device_bridge or ADBDeviceBridge()
     configured_bridges = dict(device_bridges or {})
     configured_bridges.setdefault("core_metrics", primary_bridge)
@@ -387,6 +434,10 @@ def create_app(
         positioner = getattr(app.state.store, "queue_position", None)
         public["queue_position"] = positioner(task.task_id) if callable(positioner) else None
         return TaskResponse.model_validate(public)
+
+    def notify_runner_if_queued(task: TaskRecord) -> None:
+        if task.status == TaskStatus.QUEUED:
+            app.state.runner_wake.notify()
 
     def resolve_symbol(symbol: str) -> SymbolLookup:
         try:
@@ -496,6 +547,7 @@ def create_app(
             submitted = app.state.store.submit_or_refresh(task)
         except QueueFullError:
             raise HTTPException(status_code=429, detail="queue is full") from None
+        notify_runner_if_queued(submitted)
         return task_response(submitted)
 
     @app.get("/api/v1/jobs/{public_id}", response_model=TaskResponse)
@@ -516,6 +568,7 @@ def create_app(
             raise HTTPException(status_code=429, detail="queue is full") from None
         except ValueError as error:
             raise HTTPException(status_code=409, detail=str(error)) from None
+        notify_runner_if_queued(retried)
         return task_response(retried)
 
     @app.get("/api/v1/jobs/{public_id}/captures/{kind}")
@@ -713,6 +766,7 @@ def create_app(
             resumed = app.state.store.requeue_waiting(task.task_id)
         except ValueError as error:
             raise HTTPException(status_code=409, detail=str(error)) from None
+        notify_runner_if_queued(resumed)
         return task_response(resumed)
 
     @app.post("/api/admin/jobs/{public_id}/retry", response_model=TaskResponse)
@@ -724,6 +778,7 @@ def create_app(
             retried = app.state.store.retry_failed(task.task_id)
         except ValueError as error:
             raise HTTPException(status_code=409, detail=str(error)) from None
+        notify_runner_if_queued(retried)
         return task_response(retried)
 
     @app.get("/api/admin/queue", response_model=QueueResponse)
@@ -739,6 +794,7 @@ def create_app(
     def resume_queue(_session=Depends(require_csrf)) -> QueueResponse:
         if not app.state.runner_control.resume_queue():
             raise HTTPException(status_code=409, detail="release device control before resuming the queue")
+        app.state.runner_wake.notify()
         return QueueResponse(paused=False)
 
     device_labels = {

@@ -385,3 +385,92 @@ git diff --check
 The Dockerfile and image asset layers were unchanged, so no image rebuild or
 asset audit was required. No real device, ADB server, Emulator, lifecycle
 broker, LaunchAgent, Android SDK tool, or deployment env file was touched.
+
+## Fix round 3 — Prove ADB absence and bind process identity to Emulator
+
+Two Important fail-open cases remained after fix round 2:
+
+1. Any nonzero fixed-serial `adb get-state` result was treated as proof that
+   the serial was absent.
+2. A host process was authenticated only by matching `-port` and `-avd`, so an
+   unrelated executable could supply those arguments and reach lifecycle
+   mutation.
+
+### Exact RED evidence
+
+The new ADB server/listing, offline/unauthorized, malformed listing, fake
+executable, and truly stopped regressions all exposed missing boundary checks:
+
+```text
+/Users/wilson/tonghuashun/.venv/bin/python -m pytest -q \
+  tests/test_macos_one_click_deploy.py \
+  -k 'adb_listing_transport or non_device_adb_states or malformed_or_ambiguous_adb_listing or fake_executable or truly_stopped'
+FFFFFFF                                                                  [100%]
+7 failed, 40 deselected in 0.11s
+```
+
+The failures proved that:
+
+- no `adb devices` absence proof was requested after `get-state` failure;
+- offline/unauthorized serials reached host process inspection;
+- malformed or duplicate server listings were ignored;
+- `/usr/bin/python3 helper.py -avd THS_CORE_33_ARM64 -port 5556` reached the
+  lifecycle installer;
+- the truly stopped regression could not observe the required successful
+  listing that omitted the fixed serial.
+
+### Fix and exact GREEN evidence
+
+- A successful fixed `adb devices` request is now mandatory after nonzero
+  `get-state`. Its output must begin with the exact header and contain only
+  unique, well-formed serial/state rows.
+- A listed `device` still requires exact `adb emu avd name`; listed
+  `offline`, `unauthorized`, unknown, duplicate, or malformed states fail with
+  `FIXED_AVD_IDENTITY_MISMATCH` before process inspection or lifecycle
+  mutation.
+- Only a successful listing that omits the fixed serial may proceed to
+  read-only host process inspection.
+- Emulator preflight now records the resolved absolute executable path. A
+  process claiming the fixed port must resolve to that trusted Emulator binary
+  in addition to containing exactly one fixed `-port` and `-avd`; Python,
+  wrappers, unknown paths, malformed options, or ambiguous processes fail
+  before installer mutation.
+
+Focused GREEN result for the review regressions:
+
+```text
+/Users/wilson/tonghuashun/.venv/bin/python -m pytest -q \
+  tests/test_macos_one_click_deploy.py \
+  -k 'adb_listing_transport or non_device_adb_states or malformed_or_ambiguous_adb_listing or fake_executable or truly_stopped'
+.......                                                                  [100%]
+7 passed, 40 deselected in 0.03s
+```
+
+### Covering verification
+
+```text
+/Users/wilson/tonghuashun/.venv/bin/python -m pytest -q \
+  tests/test_macos_one_click_deploy.py tests/test_deploy_configuration.py
+........................................................................ [ 97%]
+..                                                                       [100%]
+74 passed in 2.38s
+```
+
+```text
+/Users/wilson/tonghuashun/.venv/bin/python -m pytest -q
+672 passed, 24 existing deprecation warnings in 26.58s
+```
+
+Static verification completed successfully:
+
+```text
+/Users/wilson/tonghuashun/.venv/bin/python -m py_compile \
+  scripts/macos_deploy.py scripts/setup-admin.py
+/bin/sh -n scripts/deploy-macos-one-click.sh \
+  scripts/container-provision-device.sh
+git diff --check
+```
+
+The Dockerfile and image layers were unchanged, so no image rebuild or asset
+audit was required. No real device, ADB server, Emulator, lifecycle broker,
+LaunchAgent, Android SDK tool, or deployment env file was touched.

@@ -370,6 +370,8 @@ class FakeCommandRunner:
         apk_path: str = "/data/app/~~safe/com.hexin.plat.android-safe/base.apk",
         avds: tuple[str, ...] = ("THS_CORE_33_ARM64", "THS_API_33_ARM64"),
         adb_states: dict[str, str | None] | None = None,
+        adb_devices_output: str | None = None,
+        adb_devices_returncode: int = 0,
         process_snapshots: list[str] | None = None,
         avd_identity_sequences: dict[str, list[str | None]] | None = None,
         healthy: bool = True,
@@ -385,6 +387,8 @@ class FakeCommandRunner:
             "emulator-5554": "device",
             **(adb_states or {}),
         }
+        self.adb_devices_output = adb_devices_output
+        self.adb_devices_returncode = adb_devices_returncode
         self.process_snapshots = list(process_snapshots or [])
         self.avd_identity_sequences = {
             serial: list(values)
@@ -427,6 +431,23 @@ class FakeCommandRunner:
             if state is None:
                 return _completed(args, returncode=1, stderr=b"device absent")
             return _completed(args, stdout=f"{state}\n".encode())
+        if args == ("adb", "devices"):
+            if self.adb_devices_output is None:
+                attached = [
+                    f"{serial}\t{state}"
+                    for serial, state in self.adb_states.items()
+                    if state is not None
+                ]
+                output = "List of devices attached\n" + "\n".join(attached) + "\n"
+            else:
+                output = self.adb_devices_output
+            self.events.append(f"adb-devices:{self.adb_devices_returncode}:{output}")
+            return _completed(
+                args,
+                returncode=self.adb_devices_returncode,
+                stdout=output.encode(),
+                stderr=b"private adb server detail",
+            )
         if args == ("ps", "-axo", "pid=,command="):
             snapshot = self.process_snapshots.pop(0) if self.process_snapshots else ""
             self.events.append(f"process-snapshot:{snapshot}")
@@ -547,6 +568,8 @@ def existing_mac_runner(
     apk_path: str = "/data/app/~~safe/com.hexin.plat.android-safe/base.apk",
     avds: tuple[str, ...] = ("THS_CORE_33_ARM64", "THS_API_33_ARM64"),
     adb_states: dict[str, str | None] | None = None,
+    adb_devices_output: str | None = None,
+    adb_devices_returncode: int = 0,
     process_snapshots: list[str] | None = None,
     avd_identity_sequences: dict[str, list[str | None]] | None = None,
     healthy: bool = True,
@@ -559,6 +582,8 @@ def existing_mac_runner(
         apk_path=apk_path,
         avds=avds,
         adb_states=adb_states,
+        adb_devices_output=adb_devices_output,
+        adb_devices_returncode=adb_devices_returncode,
         process_snapshots=process_snapshots,
         avd_identity_sequences=avd_identity_sequences,
         healthy=healthy,
@@ -671,7 +696,7 @@ def test_existing_mode_rejects_wrong_starting_process_avd_before_mutation() -> N
     runner = existing_mac_runner(
         adb_states={"emulator-5556": None},
         process_snapshots=[
-            "123 /opt/android/emulator -avd THS_API_33_ARM64 -port 5556 -no-audio\n"
+            "123 /fake/emulator -avd THS_API_33_ARM64 -port 5556 -no-audio\n"
         ],
         events=events,
     )
@@ -687,11 +712,99 @@ def test_existing_mode_rejects_wrong_starting_process_avd_before_mutation() -> N
     assert not any(event.startswith("broker-") for event in events)
 
 
+def test_existing_mode_rejects_adb_listing_transport_failure_before_mutation() -> None:
+    """A failed get-state needs a successful server listing before absence is trusted."""
+    module = _load_macos_deploy()
+    events: list[str] = []
+    runner = existing_mac_runner(
+        adb_states={"emulator-5556": None},
+        adb_devices_returncode=1,
+        process_snapshots=[""],
+        events=events,
+    )
+
+    with pytest.raises(module.DeploymentError) as caught:
+        make_orchestrator(runner).deploy_existing()
+
+    assert caught.value.error_code == "FIXED_AVD_IDENTITY_MISMATCH"
+    assert ("adb", "devices") in runner.calls
+    assert ("ps", "-axo", "pid=,command=") not in runner.calls
+    assert "installer" not in events
+
+
+@pytest.mark.parametrize("state", ["offline", "unauthorized"])
+def test_existing_mode_rejects_non_device_adb_states_before_mutation(
+    state: str,
+) -> None:
+    """An attached but unusable fixed serial is not proof of a stopped AVD."""
+    module = _load_macos_deploy()
+    events: list[str] = []
+    runner = existing_mac_runner(
+        adb_states={"emulator-5556": state},
+        process_snapshots=[""],
+        events=events,
+    )
+
+    with pytest.raises(module.DeploymentError) as caught:
+        make_orchestrator(runner).deploy_existing()
+
+    assert caught.value.error_code == "FIXED_AVD_IDENTITY_MISMATCH"
+    assert ("ps", "-axo", "pid=,command=") not in runner.calls
+    assert "installer" not in events
+
+
+@pytest.mark.parametrize(
+    "listing",
+    [
+        "not an adb devices header\n",
+        "List of devices attached\nemulator-5556\tdevice\nemulator-5556\toffline\n",
+    ],
+)
+def test_existing_mode_rejects_malformed_or_ambiguous_adb_listing(
+    listing: str,
+) -> None:
+    """Only an exact successful listing that omits the serial proves absence."""
+    module = _load_macos_deploy()
+    events: list[str] = []
+    runner = existing_mac_runner(
+        adb_states={"emulator-5556": None},
+        adb_devices_output=listing,
+        process_snapshots=[""],
+        events=events,
+    )
+
+    with pytest.raises(module.DeploymentError) as caught:
+        make_orchestrator(runner).deploy_existing()
+
+    assert caught.value.error_code == "FIXED_AVD_IDENTITY_MISMATCH"
+    assert ("ps", "-axo", "pid=,command=") not in runner.calls
+    assert "installer" not in events
+
+
+def test_existing_mode_rejects_fake_executable_with_correct_avd_and_port() -> None:
+    """Correct-looking arguments cannot authenticate an unknown process executable."""
+    module = _load_macos_deploy()
+    events: list[str] = []
+    runner = existing_mac_runner(
+        adb_states={"emulator-5556": None},
+        process_snapshots=[
+            "123 /usr/bin/python3 helper.py -avd THS_CORE_33_ARM64 -port 5556\n"
+        ],
+        events=events,
+    )
+
+    with pytest.raises(module.DeploymentError) as caught:
+        make_orchestrator(runner).deploy_existing()
+
+    assert caught.value.error_code == "FIXED_AVD_IDENTITY_MISMATCH"
+    assert "installer" not in events
+
+
 @pytest.mark.parametrize(
     "process_line",
     [
-        "123 /opt/android/emulator -avd THS_CORE_33_ARM64 -port 5556 -port\n",
-        "not-a-pid /opt/android/emulator -avd THS_CORE_33_ARM64 -port 5556\n",
+        "123 /fake/emulator -avd THS_CORE_33_ARM64 -port 5556 -port\n",
+        "not-a-pid /fake/emulator -avd THS_CORE_33_ARM64 -port 5556\n",
     ],
 )
 def test_existing_mode_rejects_ambiguous_starting_process_options(
@@ -993,9 +1106,11 @@ def test_existing_mode_allows_a_truly_stopped_role_then_starts_it_through_broker
     post_fund = len(events) - 1 - events[::-1].index(
         "identity:emulator-5554:THS_API_33_ARM64"
     )
+    adb_devices_event = next(event for event in events if event.startswith("adb-devices:"))
     assert events.index("adb-state:emulator-5556:None") < events.index(
-        "process-snapshot:"
+        adb_devices_event
     )
+    assert events.index(adb_devices_event) < events.index("process-snapshot:")
     assert events.index("process-snapshot:") < pre_fund < events.index("installer")
     assert events.index("broker-wait:operation-core_metrics") < post_core < post_fund
 

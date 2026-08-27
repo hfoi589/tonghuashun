@@ -63,6 +63,10 @@ SANITIZED_AMBIENT_KEYS = ROOT_ONLY_COMPOSE_KEYS | {
 }
 _SAFE_APK_PATH = re.compile(r"/data/app/[A-Za-z0-9._~+=/-]+/base\.apk")
 _SAFE_OPERATION_ID = re.compile(r"[A-Za-z0-9_-]{1,256}")
+_SAFE_ADB_SERIAL = re.compile(r"[A-Za-z0-9._:-]+")
+_SAFE_ADB_STATES = frozenset(
+    {"bootloader", "device", "offline", "recovery", "sideload", "unauthorized"}
+)
 
 
 @dataclass(frozen=True)
@@ -261,6 +265,7 @@ class MacDeploymentOrchestrator:
         self._health_timeout_seconds = health_timeout_seconds
         self._poll_interval_seconds = poll_interval_seconds
         self._root_environment: dict[str, str] = {}
+        self._trusted_emulator_path: Path | None = None
 
     def deploy(self, mode: str = "auto") -> DeploymentResult:
         self._validate_env_file_location()
@@ -334,14 +339,23 @@ class MacDeploymentOrchestrator:
 
     def _validate_command_presence(self) -> None:
         try:
-            missing = any(
-                self._filesystem.which(command) is None
+            resolved_commands = {
+                command: self._filesystem.which(command)
                 for command in REQUIRED_COMMANDS
-            )
+            }
         except Exception:
             raise DeploymentError("MISSING_PREREQUISITE") from None
-        if missing:
+        if any(path is None for path in resolved_commands.values()):
             raise DeploymentError("MISSING_PREREQUISITE")
+        emulator_path = resolved_commands["emulator"]
+        assert emulator_path is not None
+        candidate = Path(emulator_path)
+        if not candidate.is_absolute() or candidate.name != "emulator":
+            raise DeploymentError("MISSING_PREREQUISITE")
+        try:
+            self._trusted_emulator_path = candidate.resolve()
+        except OSError:
+            raise DeploymentError("MISSING_PREREQUISITE") from None
 
     def _validate_host_prerequisites(self) -> None:
         self._validate_command_presence()
@@ -567,18 +581,52 @@ class MacDeploymentOrchestrator:
             if state == "device":
                 self._require_adb_avd_identity(serial, expected_avd)
                 continue
+            if state_result.returncode == 0:
+                raise DeploymentError("FIXED_AVD_IDENTITY_MISMATCH")
+            devices = self._list_adb_devices()
+            listed_state = devices.get(serial)
+            if listed_state == "device":
+                self._require_adb_avd_identity(serial, expected_avd)
+                continue
+            if listed_state is not None:
+                raise DeploymentError("FIXED_AVD_IDENTITY_MISMATCH")
             process_result = self._run(
                 ("ps", "-axo", "pid=,command="),
                 15.0,
                 "FIXED_AVD_IDENTITY_MISMATCH",
             )
-            has_starting_process = self._require_starting_process_identity(
+            self._validate_starting_process_identity(
                 self._stdout_text(process_result),
                 FIXED_EMULATOR_PORTS[role],
                 expected_avd,
             )
-            if not has_starting_process and state_result.returncode == 0:
+
+    def _list_adb_devices(self) -> dict[str, str]:
+        result = self._run(
+            ("adb", "devices"),
+            15.0,
+            "FIXED_AVD_IDENTITY_MISMATCH",
+        )
+        lines = self._stdout_text(result).splitlines()
+        if not lines or lines[0].strip() != "List of devices attached":
+            raise DeploymentError("FIXED_AVD_IDENTITY_MISMATCH")
+        devices: dict[str, str] = {}
+        for raw_line in lines[1:]:
+            line = raw_line.strip()
+            if not line:
+                continue
+            fields = line.split("\t")
+            if len(fields) != 2:
                 raise DeploymentError("FIXED_AVD_IDENTITY_MISMATCH")
+            serial, state = (field.strip() for field in fields)
+            if (
+                not _SAFE_ADB_SERIAL.fullmatch(serial)
+                or state not in _SAFE_ADB_STATES
+                or serial in devices
+            ):
+                raise DeploymentError("FIXED_AVD_IDENTITY_MISMATCH")
+            devices[serial] = state
+        return devices
 
     def _require_adb_avd_identity(self, serial: str, expected_avd: str) -> None:
         result = self._run(
@@ -596,10 +644,9 @@ class MacDeploymentOrchestrator:
         if lines != [expected_avd]:
             raise DeploymentError("FIXED_AVD_IDENTITY_MISMATCH")
 
-    @classmethod
-    def _require_starting_process_identity(
-        cls, output: str, port: int, expected_avd: str
-    ) -> bool:
+    def _validate_starting_process_identity(
+        self, output: str, port: int, expected_avd: str
+    ) -> None:
         candidates: list[str] = []
         port_text = str(port)
         port_marker = re.compile(
@@ -618,18 +665,35 @@ class MacDeploymentOrchestrator:
                 if port_marker.search(command):
                     raise DeploymentError("FIXED_AVD_IDENTITY_MISMATCH") from None
                 continue
-            port_values = cls._option_values(tokens, "-port")
+            port_values = self._option_values(tokens, "-port")
             if port_text not in port_values:
                 continue
-            avd_values = cls._option_values(tokens, "-avd")
+            self._require_trusted_emulator_executable(tokens[0])
+            avd_values = self._option_values(tokens, "-avd")
             if port_values != [port_text] or len(avd_values) != 1:
                 raise DeploymentError("FIXED_AVD_IDENTITY_MISMATCH")
             candidates.append(avd_values[0])
         if not candidates:
-            return False
+            return
         if candidates != [expected_avd]:
             raise DeploymentError("FIXED_AVD_IDENTITY_MISMATCH")
-        return True
+
+    def _require_trusted_emulator_executable(self, executable: str) -> None:
+        trusted = self._trusted_emulator_path
+        if trusted is None:
+            raise DeploymentError("FIXED_AVD_IDENTITY_MISMATCH")
+        if executable == "emulator":
+            resolved = trusted
+        else:
+            candidate = Path(executable)
+            if not candidate.is_absolute():
+                raise DeploymentError("FIXED_AVD_IDENTITY_MISMATCH")
+            try:
+                resolved = candidate.resolve()
+            except OSError:
+                raise DeploymentError("FIXED_AVD_IDENTITY_MISMATCH") from None
+        if resolved != trusted:
+            raise DeploymentError("FIXED_AVD_IDENTITY_MISMATCH")
 
     @staticmethod
     def _option_values(tokens: list[str], option: str) -> list[str]:

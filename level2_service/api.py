@@ -307,6 +307,7 @@ def create_app(
         Callable[[str], AccountSessionBundle],
     ]
     | None = None,
+    device_lifecycle: object | None = None,
 ) -> FastAPI:
     """Build an isolated application instance for one service process."""
     if cleanup_interval_seconds <= 0:
@@ -475,6 +476,7 @@ def create_app(
     app.state.device_bridges = configured_bridges
     app.state.device_bridge = configured_bridges["core_metrics"]
     app.state.device_health_probes = dict(device_health_probes or {})
+    app.state.device_lifecycle = device_lifecycle
     app.state.capture_root = (capture_root or Path("captures")).resolve()
     app.state.frontend_root = frontend_root.resolve() if frontend_root is not None else None
     app.state.secure_admin_cookies = secure_admin_cookies

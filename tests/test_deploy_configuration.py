@@ -8,12 +8,81 @@ from pathlib import Path
 
 import pytest
 
+from level2_service.main import DeploymentSettings
+
 
 ROOT = Path(__file__).resolve().parents[1]
 CANONICAL_MACOS_COMPOSE_COMMAND = (
     "docker --context orbstack compose --env-file .env "
     "--env-file deploy/macos.env -f deploy/compose.yml up -d --build"
 )
+
+
+def lifecycle_environment(**overrides: str) -> dict[str, str]:
+    return {
+        "ADMIN_PASSWORD_HASH": "$argon2id$example",
+        "ADMIN_SESSION_SECRET": "s" * 32,
+        "ADB_SERIAL": "emulator-5556",
+        **overrides,
+    }
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"THS_DEVICE_LIFECYCLE_URL": "http://localhost:18765"},
+        {"THS_DEVICE_LIFECYCLE_TOKEN": "secret"},
+    ],
+)
+def test_lifecycle_configuration_requires_url_and_token_together(
+    overrides: dict[str, str],
+) -> None:
+    """A half-configured host control capability must not start accidentally."""
+    with pytest.raises(ValueError, match="THS_DEVICE_LIFECYCLE_URL.*TOKEN"):
+        DeploymentSettings.from_environ(lifecycle_environment(**overrides))
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"THS_DEVICE_LIFECYCLE_TIMEOUT_SECONDS": "0"},
+        {"THS_DEVICE_LIFECYCLE_TIMEOUT_SECONDS": "not-a-number"},
+        {"THS_DEVICE_LIFECYCLE_TIMEOUT_SECONDS": "nan"},
+        {"THS_DEVICE_LIFECYCLE_TIMEOUT_SECONDS": "inf"},
+        {
+            "THS_DEVICE_LIFECYCLE_URL": "https://host.docker.internal:18765",
+            "THS_DEVICE_LIFECYCLE_TOKEN": "secret",
+        },
+        {
+            "THS_DEVICE_LIFECYCLE_URL": "http://broker.example.test:18765",
+            "THS_DEVICE_LIFECYCLE_TOKEN": "secret",
+        },
+    ],
+)
+def test_lifecycle_configuration_rejects_unsafe_timeout_or_url(
+    overrides: dict[str, str],
+) -> None:
+    """Unsafe lifecycle connection settings could expose host controls externally."""
+    with pytest.raises(ValueError):
+        DeploymentSettings.from_environ(lifecycle_environment(**overrides))
+
+
+def test_missing_lifecycle_settings_leave_the_feature_disabled() -> None:
+    """Normal API startup must remain available when lifecycle controls are omitted."""
+    settings = DeploymentSettings.from_environ(lifecycle_environment())
+
+    assert settings.device_lifecycle_url is None
+    assert settings.device_lifecycle_token is None
+    assert settings.device_lifecycle_timeout_seconds == 5.0
+
+
+def test_compose_injects_lifecycle_settings_without_a_token_default() -> None:
+    """A compose fallback token would turn a sample deployment into host access."""
+    compose = (ROOT / "deploy" / "compose.yml").read_text(encoding="utf-8")
+
+    assert "THS_DEVICE_LIFECYCLE_URL: ${THS_DEVICE_LIFECYCLE_URL:-http://host.docker.internal:18765}" in compose
+    assert "THS_DEVICE_LIFECYCLE_TOKEN: ${THS_DEVICE_LIFECYCLE_TOKEN}" in compose
+    assert "THS_DEVICE_LIFECYCLE_TIMEOUT_SECONDS: ${THS_DEVICE_LIFECYCLE_TIMEOUT_SECONDS:-5}" in compose
 
 
 @pytest.mark.skipif(shutil.which("docker") is None, reason="Docker is not installed")

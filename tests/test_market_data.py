@@ -2,6 +2,8 @@ import asyncio
 from dataclasses import replace
 from datetime import datetime, timezone
 
+import pytest
+
 from level2_service.market_data import (
     KlineBar,
     MarketDataBroker,
@@ -50,6 +52,27 @@ def test_china_market_schedule_uses_asia_shanghai_sessions() -> None:
     assert is_china_market_open(datetime(2026, 8, 24, 1, 31, tzinfo=timezone.utc)) is True
     assert is_china_market_open(datetime(2026, 8, 24, 4, 0, tzinfo=timezone.utc)) is False
     assert is_china_market_open(datetime(2026, 8, 23, 1, 31, tzinfo=timezone.utc)) is False
+
+
+def test_market_snapshot_exposes_public_source_and_price_precision() -> None:
+    snapshot = MarketSnapshot(
+        symbol="510300",
+        name="沪深300ETF",
+        market="20",
+        sequence=0,
+        source_time="15:00",
+        collected_at=datetime.now(timezone.utc),
+        quote={"price": "4.123"},
+        source="TENCENT_PUBLIC",
+        price_precision=3,
+    )
+
+    public = snapshot.as_public()
+
+    assert public["source"] == "TENCENT_PUBLIC"
+    assert public["price_precision"] == 3
+    with pytest.raises(ValueError, match="price_precision"):
+        replace(snapshot, price_precision=0)
 
 
 def test_broker_coalesces_multiple_subscribers_and_prioritizes_detail_refresh() -> None:

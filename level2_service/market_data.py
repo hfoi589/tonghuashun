@@ -67,6 +67,8 @@ class MarketSnapshot:
     source_time: str | None
     collected_at: datetime
     quote: dict[str, str | None]
+    source: str | None = None
+    price_precision: int = 2
     timeshare: tuple[TimesharePoint, ...] = ()
     intraday_series: dict[str, dict[str, Any]] = field(default_factory=dict)
     order_book: tuple[OrderBookLevel, ...] = ()
@@ -74,6 +76,10 @@ class MarketSnapshot:
     main_fund_flow: dict[str, Any] = field(default_factory=dict)
     capabilities: dict[str, dict[str, Any]] = field(default_factory=dict)
     source_errors: dict[str, str | None] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if not 1 <= self.price_precision <= 6:
+            raise ValueError("price_precision must be between 1 and 6")
 
     def as_public(self, *, stale_after_seconds: float = 5.0) -> dict[str, Any]:
         value = asdict(self)

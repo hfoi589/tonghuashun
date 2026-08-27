@@ -34,7 +34,13 @@ REQUIRED_MACOS_ENV = (
     "CORE_FRIDA_SERVER_ENDPOINT=host.docker.internal:27043\n"
     "FUND_ADB_SERIAL=emulator-5554\n"
     "FUND_FRIDA_SERVER_ENDPOINT=host.docker.internal:27042\n"
+    "THS_DEVICE_LIFECYCLE_URL=http://host.docker.internal:18765\n"
 )
+VALID_COMPOSE_ENVIRONMENT = {
+    "THS_DEVICE_LIFECYCLE_URL": "http://host.docker.internal:18765",
+    "THS_DEVICE_LIFECYCLE_TOKEN": "lifecycle-secret-value",
+    "THS_SESSION_ENCRYPTION_KEY": "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=",
+}
 
 
 def test_tracked_image_apk_matches_the_approved_mobile_asset() -> None:
@@ -327,6 +333,7 @@ class FakeFileSystem:
     def __init__(self, *, env_exists: bool = True) -> None:
         self.files: dict[Path, tuple[str, int]] = {
             (ROOT / "deploy/macos.env").resolve(): (REQUIRED_MACOS_ENV, 0o600),
+            (ROOT / ".dockerignore").resolve(): (".env\n", 0o644),
         }
         if env_exists:
             self.files[(ROOT / ".env").resolve()] = (REQUIRED_ROOT_ENV, 0o600)
@@ -362,14 +369,25 @@ class FakeCommandRunner:
         apk_sha256: str = APK_SHA256,
         apk_path: str = "/data/app/~~safe/com.hexin.plat.android-safe/base.apk",
         avds: tuple[str, ...] = ("THS_CORE_33_ARM64", "THS_API_33_ARM64"),
+        avd_identity_sequences: dict[str, list[str | None]] | None = None,
         healthy: bool = True,
+        compose_environment: dict[str, str] | None = None,
         filesystem: FakeFileSystem | None = None,
         events: list[str] | None = None,
     ) -> None:
         self.apk_sha256 = apk_sha256
         self.apk_path = apk_path
         self.avds = avds
+        self.avd_identity_sequences = {
+            serial: list(values)
+            for serial, values in (avd_identity_sequences or {}).items()
+        }
         self.healthy = healthy
+        self.compose_environment = (
+            dict(VALID_COMPOSE_ENVIRONMENT)
+            if compose_environment is None
+            else dict(compose_environment)
+        )
         self.filesystem = filesystem
         self.events = events if events is not None else []
         self.calls: list[tuple[str, ...]] = []
@@ -394,6 +412,29 @@ class FakeCommandRunner:
             )
         if args == ("emulator", "-list-avds"):
             return _completed(args, stdout=("\n".join(self.avds) + "\n").encode())
+        if len(args) == 6 and args[:2] == ("adb", "-s") and args[3:] == (
+            "emu",
+            "avd",
+            "name",
+        ):
+            serial = args[2]
+            default_identity = {
+                "emulator-5556": "THS_CORE_33_ARM64",
+                "emulator-5554": "THS_API_33_ARM64",
+            }[serial]
+            sequence = self.avd_identity_sequences.get(serial, [])
+            identity = sequence.pop(0) if sequence else default_identity
+            self.events.append(f"identity:{serial}:{identity}")
+            if identity is None:
+                return _completed(args, returncode=1, stderr=b"private adb detail")
+            return _completed(args, stdout=f"{identity}\nOK\n".encode())
+        if "config" in args and "--format" in args:
+            payload = {
+                "services": {
+                    "api": {"environment": self.compose_environment},
+                }
+            }
+            return _completed(args, stdout=json.dumps(payload).encode())
         if "/opt/ths/assets/manifest.json" in args:
             manifest = {
                 "apk": {
@@ -476,7 +517,9 @@ def existing_mac_runner(
     apk_sha256: str = APK_SHA256,
     apk_path: str = "/data/app/~~safe/com.hexin.plat.android-safe/base.apk",
     avds: tuple[str, ...] = ("THS_CORE_33_ARM64", "THS_API_33_ARM64"),
+    avd_identity_sequences: dict[str, list[str | None]] | None = None,
     healthy: bool = True,
+    compose_environment: dict[str, str] | None = None,
     filesystem: FakeFileSystem | None = None,
     events: list[str] | None = None,
 ) -> FakeCommandRunner:
@@ -484,7 +527,9 @@ def existing_mac_runner(
         apk_sha256=apk_sha256,
         apk_path=apk_path,
         avds=avds,
+        avd_identity_sequences=avd_identity_sequences,
         healthy=healthy,
+        compose_environment=compose_environment,
         filesystem=filesystem,
         events=events,
     )
@@ -496,6 +541,7 @@ def make_orchestrator(
     filesystem: FakeFileSystem | None = None,
     broker: FakeLifecycleBroker | None = None,
     health_timeout_seconds: float = 0.05,
+    env_file: Path = Path(".env"),
 ):
     module = _load_macos_deploy()
     filesystem = filesystem or FakeFileSystem()
@@ -505,7 +551,7 @@ def make_orchestrator(
         broker or FakeLifecycleBroker(),
         filesystem,
         project_root=ROOT,
-        env_file=Path(".env"),
+        env_file=env_file,
         health_timeout_seconds=health_timeout_seconds,
         poll_interval_seconds=0.0,
     )
@@ -523,6 +569,20 @@ def test_existing_mode_preserves_both_avds_and_uses_canonical_compose() -> None:
     assert "docker --context orbstack compose" in rendered
     assert "--env-file .env --env-file deploy/macos.env" in rendered
     assert "up -d --build" in rendered
+    config_indices = [
+        index
+        for index, call in enumerate(runner.calls)
+        if "config" in call and "--format" in call
+    ]
+    build_index = next(
+        index for index, call in enumerate(runner.calls) if call[-2:] == ("build", "api")
+    )
+    up_index = next(
+        index for index, call in enumerate(runner.calls) if call[-3:] == ("up", "-d", "--build")
+    )
+    assert len(config_indices) == 2
+    assert config_indices[0] < build_index
+    assert build_index < config_indices[1] < up_index
     for forbidden in (
         "install -r",
         " install ",
@@ -548,6 +608,28 @@ def test_existing_mode_requires_both_fixed_avds_before_building() -> None:
     assert not any("compose" in call and "build" in call for call in runner.calls)
 
 
+@pytest.mark.parametrize("identity", ["THS_API_33_ARM64", None])
+def test_existing_mode_rejects_wrong_or_missing_fixed_serial_identity_before_mutation(
+    identity: str | None,
+) -> None:
+    """A fixed serial must prove its exact AVD before host lifecycle mutation."""
+    module = _load_macos_deploy()
+    events: list[str] = []
+    runner = existing_mac_runner(
+        avd_identity_sequences={"emulator-5556": [identity]},
+        events=events,
+    )
+    broker = FakeLifecycleBroker(events=events)
+
+    with pytest.raises(module.DeploymentError) as caught:
+        make_orchestrator(runner, broker=broker).deploy_existing()
+
+    assert caught.value.error_code == "FIXED_AVD_IDENTITY_MISMATCH"
+    assert "installer" not in events
+    assert not any(event.startswith("broker-") for event in events)
+    assert not any("pm" in call and "path" in call for call in runner.calls)
+
+
 def test_existing_mode_fails_closed_on_installed_apk_mismatch_before_compose_up() -> None:
     """Automatically replacing a mismatched APK would destroy protected login state."""
     module = _load_macos_deploy()
@@ -560,6 +642,65 @@ def test_existing_mode_fails_closed_on_installed_apk_mismatch_before_compose_up(
     assert not any(call[-3:] == ("up", "-d", "--build") for call in runner.calls)
     rendered = "\n".join(" ".join(call) for call in runner.calls)
     assert " install " not in rendered
+
+
+@pytest.mark.parametrize(
+    "empty_key",
+    [
+        "THS_DEVICE_LIFECYCLE_URL",
+        "THS_DEVICE_LIFECYCLE_TOKEN",
+        "THS_SESSION_ENCRYPTION_KEY",
+    ],
+)
+def test_existing_mode_rejects_empty_effective_compose_security_settings(
+    empty_key: str,
+) -> None:
+    """A later env-file or ambient empty value must fail before image build."""
+    module = _load_macos_deploy()
+    compose_environment = dict(VALID_COMPOSE_ENVIRONMENT)
+    compose_environment[empty_key] = ""
+    runner = existing_mac_runner(compose_environment=compose_environment)
+
+    with pytest.raises(module.DeploymentError) as caught:
+        make_orchestrator(runner).deploy_existing()
+
+    assert caught.value.error_code == "COMPOSE_CONFIG_INVALID"
+    assert any("config" in call and "--format" in call for call in runner.calls)
+    assert not any(call[-2:] == ("build", "api") for call in runner.calls)
+    assert "installer" not in runner.events
+
+
+def test_subprocess_runner_removes_ambient_compose_security_overrides(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The shell environment must not take precedence over the reviewed env files."""
+    module = _load_macos_deploy()
+    probe = tmp_path / "probe-environment"
+    probe.write_text("#!/bin/sh\nexec /usr/bin/env\n", encoding="utf-8")
+    probe.chmod(0o755)
+    for key in (
+        "ADMIN_PASSWORD_HASH",
+        "ADMIN_SESSION_SECRET",
+        "THS_DEVICE_LIFECYCLE_URL",
+        "THS_DEVICE_LIFECYCLE_TOKEN",
+        "THS_SESSION_ENCRYPTION_KEY",
+    ):
+        monkeypatch.setenv(key, "")
+    monkeypatch.setenv("TASK7_UNRELATED_ENV", "preserved")
+
+    result = module.SubprocessCommandRunner(tmp_path).run((str(probe),), 1.0)
+
+    output = result.stdout.decode("utf-8").splitlines()
+    assert result.returncode == 0
+    assert "TASK7_UNRELATED_ENV=preserved" in output
+    for key in (
+        "ADMIN_PASSWORD_HASH",
+        "ADMIN_SESSION_SECRET",
+        "THS_DEVICE_LIFECYCLE_URL",
+        "THS_DEVICE_LIFECYCLE_TOKEN",
+        "THS_SESSION_ENCRYPTION_KEY",
+    ):
+        assert not any(line.startswith(f"{key}=") for line in output)
 
 
 def test_existing_mode_rejects_an_untrusted_installed_base_apk_path() -> None:
@@ -626,6 +767,32 @@ def test_existing_mode_sanitizes_a_malformed_dual_role_environment() -> None:
     assert not any("compose" in call and "build" in call for call in runner.calls)
 
 
+@pytest.mark.parametrize(
+    "root_only_key",
+    [
+        "THS_DEVICE_LIFECYCLE_TOKEN",
+        "THS_SESSION_ENCRYPTION_KEY",
+    ],
+)
+def test_existing_mode_rejects_root_only_secrets_in_macos_environment(
+    root_only_key: str,
+) -> None:
+    """A later env file must not override the root secret source, even with empty text."""
+    module = _load_macos_deploy()
+    filesystem = FakeFileSystem()
+    filesystem.files[(ROOT / "deploy/macos.env").resolve()] = (
+        REQUIRED_MACOS_ENV + f"{root_only_key}=\n",
+        0o600,
+    )
+    runner = existing_mac_runner(filesystem=filesystem)
+
+    with pytest.raises(module.DeploymentError) as caught:
+        make_orchestrator(runner, filesystem=filesystem).deploy_existing()
+
+    assert caught.value.error_code == "MACOS_ENV_INVALID"
+    assert not any("compose" in call and "build" in call for call in runner.calls)
+
+
 def test_existing_mode_sanitizes_root_environment_file_errors() -> None:
     """Filesystem diagnostics can expose local paths and must become a fixed error."""
     module = _load_macos_deploy()
@@ -644,6 +811,58 @@ def test_existing_mode_sanitizes_root_environment_file_errors() -> None:
 
     assert caught.value.error_code == "ROOT_ENV_INVALID"
     assert "private host path" not in str(caught.value)
+
+
+def test_existing_mode_rejects_a_custom_secret_file_inside_build_context() -> None:
+    """A custom in-tree env path could be sent to Docker outside the reviewed ignore rule."""
+    module = _load_macos_deploy()
+    filesystem = FakeFileSystem()
+    runner = existing_mac_runner(filesystem=filesystem)
+
+    with pytest.raises(module.DeploymentError) as caught:
+        make_orchestrator(
+            runner,
+            filesystem=filesystem,
+            env_file=Path("private/deployment-secrets.env"),
+        ).deploy()
+
+    assert caught.value.error_code == "ENV_FILE_IN_BUILD_CONTEXT"
+    assert runner.calls == []
+
+
+def test_existing_mode_requires_root_env_to_be_excluded_from_build_context() -> None:
+    """The canonical root secret file must remain covered by Docker ignore rules."""
+    module = _load_macos_deploy()
+    filesystem = FakeFileSystem()
+    filesystem.files[(ROOT / ".dockerignore").resolve()] = ("*.apk\n", 0o644)
+    runner = existing_mac_runner(filesystem=filesystem)
+
+    with pytest.raises(module.DeploymentError) as caught:
+        make_orchestrator(runner, filesystem=filesystem).deploy_existing()
+
+    assert caught.value.error_code == "ROOT_ENV_NOT_IGNORED"
+    assert runner.calls == []
+
+
+def test_existing_mode_allows_a_secret_env_file_outside_build_context(
+    tmp_path: Path,
+) -> None:
+    """Operators may keep the deployment env in a separate protected directory."""
+    external_env = (tmp_path / "deployment.env").resolve()
+    filesystem = FakeFileSystem(env_exists=False)
+    filesystem.files[external_env] = (REQUIRED_ROOT_ENV, 0o600)
+    runner = existing_mac_runner(filesystem=filesystem)
+
+    result = make_orchestrator(
+        runner,
+        filesystem=filesystem,
+        env_file=external_env,
+    ).deploy_existing()
+
+    assert result.state == "READY"
+    rendered = "\n".join(" ".join(call) for call in runner.calls)
+    assert f"--env-file {external_env} --env-file deploy/macos.env" in rendered
+    assert not any(call[0].endswith("setup-admin.sh") for call in runner.calls)
 
 
 @pytest.mark.parametrize("env_exists", [False, True])
@@ -675,10 +894,47 @@ def test_existing_mode_installs_lifecycle_before_starting_only_stopped_roles() -
     assert broker.wait_calls == [
         ("operation-core_metrics", "RUNNING", 180.0),
     ]
+    pre_core = events.index("identity:emulator-5556:THS_CORE_33_ARM64")
+    pre_fund = events.index("identity:emulator-5554:THS_API_33_ARM64")
     assert events.index("installer") < events.index("broker-start:core_metrics")
     assert events.index("broker-start:core_metrics") < events.index(
         "broker-wait:operation-core_metrics"
     )
+    post_core = len(events) - 1 - events[::-1].index(
+        "identity:emulator-5556:THS_CORE_33_ARM64"
+    )
+    post_fund = len(events) - 1 - events[::-1].index(
+        "identity:emulator-5554:THS_API_33_ARM64"
+    )
+    assert pre_core < pre_fund < events.index("installer")
+    assert events.index("broker-wait:operation-core_metrics") < post_core < post_fund
+
+
+def test_existing_mode_rechecks_fixed_serial_identity_after_broker_startup() -> None:
+    """Broker startup must not leave a newly attached wrong AVD trusted by serial alone."""
+    module = _load_macos_deploy()
+    events: list[str] = []
+    runner = existing_mac_runner(
+        avd_identity_sequences={
+            "emulator-5556": ["THS_CORE_33_ARM64", "THS_API_33_ARM64"],
+        },
+        events=events,
+    )
+    broker = FakeLifecycleBroker(
+        {"core_metrics": "STOPPED", "main_fund_flow": "RUNNING"},
+        events=events,
+    )
+
+    with pytest.raises(module.DeploymentError) as caught:
+        make_orchestrator(runner, broker=broker).deploy_existing()
+
+    assert caught.value.error_code == "FIXED_AVD_IDENTITY_MISMATCH"
+    assert events.index("installer") < events.index("broker-start:core_metrics")
+    assert events.index("broker-wait:operation-core_metrics") < events.index(
+        "identity:emulator-5556:THS_API_33_ARM64"
+    )
+    assert not any("pm" in call and "path" in call for call in runner.calls)
+    assert not any(call[-3:] == ("up", "-d", "--build") for call in runner.calls)
 
 
 def test_existing_mode_sanitizes_compose_health_timeout() -> None:

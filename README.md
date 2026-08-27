@@ -41,8 +41,9 @@ or login snapshots.
 ## Linux amd64 / Redroid
 
 1. Create the deployment secret file. It prompts without echoing and creates a
-   mode-0600 `.env` containing only an Argon2id `ADMIN_PASSWORD_HASH` and a
-   random `ADMIN_SESSION_SECRET`:
+   mode-0600 `.env` containing an Argon2id `ADMIN_PASSWORD_HASH`, random
+   `ADMIN_SESSION_SECRET`, Fernet `THS_SESSION_ENCRYPTION_KEY`, and independent
+   `THS_DEVICE_LIFECYCLE_TOKEN`:
 
    ```sh
    ./scripts/setup-admin.sh .env
@@ -124,10 +125,12 @@ human-login gate into unattended provisioning.
 
 The lifecycle broker is installed with
 `scripts/install-macos-device-lifecycle.sh` as a macOS LaunchAgent. The root
-`.env` is the source for Compose/API; the installer copies the same lifecycle
-Token into the mode-0600 host config required by the broker. That host config
-is private, and the Token is never exposed through a plist, log, or browser;
-it is also never written to `deploy/macos.env` or API responses. Operators
+`.env` is the sole source for Compose/API secrets; the later
+`deploy/macos.env` contains neither `THS_DEVICE_LIFECYCLE_TOKEN` nor
+`THS_SESSION_ENCRYPTION_KEY`. The installer copies the same lifecycle Token
+into the mode-0600 host config required by the broker. That host config is
+private, and the Token is never exposed through a plist, log, browser, or API
+response. Operators
 acquire the device lock, wait for running tasks to finish, perform one device
 action at a time, release the lock, and explicitly resume the queue. Relevant
 fixed errors include

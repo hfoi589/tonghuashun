@@ -134,3 +134,161 @@ and Frida version/digests.
 - No repository `.env` or `deploy/macos.env` was created or modified.
 - No App was installed/reinstalled, no AVD or account state was altered, and
   no image was pushed, saved, or exported.
+
+## Fix round 1 — Compose precedence, fixed AVD identity, and env-file boundary
+
+The Critical/Important review findings were addressed without entering the
+deferred broker-readiness or setup-interruption Minor findings.
+
+### Exact RED evidence
+
+Root-only secret assignments were still accepted in the later macOS env file:
+
+```text
+/Users/wilson/tonghuashun/.venv/bin/python -m pytest -q \
+  tests/test_macos_one_click_deploy.py -k 'root_only_secrets_in_macos_environment'
+FF                                                                       [100%]
+2 failed, 28 deselected in 0.28s
+```
+
+The checked-in macOS env example still assigned empty root secrets, while the
+root env example omitted the lifecycle Token:
+
+```text
+/Users/wilson/tonghuashun/.venv/bin/python -m pytest -q \
+  tests/test_deploy_configuration.py::test_macos_example_keeps_root_secrets_out_of_the_later_env_file \
+  tests/test_deploy_configuration.py::test_root_environment_example_documents_the_direct_session_key
+FF                                                                       [100%]
+2 failed in 0.21s
+```
+
+Effective Compose configuration was never validated and ambient empty values
+survived into the real subprocess environment:
+
+```text
+/Users/wilson/tonghuashun/.venv/bin/python -m pytest -q \
+  tests/test_macos_one_click_deploy.py \
+  -k 'preserves_both_avds or empty_effective_compose or removes_ambient_compose'
+FFFFF                                                                    [100%]
+5 failed, 27 deselected in 0.54s
+```
+
+Fixed serials were trusted without an Emulator-console AVD identity check:
+
+```text
+/Users/wilson/tonghuashun/.venv/bin/python -m pytest -q \
+  tests/test_macos_one_click_deploy.py \
+  -k 'fixed_serial_identity or installs_lifecycle_before_starting'
+FFFF                                                                     [100%]
+4 failed, 31 deselected in 0.08s
+```
+
+Custom in-context env files were accepted and root `.env` did not require
+Docker-ignore coverage:
+
+```text
+/Users/wilson/tonghuashun/.venv/bin/python -m pytest -q \
+  tests/test_macos_one_click_deploy.py \
+  -k 'custom_secret_file_inside or root_env_to_be_excluded or secret_env_file_outside'
+FF.                                                                      [100%]
+2 failed, 1 passed, 35 deselected in 0.10s
+```
+
+After changing the public regression to exercise default `auto`, the invalid
+env path still reached the AVD probe before rejection:
+
+```text
+F                                                                        [100%]
+FAILED tests/test_macos_one_click_deploy.py::test_existing_mode_rejects_a_custom_secret_file_inside_build_context
+AssertionError: [('emulator', '-list-avds')] == []
+1 failed in 0.06s
+```
+
+### Fixes and exact GREEN evidence
+
+- Removed `THS_DEVICE_LIFECYCLE_TOKEN` and
+  `THS_SESSION_ENCRYPTION_KEY` assignments from
+  `deploy/macos.env.example`; root `.env` now documents both keys. Real
+  `deploy/macos.env` parsing rejects every root-only secret key, including an
+  empty assignment.
+- `SubprocessCommandRunner` removes security-sensitive ambient overrides.
+  The orchestrator executes the canonical `docker --context orbstack compose
+  --env-file ... --env-file deploy/macos.env ... config --format json` before
+  image build and again immediately before `up`; the effective lifecycle URL,
+  Token, and session key must exactly match the validated sources and be
+  non-empty.
+- Both fixed serials execute read-only `adb -s <serial> emu avd name` checks
+  before lifecycle installation and again after broker startup. Wrong,
+  malformed, or missing identity returns only
+  `FIXED_AVD_IDENTITY_MISMATCH`.
+- `--env-file` paths resolving inside the project are restricted to root
+  `.env`, and the effective `.dockerignore` rules must exclude it. Other
+  in-context paths fail with `ENV_FILE_IN_BUILD_CONTEXT`; external resolved
+  paths remain supported.
+
+Focused GREEN results:
+
+```text
+# Root-only secrets in macOS env
+2 passed, 28 deselected in 0.23s
+
+# Checked-in env examples
+2 passed in 0.12s
+
+# Compose precedence and ambient sanitization
+5 passed, 27 deselected in 0.15s
+
+# Fixed serial identity and lifecycle ordering
+4 passed, 31 deselected in 0.03s
+
+# In-context/external env-file boundary
+3 passed, 35 deselected in 0.03s
+
+# Default auto rejects before AVD probing
+1 passed in 0.02s
+```
+
+The real, non-starting Compose audit used a temporary mode-0600 fake root env
+and the checked-in later env file. It preserved the root Token/session key and
+fixed lifecycle URL:
+
+```text
+/Users/wilson/tonghuashun/.venv/bin/python -m pytest -q \
+  tests/test_deploy_configuration.py::test_real_compose_config_preserves_root_secrets_with_canonical_env_order
+.                                                                        [100%]
+1 passed in 0.57s
+```
+
+### Covering verification
+
+```text
+/Users/wilson/tonghuashun/.venv/bin/python -m pytest -q \
+  tests/test_macos_one_click_deploy.py tests/test_deploy_configuration.py
+................................................................         [100%]
+65 passed in 3.23s
+```
+
+```text
+/Users/wilson/tonghuashun/.venv/bin/python -m pytest -q
+663 passed, 24 existing deprecation warnings in 27.17s
+```
+
+Static verification completed successfully:
+
+```text
+/Users/wilson/tonghuashun/.venv/bin/python -m py_compile \
+  scripts/macos_deploy.py scripts/setup-admin.py
+/bin/sh -n scripts/deploy-macos-one-click.sh \
+  scripts/container-provision-device.sh
+git diff --check
+```
+
+An active-assignment scan found neither root-only key in
+`deploy/macos.env.example`, and the dangerous-command scan remained empty.
+The Dockerfile, mobile asset stage, manifest, APK, Frida binary, and final
+image contents were unchanged in this fix round, so the image audit was not
+rerun.
+
+No real `.env`, AVD, ADB device, lifecycle broker, LaunchAgent, Emulator, or
+Android SDK command was touched. The only Docker execution was read-only
+`compose config`; it did not build, start, stop, or mutate containers.

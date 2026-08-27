@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import base64
 from dataclasses import asdict, dataclass
+import fnmatch
 import json
 import os
 from pathlib import Path, PurePosixPath
@@ -49,6 +50,11 @@ REQUIRED_MACOS_ENV = {
     "CORE_FRIDA_SERVER_ENDPOINT": "host.docker.internal:27043",
     "FUND_ADB_SERIAL": "emulator-5554",
     "FUND_FRIDA_SERVER_ENDPOINT": "host.docker.internal:27042",
+    "THS_DEVICE_LIFECYCLE_URL": "http://host.docker.internal:18765",
+}
+ROOT_ONLY_COMPOSE_KEYS = frozenset(REQUIRED_ROOT_ENV_KEYS)
+SANITIZED_AMBIENT_KEYS = ROOT_ONLY_COMPOSE_KEYS | {
+    "THS_DEVICE_LIFECYCLE_URL",
 }
 _SAFE_APK_PATH = re.compile(r"/data/app/[A-Za-z0-9._~+=/-]+/base\.apk")
 _SAFE_OPERATION_ID = re.compile(r"[A-Za-z0-9_-]{1,256}")
@@ -99,6 +105,8 @@ class SubprocessCommandRunner:
     def __init__(self, project_root: Path) -> None:
         self._project_root = project_root
         self._environment = dict(os.environ)
+        for key in SANITIZED_AMBIENT_KEYS:
+            self._environment.pop(key, None)
 
     def run(
         self, args: tuple[str, ...], timeout: float
@@ -250,6 +258,7 @@ class MacDeploymentOrchestrator:
         self._root_environment: dict[str, str] = {}
 
     def deploy(self, mode: str = "auto") -> DeploymentResult:
+        self._validate_env_file_location()
         if mode == "existing":
             return self.deploy_existing()
         if mode == "provision":
@@ -265,18 +274,58 @@ class MacDeploymentOrchestrator:
         raise DeploymentError("PROVISIONING_NOT_IMPLEMENTED")
 
     def deploy_existing(self) -> DeploymentResult:
+        self._validate_env_file_location()
         self._validate_host_prerequisites()
         self._require_fixed_avds()
         self._root_environment = self._ensure_root_environment()
         self._validate_macos_environment()
+        self._validate_effective_compose_config()
         self._build_local_image()
         manifest = self._read_image_manifest()
+        self._verify_fixed_avd_identities()
         self._install_lifecycle_service()
         self._start_stopped_roles()
+        self._verify_fixed_avd_identities()
         self._verify_installed_apks(manifest["apk"]["sha256"])
+        self._validate_effective_compose_config()
         self._compose_up()
         self._wait_for_compose_health()
         return DeploymentResult(mode="existing", state="READY")
+
+    def _validate_env_file_location(self) -> None:
+        try:
+            relative = self._env_file.relative_to(self._project_root)
+        except ValueError:
+            return
+        if relative != Path(".env"):
+            raise DeploymentError("ENV_FILE_IN_BUILD_CONTEXT")
+        dockerignore = self._project_root / ".dockerignore"
+        try:
+            ignored = self._dockerignore_excludes_root_env(
+                self._filesystem.read_text(dockerignore)
+            )
+        except Exception:
+            raise DeploymentError("ROOT_ENV_NOT_IGNORED") from None
+        if not ignored:
+            raise DeploymentError("ROOT_ENV_NOT_IGNORED")
+        self._env_argument = ".env"
+
+    @staticmethod
+    def _dockerignore_excludes_root_env(content: str) -> bool:
+        excluded = False
+        for raw_line in content.splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            negated = line.startswith("!")
+            pattern = line[1:] if negated else line
+            pattern = pattern.removeprefix("/")
+            root_pattern = pattern.removeprefix("**/")
+            if fnmatch.fnmatchcase(".env", pattern) or fnmatch.fnmatchcase(
+                ".env", root_pattern
+            ):
+                excluded = not negated
+        return excluded
 
     def _validate_command_presence(self) -> None:
         try:
@@ -368,6 +417,8 @@ class MacDeploymentOrchestrator:
             raise DeploymentError("MACOS_ENV_INVALID") from None
         except Exception:
             raise DeploymentError("MACOS_ENV_INVALID") from None
+        if ROOT_ONLY_COMPOSE_KEYS.intersection(values):
+            raise DeploymentError("MACOS_ENV_INVALID")
         if any(values.get(key) != expected for key, expected in REQUIRED_MACOS_ENV.items()):
             raise DeploymentError("MACOS_ENV_INVALID")
 
@@ -410,6 +461,34 @@ class MacDeploymentOrchestrator:
             1800.0,
             "IMAGE_BUILD_FAILED",
         )
+
+    def _validate_effective_compose_config(self) -> None:
+        result = self._run(
+            self._compose_prefix() + ("config", "--format", "json"),
+            60.0,
+            "COMPOSE_CONFIG_INVALID",
+        )
+        try:
+            document = json.loads(self._stdout_text(result))
+            environment = document["services"]["api"]["environment"]
+        except (KeyError, TypeError, ValueError):
+            environment = None
+        expected = {
+            "THS_DEVICE_LIFECYCLE_URL": REQUIRED_MACOS_ENV[
+                "THS_DEVICE_LIFECYCLE_URL"
+            ],
+            "THS_DEVICE_LIFECYCLE_TOKEN": self._root_environment[
+                "THS_DEVICE_LIFECYCLE_TOKEN"
+            ],
+            "THS_SESSION_ENCRYPTION_KEY": self._root_environment[
+                "THS_SESSION_ENCRYPTION_KEY"
+            ],
+        }
+        if not isinstance(environment, dict) or any(
+            environment.get(key) != value or not value
+            for key, value in expected.items()
+        ):
+            raise DeploymentError("COMPOSE_CONFIG_INVALID")
 
     def _read_image_manifest(self) -> dict[str, dict[str, object]]:
         result = self._run(
@@ -462,6 +541,23 @@ class MacDeploymentOrchestrator:
             120.0,
             "DEVICE_LIFECYCLE_INSTALL_FAILED",
         )
+
+    def _verify_fixed_avd_identities(self) -> None:
+        for _role, (expected_avd, serial) in FIXED_ROLES.items():
+            result = self._run(
+                ("adb", "-s", serial, "emu", "avd", "name"),
+                15.0,
+                "FIXED_AVD_IDENTITY_MISMATCH",
+            )
+            lines = [
+                line.strip().removesuffix("\r")
+                for line in self._stdout_text(result).splitlines()
+                if line.strip()
+            ]
+            if lines and lines[-1] == "OK":
+                lines.pop()
+            if lines != [expected_avd]:
+                raise DeploymentError("FIXED_AVD_IDENTITY_MISMATCH")
 
     def _start_stopped_roles(self) -> None:
         broker = self._broker

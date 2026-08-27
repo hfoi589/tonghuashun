@@ -186,7 +186,9 @@ MARKET_DIRECT_ENRICHMENT_TTL_SECONDS=15
 CORE_WARM_CONNECTION_MAX_IDLE_SECONDS=25
 ```
 
-`.env` 继续只保存管理员秘密和 `THS_SESSION_ENCRYPTION_KEY`，不得提交。
+`.env` 继续只保存管理员秘密、`THS_SESSION_ENCRYPTION_KEY` 和
+`THS_DEVICE_LIFECYCLE_TOKEN`，不得提交；后二者不得在后加载的
+`deploy/macos.env` 中出现任何赋值（包括空值）。
 
 ## 8. 2026-08-27 验收证据
 
@@ -249,11 +251,12 @@ docker --context orbstack compose \
 
 在目标 Mac 上，由
 `scripts/install-macos-device-lifecycle.sh` 安装稳定副本并加载
-`com.ths.device-lifecycle` LaunchAgent。broker 仅监听 macOS 回环地址；root
-`.env` is the source for Compose/API，installer copies the same lifecycle Token
-into the mode-0600 host config required by the broker。该 host config 私有，Token
-is never exposed through a plist, log, or browser，且绝不写入
-`deploy/macos.env`、API 响应或交接文档。
+`com.ths.device-lifecycle` LaunchAgent。broker 仅监听 macOS 回环地址；
+root `.env` is the sole source for Compose/API secrets；后加载的
+`deploy/macos.env` 不得赋值 `THS_DEVICE_LIFECYCLE_TOKEN` 或
+`THS_SESSION_ENCRYPTION_KEY`。installer copies the same lifecycle Token into
+the mode-0600 host config required by the broker。该 host config 私有，Token
+is never exposed through a plist, log, or browser，且绝不写入 API 响应或交接文档。
 
 管理员只可在已登录、CSRF 校验、取得当前会话设备锁、队列暂停且无运行设备任务后，
 调用固定的 `shutdown` 或 `start_and_launch_app`。前者使用 Emulator 正常关闭，后者

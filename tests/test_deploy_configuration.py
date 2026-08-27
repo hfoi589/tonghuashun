@@ -237,8 +237,8 @@ def test_macos_deployment_docs_use_the_binding_orbstack_command() -> None:
     assert "docker compose --env-file deploy/macos.env" not in example
 
 
-def test_macos_example_and_compose_document_a_secretless_lifecycle_configuration() -> None:
-    """A sample token or omitted broker settings could expose host lifecycle controls."""
+def test_macos_example_keeps_root_secrets_out_of_the_later_env_file() -> None:
+    """Later empty assignments would override valid secrets from the root env file."""
     example = (ROOT / "deploy" / "macos.env.example").read_text(encoding="utf-8")
     compose = (ROOT / "deploy" / "compose.yml").read_text(encoding="utf-8")
     active_assignments = [
@@ -253,13 +253,70 @@ def test_macos_example_and_compose_document_a_secretless_lifecycle_configuration
 
     assert active_values["THS_DEVICE_LIFECYCLE_URL"] == ["http://host.docker.internal:18765"]
     assert active_values["THS_DEVICE_LIFECYCLE_TIMEOUT_SECONDS"] == ["5"]
-    assert active_values["THS_DEVICE_LIFECYCLE_TOKEN"] == [""]
+    assert "THS_DEVICE_LIFECYCLE_TOKEN" not in active_values
+    assert "THS_SESSION_ENCRYPTION_KEY" not in active_values
     for setting in (
         "THS_DEVICE_LIFECYCLE_URL",
         "THS_DEVICE_LIFECYCLE_TOKEN",
         "THS_DEVICE_LIFECYCLE_TIMEOUT_SECONDS",
     ):
         assert f"{setting}: ${{{setting}:-" in compose
+
+
+@pytest.mark.skipif(shutil.which("docker") is None, reason="Docker is not installed")
+def test_real_compose_config_preserves_root_secrets_with_canonical_env_order(
+    tmp_path: Path,
+) -> None:
+    """The later macOS env file must not blank the root Token or session key."""
+    root_env = tmp_path / "root.env"
+    root_env.write_text(
+        "ADMIN_PASSWORD_HASH='$argon2id$example'\n"
+        "ADMIN_SESSION_SECRET=session-secret-value\n"
+        "THS_DEVICE_LIFECYCLE_TOKEN=lifecycle-secret-value\n"
+        "THS_SESSION_ENCRYPTION_KEY=MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=\n",
+        encoding="utf-8",
+    )
+    root_env.chmod(0o600)
+    protected = {
+        "ADMIN_PASSWORD_HASH",
+        "ADMIN_SESSION_SECRET",
+        "THS_DEVICE_LIFECYCLE_URL",
+        "THS_DEVICE_LIFECYCLE_TOKEN",
+        "THS_SESSION_ENCRYPTION_KEY",
+    }
+    environment = {key: value for key, value in os.environ.items() if key not in protected}
+
+    result = subprocess.run(
+        [
+            "docker",
+            "--context",
+            "orbstack",
+            "compose",
+            "--env-file",
+            str(root_env),
+            "--env-file",
+            "deploy/macos.env.example",
+            "-f",
+            "deploy/compose.yml",
+            "config",
+            "--format",
+            "json",
+        ],
+        cwd=ROOT,
+        env=environment,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    api_environment = json.loads(result.stdout)["services"]["api"]["environment"]
+    assert api_environment["THS_DEVICE_LIFECYCLE_URL"] == "http://host.docker.internal:18765"
+    assert api_environment["THS_DEVICE_LIFECYCLE_TOKEN"] == "lifecycle-secret-value"
+    assert api_environment["THS_SESSION_ENCRYPTION_KEY"] == (
+        "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="
+    )
 
 
 def test_readme_defines_the_unimplemented_private_complete_image_contract() -> None:
@@ -286,15 +343,21 @@ def test_lifecycle_token_docs_define_the_compose_and_host_broker_boundary() -> N
     handoff = " ".join((ROOT / "handoff.md").read_text(encoding="utf-8").split())
 
     for document in (readme, handoff):
-        assert "root `.env` is the source for Compose/API" in document
+        assert "root `.env` is the sole source for Compose/API secrets" in document
         assert "installer copies the same lifecycle Token into the mode-0600 host config" in document
-        assert "never exposed through a plist, log, or browser" in document
+        assert "never exposed" in document
+        for channel in ("plist", "log", "browser"):
+            assert channel in document
+        assert "deploy/macos.env" in document
+        assert "THS_DEVICE_LIFECYCLE_TOKEN" in document
+        assert "THS_SESSION_ENCRYPTION_KEY" in document
 
 
 def test_root_environment_example_documents_the_direct_session_key() -> None:
     example = (ROOT / ".env.example").read_text(encoding="utf-8")
 
     assert "THS_SESSION_ENCRYPTION_KEY=" in example
+    assert "THS_DEVICE_LIFECYCLE_TOKEN=" in example
 
 
 def test_api_image_installs_adb_client() -> None:

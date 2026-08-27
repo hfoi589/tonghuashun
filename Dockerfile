@@ -64,6 +64,7 @@ COPY --from=mobile-assets --chmod=0555 /opt/ths/assets/ths-frida-server /opt/ths
 COPY --chmod=0555 scripts/container-provision-device.sh /usr/local/bin/container-provision-device
 COPY --chmod=0555 scripts/install-macos-device-lifecycle.sh /opt/ths/deployment/install-macos-device-lifecycle.sh
 COPY --chmod=0555 scripts/macos-device-lifecycle.py /opt/ths/deployment/macos-device-lifecycle.py
+COPY --chmod=0444 scripts/macos_device_identity.py /opt/ths/deployment/macos_device_identity.py
 COPY --chmod=0555 scripts/watch-macos-device-bridge.sh /opt/ths/deployment/watch-macos-device-bridge.sh
 COPY --chmod=0555 scripts/configure-macos-core-display.sh /opt/ths/deployment/configure-macos-core-display.sh
 COPY scripts/container-entrypoint.sh /usr/local/bin/ths-entrypoint

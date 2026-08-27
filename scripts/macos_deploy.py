@@ -7,6 +7,7 @@ import argparse
 import base64
 import ctypes
 from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
 import fnmatch
 import getpass
 import hmac
@@ -29,8 +30,18 @@ from urllib.request import Request
 PROJECT_IMPORT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_IMPORT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_IMPORT_ROOT))
+SCRIPT_IMPORT_ROOT = Path(__file__).resolve().parent
+if str(SCRIPT_IMPORT_ROOT) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_IMPORT_ROOT))
 
 from level2_service.safe_http import SafeHttpError, SafeHttpStatusError, SafeHttpTransport
+from macos_device_identity import (
+    DarwinProcessExecutableResolver,
+    FixedAvdIdentityVerifier,
+    FixedAvdPresence,
+    IdentityVerificationError,
+    ProcessExecutableResolver,
+)
 
 
 APK_SHA256 = "2554490aa3f5e2df17ac0a711311f3f85ee3130008af9bb4ab12510b3d6e971e"
@@ -112,16 +123,21 @@ PROVISIONING_JOURNAL_PATH = (
 _PROVISIONING_STEPS = (
     "PENDING_CREATE",
     "AVD_CREATED",
-    "ASSETS_PROVISIONED",
+    "APK_VERIFIED",
+    "FRIDA_READY",
+    "LOGIN_REQUIRED",
+    "ACCEPTANCE_PENDING",
 )
 SESSION_READINESS_PROBE = """\
+import json
 import os
 import stat
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from level2_service.app_sessions import EncryptedFileSessionProvider
 
 ready = False
+updated_at = {}
 try:
     root = Path(os.environ["THS_SESSION_ROOT"])
     key = os.environ["THS_SESSION_ENCRYPTION_KEY"]
@@ -140,6 +156,10 @@ try:
     if files_safe:
         provider = EncryptedFileSessionProvider(root, key)
         statuses = [provider.status(role).as_public() for role in roles]
+        updated_at = {
+            role: status.get("updated_at")
+            for role, status in zip(roles, statuses, strict=True)
+        }
         ready = all(
             status.get("role") == role
             and status.get("state") == "READY"
@@ -150,7 +170,7 @@ try:
         )
 except Exception:
     ready = False
-print("READY" if ready else "NOT_READY")
+print(json.dumps({"ready": ready, "updated_at": updated_at}, separators=(",", ":")))
 """
 _FIRST_TIME_LOGIN_INSTRUCTIONS = (
     "Open http://127.0.0.1:8001/#admin.",
@@ -239,7 +259,15 @@ class ProvisioningJournalStore(Protocol):
         self, roles: frozenset[str]
     ) -> dict[str, str]: ...
 
-    def set_step(self, role: str, step: str) -> None: ...
+    def set_step(
+        self,
+        role: str,
+        step: str,
+        *,
+        created_at: datetime | None = None,
+    ) -> None: ...
+
+    def created_at(self, role: str) -> datetime | None: ...
 
     def complete(self, role: str) -> None: ...
 
@@ -256,41 +284,6 @@ class FileSystem(Protocol):
     def free_bytes(self, path: Path) -> int: ...
 
     def is_secure_owner_file(self, path: Path) -> bool: ...
-
-
-class ProcessExecutableResolver(Protocol):
-    def resolve(self, pid: int) -> Path: ...
-
-
-class DarwinProcessExecutableResolver:
-    """Resolve a PID to its actual executable image through macOS libproc."""
-
-    _LIBPROC_PATH = "/usr/lib/libproc.dylib"
-    _PROC_PIDPATHINFO_MAXSIZE = 4096
-
-    def resolve(self, pid: int) -> Path:
-        if sys.platform != "darwin" or pid <= 0:
-            raise OSError("proc_pidpath unavailable")
-        libproc = ctypes.CDLL(self._LIBPROC_PATH, use_errno=True)
-        proc_pidpath = libproc.proc_pidpath
-        proc_pidpath.argtypes = [
-            ctypes.c_int,
-            ctypes.c_void_p,
-            ctypes.c_uint32,
-        ]
-        proc_pidpath.restype = ctypes.c_int
-        buffer = ctypes.create_string_buffer(self._PROC_PIDPATHINFO_MAXSIZE)
-        length = proc_pidpath(pid, buffer, len(buffer))
-        if length <= 0 or length > len(buffer):
-            error_number = ctypes.get_errno()
-            raise OSError(error_number, "proc_pidpath failed")
-        raw_path = buffer.raw[:length].split(b"\0", 1)[0]
-        if not raw_path:
-            raise OSError("proc_pidpath returned an empty path")
-        executable = Path(os.fsdecode(raw_path))
-        if not executable.is_absolute():
-            raise OSError("proc_pidpath returned a relative path")
-        return executable
 
 
 class SubprocessCommandRunner:
@@ -769,6 +762,16 @@ class ProvisioningJournal:
         )
 
     def load(self) -> dict[str, str]:
+        return {
+            role: entry["step"]
+            for role, entry in self._load_entries().items()
+        }
+
+    def created_at(self, role: str) -> datetime | None:
+        entry = self._load_entries().get(role)
+        return entry["created_at"] if entry is not None else None
+
+    def _load_entries(self) -> dict[str, dict[str, object]]:
         try:
             metadata = os.lstat(self.path)
         except FileNotFoundError:
@@ -812,22 +815,35 @@ class ProvisioningJournal:
     ) -> dict[str, str]:
         if not roles.issubset(FIXED_ROLES):
             raise DeploymentError("PROVISIONING_JOURNAL_INVALID")
-        steps = self.load()
+        entries = self._load_entries()
         changed = False
         for role in FIXED_ROLES:
-            if role in roles and role not in steps:
-                steps[role] = "PENDING_CREATE"
+            if role in roles and role not in entries:
+                entries[role] = {
+                    "step": "PENDING_CREATE",
+                    "created_at": None,
+                }
                 changed = True
         if changed:
-            self._write(steps)
-        return dict(steps)
+            self._write(entries)
+        return {role: entry["step"] for role, entry in entries.items()}
 
-    def set_step(self, role: str, step: str) -> None:
-        steps = self.load()
-        current = steps.get(role)
+    def set_step(
+        self,
+        role: str,
+        step: str,
+        *,
+        created_at: datetime | None = None,
+    ) -> None:
+        entries = self._load_entries()
+        entry = entries.get(role)
+        current = entry["step"] if entry is not None else None
         transitions = {
             "PENDING_CREATE": "AVD_CREATED",
-            "AVD_CREATED": "ASSETS_PROVISIONED",
+            "AVD_CREATED": "APK_VERIFIED",
+            "APK_VERIFIED": "FRIDA_READY",
+            "FRIDA_READY": "LOGIN_REQUIRED",
+            "LOGIN_REQUIRED": "ACCEPTANCE_PENDING",
         }
         if (
             role not in FIXED_ROLES
@@ -836,51 +852,125 @@ class ProvisioningJournal:
             or (step != current and transitions.get(current) != step)
         ):
             raise DeploymentError("PROVISIONING_JOURNAL_INVALID")
+        if step == "AVD_CREATED" and (
+            current != "AVD_CREATED"
+            or (entry is not None and entry.get("created_at") is None)
+        ):
+            if created_at is None or created_at.tzinfo is None:
+                raise DeploymentError("PROVISIONING_JOURNAL_INVALID")
+        elif created_at is not None:
+            raise DeploymentError("PROVISIONING_JOURNAL_INVALID")
+        assert entry is not None
         if step != current:
-            steps[role] = step
-            self._write(steps)
+            entry["step"] = step
+            if step == "AVD_CREATED":
+                entry["created_at"] = created_at
+            self._write(entries)
+        elif step == "AVD_CREATED" and entry.get("created_at") is None:
+            entry["created_at"] = created_at
+            self._write(entries)
 
     def complete(self, role: str) -> None:
-        steps = self.load()
-        if steps.get(role) != "ASSETS_PROVISIONED":
+        entries = self._load_entries()
+        if entries.get(role, {}).get("step") != "ACCEPTANCE_PENDING":
             raise DeploymentError("PROVISIONING_JOURNAL_INVALID")
-        del steps[role]
-        self._write(steps)
+        del entries[role]
+        self._write(entries)
 
     @staticmethod
-    def _validate_document(document: object) -> dict[str, str]:
+    def _validate_document(
+        document: object,
+    ) -> dict[str, dict[str, object]]:
+        if (
+            isinstance(document, dict)
+            and document.get("version") == 1
+            and set(document) == {"version", "roles"}
+            and isinstance(document.get("roles"), dict)
+        ):
+            migrated: dict[str, dict[str, object]] = {}
+            legacy_map = {
+                "PENDING_CREATE": "PENDING_CREATE",
+                "AVD_CREATED": "AVD_CREATED",
+                # Re-run digest verification and bridge repair safely; the
+                # phase-aware provisioner never reinstalls an exact APK.
+                "ASSETS_PROVISIONED": "AVD_CREATED",
+            }
+            for role, entry in document["roles"].items():
+                if (
+                    role not in FIXED_ROLES
+                    or not isinstance(entry, dict)
+                    or set(entry) != {"avd_name", "step"}
+                    or entry.get("avd_name") != FIXED_ROLES[role][0]
+                    or entry.get("step") not in legacy_map
+                ):
+                    raise DeploymentError("PROVISIONING_JOURNAL_INVALID")
+                migrated[role] = {
+                    "step": legacy_map[entry["step"]],
+                    "created_at": None,
+                }
+            return migrated
         if (
             not isinstance(document, dict)
             or set(document) != {"version", "roles"}
-            or document.get("version") != 1
+            or document.get("version") != 2
             or not isinstance(document.get("roles"), dict)
         ):
             raise DeploymentError("PROVISIONING_JOURNAL_INVALID")
         raw_roles = document["roles"]
-        steps: dict[str, str] = {}
+        entries: dict[str, dict[str, object]] = {}
         for role, entry in raw_roles.items():
             if (
                 role not in FIXED_ROLES
                 or not isinstance(entry, dict)
-                or set(entry) != {"avd_name", "step"}
+                or set(entry) != {"avd_name", "step", "created_at"}
                 or entry.get("avd_name") != FIXED_ROLES[role][0]
                 or entry.get("step") not in _PROVISIONING_STEPS
             ):
                 raise DeploymentError("PROVISIONING_JOURNAL_INVALID")
-            steps[role] = entry["step"]
-        return steps
+            raw_created = entry.get("created_at")
+            if raw_created is None:
+                created = None
+            elif isinstance(raw_created, str):
+                try:
+                    created = datetime.fromisoformat(raw_created)
+                except ValueError:
+                    raise DeploymentError(
+                        "PROVISIONING_JOURNAL_INVALID"
+                    ) from None
+                if created.tzinfo is None:
+                    raise DeploymentError("PROVISIONING_JOURNAL_INVALID")
+            else:
+                raise DeploymentError("PROVISIONING_JOURNAL_INVALID")
+            if entry["step"] != "PENDING_CREATE" and created is None:
+                # Legacy migration is allowed in memory and is stamped before
+                # the next mutable phase; version-2 state is always precise.
+                raise DeploymentError("PROVISIONING_JOURNAL_INVALID")
+            entries[role] = {
+                "step": entry["step"],
+                "created_at": created,
+            }
+        return entries
 
-    def _write(self, steps: dict[str, str]) -> None:
-        if not set(steps).issubset(FIXED_ROLES) or any(
-            step not in _PROVISIONING_STEPS for step in steps.values()
+    def _write(self, entries: dict[str, dict[str, object]]) -> None:
+        if not set(entries).issubset(FIXED_ROLES) or any(
+            entry.get("step") not in _PROVISIONING_STEPS
+            for entry in entries.values()
         ):
             raise DeploymentError("PROVISIONING_JOURNAL_INVALID")
         document = {
-            "version": 1,
+            "version": 2,
             "roles": {
-                role: {"avd_name": FIXED_ROLES[role][0], "step": steps[role]}
+                role: {
+                    "avd_name": FIXED_ROLES[role][0],
+                    "step": entries[role]["step"],
+                    "created_at": (
+                        entries[role]["created_at"].isoformat()
+                        if isinstance(entries[role].get("created_at"), datetime)
+                        else None
+                    ),
+                }
                 for role in FIXED_ROLES
-                if role in steps
+                if role in entries
             },
         }
         encoded = json.dumps(
@@ -1361,6 +1451,7 @@ class MacDeploymentOrchestrator:
         data_only_acceptance: DataOnlyAcceptance | None = None,
         provisioning_journal: ProvisioningJournalStore | None = None,
         deployment_maintenance: DeploymentMaintenance | None = None,
+        now: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
         health_timeout_seconds: float = 180.0,
         boot_timeout_seconds: float = 180.0,
         poll_interval_seconds: float = 2.0,
@@ -1388,6 +1479,7 @@ class MacDeploymentOrchestrator:
             process_executable_resolver or DarwinProcessExecutableResolver()
         )
         self._deployment_maintenance = deployment_maintenance
+        self._now = now
 
     @property
     def initial_missing_roles(self) -> frozenset[str]:
@@ -1443,43 +1535,135 @@ class MacDeploymentOrchestrator:
                 continue
             step = journal_steps[role]
             if role in actual_missing:
-                if step == "ASSETS_PROVISIONED":
+                if step not in {"PENDING_CREATE", "AVD_CREATED"}:
                     raise DeploymentError("PROVISIONING_JOURNAL_INVALID")
-                self._create_fixed_avd(role)
-                self._provisioning_journal.set_step(role, "AVD_CREATED")
-                step = "AVD_CREATED"
+                if step == "PENDING_CREATE":
+                    self._create_fixed_avd(role)
+                    self._provisioning_journal.set_step(
+                        role, "AVD_CREATED", created_at=self._now()
+                    )
+                    step = "AVD_CREATED"
             elif step == "PENDING_CREATE":
-                self._provisioning_journal.set_step(role, "AVD_CREATED")
+                self._provisioning_journal.set_step(
+                    role, "AVD_CREATED", created_at=self._now()
+                )
+                step = "AVD_CREATED"
+            elif (
+                step != "PENDING_CREATE"
+                and self._provisioning_journal.created_at(role) is None
+            ):
+                self._provisioning_journal.set_step(
+                    role, "AVD_CREATED", created_at=self._now()
+                )
                 step = "AVD_CREATED"
             if step == "AVD_CREATED":
                 self._ensure_provisioning_avd_booted(role)
-                self._provision_created_avd(role)
-                self._provisioning_journal.set_step(
-                    role, "ASSETS_PROVISIONED"
-                )
-            elif step != "ASSETS_PROVISIONED":
+                self._provision_created_avd(role, "apk")
+                self._provisioning_journal.set_step(role, "APK_VERIFIED")
+                step = "APK_VERIFIED"
+            if step == "APK_VERIFIED":
+                self._ensure_provisioning_avd_booted(role)
+                self._provision_created_avd(role, "frida")
+                self._provisioning_journal.set_step(role, "FRIDA_READY")
+                step = "FRIDA_READY"
+            if step not in {
+                "FRIDA_READY",
+                "LOGIN_REQUIRED",
+                "ACCEPTANCE_PENDING",
+            }:
                 raise DeploymentError("PROVISIONING_JOURNAL_INVALID")
         self._install_lifecycle_service()
         for role in FIXED_ROLES:
             if role not in provisioning_roles:
                 continue
-            self._start_and_launch_roles((role,))
-            self._provisioning_journal.complete(role)
+            if self._provisioning_journal.load().get(role) == "FRIDA_READY":
+                self._start_and_launch_roles((role,))
         self._verify_fixed_avd_identities(
             tuple(role for role in FIXED_ROLES if role in provisioning_roles)
         )
         self._verify_installed_apks(manifest["apk"]["sha256"])
-        self._validate_effective_compose_config()
-        self._compose_up()
-        self._wait_for_compose_health()
-        if not self._session_bundles_ready():
-            return DeploymentResult(
-                mode="provision",
-                state="FIRST_TIME_LOGIN_REQUIRED",
-                instructions=_FIRST_TIME_LOGIN_INSTRUCTIONS,
-            )
-        self._verify_data_only_acceptance()
-        return DeploymentResult(mode="provision", state="READY")
+        maintenance = self._deployment_maintenance
+        maintenance_prepared = False
+        try:
+            before_replace = self._provisioning_journal.load()
+            if maintenance is not None and all(
+                step in {"LOGIN_REQUIRED", "ACCEPTANCE_PENDING"}
+                for step in before_replace.values()
+            ):
+                maintenance.prepare()
+                maintenance_prepared = True
+                maintenance.renew()
+            self._validate_effective_compose_config()
+            self._compose_up()
+            self._wait_for_compose_health()
+            for role in provisioning_roles:
+                if self._provisioning_journal.load().get(role) == "FRIDA_READY":
+                    self._provisioning_journal.set_step(role, "LOGIN_REQUIRED")
+            session_statuses = self._session_bundle_statuses()
+            if session_statuses is None:
+                return DeploymentResult(
+                    mode="provision",
+                    state="FIRST_TIME_LOGIN_REQUIRED",
+                    instructions=(
+                        _FIRST_TIME_LOGIN_INSTRUCTIONS
+                        + (
+                            _MAINTENANCE_RETAINED_INSTRUCTIONS
+                            if maintenance_prepared
+                            else ()
+                        )
+                    ),
+                )
+            for role in provisioning_roles:
+                created_at = self._provisioning_journal.created_at(role)
+                refreshed_at = session_statuses.get(role)
+                if (
+                    created_at is None
+                    or refreshed_at is None
+                    or refreshed_at <= created_at
+                ):
+                    return DeploymentResult(
+                        mode="provision",
+                        state="FIRST_TIME_LOGIN_REQUIRED",
+                        instructions=(
+                            _FIRST_TIME_LOGIN_INSTRUCTIONS
+                            + (
+                                _MAINTENANCE_RETAINED_INSTRUCTIONS
+                                if maintenance_prepared
+                                else ()
+                            )
+                        ),
+                    )
+            for role in provisioning_roles:
+                if self._provisioning_journal.load().get(role) == "LOGIN_REQUIRED":
+                    self._provisioning_journal.set_step(
+                        role, "ACCEPTANCE_PENDING"
+                    )
+            if any(
+                step != "ACCEPTANCE_PENDING"
+                for step in self._provisioning_journal.load().values()
+            ):
+                raise DeploymentError("PROVISIONING_JOURNAL_INVALID")
+            if maintenance is not None and not maintenance_prepared:
+                return DeploymentResult(
+                    mode="provision",
+                    state="FIRST_TIME_LOGIN_REQUIRED",
+                    instructions=_FIRST_TIME_LOGIN_INSTRUCTIONS,
+                )
+            if maintenance is not None:
+                maintenance.renew()
+            self._verify_data_only_acceptance()
+            if maintenance is not None:
+                maintenance.release()
+            for role in tuple(provisioning_roles):
+                self._provisioning_journal.complete(role)
+            return DeploymentResult(mode="provision", state="READY")
+        except DeploymentError as error:
+            if maintenance_prepared and not error.instructions:
+                raise DeploymentError(
+                    error.error_code,
+                    instructions=_MAINTENANCE_RETAINED_INSTRUCTIONS,
+                ) from None
+            raise
 
     def deploy_existing(self) -> DeploymentResult:
         maintenance = self._deployment_maintenance
@@ -1893,12 +2077,12 @@ class MacDeploymentOrchestrator:
             or api_mounts.get("/data/admin") != "admin-data"
             or api_mounts.get("/data/market") != "market-data"
             or redis_mounts != {"/data": "redis-data"}
+            or not isinstance(environment, dict)
             or environment.get("THS_SESSION_ROOT")
             != "/data/admin/ths-sessions"
-            or not isinstance(environment, dict)
             or any(
-            environment.get(key) != value or not value
-            for key, value in expected.items()
+                environment.get(key) != value or not value
+                for key, value in expected.items()
             )
         ):
             raise DeploymentError("COMPOSE_CONFIG_INVALID")
@@ -2005,21 +2189,19 @@ class MacDeploymentOrchestrator:
         self._wait_for_created_avd_boot(role)
 
     def _ensure_provisioning_avd_booted(self, role: str) -> None:
-        _avd_name, serial = FIXED_ROLES[role]
+        expected_avd, serial = FIXED_ROLES[role]
         try:
-            state_result = self._runner.run(
-                ("adb", "-s", serial, "get-state"), 15.0
+            identity = self._identity_verifier().inspect(
+                serial=serial,
+                expected_avd=expected_avd,
+                emulator_port=FIXED_EMULATOR_PORTS[role],
             )
-        except Exception:
+        except IdentityVerificationError:
             raise DeploymentError("FIXED_AVD_IDENTITY_MISMATCH") from None
-        if state_result.returncode == 0:
-            state = self._stdout_text(state_result).strip()
-            if state not in _SAFE_ADB_STATES:
-                raise DeploymentError("FIXED_AVD_IDENTITY_MISMATCH")
-            attached = True
-        else:
-            attached = serial in self._list_adb_devices()
-        if attached:
+        if identity.presence in {
+            FixedAvdPresence.ATTACHED,
+            FixedAvdPresence.STARTING,
+        }:
             self._wait_for_created_avd_boot(role)
             return
         self._start_created_avd(role)
@@ -2050,13 +2232,22 @@ class MacDeploymentOrchestrator:
             except Exception:
                 ready = False
             if ready:
-                self._require_adb_avd_identity(serial, expected_avd)
+                try:
+                    self._identity_verifier().require_attached(
+                        serial=serial, expected_avd=expected_avd
+                    )
+                except IdentityVerificationError:
+                    raise DeploymentError(
+                        "FIXED_AVD_IDENTITY_MISMATCH"
+                    ) from None
                 return
             if time.monotonic() >= deadline:
                 raise DeploymentError("DEVICE_BOOT_TIMEOUT")
             time.sleep(max(0.0, self._poll_interval_seconds))
 
-    def _provision_created_avd(self, role: str) -> None:
+    def _provision_created_avd(self, role: str, step: str) -> None:
+        if step not in {"apk", "frida"}:
+            raise DeploymentError("DEVICE_PROVISION_FAILED")
         self._run(
             (
                 "docker",
@@ -2072,6 +2263,7 @@ class MacDeploymentOrchestrator:
                 "container-provision-device",
                 IMAGE_NAME,
                 role,
+                step,
             ),
             300.0,
             "DEVICE_PROVISION_FAILED",
@@ -2083,7 +2275,12 @@ class MacDeploymentOrchestrator:
         selected = tuple(FIXED_ROLES) if roles is None else roles
         for role in selected:
             expected_avd, serial = FIXED_ROLES[role]
-            self._require_adb_avd_identity(serial, expected_avd)
+            try:
+                self._identity_verifier().require_attached(
+                    serial=serial, expected_avd=expected_avd
+                )
+            except IdentityVerificationError:
+                raise DeploymentError("FIXED_AVD_IDENTITY_MISMATCH") from None
 
     def _verify_preinstall_fixed_avd_identities(
         self, roles: tuple[str, ...] | None = None
@@ -2092,142 +2289,31 @@ class MacDeploymentOrchestrator:
         for role in selected:
             expected_avd, serial = FIXED_ROLES[role]
             try:
-                state_result = self._runner.run(
-                    ("adb", "-s", serial, "get-state"), 15.0
+                identity = self._identity_verifier().inspect(
+                    serial=serial,
+                    expected_avd=expected_avd,
+                    emulator_port=FIXED_EMULATOR_PORTS[role],
                 )
-            except Exception:
+            except IdentityVerificationError:
                 raise DeploymentError("FIXED_AVD_IDENTITY_MISMATCH") from None
-            state = (
-                self._stdout_text(state_result).strip()
-                if state_result.returncode == 0
-                else ""
-            )
-            if state == "device":
-                self._require_adb_avd_identity(serial, expected_avd)
-                continue
-            if state_result.returncode == 0:
-                raise DeploymentError("FIXED_AVD_IDENTITY_MISMATCH")
-            devices = self._list_adb_devices()
-            listed_state = devices.get(serial)
-            if listed_state == "device":
-                self._require_adb_avd_identity(serial, expected_avd)
-                continue
-            if listed_state is not None:
-                raise DeploymentError("FIXED_AVD_IDENTITY_MISMATCH")
-            process_result = self._run(
-                ("ps", "-axo", "pid=,command="),
-                15.0,
-                "FIXED_AVD_IDENTITY_MISMATCH",
-            )
-            self._validate_starting_process_identity(
-                self._stdout_text(process_result),
-                FIXED_EMULATOR_PORTS[role],
-                expected_avd,
-            )
-
-    def _list_adb_devices(self) -> dict[str, str]:
-        result = self._run(
-            ("adb", "devices"),
-            15.0,
-            "FIXED_AVD_IDENTITY_MISMATCH",
-        )
-        lines = self._stdout_text(result).splitlines()
-        if not lines or lines[0].strip() != "List of devices attached":
-            raise DeploymentError("FIXED_AVD_IDENTITY_MISMATCH")
-        devices: dict[str, str] = {}
-        for raw_line in lines[1:]:
-            line = raw_line.strip()
-            if not line:
-                continue
-            fields = line.split("\t")
-            if len(fields) != 2:
-                raise DeploymentError("FIXED_AVD_IDENTITY_MISMATCH")
-            serial, state = (field.strip() for field in fields)
             if (
-                not _SAFE_ADB_SERIAL.fullmatch(serial)
-                or state not in _SAFE_ADB_STATES
-                or serial in devices
+                identity.presence is FixedAvdPresence.ATTACHED
+                and identity.adb_state != "device"
             ):
                 raise DeploymentError("FIXED_AVD_IDENTITY_MISMATCH")
-            devices[serial] = state
-        return devices
 
-    def _require_adb_avd_identity(self, serial: str, expected_avd: str) -> None:
-        result = self._run(
-            ("adb", "-s", serial, "emu", "avd", "name"),
-            15.0,
-            "FIXED_AVD_IDENTITY_MISMATCH",
-        )
-        lines = [
-            line.strip()
-            for line in self._stdout_text(result).splitlines()
-            if line.strip()
-        ]
-        if lines and lines[-1] == "OK":
-            lines.pop()
-        if lines != [expected_avd]:
-            raise DeploymentError("FIXED_AVD_IDENTITY_MISMATCH")
-
-    def _validate_starting_process_identity(
-        self, output: str, port: int, expected_avd: str
-    ) -> None:
-        candidates: list[str] = []
-        port_text = str(port)
-        port_marker = re.compile(
-            rf"(?:^|\s)-port(?:\s+|=){re.escape(port_text)}(?:\s|$)"
-        )
-        for raw_line in output.splitlines():
-            parts = raw_line.strip().split(maxsplit=1)
-            if len(parts) != 2 or re.fullmatch(r"[1-9][0-9]*", parts[0]) is None:
-                if port_marker.search(raw_line):
-                    raise DeploymentError("FIXED_AVD_IDENTITY_MISMATCH")
-                continue
-            pid = int(parts[0])
-            command = parts[1]
-            try:
-                tokens = shlex.split(command, posix=True)
-            except ValueError:
-                if port_marker.search(command):
-                    raise DeploymentError("FIXED_AVD_IDENTITY_MISMATCH") from None
-                continue
-            port_values = self._option_values(tokens, "-port")
-            if port_text not in port_values:
-                continue
-            avd_values = self._option_values(tokens, "-avd")
-            if port_values != [port_text] or len(avd_values) != 1:
-                raise DeploymentError("FIXED_AVD_IDENTITY_MISMATCH")
-            self._require_trusted_emulator_process(pid)
-            candidates.append(avd_values[0])
-        if not candidates:
-            return
-        if candidates != [expected_avd]:
-            raise DeploymentError("FIXED_AVD_IDENTITY_MISMATCH")
-
-    def _require_trusted_emulator_process(self, pid: int) -> None:
+    def _identity_verifier(self) -> FixedAvdIdentityVerifier:
         trusted = self._trusted_emulator_path
         if trusted is None:
             raise DeploymentError("FIXED_AVD_IDENTITY_MISMATCH")
         try:
-            candidate = Path(self._process_executable_resolver.resolve(pid))
-            if not candidate.is_absolute():
-                raise ValueError("relative executable path")
-            resolved = candidate.resolve()
-        except Exception:
+            return FixedAvdIdentityVerifier(
+                self._runner,
+                trusted,
+                self._process_executable_resolver,
+            )
+        except IdentityVerificationError:
             raise DeploymentError("FIXED_AVD_IDENTITY_MISMATCH") from None
-        if resolved != trusted:
-            raise DeploymentError("FIXED_AVD_IDENTITY_MISMATCH")
-
-    @staticmethod
-    def _option_values(tokens: list[str], option: str) -> list[str]:
-        values: list[str] = []
-        for index, token in enumerate(tokens):
-            if token == option:
-                if index + 1 >= len(tokens):
-                    raise DeploymentError("FIXED_AVD_IDENTITY_MISMATCH")
-                values.append(tokens[index + 1])
-            elif token.startswith(f"{option}="):
-                values.append(token.removeprefix(f"{option}="))
-        return values
 
     def _start_stopped_roles(self) -> None:
         broker = self._broker
@@ -2240,9 +2326,7 @@ class MacDeploymentOrchestrator:
             states = dict(broker.device_states())
             for role in FIXED_ROLES:
                 state = states.get(role)
-                if state == "RUNNING":
-                    continue
-                if state != "STOPPED":
+                if state not in {"RUNNING", "STOPPED"}:
                     raise DeploymentError("DEVICE_LIFECYCLE_NOT_READY")
                 operation_id = broker.start_and_launch_app(role)
                 broker.wait_for_state(operation_id, "RUNNING", 180.0)
@@ -2325,6 +2409,9 @@ class MacDeploymentOrchestrator:
         )
 
     def _session_bundles_ready(self) -> bool:
+        return self._session_bundle_statuses() is not None
+
+    def _session_bundle_statuses(self) -> dict[str, datetime] | None:
         result = self._run(
             self._compose_prefix()
             + (
@@ -2338,12 +2425,33 @@ class MacDeploymentOrchestrator:
             30.0,
             "SESSION_STATUS_UNAVAILABLE",
         )
-        state = self._stdout_text(result).strip()
-        if state == "READY":
-            return True
-        if state == "NOT_READY":
-            return False
-        raise DeploymentError("SESSION_STATUS_UNAVAILABLE")
+        try:
+            document = json.loads(self._stdout_text(result))
+        except ValueError:
+            raise DeploymentError("SESSION_STATUS_UNAVAILABLE") from None
+        if (
+            not isinstance(document, dict)
+            or set(document) != {"ready", "updated_at"}
+            or not isinstance(document.get("ready"), bool)
+            or not isinstance(document.get("updated_at"), dict)
+        ):
+            raise DeploymentError("SESSION_STATUS_UNAVAILABLE")
+        if document["ready"] is False:
+            return None
+        parsed: dict[str, datetime] = {}
+        if set(document["updated_at"]) != set(FIXED_ROLES):
+            raise DeploymentError("SESSION_STATUS_UNAVAILABLE")
+        for role, raw in document["updated_at"].items():
+            if not isinstance(raw, str):
+                raise DeploymentError("SESSION_STATUS_UNAVAILABLE")
+            try:
+                timestamp = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            except ValueError:
+                raise DeploymentError("SESSION_STATUS_UNAVAILABLE") from None
+            if timestamp.tzinfo is None:
+                raise DeploymentError("SESSION_STATUS_UNAVAILABLE")
+            parsed[role] = timestamp
+        return parsed
 
     def _verify_data_only_acceptance(self) -> None:
         maintenance = self._deployment_maintenance

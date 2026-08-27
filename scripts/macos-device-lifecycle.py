@@ -15,7 +15,9 @@ import json
 import os
 from pathlib import Path
 import secrets
+import shutil
 import subprocess
+import sys
 import threading
 import time
 from typing import Mapping, Protocol
@@ -26,6 +28,17 @@ from urllib.parse import urlsplit
 PACKAGE_ACTIVITY = "com.hexin.plat.android/com.hexin.plat.android.LogoEmptyActivity"
 PACKAGE_NAME = "com.hexin.plat.android"
 SCRIPT_DIRECTORY = Path(__file__).resolve().parent
+if str(SCRIPT_DIRECTORY) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIRECTORY))
+
+from macos_device_identity import (
+    DarwinProcessExecutableResolver,
+    FixedAvdIdentityVerifier,
+    FixedAvdPresence,
+    IdentityVerificationError,
+    ProcessExecutableResolver,
+)
+
 MAX_REQUEST_BODY_BYTES = 1024
 
 
@@ -149,6 +162,8 @@ class DeviceLifecycleManager:
         shutdown_timeout_seconds: float = 60.0,
         command_timeout_seconds: float = 10.0,
         poll_interval_seconds: float = 1.0,
+        trusted_emulator_path: Path | None = None,
+        process_executable_resolver: ProcessExecutableResolver | None = None,
     ) -> None:
         if configs is not None and dict(configs) != FIXED_CONFIGS:
             raise LifecycleRequestError("DEVICE_LIFECYCLE_UNCONFIGURED")
@@ -156,12 +171,33 @@ class DeviceLifecycleManager:
             raise LifecycleRequestError("DEVICE_LIFECYCLE_UNCONFIGURED")
         self._runner = runner
         self._emulator_bin = emulator_bin
+        if trusted_emulator_path is None:
+            resolved = (
+                emulator_bin
+                if Path(emulator_bin).is_absolute()
+                else shutil.which(emulator_bin)
+            )
+            if not resolved:
+                raise LifecycleRequestError("DEVICE_LIFECYCLE_UNCONFIGURED")
+            trusted_emulator_path = Path(resolved)
+        try:
+            self.FixedAvdIdentityVerifier = FixedAvdIdentityVerifier
+            self._identity = FixedAvdIdentityVerifier(
+                runner,
+                trusted_emulator_path,
+                process_executable_resolver
+                or DarwinProcessExecutableResolver(),
+                timeout_seconds=command_timeout_seconds,
+            )
+        except IdentityVerificationError:
+            raise LifecycleRequestError("DEVICE_LIFECYCLE_UNCONFIGURED") from None
         self._configs = dict(FIXED_CONFIGS)
         self._boot_timeout_seconds = boot_timeout_seconds
         self._shutdown_timeout_seconds = shutdown_timeout_seconds
         self._command_timeout_seconds = command_timeout_seconds
         self._poll_interval_seconds = poll_interval_seconds
         self._operations: dict[str, DeviceOperation] = {}
+        self._latest_operations: dict[str, DeviceOperation] = {}
         self._states = {role: LifecycleState.UNKNOWN for role in self._configs}
         self._role_busy = {role: False for role in self._configs}
         self._lock = threading.Lock()
@@ -172,11 +208,32 @@ class DeviceLifecycleManager:
             with self._lock:
                 busy = self._role_busy[role]
                 saved_state = self._states[role]
-            state = saved_state if busy else self._detect_state(config)
-            if not busy:
+                latest = self._latest_operations.get(role)
+            preserve_error = (
+                not busy
+                and saved_state is LifecycleState.ERROR
+                and latest is not None
+                and latest.error_code is not None
+            )
+            state = (
+                saved_state
+                if busy or preserve_error
+                else self._detect_state(config)
+            )
+            if not busy and not preserve_error:
                 with self._lock:
                     self._states[role] = state
-            result.append({"role": role, "state": state.value})
+            result.append(
+                {
+                    "role": role,
+                    "state": state.value,
+                    "operation_id": latest.operation_id if latest else None,
+                    "error_code": latest.error_code if latest else None,
+                    "updated_at": (
+                        latest.updated_at.isoformat() if latest else None
+                    ),
+                }
+            )
         return result
 
     def submit(self, role: str, action: str) -> DeviceOperation:
@@ -199,6 +256,7 @@ class DeviceLifecycleManager:
                 secrets.token_urlsafe(18), role, parsed_action, initial_state, None, self._now()
             )
             self._operations[operation.operation_id] = operation
+            self._latest_operations[role] = operation
             self._role_busy[role] = True
             self._states[role] = initial_state
         worker = threading.Thread(
@@ -234,6 +292,7 @@ class DeviceLifecycleManager:
             operation.error_code = error_code
             operation.updated_at = self._now()
             self._states[operation.role] = state
+            self._latest_operations[operation.role] = operation
             self._role_busy[operation.role] = False
 
     def _start_and_launch_app(self, config: DeviceConfig) -> LifecycleState:
@@ -253,6 +312,7 @@ class DeviceLifecycleManager:
             self._wait_for_boot(config, time.monotonic() + self._boot_timeout_seconds)
         elif initial_state is LifecycleState.UNKNOWN:
             raise LifecycleFailure("DEVICE_LIFECYCLE_FAILED")
+        self._require_identity(config)
         if config.calibrate_display:
             self._run_required(
                 (str(SCRIPT_DIRECTORY / "configure-macos-core-display.sh"), config.serial, "adb"),
@@ -265,8 +325,12 @@ class DeviceLifecycleManager:
         return LifecycleState.RUNNING
 
     def _shutdown(self, config: DeviceConfig) -> LifecycleState:
-        if self._detect_state(config) is LifecycleState.STOPPED:
+        state = self._detect_state(config)
+        if state is LifecycleState.STOPPED:
             return LifecycleState.STOPPED
+        if state is LifecycleState.UNKNOWN:
+            raise LifecycleFailure("DEVICE_LIFECYCLE_FAILED")
+        self._require_identity(config)
         self._run(("adb", "-s", config.serial, "emu", "kill"))
         deadline = time.monotonic() + self._shutdown_timeout_seconds
         while time.monotonic() < deadline:
@@ -278,6 +342,7 @@ class DeviceLifecycleManager:
     def _wait_for_boot(self, config: DeviceConfig, deadline: float) -> None:
         while time.monotonic() < deadline:
             if self._adb_state(config) == "device" and self._boot_completed(config):
+                self._require_identity(config)
                 return
             time.sleep(self._poll_interval_seconds)
         raise LifecycleFailure("DEVICE_BOOT_TIMEOUT")
@@ -300,19 +365,28 @@ class DeviceLifecycleManager:
 
     def _detect_state(self, config: DeviceConfig) -> LifecycleState:
         try:
-            if self._adb_state(config) == "device" and self._boot_completed(config):
-                return LifecycleState.RUNNING
-            process = self._run(("ps", "-axo", "pid=,command="))
-        except (subprocess.SubprocessError, OSError):
+            identity = self._identity.inspect(
+                serial=config.serial,
+                expected_avd=config.avd_name,
+                emulator_port=config.emulator_port,
+            )
+            if identity.presence is FixedAvdPresence.ATTACHED:
+                if identity.adb_state == "device" and self._boot_completed(config):
+                    return LifecycleState.RUNNING
+                return LifecycleState.STARTING
+            if identity.presence is FixedAvdPresence.STARTING:
+                return LifecycleState.STARTING
+            return LifecycleState.STOPPED
+        except IdentityVerificationError:
             return LifecycleState.UNKNOWN
-        if process.returncode != 0:
-            return LifecycleState.UNKNOWN
-        port_marker = f"-port {config.emulator_port}"
-        return (
-            LifecycleState.STARTING
-            if any(port_marker in line for line in self._text(process.stdout).splitlines())
-            else LifecycleState.STOPPED
-        )
+
+    def _require_identity(self, config: DeviceConfig) -> None:
+        try:
+            self._identity.require_attached(
+                serial=config.serial, expected_avd=config.avd_name
+            )
+        except IdentityVerificationError:
+            raise LifecycleFailure("DEVICE_LIFECYCLE_FAILED") from None
 
     def _require_avd(self, config: DeviceConfig) -> None:
         available = self._run((self._emulator_bin, "-list-avds"))
@@ -505,9 +579,18 @@ def serve(config_path: Path) -> None:
     settings = load_settings(config_path)
     if settings.bind_host != "127.0.0.1":
         raise SystemExit("DEVICE_BIND_NOT_LOOPBACK")
+    emulator_bin = settings.environment.get(
+        "THS_DEVICE_LIFECYCLE_EMULATOR_BIN", "emulator"
+    )
+    resolved_emulator = shutil.which(
+        emulator_bin, path=settings.environment.get("PATH")
+    )
+    if not resolved_emulator:
+        raise SystemExit("DEVICE_LIFECYCLE_UNCONFIGURED")
     manager = DeviceLifecycleManager(
         SubprocessCommandRunner(settings.environment),
-        emulator_bin=settings.environment.get("THS_DEVICE_LIFECYCLE_EMULATOR_BIN", "emulator"),
+        emulator_bin=emulator_bin,
+        trusted_emulator_path=Path(resolved_emulator),
     )
     server = ThreadingHTTPServer(
         (settings.bind_host, settings.port), make_handler(manager, settings.token)

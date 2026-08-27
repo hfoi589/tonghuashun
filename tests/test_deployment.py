@@ -97,6 +97,7 @@ def test_lifecycle_installer_uses_stable_secret_and_launchagent_locations() -> N
     assert "Library/LaunchAgents/com.ths.device-lifecycle.plist" in installer
     assert ".local/lib/ths-device-lifecycle/" in installer
     assert "macos-device-lifecycle.py" in installer
+    assert "macos_device_identity.py" in installer
     assert "watch-macos-device-bridge.sh" in installer
     assert "com.ths.device-bridge.27042.plist" in installer
     assert "com.ths.device-bridge.27043.plist" in installer
@@ -229,9 +230,17 @@ def test_lifecycle_installer_runs_in_fake_home_with_safe_stable_artifacts(tmp_pa
     assert f"THS_DEVICE_LIFECYCLE_TOKEN={token}" in host_config.read_text(encoding="utf-8")
     runtime = home / ".local" / "lib" / "ths-device-lifecycle"
     assert {path.name for path in runtime.iterdir()} == {
-        "macos-device-lifecycle.py", "watch-macos-device-bridge.sh", "configure-macos-core-display.sh"
+        "macos-device-lifecycle.py",
+        "macos_device_identity.py",
+        "watch-macos-device-bridge.sh",
+        "configure-macos-core-display.sh",
     }
-    assert all(path.stat().st_mode & 0o777 == 0o755 for path in runtime.iterdir())
+    assert (runtime / "macos_device_identity.py").stat().st_mode & 0o777 == 0o644
+    assert all(
+        path.stat().st_mode & 0o777 == 0o755
+        for path in runtime.iterdir()
+        if path.name != "macos_device_identity.py"
+    )
     plists = home / "Library" / "LaunchAgents"
     for plist in plists.glob("com.ths.device*.plist"):
         content = plist.read_text(encoding="utf-8")

@@ -40,6 +40,11 @@ class FakeCommandRunner:
         return self.responses.get(args, subprocess.CompletedProcess(args, 0, b"", b""))
 
 
+class FakeProcessExecutableResolver:
+    def resolve(self, _pid: int) -> Path:
+        return Path("/fake/emulator")
+
+
 def result(args: tuple[str, ...], code: int = 0, stdout: bytes = b"", stderr: bytes = b"") -> subprocess.CompletedProcess[bytes]:
     return subprocess.CompletedProcess(args, code, stdout, stderr)
 
@@ -55,11 +60,22 @@ def lifecycle_responses(
     boot = ("adb", "-s", serial, "shell", "getprop", "sys.boot_completed")
     ps = ("ps", "-axo", "pid=,command=")
     pidof = ("adb", "-s", serial, "shell", "pidof", "com.hexin.plat.android")
+    identity = ("adb", "-s", serial, "emu", "avd", "name")
+    adb_devices = ("adb", "devices")
+    avd_name = (
+        "THS_CORE_33_ARM64" if serial == "emulator-5556" else "THS_API_33_ARM64"
+    )
     return {
-        state: result(state, 0, b"device\n" if booted else b"offline\n"),
+        state: result(
+            state,
+            0 if booted or process else 1,
+            b"device\n" if booted else (b"offline\n" if process else b""),
+        ),
         boot: result(boot, 0, b"1\n" if booted else b"0\n"),
         ps: result(ps, 0, f"123 emulator -port {serial.rsplit('-', 1)[1]}\n".encode() if process else b""),
         pidof: result(pidof, 0 if app_running else 1, b"234\n" if app_running else b""),
+        identity: result(identity, stdout=f"{avd_name}\nOK\n".encode()),
+        adb_devices: result(adb_devices, stdout=b"List of devices attached\n"),
     }
 
 
@@ -69,6 +85,10 @@ def running_device_runner(serial: str) -> FakeCommandRunner:
 
 def make_manager(runner: FakeCommandRunner, **kwargs: object):
     kwargs.setdefault("emulator_bin", "emulator")
+    kwargs.setdefault("trusted_emulator_path", Path("/fake/emulator"))
+    kwargs.setdefault(
+        "process_executable_resolver", FakeProcessExecutableResolver()
+    )
     return module.DeviceLifecycleManager(
         runner,
         boot_timeout_seconds=0.1,
@@ -324,7 +344,10 @@ def test_stopped_start_uses_fixed_commands_and_reaches_running() -> None:
     runner = FakeCommandRunner(lifecycle_responses(serial, booted=False, process=False))
     state_call = ("adb", "-s", serial, "get-state")
     boot_call = ("adb", "-s", serial, "shell", "getprop", "sys.boot_completed")
-    runner.sequences[state_call] = [result(state_call, 0, b"offline\n"), result(state_call, 0, b"device\n")]
+    runner.sequences[state_call] = [
+        result(state_call, 1, stderr=b"absent"),
+        result(state_call, 0, b"device\n"),
+    ]
     runner.responses[boot_call] = result(boot_call, 0, b"1\n")
     list_avds = ("emulator", "-list-avds")
     runner.responses[list_avds] = result(list_avds, 0, b"THS_CORE_33_ARM64\n")

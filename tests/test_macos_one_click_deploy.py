@@ -312,21 +312,28 @@ def _write_fake_adb(tmp_path: Path) -> tuple[Path, Path]:
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
     log = tmp_path / "adb.log"
+    package_state = tmp_path / "package.state"
     adb = fake_bin / "adb"
     adb.write_text(
-        """#!/bin/sh
+        f"""#!/bin/sh
 set -eu
 printf '%s\n' "$*" >> "$ADB_COMMAND_LOG"
 case "$*" in
+  *" get-state") printf '%s\n' device ;;
   *" shell getprop sys.boot_completed") printf '%s\n' 1 ;;
   *" shell pm path com.hexin.plat.android")
-    if [ "${ADB_PACKAGE_QUERY_FAIL:-0}" = 1 ]; then
+    if [ "${{ADB_PACKAGE_QUERY_FAIL:-0}}" = 1 ]; then
       exit 9
     fi
-    if [ "${ADB_PACKAGE_PRESENT:-0}" = 1 ]; then
+    if [ "${{ADB_PACKAGE_PRESENT:-0}}" = 1 ] || [ -f "{package_state}" ]; then
       printf '%s\n' package:/data/app/com.hexin.plat.android/base.apk
     fi
     ;;
+  *" install /opt/ths/assets/ths.apk") : > "{package_state}" ;;
+  *" shell sha256sum /data/app/com.hexin.plat.android/base.apk")
+    printf '%s  %s\n' '{APK_SHA256}' /data/app/com.hexin.plat.android/base.apk
+    ;;
+  *" shell pidof ths-frida-server") printf '%s\n' 4321 ;;
 esac
 """,
         encoding="utf-8",
@@ -352,8 +359,16 @@ def test_container_provisioner_uses_only_fixed_new_device_commands(
         "ADB_COMMAND_LOG": str(log),
     }
 
-    completed = subprocess.run(
-        ["/bin/sh", str(PROVISIONER), role],
+    apk = subprocess.run(
+        ["/bin/sh", str(PROVISIONER), role, "apk"],
+        cwd=ROOT,
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    frida = subprocess.run(
+        ["/bin/sh", str(PROVISIONER), role, "frida"],
         cwd=ROOT,
         env=environment,
         text=True,
@@ -361,22 +376,30 @@ def test_container_provisioner_uses_only_fixed_new_device_commands(
         check=False,
     )
 
-    assert completed.returncode == 0, completed.stderr
-    assert completed.stdout == "DEVICE_PROVISION_READY\n"
-    assert completed.stderr == ""
+    assert apk.returncode == 0, apk.stderr
+    assert frida.returncode == 0, frida.stderr
+    assert apk.stdout == "DEVICE_APK_VERIFIED\n"
+    assert frida.stdout == "DEVICE_FRIDA_READY\n"
+    assert apk.stderr == frida.stderr == ""
     assert log.read_text(encoding="utf-8").splitlines() == [
         f"-s {serial} shell getprop sys.boot_completed",
         f"-s {serial} shell pm path com.hexin.plat.android",
         f"-s {serial} install /opt/ths/assets/ths.apk",
+        f"-s {serial} shell pm path com.hexin.plat.android",
+        f"-s {serial} shell sha256sum /data/app/com.hexin.plat.android/base.apk",
+        f"-s {serial} shell getprop sys.boot_completed",
         f"-s {serial} root",
+        f"-s {serial} get-state",
+        f"-s {serial} shell getprop sys.boot_completed",
         f"-s {serial} push /opt/ths/assets/ths-frida-server /data/local/tmp/ths-frida-server",
         f"-s {serial} shell chmod 0755 /data/local/tmp/ths-frida-server",
         f"-s {serial} shell nohup /data/local/tmp/ths-frida-server >/dev/null 2>&1 &",
+        f"-s {serial} shell pidof ths-frida-server",
         f"-s {serial} forward tcp:{host_port} tcp:27042",
     ]
 
 
-def test_container_provisioner_refuses_existing_packages_without_installing(
+def test_container_provisioner_verifies_existing_packages_without_installing(
     tmp_path: Path,
 ) -> None:
     """Provisioning an existing package could erase or invalidate its logged-in state."""
@@ -388,7 +411,7 @@ def test_container_provisioner_refuses_existing_packages_without_installing(
     }
 
     completed = subprocess.run(
-        ["/bin/sh", str(PROVISIONER), "main_fund_flow"],
+        ["/bin/sh", str(PROVISIONER), "main_fund_flow", "apk"],
         cwd=ROOT,
         env=environment,
         text=True,
@@ -396,9 +419,9 @@ def test_container_provisioner_refuses_existing_packages_without_installing(
         check=False,
     )
 
-    assert completed.returncode == 1
-    assert completed.stdout == ""
-    assert completed.stderr == "DEVICE_PACKAGE_ALREADY_INSTALLED\n"
+    assert completed.returncode == 0
+    assert completed.stdout == "DEVICE_APK_VERIFIED\n"
+    assert completed.stderr == ""
     assert not any(" install " in f" {line} " for line in log.read_text().splitlines())
 
 
@@ -414,7 +437,7 @@ def test_container_provisioner_fails_closed_when_package_lookup_fails(
     }
 
     completed = subprocess.run(
-        ["/bin/sh", str(PROVISIONER), "core_metrics"],
+        ["/bin/sh", str(PROVISIONER), "core_metrics", "apk"],
         cwd=ROOT,
         env=environment,
         text=True,
@@ -429,9 +452,15 @@ def test_container_provisioner_fails_closed_when_package_lookup_fails(
 
 @pytest.mark.parametrize(
     "arguments",
-    [[], ["unknown"], ["core_metrics", "emulator-9999"]],
+    [
+        [],
+        ["unknown", "apk"],
+        ["core_metrics"],
+        ["core_metrics", "unknown-step"],
+        ["core_metrics", "apk", "emulator-9999"],
+    ],
 )
-def test_container_provisioner_accepts_exactly_one_fixed_role(
+def test_container_provisioner_accepts_only_a_fixed_role_and_phase(
     tmp_path: Path, arguments: list[str]
 ) -> None:
     """An arbitrary serial or extra argument would bypass the fixed-role boundary."""
@@ -814,17 +843,41 @@ class FakeCommandRunner:
             path = args[-1]
             return _completed(args, stdout=f"{self.apk_sha256}  {path}\n".encode())
         if "container-provision-device" in args:
-            role = args[-1]
-            self.events.append(f"container-provision:{role}")
-            return _completed(args, stdout=b"DEVICE_PROVISION_READY\n")
+            role, step = args[-2:]
+            self.events.append(f"container-provision:{role}:{step}")
+            return _completed(
+                args,
+                stdout=(
+                    b"DEVICE_APK_VERIFIED\n"
+                    if step == "apk"
+                    else b"DEVICE_FRIDA_READY\n"
+                ),
+            )
         if (
             "exec" in args
             and "api" in args
             and "EncryptedFileSessionProvider" in " ".join(args)
         ):
+            updated = getattr(self, "session_updated_at", None)
+            if updated is None:
+                timestamp = "2026-08-28T12:00:00+00:00"
+                updated = {
+                    "core_metrics": timestamp if self.sessions_ready else None,
+                    "main_fund_flow": timestamp if self.sessions_ready else None,
+                }
+            ready = all(value is not None for value in updated.values())
             return _completed(
                 args,
-                stdout=b"READY\n" if self.sessions_ready else b"NOT_READY\n",
+                stdout=json.dumps(
+                    {"ready": ready, "updated_at": updated},
+                    separators=(",", ":"),
+                    default=(
+                        lambda value: value.isoformat()
+                        if isinstance(value, datetime)
+                        else value
+                    ),
+                ).encode()
+                + b"\n",
             )
         if "ps" in args and "--format" in args:
             health = "healthy" if self.healthy else "starting"
@@ -907,9 +960,11 @@ class FakeProvisioningJournal:
         steps: dict[str, str] | None = None,
         *,
         events: list[str] | None = None,
+        created: dict[str, datetime] | None = None,
     ) -> None:
         self.steps = dict(steps or {})
         self.events = events if events is not None else []
+        self.created = dict(created or {})
 
     def load(self) -> dict[str, str]:
         return dict(self.steps)
@@ -920,12 +975,24 @@ class FakeProvisioningJournal:
             self.events.append(f"journal-record:{role}")
         return dict(self.steps)
 
-    def set_step(self, role: str, step: str) -> None:
+    def set_step(
+        self,
+        role: str,
+        step: str,
+        *,
+        created_at: datetime | None = None,
+    ) -> None:
         self.steps[role] = step
+        if created_at is not None:
+            self.created[role] = created_at
         self.events.append(f"journal-step:{role}:{step}")
+
+    def created_at(self, role: str) -> datetime | None:
+        return self.created.get(role)
 
     def complete(self, role: str) -> None:
         self.steps.pop(role)
+        self.created.pop(role, None)
         self.events.append(f"journal-complete:{role}")
 
 
@@ -979,6 +1046,7 @@ def make_orchestrator(
     acceptance: FakeDataOnlyAcceptance | None = None,
     journal=None,
     deployment_maintenance=None,
+    now=None,
     health_timeout_seconds: float = 0.05,
     boot_timeout_seconds: float = 0.05,
     env_file: Path = Path(".env"),
@@ -998,6 +1066,7 @@ def make_orchestrator(
         data_only_acceptance=acceptance or FakeDataOnlyAcceptance(),
         provisioning_journal=journal or FakeProvisioningJournal(),
         deployment_maintenance=deployment_maintenance,
+        **({"now": now} if now is not None else {}),
         health_timeout_seconds=health_timeout_seconds,
         boot_timeout_seconds=boot_timeout_seconds,
         poll_interval_seconds=0.0,
@@ -1653,9 +1722,10 @@ def test_existing_mode_allows_a_truly_stopped_role_then_starts_it_through_broker
 
     make_orchestrator(runner, filesystem=filesystem, broker=broker).deploy_existing()
 
-    assert broker.start_calls == ["core_metrics"]
+    assert broker.start_calls == ["core_metrics", "main_fund_flow"]
     assert broker.wait_calls == [
         ("operation-core_metrics", "RUNNING", 180.0),
+        ("operation-main_fund_flow", "RUNNING", 180.0),
     ]
     pre_fund = events.index("identity:emulator-5554:THS_API_33_ARM64")
     assert events.index("installer") < events.index("broker-start:core_metrics")
@@ -1862,9 +1932,11 @@ def test_provisioning_uses_only_fixed_image_avd_launch_and_asset_commands() -> N
     container_calls = [
         call for call in runner.calls if "container-provision-device" in call
     ]
-    assert [call[-1] for call in container_calls] == [
-        "core_metrics",
-        "main_fund_flow",
+    assert [call[-2:] for call in container_calls] == [
+        ("core_metrics", "apk"),
+        ("core_metrics", "frida"),
+        ("main_fund_flow", "apk"),
+        ("main_fund_flow", "frida"),
     ]
     for call in container_calls:
         assert call == (
@@ -1878,10 +1950,11 @@ def test_provisioning_uses_only_fixed_image_avd_launch_and_asset_commands() -> N
             "--env",
             "ADB_SERVER_SOCKET=tcp:host.docker.internal:5037",
             "--entrypoint",
-            "container-provision-device",
-            "ths-level2-api:local",
-            call[-1],
-        )
+                "container-provision-device",
+                "ths-level2-api:local",
+                call[-2],
+                call[-1],
+            )
     display_calls = [
         call
         for call in runner.calls
@@ -1894,18 +1967,18 @@ def test_provisioning_uses_only_fixed_image_avd_launch_and_asset_commands() -> N
     assert events.index("journal-record:main_fund_flow") < events.index(
         "avd-created:THS_API_33_ARM64"
     )
-    assert events.index("container-provision:core_metrics") < events.index("installer")
-    assert events.index("container-provision:main_fund_flow") < events.index("installer")
-    assert events.index("container-provision:core_metrics") < events.index(
+    assert events.index("container-provision:core_metrics:frida") < events.index("installer")
+    assert events.index("container-provision:main_fund_flow:frida") < events.index("installer")
+    assert events.index("container-provision:core_metrics:frida") < events.index(
         "avd-created:THS_API_33_ARM64"
     )
     assert events.index("installer") < events.index("broker-start:core_metrics")
     assert events.index("installer") < events.index("broker-start:main_fund_flow")
     assert events.index("broker-wait:operation-core_metrics") < events.index(
-        "journal-complete:core_metrics"
+        "journal-step:core_metrics:LOGIN_REQUIRED"
     )
     assert events.index("broker-wait:operation-main_fund_flow") < events.index(
-        "journal-complete:main_fund_flow"
+        "journal-step:main_fund_flow:LOGIN_REQUIRED"
     )
     assert broker.start_calls == ["core_metrics", "main_fund_flow"]
     assert not any(
@@ -1922,8 +1995,8 @@ def test_partial_provisioning_preserves_and_validates_the_existing_role() -> Non
     make_orchestrator(runner, broker=broker).deploy("auto")
 
     assert [
-        call[-1] for call in runner.calls if "container-provision-device" in call
-    ] == ["core_metrics"]
+        call[-2:] for call in runner.calls if "container-provision-device" in call
+    ] == [("core_metrics", "apk"), ("core_metrics", "frida")]
     assert [
         call[call.index("--name") + 1]
         for call in runner.calls
@@ -2034,20 +2107,26 @@ def test_provisioning_journal_persists_exact_schema_and_atomic_steps(
 
     assert path.stat().st_mode & 0o777 == 0o600
     assert json.loads(path.read_text(encoding="utf-8")) == {
-        "version": 1,
+        "version": 2,
         "roles": {
             "core_metrics": {
                 "avd_name": "THS_CORE_33_ARM64",
                 "step": "PENDING_CREATE",
+                "created_at": None,
             },
             "main_fund_flow": {
                 "avd_name": "THS_API_33_ARM64",
                 "step": "PENDING_CREATE",
+                "created_at": None,
             },
         },
     }
-    journal.set_step("core_metrics", "AVD_CREATED")
-    journal.set_step("core_metrics", "ASSETS_PROVISIONED")
+    created = datetime(2026, 8, 28, tzinfo=timezone.utc)
+    journal.set_step("core_metrics", "AVD_CREATED", created_at=created)
+    journal.set_step("core_metrics", "APK_VERIFIED")
+    journal.set_step("core_metrics", "FRIDA_READY")
+    journal.set_step("core_metrics", "LOGIN_REQUIRED")
+    journal.set_step("core_metrics", "ACCEPTANCE_PENDING")
     journal.complete("core_metrics")
 
     assert journal.load() == {"main_fund_flow": "PENDING_CREATE"}
@@ -2153,11 +2232,12 @@ def test_boot_timeout_rerun_resumes_the_journaled_role_without_recreate(
     resumed_calls = runner.calls[first_call_count:]
     assert result.state == "FIRST_TIME_LOGIN_REQUIRED"
     assert not any(call[:3] == ("avdmanager", "create", "avd") for call in resumed_calls)
-    assert [call[-1] for call in resumed_calls if "container-provision-device" in call] == [
-        "core_metrics"
+    assert [call[-2:] for call in resumed_calls if "container-provision-device" in call] == [
+        ("core_metrics", "apk"),
+        ("core_metrics", "frida"),
     ]
     assert broker.start_calls == ["core_metrics"]
-    assert second_journal.load() == {}
+    assert second_journal.load() == {"core_metrics": "LOGIN_REQUIRED"}
 
 
 def test_missing_sessions_return_only_safe_human_onboarding_instructions() -> None:
@@ -2202,7 +2282,9 @@ def test_session_readiness_probe_decrypts_both_fixed_role_bundles(
     completed = run_session_readiness_probe(module, session_root, key)
 
     assert completed.returncode == 0
-    assert completed.stdout == "READY\n"
+    document = json.loads(completed.stdout)
+    assert document["ready"] is True
+    assert set(document["updated_at"]) == {"core_metrics", "main_fund_flow"}
     assert completed.stderr == ""
 
 
@@ -2251,7 +2333,7 @@ def test_session_readiness_probe_rejects_untrusted_or_invalid_bundles(
     completed = run_session_readiness_probe(module, session_root, probe_key)
 
     assert completed.returncode == 0
-    assert completed.stdout == "NOT_READY\n"
+    assert json.loads(completed.stdout)["ready"] is False
     assert completed.stderr == ""
 
 
@@ -2269,7 +2351,7 @@ def test_session_readiness_probe_accepts_an_older_valid_bundle(
     completed = run_session_readiness_probe(module, session_root, key)
 
     assert completed.returncode == 0
-    assert completed.stdout == "READY\n"
+    assert json.loads(completed.stdout)["ready"] is True
     assert completed.stderr == ""
 
 

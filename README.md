@@ -105,23 +105,41 @@ device task is running. It never installs Homebrew or OrbStack and never
 accepts a third-party license for the operator. The Compose rebuild remains:
 
 ```sh
-docker --context orbstack compose --env-file .env --env-file deploy/macos.env -f deploy/compose.yml up -d --build
+docker --context orbstack compose --project-name ths-level2 --env-file .env --env-file deploy/macos.env -f deploy/compose.yml up -d --build
 ```
 
 When both fixed existing AVDs are present, `auto` preserves them: it does not
 create, delete, copy, wipe, reset, reinstall, or alter either App's data. It
 checks the installed APK digest and returns `INSTALLED_APK_MISMATCH` instead of
 overwriting a different installation. It then installs the stable local
-lifecycle/bridge LaunchAgents, starts only stopped AVDs through the lifecycle
-broker, launches only the THS entry Activity, and rebuilds API/Redis without
-deleting data volumes.
+lifecycle/bridge LaunchAgents and runs the fixed repair/start action for both
+roles (starting stopped AVDs and repairing already running roles), launches
+only the THS entry Activity, and rebuilds API/Redis
+without deleting data volumes. A Redis deployment-maintenance lease freezes
+ordinary claims across API replacement; only its owner-bound fixed acceptance
+task may run. READY additionally requires both encrypted sessions and strict
+data-only acceptance.
 
 When an AVD is fresh or partially missing, `auto` records which roles already
 exist and creates and installs assets only for the missing fixed role(s).
 Existing AVDs remain untouched. New AVDs require human THS login, CAPTCHA or
 device verification, and permission confirmation; the recoverable stopping
 state is `FIRST_TIME_LOGIN_REQUIRED`. It never enters credentials or turns this
-human-login gate into unattended provisioning.
+human-login gate into unattended provisioning. The journal retains each newly
+created role through `LOGIN_REQUIRED` and `ACCEPTANCE_PENDING`; that role's
+encrypted session must have been refreshed after its recorded creation time.
+
+If a post-replacement check fails, the owner-bound maintenance lease remains in
+place and ordinary queued work stays frozen. Correct the fixed error and rerun
+the same deployment command. The explicit safe rollback is:
+
+```sh
+scripts/deploy-macos-one-click.sh --release-maintenance-lease
+```
+
+Rollback reacquires the administrator device lock, releases only the matching
+lease owner, and deliberately leaves the queue paused until the operator
+releases device control and explicitly resumes it.
 
 The lifecycle broker is installed with
 `scripts/install-macos-device-lifecycle.sh` as a macOS LaunchAgent. The root

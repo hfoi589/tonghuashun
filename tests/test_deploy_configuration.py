@@ -13,7 +13,7 @@ from level2_service.main import DeploymentSettings
 
 ROOT = Path(__file__).resolve().parents[1]
 CANONICAL_MACOS_COMPOSE_COMMAND = (
-    "docker --context orbstack compose --env-file .env "
+    "docker --context orbstack compose --project-name ths-level2 --env-file .env "
     "--env-file deploy/macos.env -f deploy/compose.yml up -d --build"
 )
 
@@ -206,6 +206,10 @@ def test_api_image_embeds_read_only_fixed_host_deployment_helpers() -> None:
         ),
     ):
         assert f"COPY --chmod=0555 {source} {destination}" in dockerfile
+    assert (
+        "COPY --chmod=0444 scripts/macos_device_identity.py "
+        "/opt/ths/deployment/macos_device_identity.py"
+    ) in dockerfile
     assert "chmod 0555 /opt/ths/assets /opt/ths/deployment" in dockerfile
 
 

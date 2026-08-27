@@ -42,9 +42,10 @@ emulator_bin=$(command -v emulator 2>/dev/null) || fail
 command -v launchctl >/dev/null 2>&1 || fail
 
 service_source=$project_root/scripts/macos-device-lifecycle.py
+identity_source=$project_root/scripts/macos_device_identity.py
 watcher_source=$project_root/scripts/watch-macos-device-bridge.sh
 display_source=$project_root/scripts/configure-macos-core-display.sh
-[ -f "$service_source" ] && [ -f "$watcher_source" ] && [ -f "$display_source" ] || fail
+[ -f "$service_source" ] && [ -f "$identity_source" ] && [ -f "$watcher_source" ] && [ -f "$display_source" ] || fail
 avds=$("$emulator_bin" -list-avds 2>/dev/null) || fail
 printf '%s\n' "$avds" | grep -Fx 'THS_CORE_33_ARM64' >/dev/null || fail
 printf '%s\n' "$avds" | grep -Fx 'THS_API_33_ARM64' >/dev/null || fail
@@ -59,6 +60,7 @@ core_bridge_plist=${launch_agents_dir}/com.ths.device-bridge.27043.plist
 
 install -d -m 700 "$runtime_dir" "$config_dir" "$launch_agents_dir" || fail
 install -m 755 "$service_source" "$runtime_dir/macos-device-lifecycle.py" || fail
+install -m 644 "$identity_source" "$runtime_dir/macos_device_identity.py" || fail
 install -m 755 "$watcher_source" "$runtime_dir/watch-macos-device-bridge.sh" || fail
 install -m 755 "$display_source" "$runtime_dir/configure-macos-core-display.sh" || fail
 

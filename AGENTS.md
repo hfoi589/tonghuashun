@@ -193,7 +193,7 @@ GET /api/v1/jobs/{public_id}
 - 执行前必须等待运行中的设备任务结束；一次只操作一台设备。释放设备锁不会恢复队列，管理员必须在确认完成后显式恢复队列。这个例外不扩大资金账号权限：仍禁止账号、App、AVD 或数据变更，以及入口 Activity 之外的任何 App 内导航。
 - 自动任务导航和长截图只能操作 `emulator-5556`。核心设备必须保持 `wm size 1080x1920` 和 `wm density 480`；使用 `scripts/configure-macos-core-display.sh` 校准。
 - 在本 Mac 上必须使用 OrbStack Docker context 和 `deploy/macos.env` 部署，标准命令为
-  `docker --context orbstack compose --env-file .env --env-file deploy/macos.env -f deploy/compose.yml up -d --build`。
+  `docker --context orbstack compose --project-name ths-level2 --env-file .env --env-file deploy/macos.env -f deploy/compose.yml up -d --build`。
   根目录 `.env` 提供管理密钥，`deploy/macos.env` 提供本 Mac 的设备配置；两者必须同时加载。
   禁止使用 Docker Desktop 的 `desktop-linux` context。HTTP 使用 8001 端口，不得重新引入 Caddy。
 - 双账号变量 `CORE_ADB_SERIAL`、`CORE_FRIDA_SERVER_ENDPOINT`、`FUND_ADB_SERIAL`、`FUND_FRIDA_SERVER_ENDPOINT` 必须四项齐全；旧单设备变量仅用于兼容模式。
@@ -423,7 +423,7 @@ chart heading is present; it is never a source for any field in `values`.
 - Automated navigation and long captures may operate only on `emulator-5556`. Keep the core device at `wm size 1080x1920` and `wm density 480`; use `scripts/configure-macos-core-display.sh` to calibrate it.
 - On this Mac, deploy with the OrbStack Docker context and `deploy/macos.env`.
   The canonical command is
-  `docker --context orbstack compose --env-file .env --env-file deploy/macos.env -f deploy/compose.yml up -d --build`.
+  `docker --context orbstack compose --project-name ths-level2 --env-file .env --env-file deploy/macos.env -f deploy/compose.yml up -d --build`.
   The root `.env` provides the administrator secrets, while `deploy/macos.env`
   provides this Mac's device configuration; load both files.
   Do not use Docker Desktop's `desktop-linux` context. Keep HTTP on port 8001,

@@ -297,11 +297,28 @@ scripts/deploy-macos-one-click.sh --mode auto
 脚本将只支持 Apple Silicon macOS 和显式 OrbStack context。若两个固定 AVD 已存在，
 它只重建本地镜像、校验已安装 APK 摘要、安装/更新 LaunchAgent 和重建 Compose；绝不
 创建、删除、复制、wipe、重置或重装 App。摘要不符返回
-`INSTALLED_APK_MISMATCH`，而非覆盖已登录设备。
+`INSTALLED_APK_MISMATCH`，而非覆盖已登录设备。部署会通过已有管理员登录、CSRF 和
+设备锁暂停旧 Runner，等待活动任务清零，再以 owner token 获取有 TTL 的 Redis
+maintenance lease。API 替换后普通队列仍冻结，只有 lease 原子绑定的固定
+`601872` data-only acceptance task 可以被 Runner 领取；双会话 READY、两角色 bridge/App
+修复和严格验收全部成功后才 compare-owner 释放 lease。
 
 若任一固定 AVD 缺失，`auto` 进入可恢复的交互式 provisioning：只创建/安装本次缺失
 角色，保留已有 AVD；新设备必须由人完成登录、验证码、设备验证和权限确认。未完成时
-返回 `FIRST_TIME_LOGIN_REQUIRED`，下次从现有状态继续。
+返回 `FIRST_TIME_LOGIN_REQUIRED`，下次从现有状态继续。journal 按
+`PENDING_CREATE / AVD_CREATED / APK_VERIFIED / FRIDA_READY / LOGIN_REQUIRED /
+ACCEPTANCE_PENDING` 逐步持久化；新角色会话的 `updated_at` 必须晚于记录的创建时间，
+严格 acceptance 成功前不会清除 journal。
+
+若替换后的检查失败，maintenance lease 保留且普通任务不会自动恢复。修复固定错误后
+重跑同一部署命令；显式安全回滚命令为：
+
+```sh
+scripts/deploy-macos-one-click.sh --release-maintenance-lease
+```
+
+该回滚先重新取得管理员设备锁，只释放匹配 owner 的 lease，并保持队列暂停；随后必须
+人工交还设备控制并显式恢复队列。
 
 回滚时从 Compose 环境移除 lifecycle URL 和 Token，卸载
 `com.ths.device-lifecycle` LaunchAgent，并恢复既有人工启动方式；不删除 AVD、登录数据、

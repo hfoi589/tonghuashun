@@ -204,6 +204,21 @@ def test_http_service_rejects_non_json_action_body(http_server) -> None:
     assert body == {"detail": "DEVICE_ACTION_INVALID"}
 
 
+def test_serve_rejects_ipv6_loopback_before_starting_a_server(tmp_path: Path) -> None:
+    """Accepting ::1 would select an address family the broker does not support."""
+    config = tmp_path / "host.env"
+    config.write_text(
+        "THS_DEVICE_LIFECYCLE_TOKEN=host-secret\n"
+        "THS_DEVICE_LIFECYCLE_BIND_HOST=::1\n"
+        "THS_DEVICE_LIFECYCLE_PORT=18765\n"
+    )
+
+    with pytest.raises(SystemExit) as rejected:
+        module.serve(config)
+
+    assert rejected.value.code == "DEVICE_BIND_NOT_LOOPBACK"
+
+
 def public_device(item: dict[str, object]) -> None:
     forbidden = {"serial", "avd", "port", "command", "stdout", "stderr"}
     assert not forbidden.intersection(item)

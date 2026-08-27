@@ -503,7 +503,7 @@ def make_handler(manager: DeviceLifecycleManager, token: str) -> type[LifecycleR
 
 def serve(config_path: Path) -> None:
     settings = load_settings(config_path)
-    if settings.bind_host not in {"127.0.0.1", "::1"}:
+    if settings.bind_host != "127.0.0.1":
         raise SystemExit("DEVICE_BIND_NOT_LOOPBACK")
     manager = DeviceLifecycleManager(
         SubprocessCommandRunner(settings.environment),

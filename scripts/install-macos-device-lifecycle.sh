@@ -1,14 +1,16 @@
 #!/bin/sh
 # Install the loopback lifecycle broker from a project checkout into a stable user location.
 set -eu
+exec 3>&2
+exec 2>/dev/null
 
 usage() {
-    printf '%s\n' 'Usage: install-macos-device-lifecycle.sh --project-root PATH --env-file PATH' >&2
+    printf '%s\n' 'Usage: install-macos-device-lifecycle.sh --project-root PATH --env-file PATH' >&3
     exit 64
 }
 
 fail() {
-    printf '%s\n' 'DEVICE_LIFECYCLE_INSTALL_FAILED' >&2
+    printf '%s\n' 'DEVICE_LIFECYCLE_INSTALL_FAILED' >&3
     exit 1
 }
 
@@ -63,11 +65,6 @@ if [ -z "$token" ]; then
     token=$(
         "$python3_bin" -c 'import secrets; print(secrets.token_urlsafe(32))'
     ) || fail
-    if [ -e "$env_file" ]; then
-        env_mode=$(stat -f '%Lp' "$env_file") || fail
-    else
-        env_mode=600
-    fi
     env_parent=$(dirname "$env_file")
     [ -d "$env_parent" ] || fail
     env_tmp=$(mktemp "$env_file.tmp.XXXXXX") || fail
@@ -86,9 +83,10 @@ if [ -z "$token" ]; then
         token_replaced=0
     fi
     [ "$token_replaced" -eq 1 ] || printf '%s\n' "THS_DEVICE_LIFECYCLE_TOKEN=$token" >> "$env_tmp" || fail
-    chmod "$env_mode" "$env_tmp" || fail
+    chmod 0600 "$env_tmp" || fail
     mv "$env_tmp" "$env_file" || fail
 fi
+chmod 0600 "$env_file" || fail
 
 config_tmp=$(mktemp "$host_config.tmp.XXXXXX") || fail
 if [ -e "$host_config" ]; then

@@ -7,6 +7,9 @@ import traceback
 from dataclasses import replace
 from datetime import datetime, timezone
 from decimal import Decimal
+from threading import Thread
+from types import SimpleNamespace
+from typing import Callable
 
 import pytest
 
@@ -16,6 +19,9 @@ from level2_service.direct_market import (
     Core9528Client,
     Core9528CurveDecoder,
     Core9528TemplateProtocol,
+    Core9528WarmPool,
+    CoreRequestMaterial,
+    WarmCoreConnection,
     decode_core_base64,
     decode_core_gov,
     decode_core_snappy,
@@ -27,7 +33,7 @@ from level2_service.direct_market import (
     _core_hxl_value,
 )
 from level2_service.models import FUND_FLOW_METRICS, FUND_FLOW_PERIODS, MetricKind
-from level2_service.parsed_values import DirectRequestError
+from level2_service.parsed_values import DirectReadOutcome, DirectRequestError
 
 
 class StaticSessionProvider:
@@ -565,6 +571,55 @@ def test_core_client_passes_the_encrypted_session_bundle_to_a_protocol_driver() 
     assert seen == [("601872", "17", "core_metrics")]
 
 
+def test_core_client_reads_the_session_inside_the_lifecycle_lock() -> None:
+    old_session = replace(
+        session(),
+        role="core_metrics",
+        core_material={"marker": "old"},
+    )
+    new_session = replace(
+        old_session,
+        core_material={"marker": "new"},
+    )
+
+    class Provider:
+        def __init__(self) -> None:
+            self.session = old_session
+
+        def get(self, role: str):
+            assert role == "core_metrics"
+            return self.session
+
+        def mark_error(self, _role: str, _error_code: str) -> None:
+            pass
+
+    seen: list[str] = []
+    values = {kind: None for kind in MetricKind}
+
+    class Protocol:
+        @staticmethod
+        def read_direct(material, _symbol: str, _market: str):
+            seen.append(material.core_material["marker"])
+            return DirectReadOutcome(
+                values=values,
+                source_errors={"core_metrics": None, "main_fund_flow": None},
+            )
+
+    provider = Provider()
+    client = Core9528Client(provider, protocol=Protocol())
+    client._request_lock.acquire()
+    thread = Thread(target=lambda: client.read_direct("601872"))
+    thread.start()
+    time.sleep(0.05)
+    provider.session = new_session
+    client.invalidate()
+    client._request_lock.release()
+    thread.join(timeout=1)
+
+    assert thread.is_alive() is False
+    assert seen == ["new"]
+
+
 def test_core_base64_round_trips_with_the_app_alphabet() -> None:
     payload = bytes(range(256))
 
@@ -911,6 +966,286 @@ def test_core_template_protocol_treats_socket_timeout_after_frame_as_idle() -> N
     assert outcome.values[MetricKind.STOCK_NAME] == "测试股票"
     assert len(socket.sent) == 2
     assert any(timeout == pytest.approx(0.5) for timeout in socket.timeouts)
+
+
+def test_core_template_protocol_separates_authentication_from_business_read() -> None:
+    packet = core_request_packet()
+    auth = framed_9528(b"auth")
+    business = _core_curve_frame(
+        "601872",
+        "测试股票",
+        [(1, "int"), (33007, "hxl")],
+        [[930, 0.1]],
+    )
+
+    class Socket:
+        def __init__(self) -> None:
+            self.sent: list[bytes] = []
+            self.reads: list[bytes | Exception] = [
+                auth[:13],
+                auth[13:],
+                TimeoutError("synthetic auth idle"),
+            ]
+            self.closed = False
+
+        def settimeout(self, _timeout: float) -> None:
+            pass
+
+        def sendall(self, value: bytes) -> None:
+            self.sent.append(value)
+            if len(self.sent) == 2:
+                self.reads.extend([business[:13], business[13:]])
+
+        def recv(self, size: int) -> bytes:
+            value = self.reads.pop(0)
+            if isinstance(value, Exception):
+                raise value
+            return value[:size]
+
+        def close(self) -> None:
+            self.closed = True
+
+    material = replace(
+        session(),
+        role="core_metrics",
+        core_material={
+            "server_ip": "127.0.0.1",
+            "server_port": "9528",
+            "auth_packet_hex": auth.hex(),
+            "base64_alphabet": CORE_BASE64_ALPHABET,
+            "template_symbol": "600519",
+            "request_packets_hex": json.dumps([packet.hex()]),
+        },
+    )
+    values = {kind: None for kind in MetricKind}
+    values[MetricKind.STOCK_NAME] = "测试股票"
+    socket = Socket()
+    protocol = Core9528TemplateProtocol(
+        socket_factory=lambda _address, _timeout: socket,
+        response_decoder=lambda _frames, _symbol, _market: DirectReadOutcome(
+            values=values,
+            source_errors={"core_metrics": None, "main_fund_flow": None},
+        ),
+    )
+
+    prepared = protocol.prepare(material, "601872")
+    warm = protocol.authenticate(prepared)
+
+    assert socket.sent == [auth]
+    assert socket.closed is False
+
+    outcome = protocol.read_authenticated(warm, prepared, "601872", "17")
+
+    assert outcome.values[MetricKind.STOCK_NAME] == "测试股票"
+    assert len(socket.sent) == 2
+    assert socket.sent[1] != auth
+    assert socket.closed is True
+
+
+def test_core_warm_pool_consumes_a_ready_connection_only_once() -> None:
+    sockets = [SimpleNamespace(closed=False), SimpleNamespace(closed=False)]
+    authenticated: list[WarmCoreConnection] = []
+
+    class Protocol:
+        def prepare(self, _session, symbol: str) -> CoreRequestMaterial:
+            return CoreRequestMaterial(
+                host="127.0.0.1",
+                port=9528,
+                auth_packet=b"auth",
+                request_packets=(symbol.encode(),),
+                macdfs_params=(12, 26, 9),
+                timeout_seconds=10,
+                session_fingerprint=b"session-one",
+            )
+
+        def authenticate(self, prepared: CoreRequestMaterial) -> WarmCoreConnection:
+            warm = WarmCoreConnection(
+                connection=sockets[len(authenticated)],
+                session_fingerprint=prepared.session_fingerprint,
+                authenticated_at=10,
+            )
+            authenticated.append(warm)
+            return warm
+
+        @staticmethod
+        def close_connection(warm: WarmCoreConnection) -> None:
+            warm.connection.closed = True
+
+    pending_refills: list[Callable[[], None]] = []
+    pool = Core9528WarmPool(
+        Protocol(),
+        clock=lambda: 20,
+        start_background=pending_refills.append,
+    )
+    pool.prewarm(session(), "601872")
+    assert len(pending_refills) == 1
+    pending_refills.pop()()
+    assert pool.ready_count == 1
+
+    prepared, first = pool.acquire(session(), "601872")
+    assert prepared.session_fingerprint == b"session-one"
+    assert first is authenticated[0]
+    assert pool.ready_count == 0
+    assert len(pending_refills) == 1
+
+    pending_refills.pop()()
+    _prepared, second = pool.acquire(session(), "601872")
+
+    assert second is authenticated[1]
+    assert second is not first
+    pool.close_connection(first)
+    pool.close_connection(second)
+    assert sockets[0].closed is True
+    assert sockets[1].closed is True
+
+
+def test_core_warm_pool_restarts_an_inflight_refill_after_session_change() -> None:
+    sockets: list[SimpleNamespace] = []
+
+    class Protocol:
+        def prepare(self, current_session, symbol: str) -> CoreRequestMaterial:
+            fingerprint = current_session.core_material["fingerprint"].encode()
+            return CoreRequestMaterial(
+                host="127.0.0.1",
+                port=9528,
+                auth_packet=b"auth",
+                request_packets=(symbol.encode(),),
+                macdfs_params=(12, 26, 9),
+                timeout_seconds=10,
+                session_fingerprint=fingerprint,
+            )
+
+        def authenticate(self, prepared: CoreRequestMaterial) -> WarmCoreConnection:
+            socket = SimpleNamespace(closed=False)
+            sockets.append(socket)
+            return WarmCoreConnection(
+                connection=socket,
+                session_fingerprint=prepared.session_fingerprint,
+                authenticated_at=0,
+            )
+
+        @staticmethod
+        def close_connection(warm: WarmCoreConnection) -> None:
+            warm.connection.closed = True
+
+    pending_refills: list[Callable[[], None]] = []
+    first_session = replace(
+        session(),
+        role="core_metrics",
+        core_material={"fingerprint": "first", "template_symbol": "600519"},
+    )
+    second_session = replace(
+        first_session,
+        core_material={"fingerprint": "second", "template_symbol": "600519"},
+    )
+    pool = Core9528WarmPool(
+        Protocol(),
+        start_background=pending_refills.append,
+    )
+
+    pool.prewarm(first_session)
+    pool.invalidate()
+    pool.prewarm(second_session)
+
+    assert len(pending_refills) == 2
+    pending_refills.pop(0)()
+    assert sockets[0].closed is True
+    pending_refills.pop(0)()
+    assert pool.ready_count == 1
+
+
+def test_core_warm_pool_rejects_sync_auth_completed_after_invalidation() -> None:
+    sockets: list[SimpleNamespace] = []
+    pool_ref: dict[str, Core9528WarmPool] = {}
+
+    class Protocol:
+        @staticmethod
+        def prepare(_session, symbol: str) -> CoreRequestMaterial:
+            return CoreRequestMaterial(
+                host="127.0.0.1",
+                port=9528,
+                auth_packet=b"auth",
+                request_packets=(symbol.encode(),),
+                macdfs_params=(12, 26, 9),
+                timeout_seconds=10,
+                session_fingerprint=b"session-one",
+            )
+
+        def authenticate(self, prepared: CoreRequestMaterial) -> WarmCoreConnection:
+            socket = SimpleNamespace(closed=False)
+            sockets.append(socket)
+            pool_ref["pool"].invalidate()
+            return WarmCoreConnection(
+                connection=socket,
+                session_fingerprint=prepared.session_fingerprint,
+                authenticated_at=0,
+            )
+
+        @staticmethod
+        def close_connection(warm: WarmCoreConnection) -> None:
+            warm.connection.closed = True
+
+    pending_refills: list[Callable[[], None]] = []
+    pool = Core9528WarmPool(
+        Protocol(),
+        start_background=pending_refills.append,
+    )
+    pool_ref["pool"] = pool
+
+    with pytest.raises(DirectRequestError) as caught:
+        pool.acquire(session(), "601872")
+
+    assert caught.value.error_code == "DIRECT_PROTOCOL_HANDSHAKE_FAILED"
+    assert sockets[0].closed is True
+    assert pending_refills == []
+
+
+def test_core_warm_pool_discards_a_connection_past_its_idle_limit() -> None:
+    now = [0.0]
+    sockets: list[SimpleNamespace] = []
+
+    class Protocol:
+        @staticmethod
+        def prepare(_session, symbol: str) -> CoreRequestMaterial:
+            return CoreRequestMaterial(
+                host="127.0.0.1",
+                port=9528,
+                auth_packet=b"auth",
+                request_packets=(symbol.encode(),),
+                macdfs_params=(12, 26, 9),
+                timeout_seconds=10,
+                session_fingerprint=b"session-one",
+            )
+
+        def authenticate(self, prepared: CoreRequestMaterial) -> WarmCoreConnection:
+            socket = SimpleNamespace(closed=False)
+            sockets.append(socket)
+            return WarmCoreConnection(
+                connection=socket,
+                session_fingerprint=prepared.session_fingerprint,
+                authenticated_at=now[0],
+            )
+
+        @staticmethod
+        def close_connection(warm: WarmCoreConnection) -> None:
+            warm.connection.closed = True
+
+    pending_refills: list[Callable[[], None]] = []
+    pool = Core9528WarmPool(
+        Protocol(),
+        max_idle_seconds=25,
+        clock=lambda: now[0],
+        start_background=pending_refills.append,
+    )
+    pool.prewarm(session(), "601872")
+    pending_refills.pop()()
+    assert pool.ready_count == 1
+
+    now[0] = 26
+    _prepared, warm = pool.acquire(session(), "601872")
+
+    assert sockets[0].closed is True
+    assert warm.connection is sockets[1]
 
 
 def test_core_template_protocol_uses_short_idle_wait_only_after_a_frame() -> None:

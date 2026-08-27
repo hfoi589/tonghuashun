@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import gzip
+import hashlib
 import json
 import logging
 import base64
@@ -10,10 +11,10 @@ import re
 import socket
 import struct
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
-from threading import RLock
+from threading import Lock, RLock, Thread
 from typing import Any, Callable, Mapping, Protocol
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
@@ -1303,6 +1304,24 @@ CoreResponseDecoder = Callable[
 ]
 
 
+@dataclass(frozen=True)
+class CoreRequestMaterial:
+    host: str
+    port: int
+    auth_packet: bytes = field(repr=False)
+    request_packets: tuple[bytes, ...] = field(repr=False)
+    macdfs_params: tuple[int, int, int] | None
+    timeout_seconds: float
+    session_fingerprint: bytes = field(repr=False)
+
+
+@dataclass
+class WarmCoreConnection:
+    connection: object = field(repr=False)
+    session_fingerprint: bytes = field(repr=False)
+    authenticated_at: float
+
+
 class Core9528TemplateProtocol:
     """Send captured 9528 templates over a fresh connection.
 
@@ -1393,6 +1412,100 @@ class Core9528TemplateProtocol:
         ):
             raise DirectRequestError("DIRECT_PROTOCOL_HANDSHAKE_FAILED")
         return parsed[0], parsed[1], parsed[2]
+
+    @staticmethod
+    def _session_fingerprint(material: object) -> bytes:
+        core_material = getattr(material, "core_material", {})
+        updated_at = getattr(material, "updated_at", None)
+        try:
+            normalized = json.dumps(
+                {
+                    "updated_at": (
+                        updated_at.isoformat()
+                        if callable(getattr(updated_at, "isoformat", None))
+                        else str(updated_at)
+                    ),
+                    "core_material": dict(core_material),
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        except (TypeError, ValueError):
+            raise DirectRequestError("DIRECT_PROTOCOL_HANDSHAKE_FAILED") from None
+        return hashlib.sha256(normalized).digest()
+
+    def prepare(self, material: object, symbol: str) -> CoreRequestMaterial:
+        self.ensure_read_direct_supported()
+        host, port, packets, _alphabet = self._material_packets(material, symbol)
+        macdfs_params = self._material_macdfs_params(material)
+        if macdfs_params is None and callable(
+            getattr(self.response_decoder, "with_macdfs_params", None)
+        ):
+            raise DirectRequestError("DIRECT_PROTOCOL_HANDSHAKE_FAILED")
+        try:
+            timeout_seconds = float(getattr(material, "timeout_seconds", 10.0))
+        except (TypeError, ValueError):
+            raise DirectRequestError("DIRECT_PROTOCOL_HANDSHAKE_FAILED") from None
+        if timeout_seconds <= 0:
+            raise DirectRequestError("DIRECT_PROTOCOL_HANDSHAKE_FAILED")
+        return CoreRequestMaterial(
+            host=host,
+            port=port,
+            auth_packet=packets[0],
+            request_packets=tuple(packets[1:]),
+            macdfs_params=macdfs_params,
+            timeout_seconds=timeout_seconds,
+            session_fingerprint=self._session_fingerprint(material),
+        )
+
+    @staticmethod
+    def close_connection(warm: WarmCoreConnection) -> None:
+        try:
+            warm.connection.close()
+        except Exception:
+            pass
+
+    def authenticate(self, prepared: CoreRequestMaterial) -> WarmCoreConnection:
+        connection = None
+        try:
+            connection = self.socket_factory(
+                (prepared.host, prepared.port),
+                prepared.timeout_seconds,
+            )
+            connection.settimeout(prepared.timeout_seconds)
+            connection.sendall(prepared.auth_packet)
+            frames = self._read_frames(
+                connection,
+                prepared.timeout_seconds,
+                inter_frame_timeout_seconds=self.frame_idle_timeout_seconds,
+            )
+            if not frames:
+                raise DirectRequestError("DIRECT_PROTOCOL_RESPONSE_TIMEOUT")
+            return WarmCoreConnection(
+                connection=connection,
+                session_fingerprint=prepared.session_fingerprint,
+                authenticated_at=time.monotonic(),
+            )
+        except DirectRequestError as error:
+            if connection is not None:
+                try:
+                    connection.close()
+                except Exception:
+                    pass
+            raise DirectRequestError(
+                sanitized_direct_error_code(
+                    error.error_code,
+                    "DIRECT_PROTOCOL_HANDSHAKE_FAILED",
+                )
+            ) from None
+        except Exception:
+            if connection is not None:
+                try:
+                    connection.close()
+                except Exception:
+                    pass
+            raise DirectRequestError("DIRECT_PROTOCOL_HANDSHAKE_FAILED") from None
 
     @staticmethod
     def _read_exact(
@@ -1521,62 +1634,52 @@ class Core9528TemplateProtocol:
                     break
         return frames
 
-    def read_direct(
-        self, material: object, symbol: str, market: str
+    def read_authenticated(
+        self,
+        warm: WarmCoreConnection,
+        prepared: CoreRequestMaterial,
+        symbol: str,
+        market: str,
     ) -> DirectReadOutcome:
-        self.ensure_read_direct_supported()
-        host, port, packets, _alphabet = self._material_packets(material, symbol)
-        macdfs_params = self._material_macdfs_params(material)
-        if macdfs_params is None and callable(
-            getattr(self.response_decoder, "with_macdfs_params", None)
-        ):
+        if warm.session_fingerprint != prepared.session_fingerprint:
+            self.close_connection(warm)
             raise DirectRequestError("DIRECT_PROTOCOL_HANDSHAKE_FAILED")
-        timeout_seconds = float(getattr(material, "timeout_seconds", 10.0))
-        connection = None
         try:
-            connection = self.socket_factory((host, port), timeout_seconds)
-            connection.settimeout(timeout_seconds)
-            # The App's server expects the authentication response before it
-            # accepts a request template.  Keep the handshake stateful so a
-            # fresh connection has the same ordering as the App connection.
-            connection.sendall(packets[0])
-            frames = self._read_frames(
-                connection,
-                timeout_seconds,
-                inter_frame_timeout_seconds=self.frame_idle_timeout_seconds,
-            )
-            if not frames:
-                raise DirectRequestError("DIRECT_PROTOCOL_RESPONSE_TIMEOUT")
+            frames: list[bytes] = []
             # Captured request templates are emitted as adjacent pairs by the
             # App (a request descriptor followed by its 6001 payload).  Keep
             # each pair together and stop after its first curve response before
             # moving on to the next indicator.  A final unpaired template is
             # still sent as a single request for compatibility with captures.
             seen_batches: set[tuple[bytes, ...]] = set()
-            for batch_start in range(1, len(packets), 2):
-                batch = tuple(packets[batch_start : batch_start + 2])
+            for batch_start in range(0, len(prepared.request_packets), 2):
+                batch = tuple(
+                    prepared.request_packets[batch_start : batch_start + 2]
+                )
                 if batch in seen_batches:
                     continue
                 seen_batches.add(batch)
                 for packet in batch:
-                    connection.sendall(packet)
+                    warm.connection.sendall(packet)
                 frames.extend(
                     self._read_frames(
-                        connection,
-                        timeout_seconds,
+                        warm.connection,
+                        prepared.timeout_seconds,
                         stop_after_curves=1,
                     )
                 )
             assert self.response_decoder is not None
             response_decoder = self.response_decoder
-            if macdfs_params is not None:
+            if prepared.macdfs_params is not None:
                 bind_macdfs_params = getattr(
                     response_decoder,
                     "with_macdfs_params",
                     None,
                 )
                 if callable(bind_macdfs_params):
-                    response_decoder = bind_macdfs_params(macdfs_params)
+                    response_decoder = bind_macdfs_params(
+                        prepared.macdfs_params
+                    )
             try:
                 return response_decoder(frames, symbol, market)
             except DirectRequestError as error:
@@ -1596,11 +1699,14 @@ class Core9528TemplateProtocol:
         except Exception:
             raise DirectRequestError("DIRECT_PROTOCOL_HANDSHAKE_FAILED") from None
         finally:
-            if connection is not None:
-                try:
-                    connection.close()
-                except OSError:
-                    pass
+            self.close_connection(warm)
+
+    def read_direct(
+        self, material: object, symbol: str, market: str
+    ) -> DirectReadOutcome:
+        prepared = self.prepare(material, symbol)
+        warm = self.authenticate(prepared)
+        return self.read_authenticated(warm, prepared, symbol, market)
 
     def read_market_snapshot(
         self,
@@ -1632,6 +1738,222 @@ class Core9528Protocol(Protocol):
     ) -> MarketSnapshot: ...
 
 
+def _start_warm_background(task: Callable[[], None]) -> None:
+    Thread(target=task, name="ths-core-warm", daemon=True).start()
+
+
+class Core9528WarmPool:
+    """Hold one authenticated connection that may be consumed exactly once."""
+
+    def __init__(
+        self,
+        protocol: object,
+        *,
+        max_idle_seconds: float = 25.0,
+        clock: Callable[[], float] = time.monotonic,
+        start_background: Callable[[Callable[[], None]], None] = (
+            _start_warm_background
+        ),
+    ) -> None:
+        if max_idle_seconds <= 0:
+            raise ValueError("max_idle_seconds must be positive")
+        self.protocol = protocol
+        self.max_idle_seconds = max_idle_seconds
+        self.clock = clock
+        self.start_background = start_background
+        self._lock = Lock()
+        self._ready: WarmCoreConnection | None = None
+        self._session_fingerprint: bytes | None = None
+        self._refilling = False
+        self._closed = False
+        self._generation = 0
+
+    @property
+    def ready_count(self) -> int:
+        with self._lock:
+            return int(self._ready is not None)
+
+    def close_connection(self, warm: WarmCoreConnection) -> None:
+        close_connection = getattr(self.protocol, "close_connection", None)
+        if callable(close_connection):
+            try:
+                close_connection(warm)
+            except Exception:
+                pass
+            return
+        try:
+            warm.connection.close()
+        except Exception:
+            pass
+
+    @staticmethod
+    def _template_symbol(session: object) -> str:
+        core_material = getattr(session, "core_material", {})
+        value = str(core_material.get("template_symbol", "")).strip()
+        return value if len(value) == 6 and value.isdigit() else "600000"
+
+    def _prepare(self, session: object, symbol: str) -> CoreRequestMaterial:
+        prepare = getattr(self.protocol, "prepare", None)
+        if not callable(prepare):
+            raise DirectRequestError("DIRECT_PROTOCOL_HANDSHAKE_FAILED")
+        return prepare(session, symbol)
+
+    def _schedule_refill(
+        self,
+        prepared: CoreRequestMaterial,
+        *,
+        expected_generation: int | None = None,
+    ) -> bool:
+        stale: WarmCoreConnection | None = None
+        with self._lock:
+            if self._closed:
+                return False
+            if expected_generation is not None and (
+                expected_generation != self._generation
+                or self._session_fingerprint
+                != prepared.session_fingerprint
+            ):
+                return False
+            if self._session_fingerprint != prepared.session_fingerprint:
+                stale = self._ready
+                self._ready = None
+                self._session_fingerprint = prepared.session_fingerprint
+                self._generation += 1
+                self._refilling = False
+            if self._ready is not None or self._refilling:
+                should_start = False
+            else:
+                self._refilling = True
+                should_start = True
+                generation = self._generation
+        if stale is not None:
+            self.close_connection(stale)
+        if not should_start:
+            return True
+        try:
+            self.start_background(
+                lambda: self._refill(prepared, generation)
+            )
+        except Exception:
+            with self._lock:
+                self._refilling = False
+            return False
+        return True
+
+    def _refill(
+        self,
+        prepared: CoreRequestMaterial,
+        generation: int,
+    ) -> None:
+        warm: WarmCoreConnection | None = None
+        try:
+            authenticate = getattr(self.protocol, "authenticate", None)
+            if not callable(authenticate):
+                return
+            warm = authenticate(prepared)
+        except Exception:
+            warm = None
+        stale: WarmCoreConnection | None = None
+        with self._lock:
+            if generation == self._generation:
+                self._refilling = False
+                if (
+                    warm is not None
+                    and not self._closed
+                    and self._session_fingerprint
+                    == warm.session_fingerprint
+                    and self._ready is None
+                ):
+                    self._ready = warm
+                    warm = None
+                elif self._ready is not None and self._closed:
+                    stale = self._ready
+                    self._ready = None
+        if warm is not None:
+            self.close_connection(warm)
+        if stale is not None:
+            self.close_connection(stale)
+
+    def prewarm(self, session: object, symbol: str | None = None) -> None:
+        prepared = self._prepare(
+            session,
+            symbol or self._template_symbol(session),
+        )
+        self._schedule_refill(prepared)
+
+    def acquire(
+        self,
+        session: object,
+        symbol: str,
+    ) -> tuple[CoreRequestMaterial, WarmCoreConnection]:
+        prepared = self._prepare(session, symbol)
+        stale: WarmCoreConnection | None = None
+        with self._lock:
+            if self._closed:
+                raise DirectRequestError("DIRECT_PROTOCOL_HANDSHAKE_FAILED")
+            if self._session_fingerprint != prepared.session_fingerprint:
+                stale = self._ready
+                self._ready = None
+                self._session_fingerprint = prepared.session_fingerprint
+                self._generation += 1
+                self._refilling = False
+            generation = self._generation
+            warm = self._ready
+            self._ready = None
+            if (
+                warm is not None
+                and self.clock() - warm.authenticated_at
+                > self.max_idle_seconds
+            ):
+                if stale is None:
+                    stale = warm
+                else:
+                    self.close_connection(warm)
+                warm = None
+        if stale is not None:
+            self.close_connection(stale)
+        if warm is None:
+            authenticate = getattr(self.protocol, "authenticate", None)
+            if not callable(authenticate):
+                raise DirectRequestError("DIRECT_PROTOCOL_HANDSHAKE_FAILED")
+            warm = authenticate(prepared)
+        with self._lock:
+            valid = (
+                not self._closed
+                and generation == self._generation
+                and self._session_fingerprint
+                == prepared.session_fingerprint
+            )
+        if not valid or not self._schedule_refill(
+            prepared,
+            expected_generation=generation,
+        ):
+            self.close_connection(warm)
+            raise DirectRequestError("DIRECT_PROTOCOL_HANDSHAKE_FAILED")
+        return prepared, warm
+
+    def invalidate(self) -> None:
+        with self._lock:
+            stale = self._ready
+            self._ready = None
+            self._session_fingerprint = None
+            self._generation += 1
+            self._refilling = False
+        if stale is not None:
+            self.close_connection(stale)
+
+    def close(self) -> None:
+        with self._lock:
+            self._closed = True
+            stale = self._ready
+            self._ready = None
+            self._session_fingerprint = None
+            self._generation += 1
+            self._refilling = False
+        if stale is not None:
+            self.close_connection(stale)
+
+
 class Core9528Client:
     """Standalone core transport with an explicit protocol-research stage gate."""
 
@@ -1640,9 +1962,22 @@ class Core9528Client:
         session_provider: SessionProvider,
         *,
         protocol: Core9528Protocol | None = None,
+        warm_pool: Core9528WarmPool | None = None,
     ) -> None:
         self.session_provider = session_provider
         self.protocol = protocol
+        self._request_lock = RLock()
+        supports_warm_pool = all(
+            callable(getattr(protocol, name, None))
+            for name in ("prepare", "authenticate", "read_authenticated")
+        )
+        self.warm_pool = (
+            warm_pool
+            if warm_pool is not None
+            else Core9528WarmPool(protocol)
+            if protocol is not None and supports_warm_pool
+            else None
+        )
 
     def _session(self):
         session = self.session_provider.get("core_metrics")
@@ -1661,9 +1996,45 @@ class Core9528Client:
         gate = getattr(self.protocol, "ensure_read_direct_supported", None)
         if callable(gate):
             gate()
-        session = self._session()
-        assert self.protocol is not None
-        return self.protocol.read_direct(session, symbol, market)
+        with self._request_lock:
+            session = self._session()
+            assert self.protocol is not None
+            if self.warm_pool is not None:
+                prepared, warm = self.warm_pool.acquire(session, symbol)
+                read_authenticated = getattr(
+                    self.protocol,
+                    "read_authenticated",
+                    None,
+                )
+                if not callable(read_authenticated):
+                    self.warm_pool.close_connection(warm)
+                    raise DirectRequestError(
+                        "DIRECT_PROTOCOL_HANDSHAKE_FAILED"
+                    )
+                return read_authenticated(
+                    warm,
+                    prepared,
+                    symbol,
+                    market,
+                )
+            return self.protocol.read_direct(session, symbol, market)
+
+    def prewarm(self, symbol: str | None = None) -> None:
+        if self.warm_pool is None:
+            return
+        with self._request_lock:
+            session = self._session()
+            self.warm_pool.prewarm(session, symbol)
+
+    def invalidate(self) -> None:
+        with self._request_lock:
+            if self.warm_pool is not None:
+                self.warm_pool.invalidate()
+
+    def close(self) -> None:
+        with self._request_lock:
+            if self.warm_pool is not None:
+                self.warm_pool.close()
 
     def read(self, symbol: str) -> dict[MetricKind, str | None]:
         return self.read_direct(symbol).values
@@ -1673,11 +2044,12 @@ class Core9528Client:
         gate = getattr(self.protocol, "ensure_market_snapshot_supported", None)
         if callable(gate):
             gate()
-        session = self._session()
-        assert self.protocol is not None
-        return self.protocol.read_market_snapshot(
-            session,
-            symbol,
-            market,
-            detail=detail,
-        )
+        with self._request_lock:
+            session = self._session()
+            assert self.protocol is not None
+            return self.protocol.read_market_snapshot(
+                session,
+                symbol,
+                market,
+                detail=detail,
+            )

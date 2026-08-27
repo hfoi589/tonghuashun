@@ -80,3 +80,42 @@ tests/test_deploy_configuration.py::test_macos_example_and_compose_document_a_se
 tests/test_deploy_configuration.py::test_readme_defines_the_unimplemented_private_complete_image_contract
 tests/test_deploy_configuration.py::test_lifecycle_token_docs_define_the_compose_and_host_broker_boundary
 ```
+
+## Fix round 2 — Active Token-assignment cardinality
+
+The deployment-example test now retains every active, non-comment assignment
+and collects all values for each key. It requires exactly one
+`THS_DEVICE_LIFECYCLE_TOKEN` assignment and requires that value to be empty, so
+a non-empty assignment followed by an empty one cannot pass through
+last-assignment-wins folding.
+
+### RED (exact output)
+
+```text
+F                                                                        [100%]
+=================================== FAILURES ===================================
+_ test_macos_example_and_compose_document_a_secretless_lifecycle_configuration _
+
+E       KeyError: 'THS_DEVICE_LIFECYCLE_TOKEN'
+
+tests/test_deploy_configuration.py:230: KeyError
+=========================== short test summary info ============================
+FAILED tests/test_deploy_configuration.py::test_macos_example_and_compose_document_a_secretless_lifecycle_configuration
+1 failed in 0.22s
+```
+
+### GREEN focused output (exact output)
+
+```text
+.                                                                        [100%]
+1 passed in 0.18s
+```
+
+### GREEN covering output (exact output)
+
+```text
+.........................................................                [100%]
+57 passed, 1 warning in 2.87s
+```
+
+`git diff --check` exited successfully with no output.

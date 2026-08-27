@@ -215,16 +215,19 @@ def test_macos_example_and_compose_document_a_secretless_lifecycle_configuration
     """A sample token or omitted broker settings could expose host lifecycle controls."""
     example = (ROOT / "deploy" / "macos.env.example").read_text(encoding="utf-8")
     compose = (ROOT / "deploy" / "compose.yml").read_text(encoding="utf-8")
-    active_assignments = {
-        name: value
+    active_assignments = [
+        (name, value)
         for raw_line in example.splitlines()
         if (line := raw_line.strip()) and not line.startswith("#") and "=" in line
         for name, value in [line.split("=", 1)]
-    }
+    ]
+    active_values = {}
+    for name, value in active_assignments:
+        active_values.setdefault(name, []).append(value)
 
-    assert active_assignments["THS_DEVICE_LIFECYCLE_URL"] == "http://host.docker.internal:18765"
-    assert active_assignments["THS_DEVICE_LIFECYCLE_TIMEOUT_SECONDS"] == "5"
-    assert active_assignments.get("THS_DEVICE_LIFECYCLE_TOKEN", "") == ""
+    assert active_values["THS_DEVICE_LIFECYCLE_URL"] == ["http://host.docker.internal:18765"]
+    assert active_values["THS_DEVICE_LIFECYCLE_TIMEOUT_SECONDS"] == ["5"]
+    assert active_values["THS_DEVICE_LIFECYCLE_TOKEN"] == [""]
     for setting in (
         "THS_DEVICE_LIFECYCLE_URL",
         "THS_DEVICE_LIFECYCLE_TOKEN",

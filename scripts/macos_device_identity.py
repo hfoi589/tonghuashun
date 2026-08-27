@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import ctypes
 from dataclasses import dataclass
-from enum import StrEnum
+from enum import Enum
 import os
 from pathlib import Path
 import re
@@ -58,10 +58,13 @@ class DarwinProcessExecutableResolver:
         return executable
 
 
-class FixedAvdPresence(StrEnum):
+class FixedAvdPresence(str, Enum):
     ATTACHED = "ATTACHED"
     STARTING = "STARTING"
     ABSENT = "ABSENT"
+
+    def __str__(self) -> str:
+        return self.value
 
 
 @dataclass(frozen=True)

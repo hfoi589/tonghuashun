@@ -8,6 +8,7 @@ from importlib.util import module_from_spec, spec_from_file_location
 import json
 import os
 import re
+import shutil
 from pathlib import Path
 import struct
 import subprocess
@@ -130,6 +131,58 @@ def run_session_readiness_probe(
         capture_output=True,
         check=False,
     )
+
+
+def test_host_cli_help_runs_on_default_python_without_host_actions(
+    tmp_path: Path,
+) -> None:
+    """The documented host entrypoint must import on macOS Python 3.10."""
+    python = shutil.which(os.environ.get("PYTHON_BIN", "python3"))
+    assert python is not None
+    action_log = tmp_path / "host-actions.log"
+    for command in (
+        "adb",
+        "avdmanager",
+        "docker",
+        "emulator",
+        "java",
+        "launchctl",
+        "sdkmanager",
+    ):
+        fake = tmp_path / command
+        fake.write_text(
+            "#!/bin/sh\nprintf '%s\\n' \"$0 $*\" >> \"$HOST_ACTION_LOG\"\nexit 99\n",
+            encoding="utf-8",
+        )
+        fake.chmod(0o755)
+
+    completed = subprocess.run(
+        [python, str(MACOS_DEPLOY), "--help"],
+        cwd=ROOT,
+        env=os.environ
+        | {
+            "HOST_ACTION_LOG": str(action_log),
+            "PATH": f"{tmp_path}:{os.environ.get('PATH', '')}",
+        },
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert "usage:" in completed.stdout
+    assert "ImportError" not in completed.stderr
+    assert not action_log.exists()
+
+
+def test_fixed_avd_presence_keeps_string_enum_semantics() -> None:
+    """The compatibility enum preserves the wire/log value behavior of StrEnum."""
+    from scripts.macos_device_identity import FixedAvdPresence
+
+    assert FixedAvdPresence.ATTACHED.value == "ATTACHED"
+    assert str(FixedAvdPresence.ATTACHED) == "ATTACHED"
+    assert FixedAvdPresence("STARTING") is FixedAvdPresence.STARTING
 
 
 def valid_acceptance_task() -> dict[str, object]:

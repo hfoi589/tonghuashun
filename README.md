@@ -156,10 +156,17 @@ bundle is available. `shadow` runs both paths but returns the existing Frida
 result while recording only field-name mismatches. Direct or shadow mode
 requires a Fernet `THS_SESSION_ENCRYPTION_KEY`; raw cookies and auth packets are
 stored only in encrypted files under `/data/admin/ths-sessions`.
-The current direct core transport has the authentication/frame state machine
-and an explicit response-decoder gate; until the `StuffCurveStruct` decoder is
-verified, it returns `DIRECT_PROTOCOL_RESPONSE_UNSUPPORTED` and never publishes
-undecoded binary data as metrics.
+The direct core transport implements the authenticated 9528 frame state
+machine plus pure-Python Snappy, `gov`, `cv3`, HXLONG, retail-count (`216`),
+large-order-net (`33007`), and large-order-amount (`33015`) decoding. MACDFS is
+calculated from the returned price curve using the App's captured indicator
+parameters. Explicit `direct` mode uses this decoder; `shadow` keeps returning
+the Frida result while comparing the candidate. Unsupported encryption or
+compression flags still fail closed and undecoded bytes are never published as
+metrics.
+Refresh the core session bundle after upgrading so it includes the App's
+current MACDFS parameters; older bundles fail the direct handshake instead of
+using guessed defaults.
 
 After manual login, an authenticated administrator can inspect
 `GET /api/admin/account-sessions` and refresh a role with

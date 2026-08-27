@@ -6,6 +6,7 @@ import gzip
 import json
 import logging
 import base64
+import re
 import socket
 import struct
 import time
@@ -137,6 +138,8 @@ def patch_core_packet_symbol(
 def _validate_9528_outer_packet(packet: bytes) -> None:
     if len(packet) < 14 or packet[:4] != b"\xfd" * 4:
         raise ValueError("core packet does not contain the expected wire prefix")
+    if re.fullmatch(rb"[0-9A-Fa-f]{8}", packet[4:12]) is None:
+        raise ValueError("core packet length field is invalid")
     try:
         declared_length = int(packet[4:12].decode("ascii"), 16)
     except (UnicodeDecodeError, ValueError):
@@ -145,6 +148,778 @@ def _validate_9528_outer_packet(packet: bytes) -> None:
         raise ValueError("core packet separator is invalid")
     if declared_length != len(packet) - 13 or declared_length > 16 * 1024 * 1024:
         raise ValueError("core packet length does not match its payload")
+
+
+class _CoreGovBitReader:
+    """Read the MSB-first control stream used by the App's ``gov`` codec."""
+
+    def __init__(self, payload: bytes) -> None:
+        if len(payload) < 2:
+            raise ValueError("core compressed payload is truncated")
+        self.payload = payload
+        self.position = 1
+        self.control = payload[0]
+        self.bits_remaining = 8
+
+    def bit(self) -> int:
+        value = 1 if self.control & 0x80 else 0
+        self.control = (self.control << 1) & 0xFF
+        self.bits_remaining -= 1
+        if self.bits_remaining == 0:
+            if self.position >= len(self.payload):
+                raise ValueError("core compressed control stream is truncated")
+            self.control = self.payload[self.position]
+            self.position += 1
+            self.bits_remaining = 8
+        return value
+
+    def byte(self) -> int:
+        if self.position >= len(self.payload):
+            raise ValueError("core compressed literal stream is truncated")
+        value = self.payload[self.position]
+        self.position += 1
+        return value
+
+
+def decode_core_gov(payload: bytes, output_length: int) -> bytes:
+    """Decode the verified App ``gov.a`` column compressor."""
+
+    if output_length <= 0 or output_length > 16 * 1024 * 1024:
+        raise DirectRequestError("DIRECT_PROTOCOL_RESPONSE_INVALID")
+    try:
+        reader = _CoreGovBitReader(bytes(payload))
+        output = bytearray([reader.byte()])
+
+        max_output_length = output_length + 1
+
+        def append_last(count: int, last: int) -> None:
+            if count < 0 or len(output) + count > max_output_length:
+                raise ValueError("core compressed output length is invalid")
+            output.extend([last] * count)
+
+        last = output[0]
+        while len(output) < output_length:
+            if reader.bit() == 0:
+                if len(output) + 2 > max_output_length:
+                    raise ValueError("core compressed output length is invalid")
+                output.extend((reader.byte(), reader.byte()))
+                last = output[-1]
+                continue
+            if reader.bit() == 0:
+                last = reader.byte()
+                output.append(last)
+            append_last(1, last)
+            if reader.bit() == 0:
+                continue
+            append_last(1, last)
+            if reader.bit() == 0:
+                if reader.bit() != 0:
+                    append_last(1, last)
+                continue
+            append_last(2, last)
+            if reader.bit() == 0:
+                continue
+            append_last(1, last)
+            if reader.bit() == 0:
+                if reader.bit() == 0:
+                    if reader.bit() != 0:
+                        append_last(1, last)
+                elif reader.bit() == 0:
+                    append_last(2, last)
+                else:
+                    append_last(3, last)
+                continue
+            append_last(4, last)
+            if reader.bit() == 0:
+                if reader.bit() != 0:
+                    append_last(1, last)
+                continue
+            if reader.bit() == 0:
+                append_last(2, last)
+                continue
+            append_last(3, last)
+            while True:
+                run_length = reader.byte()
+                if run_length > 127:
+                    run_length = ((run_length - 128) << 8) | reader.byte()
+                append_last(run_length, last)
+                if run_length != 32767:
+                    break
+        if len(output) not in {output_length, max_output_length}:
+            raise ValueError("core compressed output length is invalid")
+        return bytes(output[:output_length])
+    except DirectRequestError:
+        raise
+    except (IndexError, ValueError, OverflowError):
+        raise DirectRequestError("DIRECT_PROTOCOL_RESPONSE_INVALID") from None
+
+
+def decode_core_snappy(payload: bytes) -> bytes:
+    """Decode the raw Snappy block format used by mini-body type ``0x1000``."""
+
+    try:
+        data = bytes(payload)
+        position = 0
+        output_length = 0
+        shift = 0
+        while True:
+            if position >= len(data) or shift > 28:
+                raise ValueError("core Snappy length is truncated")
+            value = data[position]
+            position += 1
+            output_length |= (value & 0x7F) << shift
+            if value & 0x80 == 0:
+                break
+            shift += 7
+        if output_length < 0 or output_length > 16 * 1024 * 1024:
+            raise ValueError("core Snappy output length is invalid")
+
+        output = bytearray()
+        while position < len(data):
+            tag = data[position]
+            position += 1
+            tag_type = tag & 0x03
+            if tag_type == 0:
+                length_code = tag >> 2
+                if length_code < 60:
+                    length = length_code + 1
+                else:
+                    length_bytes = length_code - 59
+                    if length_bytes > 4 or position + length_bytes > len(data):
+                        raise ValueError("core Snappy literal length is invalid")
+                    length = (
+                        int.from_bytes(
+                            data[position : position + length_bytes],
+                            "little",
+                        )
+                        + 1
+                    )
+                    position += length_bytes
+                if (
+                    position + length > len(data)
+                    or len(output) + length > output_length
+                ):
+                    raise ValueError("core Snappy literal is truncated")
+                output.extend(data[position : position + length])
+                position += length
+                continue
+
+            if tag_type == 1:
+                if position >= len(data):
+                    raise ValueError("core Snappy copy offset is truncated")
+                length = 4 + ((tag >> 2) & 0x07)
+                offset = ((tag & 0xE0) << 3) | data[position]
+                position += 1
+            elif tag_type == 2:
+                if position + 2 > len(data):
+                    raise ValueError("core Snappy copy offset is truncated")
+                length = 1 + (tag >> 2)
+                offset = int.from_bytes(data[position : position + 2], "little")
+                position += 2
+            else:
+                if position + 4 > len(data):
+                    raise ValueError("core Snappy copy offset is truncated")
+                length = 1 + (tag >> 2)
+                offset = int.from_bytes(data[position : position + 4], "little")
+                position += 4
+            if (
+                offset <= 0
+                or offset > len(output)
+                or len(output) + length > output_length
+            ):
+                raise ValueError("core Snappy copy is invalid")
+            for _ in range(length):
+                output.append(output[-offset])
+
+        if len(output) != output_length:
+            raise ValueError("core Snappy output length does not match")
+        return bytes(output)
+    except (IndexError, ValueError, OverflowError):
+        raise DirectRequestError("DIRECT_PROTOCOL_RESPONSE_INVALID") from None
+
+
+def _core_hxl_value(raw: int) -> Decimal | None:
+    unsigned = raw & 0xFFFFFFFF
+    if unsigned in {0x80000000, 0xFFFFFFFF}:
+        return None
+    if unsigned == 0:
+        return Decimal(0)
+    magnitude = Decimal(unsigned & 0x07FFFFFF)
+    exponent = (unsigned >> 28) & 0x07
+    scale = Decimal(10) ** exponent
+    value = magnitude / scale if unsigned & 0x80000000 else magnitude * scale
+    return -value if unsigned & 0x08000000 else value
+
+
+def _core_format_number(
+    value: Decimal | int | float | None,
+    places: int,
+    *,
+    suffix: str = "",
+    show_plus: bool = False,
+) -> str | None:
+    if value is None:
+        return None
+    try:
+        decimal = value if isinstance(value, Decimal) else Decimal(str(value))
+        rounded = decimal.quantize(Decimal(1).scaleb(-places), rounding=ROUND_HALF_UP)
+    except (InvalidOperation, ValueError):
+        return None
+    if rounded == 0:
+        rounded = abs(rounded)
+    prefix = "+" if show_plus and rounded > 0 else ""
+    return f"{prefix}{rounded:.{places}f}{suffix}"
+
+
+def _core_time(value: object) -> str | None:
+    text = str(value).strip() if value is not None else ""
+    compact = text.replace(":", "")
+    if compact.isdigit() and 3 <= len(compact) <= 4:
+        padded = compact.zfill(4)
+        hour, minute = int(padded[:2]), int(padded[2:])
+        if 0 <= hour <= 23 and 0 <= minute <= 59:
+            return f"{hour:02d}:{minute:02d}"
+    try:
+        packed = int(text)
+    except ValueError:
+        packed = 0
+    if packed > 0xFFFF:
+        year = ((packed >> 20) & 0xFFF) + 1900
+        month = (packed >> 16) & 0x0F
+        day = (packed >> 11) & 0x1F
+        hour = (packed >> 6) & 0x1F
+        minute = packed & 0x3F
+        in_session = (
+            9 * 60 + 30 <= hour * 60 + minute <= 11 * 60 + 30
+            or 13 * 60 <= hour * 60 + minute <= 15 * 60
+        )
+        if 2000 <= year <= 2199 and in_session:
+            try:
+                datetime(year, month, day)
+            except ValueError:
+                pass
+            else:
+                return f"{hour:02d}:{minute:02d}"
+    return text or None
+
+
+@dataclass(frozen=True)
+class _CoreCurve:
+    symbol: str
+    name: str
+    ext: dict[int, object]
+    data: dict[int, tuple[Decimal | int | None, ...]]
+
+
+class Core9528CurveDecoder:
+    """Decode verified ``cv3`` response frames into direct result values."""
+
+    _RETAIL_DATA_IDS = (13, 18, 216, 218, 220, 222, 215, 217, 219, 221)
+
+    def __init__(
+        self,
+        macdfs_params: tuple[int, int, int] = (12, 26, 9),
+    ) -> None:
+        params = tuple(int(value) for value in macdfs_params)
+        if len(params) != 3 or any(value <= 0 or value > 1000 for value in params):
+            raise DirectRequestError("DIRECT_PROTOCOL_RESPONSE_INVALID")
+        self.macdfs_params = params
+
+    def with_macdfs_params(
+        self, macdfs_params: tuple[int, int, int]
+    ) -> "Core9528CurveDecoder":
+        return type(self)(macdfs_params=macdfs_params)
+
+    def __call__(
+        self, frames: list[bytes], symbol: str, market: str
+    ) -> DirectReadOutcome:
+        curves = [
+            self._decode_frame(frame, symbol, market)
+            for frame in frames
+        ]
+        curves = [curve for curve in curves if curve is not None]
+        if not curves:
+            raise DirectRequestError("DIRECT_PROTOCOL_RESPONSE_INVALID")
+
+        values = empty_metric_values()
+        intraday: dict[MetricKind, dict[str, Any]] = {}
+        quote = next(
+            (
+                curve
+                for curve in curves
+                if {1, 10, 13, 19, 34312}.issubset(curve.data)
+            ),
+            None,
+        )
+        if quote is not None:
+            values[MetricKind.STOCK_NAME] = quote.name or None
+            price = self._ext_decimal(quote.ext.get(10))
+            if price is None:
+                price = self._last_decimal(quote.data.get(10))
+            values[MetricKind.CURRENT_PRICE] = _core_format_number(price, 2)
+            previous_close = self._ext_decimal(quote.ext.get(6))
+            change = self._ext_decimal(quote.ext.get(34315))
+            if change is None and price is not None and previous_close not in (None, Decimal(0)):
+                change = (price / previous_close - Decimal(1)) * Decimal(100)
+            values[MetricKind.CHANGE_PERCENT] = _core_format_number(
+                change, 2, suffix="%"
+            )
+            values[MetricKind.TURNOVER_RATE] = _core_format_number(
+                self._ext_decimal(quote.ext.get(34312)), 2, suffix="%"
+            )
+            macdfs = self._calculate_macdfs(quote, self.macdfs_params)
+            values[MetricKind.MACDFS] = _core_format_number(
+                self._last_decimal(macdfs),
+                3,
+                show_plus=True,
+            )
+            if macdfs is not None:
+                macdfs_points = []
+                for raw_time, value in zip(
+                    quote.data.get(1, ()),
+                    macdfs,
+                    strict=True,
+                ):
+                    time_value = _core_time(raw_time)
+                    if time_value is not None:
+                        macdfs_points.append(
+                            {
+                                "time": time_value,
+                                "value": _core_format_number(
+                                    value,
+                                    3,
+                                    show_plus=True,
+                                ),
+                            }
+                        )
+                if macdfs_points:
+                    intraday[MetricKind.MACDFS] = {
+                        "unit": None,
+                        "points": macdfs_points,
+                    }
+
+        if market != "151":
+            for curve in curves:
+                if 33007 in curve.data:
+                    series = self._series(curve, 33007, places=2)
+                    values[MetricKind.LARGE_ORDER_NET] = series["latest"]
+                    intraday[MetricKind.LARGE_ORDER_NET] = series["intraday"]
+                if 33015 in curve.data:
+                    series = self._series(
+                        curve,
+                        33015,
+                        places=1,
+                        divisor=Decimal(10000),
+                        unit="万",
+                    )
+                    values[MetricKind.LARGE_ORDER_AMOUNT] = series["latest"]
+                    intraday[MetricKind.LARGE_ORDER_AMOUNT] = series["intraday"]
+                if set(self._RETAIL_DATA_IDS).issubset(curve.data):
+                    retail_values = self._calculate_retail(curve)
+                    if retail_values is None:
+                        continue
+                    times = curve.data.get(1, ())
+                    points = []
+                    for raw_time, value in zip(times, retail_values, strict=True):
+                        time_value = _core_time(raw_time)
+                        if time_value is not None:
+                            points.append(
+                                {
+                                    "time": time_value,
+                                    "value": _core_format_number(value, 2),
+                                }
+                            )
+                    if points:
+                        values[MetricKind.RETAIL_COUNT] = points[-1]["value"]
+                        intraday[MetricKind.RETAIL_COUNT] = {
+                            "unit": None,
+                            "points": points,
+                        }
+
+        return DirectReadOutcome(
+            values=values,
+            source_errors={"core_metrics": None, "main_fund_flow": None},
+            intraday_series=intraday,
+        )
+
+    @classmethod
+    def _decode_frame(
+        cls,
+        frame: bytes,
+        symbol: str,
+        market: str,
+    ) -> _CoreCurve | None:
+        try:
+            _validate_9528_outer_packet(frame)
+            if len(frame) < 13 + struct.calcsize("<HiiHiiiI"):
+                raise ValueError("core response mini header is truncated")
+            (
+                head_length,
+                _head_id,
+                head_type,
+                _page_id,
+                data_length,
+                _mini_frame_id,
+                text_length,
+                _session,
+            ) = struct.unpack_from("<HiiHiiiI", frame, 13)
+            if head_length < 24 or 13 + head_length > len(frame):
+                raise ValueError("core response mini header is invalid")
+            body = frame[13 + head_length :]
+            if data_length != len(body) or text_length < 0:
+                raise ValueError("core response mini header length is invalid")
+            if head_type & 0xF0000000:
+                raise ValueError("core encrypted mini body is unsupported")
+            compression_type = head_type & 0xF000
+            if compression_type == 0x1000:
+                body = decode_core_snappy(body)
+            elif compression_type == 0x3000:
+                raise ValueError("core Zstd mini body is unsupported")
+            if body[:3].lower() != b"cv3":
+                if body[4:7].lower() == b"cv3":
+                    body = body[4:]
+                else:
+                    return None
+            if head_length < 32:
+                raise ValueError("core curve mini header is invalid")
+            if len(body) < 24:
+                raise ValueError("core curve header is truncated")
+            (
+                name_raw,
+                point_count,
+                _curve_flags,
+                first_index,
+                extension_end,
+                row_width,
+                field_count,
+            ) = struct.unpack_from("<6s i I i H H H", body, 0)
+            if name_raw[:3].lower() != b"cv3" or point_count <= 0 or point_count > 1441:
+                raise ValueError("core curve header is invalid")
+            if (
+                first_index < 0
+                or row_width <= 0
+                or row_width > 4096
+                or field_count <= 0
+                or field_count > 256
+            ):
+                raise ValueError("core curve dimensions are invalid")
+            header_length = 24 + field_count * 4
+            if header_length > extension_end or extension_end > len(body):
+                raise ValueError("core curve extension bounds are invalid")
+
+            descriptors: list[tuple[int, int, int]] = []
+            expected_width = 0
+            seen_ids: set[int] = set()
+            for index in range(field_count):
+                type_word, width, _aux = struct.unpack_from(
+                    "<HBB", body, 24 + index * 4
+                )
+                data_id = type_word & 0x8FFF
+                type_bits = type_word & 0x7000
+                if data_id in seen_ids:
+                    raise ValueError("core curve field ids are duplicated")
+                expected_field_width = 2 if type_bits == 0x3000 else 4
+                if (
+                    type_bits not in {0x1000, 0x2000, 0x3000}
+                    or width != expected_field_width
+                ):
+                    raise ValueError("core curve field type is unsupported")
+                seen_ids.add(data_id)
+                descriptors.append((data_id, type_bits, width))
+                expected_width += width
+            if expected_width != row_width:
+                raise ValueError("core curve row width is invalid")
+
+            ext = cls._parse_extensions(body[header_length:extension_end])
+            raw_symbol = ext.get(4)
+            raw_name = ext.get(55)
+            if not isinstance(raw_symbol, str) or raw_symbol != symbol:
+                raise ValueError("core curve response identity does not match")
+            if not isinstance(raw_name, str) or not raw_name.strip():
+                raise ValueError("core curve response name is missing")
+            if market_code_for_symbol(raw_symbol) != market:
+                raise ValueError("core curve response market does not match")
+
+            remaining = body[extension_end:]
+            expected_bytes = point_count * row_width
+
+            def decode_data(data_segment: bytes) -> bytearray:
+                if len(data_segment) >= 8:
+                    compressed_length = int.from_bytes(data_segment[:4], "little")
+                    declared_output = int.from_bytes(data_segment[4:8], "big")
+                    compressed = data_segment[8:]
+                    if (
+                        declared_output != expected_bytes
+                        or compressed_length
+                        not in {len(compressed), len(compressed) + 4}
+                    ):
+                        raise ValueError("core curve compressed length is invalid")
+                    column_bytes = decode_core_gov(compressed, expected_bytes)
+                    decoded_rows = bytearray(expected_bytes)
+                    for column in range(row_width):
+                        for row in range(point_count):
+                            decoded_rows[row * row_width + column] = column_bytes[
+                                column * point_count + row
+                            ]
+                    return decoded_rows
+                if len(data_segment) == expected_bytes:
+                    return bytearray(data_segment)
+                raise ValueError("core curve data is truncated")
+
+            row_bytes = decode_data(remaining)
+
+            data: dict[int, tuple[Decimal | int | None, ...]] = {}
+            field_offset = 0
+            for data_id, type_bits, width in descriptors:
+                column_values: list[Decimal | int | None] = []
+                for row in range(point_count):
+                    offset = row * row_width + field_offset
+                    raw = row_bytes[offset : offset + width]
+                    if len(raw) != width:
+                        raise ValueError("core curve row is truncated")
+                    if type_bits == 0x1000:
+                        column_values.append(
+                            _core_hxl_value(int.from_bytes(raw, "little"))
+                        )
+                    elif type_bits == 0x3000:
+                        column_values.append(
+                            int.from_bytes(raw, "little", signed=True)
+                        )
+                    else:
+                        column_values.append(
+                            int.from_bytes(raw, "little", signed=type_bits == 0x2000)
+                        )
+                data[data_id] = tuple(column_values)
+                field_offset += width
+            return _CoreCurve(symbol=raw_symbol, name=raw_name, ext=ext, data=data)
+        except DirectRequestError:
+            raise
+        except (KeyError, IndexError, TypeError, ValueError, struct.error, UnicodeDecodeError):
+            raise DirectRequestError("DIRECT_PROTOCOL_RESPONSE_INVALID") from None
+
+    @staticmethod
+    def _parse_extensions(payload: bytes) -> dict[int, object]:
+        if len(payload) < 2:
+            raise ValueError("core curve extension header is truncated")
+        position = 0
+        count = int.from_bytes(payload[:2], "little", signed=True)
+        position += 2
+        if count < 0 or count > 1024:
+            raise ValueError("core curve extension count is invalid")
+        result: dict[int, object] = {}
+        for _ in range(count):
+            if position + 2 > len(payload):
+                raise ValueError("core curve extension type is truncated")
+            type_word = int.from_bytes(payload[position : position + 2], "little")
+            position += 2
+            data_id = type_word & 0x8FFF
+            type_bits = type_word & 0x7000
+            if type_bits == 0:
+                if position + 2 > len(payload):
+                    raise ValueError("core curve extension string length is truncated")
+                length = int.from_bytes(payload[position : position + 2], "little")
+                position += 2
+                size = length * 2
+                if position + size > len(payload):
+                    raise ValueError("core curve extension string is truncated")
+                result[data_id] = payload[position : position + size].decode("utf-16-le")
+                position += size
+            elif type_bits == 0x1000:
+                if position + 4 > len(payload):
+                    raise ValueError("core curve extension HXLONG is truncated")
+                result[data_id] = _core_hxl_value(
+                    int.from_bytes(payload[position : position + 4], "little")
+                )
+                position += 4
+            elif type_bits == 0x2000:
+                if position + 4 > len(payload):
+                    raise ValueError("core curve extension int is truncated")
+                result[data_id] = int.from_bytes(
+                    payload[position : position + 4], "little", signed=True
+                )
+                position += 4
+            elif type_bits == 0x3000:
+                if position + 2 > len(payload):
+                    raise ValueError("core curve extension short is truncated")
+                result[data_id] = int.from_bytes(
+                    payload[position : position + 2], "little", signed=True
+                )
+                position += 2
+            elif type_bits == 0x5000:
+                if position + 8 > len(payload):
+                    raise ValueError("core curve extension double is truncated")
+                position += 8
+            elif type_bits == 0x6000:
+                if position + 2 > len(payload):
+                    raise ValueError("core curve extension array length is truncated")
+                length = int.from_bytes(
+                    payload[position : position + 2], "little", signed=True
+                )
+                position += 2
+                if length < 0 or length > 100 or position + 4 * length > len(payload):
+                    raise ValueError("core curve extension array is invalid")
+                result[data_id] = tuple(
+                    int.from_bytes(
+                        payload[position + 4 * index : position + 4 * index + 4],
+                        "little",
+                        signed=True,
+                    )
+                    for index in range(length)
+                )
+                position += 4 * length
+            elif type_bits == 0x7000:
+                if position + 2 > len(payload):
+                    raise ValueError("core curve extension struct length is truncated")
+                length = int.from_bytes(
+                    payload[position : position + 2], "little", signed=True
+                )
+                if length < 6 or position + length > len(payload):
+                    raise ValueError("core curve extension struct is invalid")
+                result[data_id] = None
+                position += length
+            else:
+                raise ValueError("core curve extension type is unsupported")
+        return result
+
+    @staticmethod
+    def _ext_decimal(value: object) -> Decimal | None:
+        return value if isinstance(value, Decimal) else _decimal(value)
+
+    @staticmethod
+    def _last_decimal(
+        values: tuple[Decimal | int | None, ...] | None,
+    ) -> Decimal | None:
+        if not values:
+            return None
+        for value in reversed(values):
+            if value is not None:
+                return value if isinstance(value, Decimal) else Decimal(value)
+        return None
+
+    @classmethod
+    def _series(
+        cls,
+        curve: _CoreCurve,
+        data_id: int,
+        *,
+        places: int,
+        divisor: Decimal = Decimal(1),
+        unit: str | None = None,
+    ) -> dict[str, object]:
+        times = curve.data.get(1, ())
+        values = curve.data.get(data_id, ())
+        points: list[dict[str, str | None]] = []
+        for raw_time, raw_value in zip(times, values, strict=True):
+            time_value = _core_time(raw_time)
+            if time_value is None:
+                continue
+            number = raw_value if isinstance(raw_value, Decimal) else _decimal(raw_value)
+            points.append(
+                {
+                    "time": time_value,
+                    "value": _core_format_number(
+                        number / divisor if number is not None else None,
+                        places,
+                    ),
+                }
+            )
+        latest_number = cls._last_decimal(values)
+        return {
+            "latest": _core_format_number(
+                latest_number / divisor if latest_number is not None else None,
+                places,
+                suffix=unit or "",
+            ),
+            "intraday": {"unit": unit, "points": points},
+        }
+
+    @classmethod
+    def _calculate_retail(
+        cls, curve: _CoreCurve
+    ) -> tuple[Decimal | None, ...] | None:
+        columns = [curve.data.get(data_id) for data_id in cls._RETAIL_DATA_IDS]
+        if any(column is None or not column for column in columns):
+            return None
+        assert all(column is not None for column in columns)
+        length = len(columns[0])
+        if any(len(column) != length for column in columns):
+            return None
+        divisor = cls._ext_decimal(curve.ext.get(407))
+        if divisor in (None, Decimal(0)):
+            return None
+        result: list[Decimal | None] = []
+        for index in range(length):
+            data = [column[index] for column in columns]
+            if any(value is None for value in data):
+                result.append(None)
+                continue
+            volume = data[0] if isinstance(data[0], Decimal) else Decimal(data[0])
+            amount = data[1] if isinstance(data[1], Decimal) else Decimal(data[1])
+            if volume == 0 or amount == 0:
+                result.append(None)
+                continue
+            positive = sum(
+                (
+                    value if isinstance(value, Decimal) else Decimal(value)
+                    for value in data[2:6]
+                ),
+                Decimal(0),
+            )
+            negative = sum(
+                (
+                    value if isinstance(value, Decimal) else Decimal(value)
+                    for value in data[6:10]
+                ),
+                Decimal(0),
+            )
+            result.append(
+                ((positive - negative) * Decimal(1000000))
+                / (divisor / (volume / amount))
+            )
+        return tuple(result)
+
+    @classmethod
+    def _calculate_macdfs(
+        cls,
+        curve: _CoreCurve,
+        params: tuple[int, int, int],
+    ) -> tuple[Decimal | None, ...] | None:
+        prices = curve.data.get(10)
+        if not prices:
+            return None
+        fallback = cls._ext_decimal(curve.ext.get(6)) or Decimal(0)
+        previous_price = fallback
+        ema_short = fallback
+        ema_long = fallback
+        dea = Decimal(0)
+        result: list[Decimal | None] = []
+
+        def ema(value: Decimal, period: int, previous: Decimal) -> Decimal:
+            return (
+                value * Decimal(2) + Decimal(period - 1) * previous
+            ) / Decimal(period + 1)
+
+        for index, raw_price in enumerate(prices):
+            price = (
+                raw_price
+                if isinstance(raw_price, Decimal)
+                else _decimal(raw_price)
+            )
+            if price is None:
+                price = previous_price if index > 0 else fallback
+            if index == 0:
+                ema_short = ema(price, params[0], price)
+                ema_long = ema(price, params[1], price)
+                diff = ema_short - ema_long
+                dea = ema(diff, params[2], diff)
+            else:
+                ema_short = ema(price, params[0], ema_short)
+                ema_long = ema(price, params[1], ema_long)
+                diff = ema_short - ema_long
+                dea = ema(diff, params[2], dea)
+            result.append((diff - dea) * Decimal(2))
+            previous_price = price
+        return tuple(result)
 
 
 def validate_core_auth_packet(packet: bytes) -> None:
@@ -429,21 +1204,45 @@ class ShadowParsedValueSource:
         values = getattr(result, "values", result)
         return values if isinstance(values, Mapping) else {}
 
+    @staticmethod
+    def _intraday(result: object) -> Mapping[object, object]:
+        intraday = getattr(result, "intraday_series", {})
+        return intraday if isinstance(intraday, Mapping) else {}
+
+    @staticmethod
+    def _intraday_signature(series: object) -> object:
+        if not isinstance(series, Mapping):
+            return series
+        raw_points = series.get("points", ())
+        points = [point for point in raw_points if isinstance(point, Mapping)]
+        return (
+            series.get("unit"),
+            tuple(point.get("time") for point in points),
+            points[-1].get("value") if points else None,
+        )
+
     def _compare(self, primary: object, candidate: object) -> None:
         primary_values = self._values(primary)
         candidate_values = self._values(candidate)
-        mismatches = sorted(
-            (
+        mismatches = {
                 key.value if isinstance(key, MetricKind) else str(key)
                 for key in set(primary_values) | set(candidate_values)
                 if primary_values.get(key) != candidate_values.get(key)
-            )
+        }
+        primary_intraday = self._intraday(primary)
+        candidate_intraday = self._intraday(candidate)
+        mismatches.update(
+            "intraday_series."
+            + (key.value if isinstance(key, MetricKind) else str(key))
+            for key in set(primary_intraday) | set(candidate_intraday)
+            if self._intraday_signature(primary_intraday.get(key))
+            != self._intraday_signature(candidate_intraday.get(key))
         )
         if mismatches:
             logger.warning(
                 "direct transport shadow mismatch role=%s fields=%s",
                 self.role,
-                ",".join(mismatches),
+                ",".join(sorted(mismatches)),
             )
 
     def read_direct(self, symbol: str):
@@ -520,10 +1319,14 @@ class Core9528TemplateProtocol:
         ] = socket.create_connection,
         response_decoder: CoreResponseDecoder | None = None,
         max_response_frames: int = 64,
+        frame_idle_timeout_seconds: float = 0.5,
     ) -> None:
+        if frame_idle_timeout_seconds <= 0:
+            raise ValueError("frame_idle_timeout_seconds must be positive")
         self.socket_factory = socket_factory
         self.response_decoder = response_decoder
         self.max_response_frames = max_response_frames
+        self.frame_idle_timeout_seconds = frame_idle_timeout_seconds
 
     def ensure_read_direct_supported(self) -> None:
         if self.response_decoder is None:
@@ -565,30 +1368,135 @@ class Core9528TemplateProtocol:
         return host, port, [auth, *packets], alphabet
 
     @staticmethod
-    def _read_exact(connection: object, length: int, deadline: float) -> bytes:
+    def _material_macdfs_params(
+        material: object,
+    ) -> tuple[int, int, int] | None:
+        core_material = getattr(material, "core_material", {})
+        raw_value = core_material.get("macdfs_params", "")
+        raw_params = "" if raw_value is None else str(raw_value).strip()
+        if not raw_params:
+            return None
+        try:
+            parsed = json.loads(raw_params)
+        except json.JSONDecodeError:
+            raise DirectRequestError("DIRECT_PROTOCOL_HANDSHAKE_FAILED") from None
+        if (
+            not isinstance(parsed, list)
+            or len(parsed) != 3
+            or any(
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or value <= 0
+                or value > 1000
+                for value in parsed
+            )
+        ):
+            raise DirectRequestError("DIRECT_PROTOCOL_HANDSHAKE_FAILED")
+        return parsed[0], parsed[1], parsed[2]
+
+    @staticmethod
+    def _read_exact(
+        connection: object,
+        length: int,
+        deadline: float,
+        *,
+        max_wait_seconds: float | None = None,
+    ) -> bytes:
         chunks: list[bytes] = []
         received = 0
         while received < length:
-            if time.monotonic() >= deadline:
+            remaining_seconds = deadline - time.monotonic()
+            if remaining_seconds <= 0:
                 raise DirectRequestError("DIRECT_PROTOCOL_RESPONSE_TIMEOUT")
-            chunk = connection.recv(length - received)
+            socket_timeout_seconds = remaining_seconds
+            if max_wait_seconds is not None:
+                socket_timeout_seconds = min(
+                    socket_timeout_seconds,
+                    max_wait_seconds,
+                )
+            settimeout = getattr(connection, "settimeout", None)
+            if callable(settimeout):
+                settimeout(socket_timeout_seconds)
+            try:
+                chunk = connection.recv(length - received)
+            except (TimeoutError, OSError):
+                if received:
+                    raise DirectRequestError(
+                        "DIRECT_PROTOCOL_RESPONSE_INVALID"
+                    ) from None
+                raise DirectRequestError(
+                    "DIRECT_PROTOCOL_RESPONSE_TIMEOUT"
+                ) from None
             if not chunk:
                 raise DirectRequestError("DIRECT_PROTOCOL_RESPONSE_INVALID")
             chunks.append(bytes(chunk))
             received += len(chunk)
         return b"".join(chunks)
 
-    def _read_frames(self, connection: object, timeout_seconds: float) -> list[bytes]:
+    @staticmethod
+    def _is_curve_frame(frame: bytes) -> bool:
+        """Recognize a ``cv3`` payload without decoding its fields."""
+
+        payload = frame[13:]
+        if len(payload) < 10:
+            return False
+        head_length = int.from_bytes(payload[:2], "little")
+        if head_length < 24 or head_length > len(payload):
+            return False
+        body = payload[head_length:]
+        head_type = int.from_bytes(payload[6:10], "little", signed=True)
+        if head_type & 0xF0000000:
+            return False
+        if head_type & 0xF000 == 0x1000:
+            try:
+                body = decode_core_snappy(body)
+            except DirectRequestError:
+                return False
+        elif head_type & 0xF000 == 0x3000:
+            return False
+        return body[:3].lower() == b"cv3" or body[4:7].lower() == b"cv3"
+
+    def _read_frames(
+        self,
+        connection: object,
+        timeout_seconds: float,
+        *,
+        stop_after_curves: int | None = None,
+        inter_frame_timeout_seconds: float | None = None,
+    ) -> list[bytes]:
+        if stop_after_curves is not None and stop_after_curves <= 0:
+            raise ValueError("stop_after_curves must be positive")
+        if (
+            inter_frame_timeout_seconds is not None
+            and inter_frame_timeout_seconds <= 0
+        ):
+            raise ValueError("inter_frame_timeout_seconds must be positive")
         deadline = time.monotonic() + timeout_seconds
         frames: list[bytes] = []
+        curve_frames = 0
         for _ in range(self.max_response_frames):
             try:
-                header = self._read_exact(connection, 13, deadline)
-            except DirectRequestError:
-                if frames:
+                header = self._read_exact(
+                    connection,
+                    13,
+                    deadline,
+                    max_wait_seconds=(
+                        inter_frame_timeout_seconds if frames else None
+                    ),
+                )
+            except DirectRequestError as error:
+                if (
+                    frames
+                    and error.error_code == "DIRECT_PROTOCOL_RESPONSE_TIMEOUT"
+                ):
                     break
                 raise
             if header[:4] != b"\xfd" * 4:
+                raise DirectRequestError("DIRECT_PROTOCOL_RESPONSE_INVALID")
+            if (
+                re.fullmatch(rb"[0-9A-Fa-f]{8}", header[4:12]) is None
+                or header[12] != 0
+            ):
                 raise DirectRequestError("DIRECT_PROTOCOL_RESPONSE_INVALID")
             try:
                 length = int(header[4:12].decode("ascii"), 16)
@@ -596,7 +1504,21 @@ class Core9528TemplateProtocol:
                 raise DirectRequestError("DIRECT_PROTOCOL_RESPONSE_INVALID") from None
             if length < 0 or length > 16 * 1024 * 1024:
                 raise DirectRequestError("DIRECT_PROTOCOL_RESPONSE_INVALID")
-            frames.append(header + self._read_exact(connection, length, deadline))
+            try:
+                body = self._read_exact(connection, length, deadline)
+            except DirectRequestError as error:
+                # A complete header commits us to reading this frame.  Even
+                # an empty read after it is a truncated response, not idle.
+                if error.error_code == "DIRECT_PROTOCOL_RESPONSE_TIMEOUT":
+                    raise DirectRequestError(
+                        "DIRECT_PROTOCOL_RESPONSE_INVALID"
+                    ) from None
+                raise
+            frames.append(header + body)
+            if stop_after_curves is not None and self._is_curve_frame(frames[-1]):
+                curve_frames += 1
+                if curve_frames >= stop_after_curves:
+                    break
         return frames
 
     def read_direct(
@@ -604,19 +1526,59 @@ class Core9528TemplateProtocol:
     ) -> DirectReadOutcome:
         self.ensure_read_direct_supported()
         host, port, packets, _alphabet = self._material_packets(material, symbol)
+        macdfs_params = self._material_macdfs_params(material)
+        if macdfs_params is None and callable(
+            getattr(self.response_decoder, "with_macdfs_params", None)
+        ):
+            raise DirectRequestError("DIRECT_PROTOCOL_HANDSHAKE_FAILED")
         timeout_seconds = float(getattr(material, "timeout_seconds", 10.0))
         connection = None
         try:
             connection = self.socket_factory((host, port), timeout_seconds)
             connection.settimeout(timeout_seconds)
-            for packet in packets:
-                connection.sendall(packet)
-            frames = self._read_frames(connection, timeout_seconds)
+            # The App's server expects the authentication response before it
+            # accepts a request template.  Keep the handshake stateful so a
+            # fresh connection has the same ordering as the App connection.
+            connection.sendall(packets[0])
+            frames = self._read_frames(
+                connection,
+                timeout_seconds,
+                inter_frame_timeout_seconds=self.frame_idle_timeout_seconds,
+            )
             if not frames:
                 raise DirectRequestError("DIRECT_PROTOCOL_RESPONSE_TIMEOUT")
+            # Captured request templates are emitted as adjacent pairs by the
+            # App (a request descriptor followed by its 6001 payload).  Keep
+            # each pair together and stop after its first curve response before
+            # moving on to the next indicator.  A final unpaired template is
+            # still sent as a single request for compatibility with captures.
+            seen_batches: set[tuple[bytes, ...]] = set()
+            for batch_start in range(1, len(packets), 2):
+                batch = tuple(packets[batch_start : batch_start + 2])
+                if batch in seen_batches:
+                    continue
+                seen_batches.add(batch)
+                for packet in batch:
+                    connection.sendall(packet)
+                frames.extend(
+                    self._read_frames(
+                        connection,
+                        timeout_seconds,
+                        stop_after_curves=1,
+                    )
+                )
             assert self.response_decoder is not None
+            response_decoder = self.response_decoder
+            if macdfs_params is not None:
+                bind_macdfs_params = getattr(
+                    response_decoder,
+                    "with_macdfs_params",
+                    None,
+                )
+                if callable(bind_macdfs_params):
+                    response_decoder = bind_macdfs_params(macdfs_params)
             try:
-                return self.response_decoder(frames, symbol, market)
+                return response_decoder(frames, symbol, market)
             except DirectRequestError as error:
                 raise DirectRequestError(
                     sanitized_direct_error_code(

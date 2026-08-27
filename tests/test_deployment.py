@@ -13,13 +13,18 @@ from level2_service.app_sessions import EncryptedFileSessionProvider
 from level2_service.daily_kline import DailyKlineMarketDataSource
 from level2_service.direct_market import (
     Core9528Client,
+    Core9528CurveDecoder,
     Core9528TemplateProtocol,
     FundFlowHttpClient,
     ShadowParsedValueSource,
 )
 from level2_service.market_accounts import RedisMarketSessionStore, SQLiteMarketAccountStore
 from level2_service.market_data import MarketDataBroker
-from level2_service.parsed_values import DirectRequestError, DualAccountParsedValueSource
+from level2_service.parsed_values import (
+    DirectRequestError,
+    DualAccountParsedValueSource,
+    FridaParsedValueSource,
+)
 from level2_service.runner import DailyCheckState, OpenCVTemplateFallback, long_capture_has_net_heading
 from level2_service.symbol_cache import RedisSymbolLookupCache
 from scripts.preflight import PreflightError, validate_apk, validate_host_profile
@@ -265,7 +270,7 @@ def test_production_factory_wires_the_fund_http_transport(
     assert set(app.state.account_session_refreshers) == {"core_metrics", "main_fund_flow"}
 
 
-def test_production_factory_exposes_the_core_protocol_stage_gate(tmp_path: Path) -> None:
+def test_production_factory_wires_the_verified_core_decoder(tmp_path: Path) -> None:
     environment = dual_environment(tmp_path)
     environment["CORE_METRICS_TRANSPORT"] = "direct"
     settings = DeploymentSettings.from_environ(environment)
@@ -280,9 +285,13 @@ def test_production_factory_exposes_the_core_protocol_stage_gate(tmp_path: Path)
     source = app.state.runner.parsed_value_source
     assert isinstance(source.core_source, Core9528Client)
     assert isinstance(source.core_source.protocol, Core9528TemplateProtocol)
+    assert isinstance(
+        source.core_source.protocol.response_decoder,
+        Core9528CurveDecoder,
+    )
 
 
-def test_production_core_stage_gate_fails_before_session_material_or_socket_activity(
+def test_production_core_direct_requires_session_material_before_socket_activity(
     tmp_path: Path,
 ) -> None:
     environment = dual_environment(tmp_path)
@@ -294,17 +303,34 @@ def test_production_core_stage_gate_fails_before_session_material_or_socket_acti
         runner_factory=FakeRunner,
     )
     client = app.state.runner.parsed_value_source.core_source
-    client.session_provider.get = lambda _role: (_ for _ in ()).throw(
-        AssertionError("stage gate must not load encrypted material")
-    )
+    client.session_provider.get = lambda _role: None
     client.protocol.socket_factory = lambda *_args: (_ for _ in ()).throw(
-        AssertionError("stage gate must not create a socket")
+        AssertionError("missing session material must not create a socket")
     )
 
     with pytest.raises(DirectRequestError) as caught:
         client.read_direct("601872")
 
-    assert caught.value.error_code == "DIRECT_PROTOCOL_RESPONSE_UNSUPPORTED"
+    assert caught.value.error_code == "DIRECT_SESSION_UNAVAILABLE"
+
+
+def test_production_core_direct_keeps_market_snapshots_on_frida(tmp_path: Path) -> None:
+    environment = dual_environment(tmp_path)
+    environment["CORE_METRICS_TRANSPORT"] = "direct"
+    app = create_production_app(
+        settings=DeploymentSettings.from_environ(environment),
+        redis_client_factory=lambda _url: FakeRedis(),
+        bridge_factory=FakeBridge,
+        runner_factory=FakeRunner,
+    )
+
+    task_source = app.state.runner.parsed_value_source
+    market_source = app.state.market_data_broker.source.app_source
+
+    assert market_source is not task_source
+    assert isinstance(market_source, DualAccountParsedValueSource)
+    assert isinstance(market_source.core_source, FridaParsedValueSource)
+    assert market_source.fund_source is task_source.fund_source
 
 
 def test_production_factory_wires_two_independent_bridges_and_frida_sources(tmp_path: Path) -> None:

@@ -23,6 +23,7 @@ from .app_sessions import (
 from .daily_kline import DailyKlineMarketDataSource, TonghuashunPublicDailyKlineProvider
 from .direct_market import (
     Core9528Client,
+    Core9528CurveDecoder,
     Core9528TemplateProtocol,
     FundFlowHttpClient,
     ShadowParsedValueSource,
@@ -290,6 +291,7 @@ def create_production_app(
     navigator = Level2Navigator(core_bridge, OpenCVTemplateFallback(templates))
     account_session_provider = None
     account_session_refreshers: dict[str, Callable] = {}
+    market_parsed_value_source = None
     if config.dual_account_mode:
         assert config.core_frida_server_endpoint is not None
         assert config.fund_frida_server_endpoint is not None
@@ -328,7 +330,9 @@ def create_production_app(
             assert account_session_provider is not None
             direct_core_source = Core9528Client(
                 account_session_provider,
-                protocol=Core9528TemplateProtocol(),
+                protocol=Core9528TemplateProtocol(
+                    response_decoder=Core9528CurveDecoder(),
+                ),
             )
             core_source = (
                 direct_core_source
@@ -358,12 +362,22 @@ def create_production_app(
             fund_source,
             symbol_source=frida_core_source,
         )
+        market_parsed_value_source = (
+            parsed_value_source
+            if config.core_metrics_transport == "frida"
+            else DualAccountParsedValueSource(
+                frida_core_source,
+                fund_source,
+                symbol_source=frida_core_source,
+            )
+        )
     else:
         parsed_value_source = (
             FridaParsedValueSource(config.frida_server_endpoint)
             if config.frida_server_endpoint
             else None
         )
+        market_parsed_value_source = parsed_value_source
     runner = runner_factory(
         store,
         navigator,
@@ -378,13 +392,13 @@ def create_production_app(
     market_broker = (
         MarketDataBroker(
             DailyKlineMarketDataSource(
-                parsed_value_source,
+                market_parsed_value_source,
                 TonghuashunPublicDailyKlineProvider(),
                 is_market_open=is_china_market_open,
             ),
             is_market_open=is_china_market_open,
         )
-        if parsed_value_source is not None
+        if market_parsed_value_source is not None
         else None
     )
     app = create_app(

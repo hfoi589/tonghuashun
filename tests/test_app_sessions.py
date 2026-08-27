@@ -115,6 +115,37 @@ def test_session_provider_exposes_missing_and_error_states(tmp_path: Path) -> No
     }
 
 
+def test_session_provider_marks_legacy_core_bundle_without_macdfs_params_error(
+    tmp_path: Path,
+) -> None:
+    provider = EncryptedFileSessionProvider(tmp_path / "sessions", encryption_key())
+    legacy = AccountSessionBundle(
+        role="core_metrics",
+        cookie="",
+        user_agent="",
+        platform="android",
+        updated_at=datetime(2026, 8, 26, 10, 30, tzinfo=timezone.utc),
+        core_material={
+            "server_ip": "60.204.184.46",
+            "server_port": "9528",
+            "auth_packet_hex": core_auth_packet_hex(),
+            "base64_alphabet": CORE_BASE64_ALPHABET,
+            "template_symbol": "600519",
+            "request_packets_hex": json.dumps([core_template_packet_hex()]),
+        },
+    )
+    encoded = json.dumps(legacy._as_storage(), separators=(",", ":")).encode()
+    provider._path("core_metrics").write_bytes(provider._fernet.encrypt(encoded))
+
+    assert provider.get("core_metrics") is None
+    assert provider.status("core_metrics").as_public() == {
+        "role": "core_metrics",
+        "state": "ERROR",
+        "updated_at": None,
+        "error_code": "DIRECT_PROTOCOL_HANDSHAKE_FAILED",
+    }
+
+
 def test_session_provider_rejects_invalid_roles_and_keys(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="THS_SESSION_ENCRYPTION_KEY"):
         EncryptedFileSessionProvider(tmp_path / "sessions", "not-a-fernet-key")
@@ -184,6 +215,7 @@ def test_core_session_refresher_preserves_complete_opaque_material_without_expos
             "base64_alphabet": CORE_BASE64_ALPHABET,
             "template_symbol": "600519",
             "request_packets_hex": json.dumps([synthetic_request]),
+            "macdfs_params": json.dumps([10, 20, 5]),
         },
         now=lambda: datetime(2026, 8, 26, 10, 30, tzinfo=timezone.utc),
     )
@@ -203,11 +235,55 @@ def test_core_session_refresher_preserves_complete_opaque_material_without_expos
     assert json.loads(refreshed.core_material["request_packets_hex"]) == [
         synthetic_request
     ]
+    assert json.loads(refreshed.core_material["macdfs_params"]) == [10, 20, 5]
     for secret in (synthetic_auth, synthetic_request):
         assert secret not in repr(refreshed)
         assert secret not in public_status
         assert secret not in caplog.text
         assert secret.encode("ascii") not in stored
+
+
+def test_core_session_refresher_preserves_macdfs_parameters() -> None:
+    refresher = CoreAccountSessionRefresher(
+        lambda: {
+            "server_ip": "60.204.184.46",
+            "server_port": "9528",
+            "auth_packet_hex": core_auth_packet_hex(),
+            "base64_alphabet": CORE_BASE64_ALPHABET,
+            "template_symbol": "600519",
+            "request_packets_hex": json.dumps([core_template_packet_hex()]),
+            "macdfs_params": json.dumps([10, 20, 5]),
+        }
+    )
+
+    refreshed = refresher("core_metrics")
+
+    assert json.loads(refreshed.core_material["macdfs_params"]) == [10, 20, 5]
+
+
+@pytest.mark.parametrize(
+    "macdfs_params",
+    ["not-json", json.dumps([10, 20]), json.dumps([10, 0, 5])],
+)
+def test_core_session_refresher_rejects_invalid_macdfs_parameters(
+    macdfs_params: str,
+) -> None:
+    refresher = CoreAccountSessionRefresher(
+        lambda: {
+            "server_ip": "60.204.184.46",
+            "server_port": "9528",
+            "auth_packet_hex": core_auth_packet_hex(),
+            "base64_alphabet": CORE_BASE64_ALPHABET,
+            "template_symbol": "600519",
+            "request_packets_hex": json.dumps([core_template_packet_hex()]),
+            "macdfs_params": macdfs_params,
+        }
+    )
+
+    with pytest.raises(DirectRequestError) as error:
+        refresher("core_metrics")
+
+    assert error.value.error_code == "DIRECT_PROTOCOL_HANDSHAKE_FAILED"
 
 
 def test_core_session_refresher_rejects_missing_protocol_material() -> None:
@@ -613,6 +689,46 @@ process.stdout.write(JSON.stringify({{ packetCount: rpc.exports.packets().length
     assert json.loads(completed.stdout) == {"packetCount": 1}
 
 
+@pytest.mark.skipif(shutil.which("node") is None, reason="Node.js is not installed")
+def test_core_capture_script_binds_macdfs_parameters_to_the_armed_symbol() -> None:
+    harness = f"""
+const calculate = {{ call: () => null, implementation: null }};
+const transform = {{ call: () => null, implementation: null }};
+const socketSend = {{ call: () => null, implementation: null }};
+const write = {{ call: () => null, implementation: null }};
+globalThis.rpc = {{ exports: {{}} }};
+globalThis.Java = {{
+  perform: (callback) => callback(),
+  use: (name) => {{
+    if (name === 'wmg') return {{ E: {{ overload: () => calculate }} }};
+    if (name === 'nsv') return {{ I: {{ overload: () => transform }} }};
+    if (name === 'com.hexin.plat.android.net.Socket') return {{ send: {{ overload: () => socketSend }} }};
+    if (name === 'java.net.SocketOutputStream') return {{ write: {{ overload: () => write }} }};
+    return {{}};
+  }}
+}};
+new Function({json.dumps(_FRIDA_CORE_SESSION_CAPTURE_SCRIPT)})();
+const indicator = (symbol) => ({{ g: () => ({{ getExtData: () => symbol }}) }});
+const descriptor = (params) => ({{ getTechParam: () => params }});
+calculate.implementation(indicator('600519'), descriptor([12, 26, 9]));
+rpc.exports.arm('600519');
+calculate.implementation(indicator('600519'), descriptor([10, 20, 5]));
+Promise.resolve(rpc.exports.macdfsparams()).then((result) => process.stdout.write(result));
+"""
+
+    completed = subprocess.run(
+        ["node", "-e", harness],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+        timeout=5,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert json.loads(completed.stdout) == [10, 20, 5]
+
+
 def test_core_session_capture_collects_complete_template_material(monkeypatch) -> None:
     calls: dict[str, object] = {}
     synthetic_request = core_template_packet_hex()
@@ -633,6 +749,10 @@ def test_core_session_capture_collects_complete_template_material(monkeypatch) -
 
         def packets(self) -> list[str]:
             return [synthetic_request]
+
+        def macdfsparams(self) -> str:
+            calls["macdfs_params_requested"] = True
+            return json.dumps([10, 20, 5])
 
     class FakeScript:
         exports_sync = FakeExports()
@@ -689,11 +809,13 @@ def test_core_session_capture_collects_complete_template_material(monkeypatch) -
     assert captured["server_port"] == "9528"
     assert captured["auth_packet_hex"] == core_auth_packet_hex()
     assert captured["template_symbol"] == "600519"
+    assert json.loads(captured["macdfs_params"]) == [10, 20, 5]
     assert json.loads(captured["request_packets_hex"]) == [synthetic_request]
     assert calls["timeout"] == 3500
     assert calls["endpoint"] == "127.0.0.1:27043"
     assert calls["pid"] == 14186
     assert calls["armed_symbol"] == "600519"
+    assert calls["macdfs_params_requested"] is True
     assert calls["trigger"] == (
         "127.0.0.1:27043",
         "com.hexin.plat.android",

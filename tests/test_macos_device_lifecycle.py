@@ -2,10 +2,12 @@ from __future__ import annotations
 
 from datetime import datetime
 from importlib.util import module_from_spec, spec_from_file_location
+import json
 from pathlib import Path
 import subprocess
 import threading
 import time
+from http.client import HTTPConnection
 
 import pytest
 
@@ -84,6 +86,122 @@ def wait_for_terminal(manager, operation_id: str):
             return operation
         time.sleep(0.001)
     pytest.fail("operation did not reach a terminal state")
+
+
+def start_test_server(*, token: str, manager):
+    server = module.ThreadingHTTPServer(("127.0.0.1", 0), module.make_handler(manager, token))
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    return server, thread
+
+
+def request(
+    server,
+    method: str,
+    path: str,
+    *,
+    token: str | None = None,
+    json_body: object | None = None,
+    raw_body: bytes | None = None,
+    content_type: str = "application/json",
+):
+    headers = {}
+    if token is not None:
+        headers["Authorization"] = f"Bearer {token}"
+    if json_body is not None:
+        raw_body = json.dumps(json_body).encode("utf-8")
+    if raw_body is not None:
+        headers["Content-Type"] = content_type
+    connection = HTTPConnection("127.0.0.1", server.server_port, timeout=1)
+    connection.request(method, path, body=raw_body, headers=headers)
+    response = connection.getresponse()
+    payload = response.read()
+    connection.close()
+    return response.status, json.loads(payload.decode("utf-8"))
+
+
+@pytest.fixture
+def http_server():
+    server, thread = start_test_server(token="host-secret", manager=make_manager(FakeCommandRunner()))
+    yield server
+    server.shutdown()
+    server.server_close()
+    thread.join(1)
+
+
+def test_http_service_requires_bearer_token(http_server) -> None:
+    """Removing broker authentication would expose host lifecycle controls."""
+    status, body = request(http_server, "GET", "/v1/devices")
+
+    assert status == 401
+    assert body == {"detail": "DEVICE_AUTH_REQUIRED"}
+
+
+def test_http_service_rejects_action_fields_other_than_action(http_server) -> None:
+    """Accepting serial overrides would let callers bypass fixed device mappings."""
+    status, body = request(
+        http_server,
+        "POST",
+        "/v1/devices/core_metrics/actions",
+        token="host-secret",
+        json_body={"action": "shutdown", "serial": "emulator-9999"},
+    )
+
+    assert status == 422
+    assert body == {"detail": "DEVICE_ACTION_INVALID"}
+
+
+def test_http_service_accepts_a_safe_action_and_returns_only_public_fields(http_server) -> None:
+    """Returning command or device details would leak host-control implementation data."""
+    status, body = request(
+        http_server,
+        "POST",
+        "/v1/devices/core_metrics/actions",
+        token="host-secret",
+        json_body={"action": "shutdown"},
+    )
+
+    assert status == 202
+    assert set(body) == {"operation_id", "role", "action", "state", "error_code", "updated_at"}
+    assert body["role"] == "core_metrics"
+    assert body["action"] == "shutdown"
+
+
+def test_http_service_returns_404_for_unknown_operation(http_server) -> None:
+    """Treating arbitrary operation IDs as valid would blur operation state ownership."""
+    status, body = request(http_server, "GET", "/v1/operations/not-an-operation", token="host-secret")
+
+    assert status == 404
+    assert body == {"detail": "DEVICE_OPERATION_NOT_FOUND"}
+
+
+def test_http_service_rejects_oversized_action_body(http_server) -> None:
+    """Removing the request cap would permit unbounded loopback request buffering."""
+    status, body = request(
+        http_server,
+        "POST",
+        "/v1/devices/core_metrics/actions",
+        token="host-secret",
+        raw_body=b"x" * 1025,
+    )
+
+    assert status == 413
+    assert body == {"detail": "DEVICE_REQUEST_TOO_LARGE"}
+
+
+def test_http_service_rejects_non_json_action_body(http_server) -> None:
+    """Parsing arbitrary non-JSON bodies would weaken the fixed action schema."""
+    status, body = request(
+        http_server,
+        "POST",
+        "/v1/devices/core_metrics/actions",
+        token="host-secret",
+        raw_body=b"action=shutdown",
+        content_type="application/x-www-form-urlencoded",
+    )
+
+    assert status == 400
+    assert body == {"detail": "DEVICE_ACTION_INVALID"}
 
 
 def public_device(item: dict[str, object]) -> None:

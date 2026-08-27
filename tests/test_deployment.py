@@ -34,6 +34,9 @@ from level2_service.symbol_catalog import SQLiteSymbolCatalog
 from scripts.preflight import PreflightError, validate_apk, validate_host_profile
 
 
+INSTALLER = Path(__file__).parents[1] / "scripts" / "install-macos-device-lifecycle.sh"
+
+
 class FakeRedis:
     """Enough of the Redis protocol for construction; no network is used."""
 
@@ -80,6 +83,43 @@ class FakeRunner:
     def run_once(self) -> None:
         self.calls += 1
         self.control.heartbeat("READY")
+
+
+def test_lifecycle_installer_uses_stable_secret_and_launchagent_locations() -> None:
+    """Referencing a worktree could leave the host broker broken after cleanup."""
+    installer = INSTALLER.read_text(encoding="utf-8")
+
+    assert ".config/ths-device-lifecycle.env" in installer
+    assert "chmod 0600" in installer
+    assert "Library/LaunchAgents/com.ths.device-lifecycle.plist" in installer
+    assert ".local/lib/ths-device-lifecycle/" in installer
+    assert "macos-device-lifecycle.py" in installer
+    assert "watch-macos-device-bridge.sh" in installer
+    assert "com.ths.device-bridge.27042.plist" in installer
+    assert "com.ths.device-bridge.27043.plist" in installer
+
+
+def test_lifecycle_installer_launches_only_stable_copies_without_secrets() -> None:
+    """Embedding a token or repository path in a plist would expose or destabilize the broker."""
+    installer = INSTALLER.read_text(encoding="utf-8")
+
+    assert "launchctl bootstrap gui/$UID" in installer
+    assert "launchctl kickstart -k gui/$UID/com.ths.device-lifecycle" in installer
+    plist_writers = installer.split("write_service_plist() {", 1)[1].split(
+        "write_service_plist\n", 1
+    )[0]
+    assert "THS_DEVICE_LIFECYCLE_TOKEN" not in plist_writers
+    assert "$token" not in plist_writers
+    assert "${project_root}" not in plist_writers
+    assert "printf '%s\\n' \"$token\"" not in installer
+
+
+def test_lifecycle_installer_excludes_forbidden_device_mutations() -> None:
+    """Adding destructive ADB or AVD commands would violate the protected-device boundary."""
+    installer = INSTALLER.read_text(encoding="utf-8")
+
+    forbidden = ("force-stop", "pm clear", "install -r", " uninstall", "wipe-data", "avdmanager create")
+    assert not [command for command in forbidden if command in installer]
 
 
 class StaticCatalogSource:

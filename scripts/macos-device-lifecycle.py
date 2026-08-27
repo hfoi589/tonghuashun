@@ -9,6 +9,9 @@ command construction.
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
+import argparse
+import hmac
+import json
 import os
 from pathlib import Path
 import secrets
@@ -16,11 +19,14 @@ import subprocess
 import threading
 import time
 from typing import Mapping, Protocol
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlsplit
 
 
 PACKAGE_ACTIVITY = "com.hexin.plat.android/com.hexin.plat.android.LogoEmptyActivity"
 PACKAGE_NAME = "com.hexin.plat.android"
 SCRIPT_DIRECTORY = Path(__file__).resolve().parent
+MAX_REQUEST_BODY_BYTES = 1024
 
 
 class LifecycleState(str, Enum):
@@ -46,6 +52,14 @@ class DeviceConfig:
     emulator_port: int
     frida_host_port: int
     calibrate_display: bool = False
+
+
+@dataclass(frozen=True)
+class HostSettings:
+    bind_host: str
+    port: int
+    token: str
+    environment: Mapping[str, str]
 
 
 @dataclass
@@ -339,3 +353,174 @@ class DeviceLifecycleManager:
     @staticmethod
     def _now() -> datetime:
         return datetime.now(timezone.utc)
+
+
+def load_settings(config_path: Path) -> HostSettings:
+    """Load only the broker settings from its owner-readable host config."""
+    try:
+        lines = config_path.read_text(encoding="utf-8").splitlines()
+    except OSError as exc:
+        raise SystemExit("DEVICE_LIFECYCLE_UNCONFIGURED") from exc
+    values: dict[str, str] = {}
+    for line in lines:
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        values[key] = value
+    token = values.get("THS_DEVICE_LIFECYCLE_TOKEN", "")
+    bind_host = values.get("THS_DEVICE_LIFECYCLE_BIND_HOST", "127.0.0.1")
+    try:
+        port = int(values.get("THS_DEVICE_LIFECYCLE_PORT", "18765"))
+    except ValueError as exc:
+        raise SystemExit("DEVICE_LIFECYCLE_UNCONFIGURED") from exc
+    if not token or not 1 <= port <= 65535:
+        raise SystemExit("DEVICE_LIFECYCLE_UNCONFIGURED")
+    environment = {"PATH": values.get("PATH", os.environ.get("PATH", ""))}
+    if "THS_DEVICE_LIFECYCLE_EMULATOR_BIN" in values:
+        environment["THS_DEVICE_LIFECYCLE_EMULATOR_BIN"] = values[
+            "THS_DEVICE_LIFECYCLE_EMULATOR_BIN"
+        ]
+    return HostSettings(bind_host, port, token, environment)
+
+
+class LifecycleRequestHandler(BaseHTTPRequestHandler):
+    """Narrow loopback-only HTTP boundary for the fixed lifecycle manager."""
+
+    manager: DeviceLifecycleManager
+    token: str
+
+    def do_GET(self) -> None:  # noqa: N802 - HTTP verb hook
+        if not self._authorized():
+            return
+        route = urlsplit(self.path)
+        if route.query:
+            self._error(404, "DEVICE_ROUTE_NOT_FOUND")
+        elif route.path == "/v1/devices":
+            self._send(200, {"devices": self.manager.devices()})
+        elif route.path.startswith("/v1/operations/"):
+            operation_id = route.path.removeprefix("/v1/operations/")
+            if not operation_id or "/" in operation_id:
+                self._error(404, "DEVICE_OPERATION_NOT_FOUND")
+                return
+            operation = self.manager.operation(operation_id)
+            if operation is None:
+                self._error(404, "DEVICE_OPERATION_NOT_FOUND")
+                return
+            self._send(200, operation.public_dict())
+        else:
+            self._error(404, "DEVICE_ROUTE_NOT_FOUND")
+
+    def do_POST(self) -> None:  # noqa: N802 - HTTP verb hook
+        if not self._authorized():
+            return
+        route = urlsplit(self.path)
+        prefix = "/v1/devices/"
+        suffix = "/actions"
+        if route.query or not route.path.startswith(prefix) or not route.path.endswith(suffix):
+            self._error(404, "DEVICE_ROUTE_NOT_FOUND")
+            return
+        role = route.path[len(prefix):-len(suffix)]
+        if not role or "/" in role:
+            self._error(404, "DEVICE_ROUTE_NOT_FOUND")
+            return
+        payload = self._action_payload()
+        if payload is None:
+            return
+        if set(payload) != {"action"} or not isinstance(payload["action"], str):
+            self._error(422, "DEVICE_ACTION_INVALID")
+            return
+        try:
+            operation = self.manager.submit(role, payload["action"])
+        except LifecycleRequestError as exc:
+            status = 409 if exc.error_code == "DEVICE_ACTION_IN_PROGRESS" else 422
+            self._error(status, exc.error_code)
+            return
+        self._send(202, operation.public_dict())
+
+    def _authorized(self) -> bool:
+        header = self.headers.get("Authorization")
+        expected = f"Bearer {self.token}"
+        try:
+            valid = header is not None and hmac.compare_digest(header, expected)
+        except TypeError:
+            valid = False
+        if not valid:
+            self._error(401, "DEVICE_AUTH_REQUIRED")
+            return False
+        return True
+
+    def _action_payload(self) -> dict[str, object] | None:
+        if self.headers.get("Content-Type") != "application/json":
+            self._error(400, "DEVICE_ACTION_INVALID")
+            return None
+        try:
+            length = int(self.headers.get("Content-Length", ""))
+        except ValueError:
+            self._error(400, "DEVICE_ACTION_INVALID")
+            return None
+        if length < 0:
+            self._error(400, "DEVICE_ACTION_INVALID")
+            return None
+        if length > MAX_REQUEST_BODY_BYTES:
+            self._error(413, "DEVICE_REQUEST_TOO_LARGE")
+            return None
+        try:
+            parsed = json.loads(self.rfile.read(length).decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            self._error(400, "DEVICE_ACTION_INVALID")
+            return None
+        if not isinstance(parsed, dict):
+            self._error(422, "DEVICE_ACTION_INVALID")
+            return None
+        return parsed
+
+    def _send(self, status: int, document: Mapping[str, object]) -> None:
+        body = json.dumps(document, separators=(",", ":")).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _error(self, status: int, error_code: str) -> None:
+        self._send(status, {"detail": error_code})
+
+    def log_message(self, _format: str, *_args: object) -> None:
+        """Never log request paths, headers, bodies, or exception details."""
+
+
+def make_handler(manager: DeviceLifecycleManager, token: str) -> type[LifecycleRequestHandler]:
+    if not token:
+        raise ValueError("token must not be empty")
+
+    class BoundLifecycleRequestHandler(LifecycleRequestHandler):
+        pass
+
+    BoundLifecycleRequestHandler.manager = manager
+    BoundLifecycleRequestHandler.token = token
+    return BoundLifecycleRequestHandler
+
+
+def serve(config_path: Path) -> None:
+    settings = load_settings(config_path)
+    if settings.bind_host not in {"127.0.0.1", "::1"}:
+        raise SystemExit("DEVICE_BIND_NOT_LOOPBACK")
+    manager = DeviceLifecycleManager(
+        SubprocessCommandRunner(settings.environment),
+        emulator_bin=settings.environment.get("THS_DEVICE_LIFECYCLE_EMULATOR_BIN", "emulator"),
+    )
+    server = ThreadingHTTPServer(
+        (settings.bind_host, settings.port), make_handler(manager, settings.token)
+    )
+    server.serve_forever()
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", type=Path, required=True)
+    args = parser.parse_args()
+    serve(args.config)
+
+
+if __name__ == "__main__":
+    main()

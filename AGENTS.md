@@ -189,6 +189,8 @@ GET /api/v1/jobs/{public_id}
   - `core_metrics`：`THS_CORE_33_ARM64 / emulator-5556 / 27043`，用于人工会话续签、原八项协议材料、显式长截图请求和必要的管理员维护；股票名称和 market 基础行情不再依赖它。
   - `main_fund_flow`：`THS_API_33_ARM64 / emulator-5554 / 27042`，只用于资金 1/3/5 日接口。
 - `emulator-5554` 是受保护的当前资金账号。禁止退出登录、切换账号、克隆 AVD、重装/卸载 App、清数据、`force-stop` 或自动页面导航。
+- 对 `core_metrics` 和 `main_fund_flow` 的唯一生命周期例外，是经管理员登录、CSRF、当前会话设备锁和暂停队列校验后，通过已认证的 lifecycle broker 提交固定的 `shutdown`（Emulator 正常关机）或 `start_and_launch_app`（启动并只打开同花顺入口 Activity）。调用方不得传入 AVD、serial、端口、Activity、命令或其他参数。
+- 执行前必须等待运行中的设备任务结束；一次只操作一台设备。释放设备锁不会恢复队列，管理员必须在确认完成后显式恢复队列。这个例外不扩大资金账号权限：仍禁止账号、App、AVD 或数据变更，以及入口 Activity 之外的任何 App 内导航。
 - 自动任务导航和长截图只能操作 `emulator-5556`。核心设备必须保持 `wm size 1080x1920` 和 `wm density 480`；使用 `scripts/configure-macos-core-display.sh` 校准。
 - 在本 Mac 上必须使用 OrbStack Docker context 和 `deploy/macos.env` 部署，标准命令为
   `docker --context orbstack compose --env-file .env --env-file deploy/macos.env -f deploy/compose.yml up -d --build`。
@@ -416,6 +418,8 @@ chart heading is present; it is never a source for any field in `values`.
   - `core_metrics`: `THS_CORE_33_ARM64 / emulator-5556 / 27043` for human session renewal, core protocol material, explicit long captures, and administrator maintenance. Symbol lookup and basic market data no longer depend on it.
   - `main_fund_flow`: `THS_API_33_ARM64 / emulator-5554 / 27042` only for 1/3/5-day fund-flow interface requests.
 - `emulator-5554` holds the protected current fund account. Never log it out, switch accounts, clone the AVD, reinstall/uninstall or clear the App, `force-stop` it, or navigate it automatically.
+- The sole lifecycle exception for both `core_metrics` and `main_fund_flow` is a fixed `shutdown` (normal Emulator shutdown) or `start_and_launch_app` (start and launch only the THS entry Activity) through the authenticated lifecycle broker, after administrator session, CSRF, current-session device-lock, and paused-queue checks. Callers must never supply an AVD, serial, port, Activity, command, or other argument.
+- Wait for running device tasks to finish and take one device action at a time. Releasing the device lock does not resume the queue; the administrator must explicitly resume the queue after confirming completion. This exception does not broaden fund-account access: account, App, AVD, and data mutations and any in-App navigation beyond the entry Activity remain forbidden.
 - Automated navigation and long captures may operate only on `emulator-5556`. Keep the core device at `wm size 1080x1920` and `wm density 480`; use `scripts/configure-macos-core-display.sh` to calibrate it.
 - On this Mac, deploy with the OrbStack Docker context and `deploy/macos.env`.
   The canonical command is

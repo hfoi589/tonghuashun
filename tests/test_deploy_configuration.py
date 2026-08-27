@@ -211,6 +211,39 @@ def test_macos_deployment_docs_use_the_binding_orbstack_command() -> None:
     assert "docker compose --env-file deploy/macos.env" not in example
 
 
+def test_macos_example_and_compose_document_a_secretless_lifecycle_configuration() -> None:
+    """A sample token or omitted broker settings could expose host lifecycle controls."""
+    example = (ROOT / "deploy" / "macos.env.example").read_text(encoding="utf-8")
+    compose = (ROOT / "deploy" / "compose.yml").read_text(encoding="utf-8")
+
+    assert "THS_DEVICE_LIFECYCLE_URL=http://host.docker.internal:18765" in example
+    assert "THS_DEVICE_LIFECYCLE_TIMEOUT_SECONDS=5" in example
+    assert "# THS_DEVICE_LIFECYCLE_TOKEN=" in example
+    assert "THS_DEVICE_LIFECYCLE_TOKEN=<" not in example
+    for setting in (
+        "THS_DEVICE_LIFECYCLE_URL",
+        "THS_DEVICE_LIFECYCLE_TOKEN",
+        "THS_DEVICE_LIFECYCLE_TIMEOUT_SECONDS",
+    ):
+        assert f"{setting}: ${{{setting}:-" in compose
+
+
+def test_readme_defines_the_unimplemented_private_complete_image_contract() -> None:
+    """Operators need the image, preservation, and human-login boundary before provisioning ships."""
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    normalized_readme = " ".join(readme.split())
+
+    assert "scripts/deploy-macos-one-click.sh --mode auto" in readme
+    assert "local/private" in readme
+    assert "APK" in readme and "Frida" in readme
+    assert "existing AVD" in readme
+    assert "FIRST_TIME_LOGIN_REQUIRED" in readme
+    assert "INSTALLED_APK_MISMATCH" in readme
+    assert "not in this repository, Docker build context, or Git history" not in readme
+    assert "does not claim real deployment" in normalized_readme
+    assert "clean-Mac acceptance" in normalized_readme
+
+
 def test_root_environment_example_documents_the_direct_session_key() -> None:
     example = (ROOT / ".env.example").read_text(encoding="utf-8")
 

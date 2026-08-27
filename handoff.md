@@ -239,3 +239,64 @@ docker --context orbstack compose \
 目录异常先检查 `/data/market/symbol-catalog.db` 和 API 日志；公开行情异常检查
 腾讯/新浪网络与 stale 缓存。只有 `DIRECT_SESSION_*` 或核心协议错误才需要管理员
 人工打开 App 续签。不要把公开源故障误诊为 App 故障，也不要操作资金设备。
+
+## 10. 管理员设备生命周期与完整镜像部署合同（待后续实现/验收）
+
+本节记录已批准的操作合同，不是本轮真实部署或全新 Mac 验收记录。Task 7–9 完成前，
+不得声称已接受真实 host、设备、镜像、首次开通或人工登录。
+
+### 生命周期安装与操作
+
+在目标 Mac 上，由
+`scripts/install-macos-device-lifecycle.sh` 安装稳定副本并加载
+`com.ths.device-lifecycle` LaunchAgent。broker 仅监听 macOS 回环地址；其随机
+Token 只保存在权限 `0600` 的根目录 `.env` 和本机私有配置中，绝不写入 plist、
+`deploy/macos.env`、日志、API 响应或交接文档。
+
+管理员只可在已登录、CSRF 校验、取得当前会话设备锁、队列暂停且无运行设备任务后，
+调用固定的 `shutdown` 或 `start_and_launch_app`。前者使用 Emulator 正常关闭，后者
+只打开同花顺入口 Activity；两个角色均适用，但资金设备仍禁止账号、App、数据或 AVD
+变更和任何后续页面导航。操作员必须取得当前会话设备锁，等待运行中的设备任务结束，
+一次只操作一台设备，随后释放锁并显式恢复队列。
+
+状态只使用 `UNCONFIGURED`、`UNKNOWN`、`STOPPED`、`STARTING`、`RUNNING`、
+`STOPPING` 和 `ERROR`。固定错误码为：
+
+- `DEVICE_LIFECYCLE_UNAVAILABLE`
+- `DEVICE_LIFECYCLE_LOCK_REQUIRED`
+- `DEVICE_LIFECYCLE_BUSY`
+- `DEVICE_ACTION_IN_PROGRESS`
+- `DEVICE_AVD_NOT_FOUND`
+- `DEVICE_BOOT_TIMEOUT`
+- `DEVICE_APP_LAUNCH_FAILED`
+- `DEVICE_SHUTDOWN_FAILED`
+- `DEVICE_LIFECYCLE_FAILED`
+
+不得返回或记录 Token、AVD/serial/端口、命令、stderr、账号或会话材料。
+
+### 本地/私有完整镜像与一键部署
+
+目标镜像为本机 `ths-level2-api:local`，包含已摘要校验的 THS APK、Frida Server
+16.7.19、非秘密 manifest 和只读辅助脚本。它只用于 local/private 环境；不得
+`docker push`、`docker save` 或发布公共 Registry，也绝不包含 `.env`、Token、账号、
+会话、AVD、capture、Redis 或日志。APK 并非“不在 Git 历史中”：它存在于历史记录，
+旧镜像只是通过 `.dockerignore` 排除了它；完整镜像在实现后才会以固定摘要刻意纳入。
+
+标准入口为：
+
+```sh
+scripts/deploy-macos-one-click.sh --mode auto
+```
+
+脚本将只支持 Apple Silicon macOS 和显式 OrbStack context。若两个固定 AVD 已存在，
+它只重建本地镜像、校验已安装 APK 摘要、安装/更新 LaunchAgent 和重建 Compose；绝不
+创建、删除、复制、wipe、重置或重装 App。摘要不符返回
+`INSTALLED_APK_MISMATCH`，而非覆盖已登录设备。
+
+若任一固定 AVD 缺失，`auto` 进入可恢复的交互式 provisioning：只创建/安装本次缺失
+角色，保留已有 AVD；新设备必须由人完成登录、验证码、设备验证和权限确认。未完成时
+返回 `FIRST_TIME_LOGIN_REQUIRED`，下次从现有状态继续。
+
+回滚时从 Compose 环境移除 lifecycle URL 和 Token，卸载
+`com.ths.device-lifecycle` LaunchAgent，并恢复既有人工启动方式；不删除 AVD、登录数据、
+会话包或 Docker 数据卷。公开 Market 和直连任务仍应保持可用。

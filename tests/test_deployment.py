@@ -125,6 +125,46 @@ def test_lifecycle_installer_excludes_forbidden_device_mutations() -> None:
     assert not [command for command in forbidden if command in installer]
 
 
+def test_agents_define_the_narrow_dual_role_lifecycle_authorization() -> None:
+    """Broader fund-device access would bypass the preserved account protections."""
+    agents = (Path(__file__).parents[1] / "AGENTS.md").read_text(encoding="utf-8")
+
+    for language_marker, broker_phrase in (
+        ("## 本地部署", "已认证的 lifecycle broker"),
+        ("## Local deployment", "authenticated lifecycle broker"),
+    ):
+        section = agents.split(language_marker, 1)[1]
+        assert broker_phrase in section
+        assert "start_and_launch_app" in section
+        assert "shutdown" in section
+    for forbidden in ("退出登录", "切换账号", "清数据", "重装/卸载 App", "force-stop", "自动页面导航"):
+        assert forbidden in agents
+    for forbidden in ("log it out", "switch accounts", "clear the App", "reinstall/uninstall", "force-stop", "navigate it automatically"):
+        assert forbidden in agents
+
+
+def test_handoff_documents_lifecycle_installation_queue_recovery_and_safe_rollback() -> None:
+    """A lifecycle operation without its lock and rollback procedure risks protected state."""
+    handoff = (Path(__file__).parents[1] / "handoff.md").read_text(encoding="utf-8")
+    normalized_handoff = " ".join(handoff.split())
+
+    for required in (
+        "install-macos-device-lifecycle.sh",
+        "LaunchAgent",
+        "UNCONFIGURED",
+        "DEVICE_LIFECYCLE_UNAVAILABLE",
+        "DEVICE_SHUTDOWN_FAILED",
+        "scripts/deploy-macos-one-click.sh --mode auto",
+        "取得当前会话设备锁",
+        "等待运行中的设备任务结束",
+        "一次只操作一台设备",
+        "显式恢复队列",
+        "不删除 AVD、登录数据、",
+        "会话包或 Docker 数据卷",
+    ):
+        assert required in normalized_handoff
+
+
 def write_fake_tool(path: Path, body: str) -> None:
     path.write_text(f"#!/bin/sh\nset -eu\n{body}\n", encoding="utf-8")
     path.chmod(0o755)

@@ -32,11 +32,11 @@ the App, scroll, capture, stitch, or run OCR.
 Both profiles require a practical minimum of 4 CPU cores, 8 GiB RAM, and 30
 GiB free disk. Preflight also requires the verified APK SHA-256:
 `2554490aa3f5e2df17ac0a711311f3f85ee3130008af9bb4ab12510b3d6e971e`, and at
-least one ARM ABI (`arm64-v8a` or `armeabi-v7a`). The APK exists in this
-repository's Git history, but the old image intentionally excluded it from its
-Docker build context. The approved macOS complete-image design deliberately
-adds it only to a digest-verified local/private image; it never includes
-credentials, sessions, AVD data, or login snapshots.
+least one ARM ABI (`arm64-v8a` or `armeabi-v7a`). The 204 MB APK is tracked in
+Git history, but the old Docker build context and image excluded it. The
+approved image is local/private-only and deliberately adds the APK only after
+fixed digest verification; it never includes credentials, sessions, AVD data,
+or login snapshots.
 
 ## Linux amd64 / Redroid
 
@@ -123,11 +123,14 @@ state is `FIRST_TIME_LOGIN_REQUIRED`. It never enters credentials or turns this
 human-login gate into unattended provisioning.
 
 The lifecycle broker is installed with
-`scripts/install-macos-device-lifecycle.sh` as a macOS LaunchAgent. Its random
-token belongs only in mode-0600 root `.env`, never in `deploy/macos.env`, a
-plist, log, API response, or this document. Operators acquire the device lock,
-wait for running tasks to finish, perform one device action at a time, release
-the lock, and explicitly resume the queue. Relevant fixed errors include
+`scripts/install-macos-device-lifecycle.sh` as a macOS LaunchAgent. The root
+`.env` is the source for Compose/API; the installer copies the same lifecycle
+Token into the mode-0600 host config required by the broker. That host config
+is private, and the Token is never exposed through a plist, log, or browser;
+it is also never written to `deploy/macos.env` or API responses. Operators
+acquire the device lock, wait for running tasks to finish, perform one device
+action at a time, release the lock, and explicitly resume the queue. Relevant
+fixed errors include
 `DEVICE_LIFECYCLE_UNAVAILABLE`, `DEVICE_LIFECYCLE_LOCK_REQUIRED`,
 `DEVICE_LIFECYCLE_BUSY`, `DEVICE_ACTION_IN_PROGRESS`,
 `DEVICE_AVD_NOT_FOUND`, `DEVICE_BOOT_TIMEOUT`, `DEVICE_APP_LAUNCH_FAILED`,

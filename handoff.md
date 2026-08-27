@@ -249,9 +249,11 @@ docker --context orbstack compose \
 
 在目标 Mac 上，由
 `scripts/install-macos-device-lifecycle.sh` 安装稳定副本并加载
-`com.ths.device-lifecycle` LaunchAgent。broker 仅监听 macOS 回环地址；其随机
-Token 只保存在权限 `0600` 的根目录 `.env` 和本机私有配置中，绝不写入 plist、
-`deploy/macos.env`、日志、API 响应或交接文档。
+`com.ths.device-lifecycle` LaunchAgent。broker 仅监听 macOS 回环地址；root
+`.env` is the source for Compose/API，installer copies the same lifecycle Token
+into the mode-0600 host config required by the broker。该 host config 私有，Token
+is never exposed through a plist, log, or browser，且绝不写入
+`deploy/macos.env`、API 响应或交接文档。
 
 管理员只可在已登录、CSRF 校验、取得当前会话设备锁、队列暂停且无运行设备任务后，
 调用固定的 `shutdown` 或 `start_and_launch_app`。前者使用 Emulator 正常关闭，后者
@@ -279,8 +281,9 @@ Token 只保存在权限 `0600` 的根目录 `.env` 和本机私有配置中，�
 目标镜像为本机 `ths-level2-api:local`，包含已摘要校验的 THS APK、Frida Server
 16.7.19、非秘密 manifest 和只读辅助脚本。它只用于 local/private 环境；不得
 `docker push`、`docker save` 或发布公共 Registry，也绝不包含 `.env`、Token、账号、
-会话、AVD、capture、Redis 或日志。APK 并非“不在 Git 历史中”：它存在于历史记录，
-旧镜像只是通过 `.dockerignore` 排除了它；完整镜像在实现后才会以固定摘要刻意纳入。
+会话、AVD、capture、Redis 或日志。The 204 MB APK is tracked in Git history；
+the old Docker build context and image excluded it。The approved image is
+local/private-only，完整镜像在实现后才会以固定摘要刻意纳入。
 
 标准入口为：
 

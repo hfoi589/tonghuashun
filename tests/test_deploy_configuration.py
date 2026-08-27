@@ -215,11 +215,16 @@ def test_macos_example_and_compose_document_a_secretless_lifecycle_configuration
     """A sample token or omitted broker settings could expose host lifecycle controls."""
     example = (ROOT / "deploy" / "macos.env.example").read_text(encoding="utf-8")
     compose = (ROOT / "deploy" / "compose.yml").read_text(encoding="utf-8")
+    active_assignments = {
+        name: value
+        for raw_line in example.splitlines()
+        if (line := raw_line.strip()) and not line.startswith("#") and "=" in line
+        for name, value in [line.split("=", 1)]
+    }
 
-    assert "THS_DEVICE_LIFECYCLE_URL=http://host.docker.internal:18765" in example
-    assert "THS_DEVICE_LIFECYCLE_TIMEOUT_SECONDS=5" in example
-    assert "# THS_DEVICE_LIFECYCLE_TOKEN=" in example
-    assert "THS_DEVICE_LIFECYCLE_TOKEN=<" not in example
+    assert active_assignments["THS_DEVICE_LIFECYCLE_URL"] == "http://host.docker.internal:18765"
+    assert active_assignments["THS_DEVICE_LIFECYCLE_TIMEOUT_SECONDS"] == "5"
+    assert active_assignments.get("THS_DEVICE_LIFECYCLE_TOKEN", "") == ""
     for setting in (
         "THS_DEVICE_LIFECYCLE_URL",
         "THS_DEVICE_LIFECYCLE_TOKEN",
@@ -239,9 +244,22 @@ def test_readme_defines_the_unimplemented_private_complete_image_contract() -> N
     assert "existing AVD" in readme
     assert "FIRST_TIME_LOGIN_REQUIRED" in readme
     assert "INSTALLED_APK_MISMATCH" in readme
-    assert "not in this repository, Docker build context, or Git history" not in readme
+    assert "204 MB APK is tracked in Git history" in normalized_readme
+    assert "old Docker build context and image excluded it" in normalized_readme
+    assert "approved image is local/private-only" in normalized_readme
     assert "does not claim real deployment" in normalized_readme
     assert "clean-Mac acceptance" in normalized_readme
+
+
+def test_lifecycle_token_docs_define_the_compose_and_host_broker_boundary() -> None:
+    """Calling the root environment the token's only location would leave the broker unauthenticated."""
+    readme = " ".join((ROOT / "README.md").read_text(encoding="utf-8").split())
+    handoff = " ".join((ROOT / "handoff.md").read_text(encoding="utf-8").split())
+
+    for document in (readme, handoff):
+        assert "root `.env` is the source for Compose/API" in document
+        assert "installer copies the same lifecycle Token into the mode-0600 host config" in document
+        assert "never exposed through a plist, log, or browser" in document
 
 
 def test_root_environment_example_documents_the_direct_session_key() -> None:

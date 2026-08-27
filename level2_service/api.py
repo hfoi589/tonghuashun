@@ -9,9 +9,10 @@ import secrets
 from threading import RLock
 from asyncio import FIRST_COMPLETED, CancelledError, Event, TimeoutError, create_task, gather, get_running_loop, sleep, to_thread, wait, wait_for
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import AsyncIterator, Callable, Mapping, Optional
+from zoneinfo import ZoneInfo
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, StreamingResponse
@@ -38,10 +39,48 @@ from .parsed_values import (
 from .queue import InMemoryStreams, QueueFullError, TaskStore
 from .runner import ADBDeviceBridge, DeviceBridge, Level2Runner, RunnerControl, jpeg_base64
 from .security import AdminSessionManager, persist_password_hash
-from .symbol_cache import InMemorySymbolLookupCache, SymbolLookupCache
+from .symbol_cache import SymbolLookupCache
 
 
 logger = logging.getLogger(__name__)
+
+
+class RunnerWake:
+    """Thread-safe wake signal for the lifespan-owned runner loop."""
+
+    def __init__(self) -> None:
+        self._lock = RLock()
+        self._loop = None
+        self._event: Event | None = None
+
+    def bind(self) -> None:
+        with self._lock:
+            self._loop = get_running_loop()
+            self._event = Event()
+
+    def clear(self) -> None:
+        with self._lock:
+            event = self._event
+        if event is not None:
+            event.clear()
+
+    def notify(self) -> None:
+        with self._lock:
+            loop = self._loop
+            event = self._event
+        if loop is None or event is None:
+            return
+        try:
+            loop.call_soon_threadsafe(event.set)
+        except RuntimeError:
+            pass
+
+    async def wait(self, timeout: float) -> None:
+        with self._lock:
+            event = self._event
+        if event is None:
+            raise RuntimeError("runner wake is not bound")
+        await wait_for(event.wait(), timeout=timeout)
 
 
 class SubmitTask(BaseModel):
@@ -253,6 +292,12 @@ def create_app(
     symbol_lookup: Callable[[str], SymbolLookup] | None = None,
     symbol_search: Callable[[str, int], list[SymbolLookup]] | None = None,
     symbol_lookup_cache: SymbolLookupCache | None = None,
+    symbol_catalog: object | None = None,
+    symbol_catalog_refresh_hour: int = 16,
+    symbol_catalog_refresh_minute: int = 20,
+    core_prewarmer: Callable[[str | None], None] | None = None,
+    core_session_invalidator: Callable[[], None] | None = None,
+    managed_resources: tuple[object, ...] = (),
     market_account_store: object | None = None,
     market_session_store: object | None = None,
     market_data_broker: object | None = None,
@@ -268,10 +313,24 @@ def create_app(
         raise ValueError("cleanup_interval_seconds must be positive")
     if runner_poll_interval_seconds <= 0:
         raise ValueError("runner_poll_interval_seconds must be positive")
+    if not 0 <= symbol_catalog_refresh_hour <= 23:
+        raise ValueError("symbol_catalog_refresh_hour must be between 0 and 23")
+    if not 0 <= symbol_catalog_refresh_minute <= 59:
+        raise ValueError(
+            "symbol_catalog_refresh_minute must be between 0 and 59"
+        )
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         stop = Event()
+        app.state.runner_wake.bind()
+        for resource in app.state.managed_resources:
+            prewarm = getattr(resource, "prewarm", None)
+            if callable(prewarm):
+                try:
+                    prewarm()
+                except Exception:
+                    pass
         app.state.store.recover_running()
         deduplicate = getattr(app.state.store, "deduplicate_by_symbol", None)
         app.state.task_migration = (
@@ -299,13 +358,19 @@ def create_app(
             """Run the blocking ADB worker off the API event loop until shutdown."""
             assert runner is not None
             while not stop.is_set():
+                app.state.runner_wake.clear()
+                claimed = None
                 try:
-                    await to_thread(runner.run_once)
+                    claimed = await to_thread(runner.run_once)
                 except Exception:
                     # Device failures are surfaced through the authenticated health API.
                     app.state.runner_control.heartbeat("OFFLINE")
+                if claimed is not None:
+                    continue
                 try:
-                    await wait_for(stop.wait(), timeout=runner_poll_interval_seconds)
+                    await app.state.runner_wake.wait(
+                        runner_poll_interval_seconds
+                    )
                 except TimeoutError:
                     continue
 
@@ -320,21 +385,79 @@ def create_app(
                 except TimeoutError:
                     continue
 
+        async def symbol_catalog_loop() -> None:
+            catalog = app.state.symbol_catalog
+            if catalog is None:
+                return
+            refresh = getattr(catalog, "refresh", None)
+            needs_startup_refresh = getattr(
+                catalog,
+                "startup_refresh_required",
+                None,
+            )
+            if callable(refresh) and (
+                not callable(needs_startup_refresh)
+                or needs_startup_refresh()
+            ):
+                try:
+                    await to_thread(refresh)
+                except Exception:
+                    pass
+            while not stop.is_set():
+                local_now = datetime.now(ZoneInfo("Asia/Shanghai"))
+                next_refresh = local_now.replace(
+                    hour=symbol_catalog_refresh_hour,
+                    minute=symbol_catalog_refresh_minute,
+                    second=0,
+                    microsecond=0,
+                )
+                if next_refresh <= local_now:
+                    next_refresh += timedelta(days=1)
+                delay = max(
+                    1.0,
+                    (next_refresh - local_now).total_seconds(),
+                )
+                try:
+                    await wait_for(stop.wait(), timeout=delay)
+                    continue
+                except TimeoutError:
+                    pass
+                if callable(refresh):
+                    try:
+                        await to_thread(refresh)
+                    except Exception:
+                        pass
+
         app.state.cleanup_stop = stop
         app.state.cleanup_task = create_task(retention_loop())
         app.state.runner_task = create_task(runner_loop()) if runner is not None else None
         app.state.market_task = (
             create_task(market_loop()) if app.state.market_data_broker is not None else None
         )
+        app.state.symbol_catalog_task = (
+            create_task(symbol_catalog_loop())
+            if app.state.symbol_catalog is not None
+            else None
+        )
         try:
             yield
         finally:
             stop.set()
+            app.state.runner_wake.notify()
             await app.state.cleanup_task
             if app.state.runner_task is not None:
                 await app.state.runner_task
             if app.state.market_task is not None:
                 await app.state.market_task
+            if app.state.symbol_catalog_task is not None:
+                await app.state.symbol_catalog_task
+            for resource in reversed(app.state.managed_resources):
+                close = getattr(resource, "close", None)
+                if callable(close):
+                    try:
+                        close()
+                    except Exception:
+                        pass
 
     app = FastAPI(title="THS Level2 Capture Service", lifespan=lifespan)
     app.state.store = store or InMemoryStreams()
@@ -345,6 +468,7 @@ def create_app(
         persist_password_hash=persist,
     )
     app.state.runner_control = runner_control or RunnerControl()
+    app.state.runner_wake = RunnerWake()
     primary_bridge = device_bridge or ADBDeviceBridge()
     configured_bridges = dict(device_bridges or {})
     configured_bridges.setdefault("core_metrics", primary_bridge)
@@ -357,8 +481,12 @@ def create_app(
     app.state.symbol_lookup = symbol_lookup
     app.state.symbol_search = symbol_search
     app.state.symbol_verification_enabled = symbol_lookup is not None or symbol_lookup_cache is not None
-    app.state.symbol_lookup_cache = symbol_lookup_cache or InMemorySymbolLookupCache()
+    app.state.symbol_lookup_cache = symbol_lookup_cache
     app.state.symbol_lookup_cache_lock = RLock()
+    app.state.symbol_catalog = symbol_catalog
+    app.state.core_prewarmer = core_prewarmer
+    app.state.core_session_invalidator = core_session_invalidator
+    app.state.managed_resources = tuple(managed_resources)
     app.state.market_account_store = market_account_store
     app.state.market_session_store = market_session_store
     app.state.market_data_broker = market_data_broker
@@ -388,6 +516,19 @@ def create_app(
         public["queue_position"] = positioner(task.task_id) if callable(positioner) else None
         return TaskResponse.model_validate(public)
 
+    def notify_runner_if_queued(task: TaskRecord) -> None:
+        if task.status == TaskStatus.QUEUED:
+            app.state.runner_wake.notify()
+
+    def trigger_core_prewarm(symbol: str | None) -> None:
+        prewarm = app.state.core_prewarmer
+        if not callable(prewarm):
+            return
+        try:
+            prewarm(symbol)
+        except Exception:
+            pass
+
     def resolve_symbol(symbol: str) -> SymbolLookup:
         try:
             expected_market = market_code_for_symbol(symbol)
@@ -395,37 +536,49 @@ def create_app(
             raise HTTPException(status_code=422, detail=str(error)) from error
 
         try:
-            with app.state.symbol_lookup_cache_lock:
-                cached = app.state.symbol_lookup_cache.get(symbol)
+            cache = app.state.symbol_lookup_cache
+            cached = None
+            if cache is not None:
+                with app.state.symbol_lookup_cache_lock:
+                    cached = cache.get(symbol)
                 if cached is not None:
                     if cached.symbol != symbol or cached.market != expected_market:
                         raise DirectRequestError(
                             "SYMBOL_LOOKUP_INVALID",
-                            "cached App search returned a mismatched stock",
+                            "cached symbol lookup returned a mismatched stock",
                         )
+                    trigger_core_prewarm(symbol)
                     return cached
-                lookup = app.state.symbol_lookup
-                if lookup is None:
-                    raise HTTPException(
-                        status_code=503,
-                        detail="symbol lookup temporarily unavailable",
-                    )
-                result = lookup(symbol)
-                if result.symbol != symbol or result.market != expected_market:
-                    raise DirectRequestError(
-                        "SYMBOL_LOOKUP_INVALID",
-                        "App search returned a mismatched stock",
-                    )
-                app.state.symbol_lookup_cache.set(result)
-                return result
+            lookup = app.state.symbol_lookup
+            if lookup is None:
+                raise HTTPException(
+                    status_code=503,
+                    detail="symbol lookup temporarily unavailable",
+                )
+            result = lookup(symbol)
+            if result.symbol != symbol or result.market != expected_market:
+                raise DirectRequestError(
+                    "SYMBOL_LOOKUP_INVALID",
+                    "symbol lookup returned a mismatched stock",
+                )
+            if cache is not None:
+                with app.state.symbol_lookup_cache_lock:
+                    cache.set(result)
+            trigger_core_prewarm(symbol)
+            return result
         except SymbolLookupNotFoundError as error:
             raise HTTPException(status_code=404, detail="symbol not found") from error
         except SymbolLookupAmbiguousError as error:
             raise HTTPException(status_code=409, detail="symbol lookup is ambiguous") from error
         except DirectRequestError as error:
+            detail = (
+                error.error_code
+                if error.error_code.startswith("SYMBOL_CATALOG_")
+                else "symbol lookup temporarily unavailable"
+            )
             raise HTTPException(
                 status_code=503,
-                detail="symbol lookup temporarily unavailable",
+                detail=detail,
             ) from error
         except HTTPException:
             raise
@@ -465,9 +618,14 @@ def create_app(
         except ValueError as error:
             raise HTTPException(status_code=422, detail=str(error)) from error
         except DirectRequestError as error:
+            detail = (
+                error.error_code
+                if error.error_code.startswith("SYMBOL_CATALOG_")
+                else "symbol search temporarily unavailable"
+            )
             raise HTTPException(
                 status_code=503,
-                detail="symbol search temporarily unavailable",
+                detail=detail,
             ) from error
         except Exception as error:
             raise HTTPException(
@@ -496,6 +654,7 @@ def create_app(
             submitted = app.state.store.submit_or_refresh(task)
         except QueueFullError:
             raise HTTPException(status_code=429, detail="queue is full") from None
+        notify_runner_if_queued(submitted)
         return task_response(submitted)
 
     @app.get("/api/v1/jobs/{public_id}", response_model=TaskResponse)
@@ -516,6 +675,7 @@ def create_app(
             raise HTTPException(status_code=429, detail="queue is full") from None
         except ValueError as error:
             raise HTTPException(status_code=409, detail=str(error)) from None
+        notify_runner_if_queued(retried)
         return task_response(retried)
 
     @app.get("/api/v1/jobs/{public_id}/captures/{kind}")
@@ -669,6 +829,11 @@ def create_app(
                     "account session refresher returned a mismatched role",
                 )
             provider.put(bundle)
+            if role == "core_metrics":
+                invalidator = app.state.core_session_invalidator
+                if callable(invalidator):
+                    invalidator()
+                trigger_core_prewarm(None)
         except DirectRequestError as error:
             provider.mark_error(
                 role,
@@ -713,6 +878,7 @@ def create_app(
             resumed = app.state.store.requeue_waiting(task.task_id)
         except ValueError as error:
             raise HTTPException(status_code=409, detail=str(error)) from None
+        notify_runner_if_queued(resumed)
         return task_response(resumed)
 
     @app.post("/api/admin/jobs/{public_id}/retry", response_model=TaskResponse)
@@ -724,6 +890,7 @@ def create_app(
             retried = app.state.store.retry_failed(task.task_id)
         except ValueError as error:
             raise HTTPException(status_code=409, detail=str(error)) from None
+        notify_runner_if_queued(retried)
         return task_response(retried)
 
     @app.get("/api/admin/queue", response_model=QueueResponse)
@@ -739,6 +906,7 @@ def create_app(
     def resume_queue(_session=Depends(require_csrf)) -> QueueResponse:
         if not app.state.runner_control.resume_queue():
             raise HTTPException(status_code=409, detail="release device control before resuming the queue")
+        app.state.runner_wake.notify()
         return QueueResponse(paused=False)
 
     device_labels = {

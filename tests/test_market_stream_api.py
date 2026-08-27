@@ -97,6 +97,64 @@ def test_market_snapshot_and_kline_routes_require_user_authentication(tmp_path) 
     }
 
 
+def test_market_snapshot_redacts_arbitrary_upstream_exception_details(tmp_path) -> None:
+    class FailingSource(ApiMarketSource):
+        def read_market_snapshot(self, symbol: str, *, detail: bool) -> MarketSnapshot:
+            raise RuntimeError("https://upstream.invalid/?token=private body=secret")
+
+    accounts = SQLiteMarketAccountStore(tmp_path / "market.db")
+    user = accounts.create_user("trader", "temporary-123")
+    accounts.change_password(user.id, "temporary-123", "permanent-456")
+    app = create_app(
+        secure_admin_cookies=False,
+        market_account_store=accounts,
+        market_session_store=InMemoryMarketSessionStore(),
+        market_data_broker=MarketDataBroker(FailingSource()),
+        symbol_lookup=lambda symbol: SymbolLookup(symbol, "招商轮船", "17"),
+    )
+
+    with TestClient(app) as client:
+        assert client.post(
+            "/api/v1/session",
+            json={"username": "trader", "password": "permanent-456"},
+        ).status_code == 200
+        response = client.get("/api/v1/market/symbols/601872/snapshot")
+
+    assert response.status_code == 503
+    assert response.json() == {"detail": "MARKET_QUOTE_UNAVAILABLE"}
+    assert "private" not in response.text
+
+
+def test_market_series_does_not_publish_source_value_error_text(tmp_path) -> None:
+    class FailingSource(ApiMarketSource):
+        def read_market_series(self, symbol, period, cursor, limit):
+            raise ValueError("PRIVATE_SECRET_TOKEN")
+
+    accounts = SQLiteMarketAccountStore(tmp_path / "market.db")
+    user = accounts.create_user("trader", "temporary-123")
+    accounts.change_password(user.id, "temporary-123", "permanent-456")
+    app = create_app(
+        secure_admin_cookies=False,
+        market_account_store=accounts,
+        market_session_store=InMemoryMarketSessionStore(),
+        market_data_broker=MarketDataBroker(FailingSource()),
+        symbol_lookup=lambda symbol: SymbolLookup(symbol, "招商轮船", "17"),
+    )
+
+    with TestClient(app) as client:
+        assert client.post(
+            "/api/v1/session",
+            json={"username": "trader", "password": "permanent-456"},
+        ).status_code == 200
+        response = client.get(
+            "/api/v1/market/symbols/601872/series?period=day&limit=120"
+        )
+
+    assert response.status_code == 503
+    assert response.json() == {"detail": "MARKET_SERIES_UNAVAILABLE"}
+    assert "PRIVATE_SECRET_TOKEN" not in response.text
+
+
 def test_market_websocket_authenticates_and_pushes_subscribed_snapshots(tmp_path) -> None:
     app = _authenticated_market_app(tmp_path)
     with TestClient(app) as client:

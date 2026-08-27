@@ -1,5 +1,6 @@
 from datetime import timedelta
 from pathlib import Path
+from threading import Event, Lock
 from time import sleep
 
 from fastapi.testclient import TestClient
@@ -7,6 +8,78 @@ from fastapi.testclient import TestClient
 from level2_service.api import create_app
 from level2_service.models import CaptureKind, CaptureStatus, TaskRecord, TaskStatus
 from level2_service.queue import InMemoryStreams
+
+
+def test_job_submission_wakes_runner_before_the_poll_interval() -> None:
+    first_call = Event()
+    next_call = Event()
+
+    class Runner:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.lock = Lock()
+
+        def run_once(self):
+            with self.lock:
+                self.calls += 1
+                calls = self.calls
+            if calls == 1:
+                first_call.set()
+            else:
+                next_call.set()
+            return None
+
+    runner = Runner()
+    app = create_app(
+        runner=runner,
+        runner_poll_interval_seconds=30,
+    )
+
+    with TestClient(app) as client:
+        assert first_call.wait(1)
+        assert client.post(
+            "/api/v1/jobs",
+            json={"symbol": "601872", "include_long_capture": False},
+        ).status_code == 202
+        assert next_call.wait(1)
+
+
+def test_app_lifespan_refreshes_an_uninitialized_symbol_catalog() -> None:
+    refreshed = Event()
+
+    class Catalog:
+        @staticmethod
+        def startup_refresh_required() -> bool:
+            return True
+
+        @staticmethod
+        def refresh() -> None:
+            refreshed.set()
+
+    app = create_app(symbol_catalog=Catalog())
+
+    with TestClient(app):
+        assert refreshed.wait(1)
+
+    assert app.state.symbol_catalog_task.done()
+
+
+def test_app_lifespan_prewarms_and_closes_managed_resources() -> None:
+    calls: list[str] = []
+
+    class Resource:
+        @staticmethod
+        def prewarm() -> None:
+            calls.append("prewarm")
+
+        @staticmethod
+        def close() -> None:
+            calls.append("close")
+
+    with TestClient(create_app(managed_resources=(Resource(),))):
+        assert calls == ["prewarm"]
+
+    assert calls == ["prewarm", "close"]
 
 
 def test_app_lifespan_runs_retention_and_stops_its_background_task(tmp_path: Path) -> None:

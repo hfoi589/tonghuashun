@@ -99,6 +99,31 @@ def test_admin_creates_users_and_user_manages_grouped_watchlists(tmp_path) -> No
     assert all(group["items"] == [] for group in synchronized_groups)
 
 
+def test_watchlist_reads_the_current_catalog_name(tmp_path) -> None:
+    client, _accounts = _market_client(tmp_path)
+    _create_user(client)
+    _login_and_change_password(client)
+    group_id = client.get("/api/v1/watchlists").json()["groups"][0]["id"]
+    assert client.post(
+        f"/api/v1/watchlists/groups/{group_id}/symbols",
+        headers={"X-CSRF-Token": client.cookies.get("ths_market_csrf")},
+        json={"symbol": "601872"},
+    ).status_code == 201
+    client.app.state.symbol_lookup = lambda symbol: SymbolLookup(
+        symbol=symbol,
+        name="招商轮船新名",
+        market="17",
+    )
+
+    item = client.get("/api/v1/watchlists").json()["groups"][0]["items"][0]
+
+    assert item == {
+        "symbol": "601872",
+        "name": "招商轮船新名",
+        "market": "17",
+    }
+
+
 def test_market_user_write_routes_require_csrf_and_logout_revokes_session(tmp_path) -> None:
     client, _accounts = _market_client(tmp_path)
     _create_user(client)

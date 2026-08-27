@@ -2,7 +2,9 @@
 
 ## 市场数据采集
 
-- 任务指标只能通过同花顺 App 内部接口 `FridaParsedValueSource.read_direct()` 获取。
+- 任务指标只能通过已选择的同花顺 App 内部协议契约获取：默认
+  `FridaParsedValueSource.read_direct()`，显式 `CORE_METRICS_TRANSPORT=direct`
+  时使用已验证的 `Core9528Client`；公开行情源绝不能填写任务指标。
 - 严禁使用截图 OCR、UI 文本提取或长截图解析结果填写任何任务指标。
 - 接口请求失败时，必须以原始接口错误码结束任务；不得打开股票搜索页作为降级路径。
 - 接口只返回部分指标时，缺失指标必须保持为空并返回部分任务；不得使用 OCR 补值。
@@ -12,8 +14,8 @@
 ### 对外 API 调用契约
 
 对外 API 有两个独立的市场数据调用：先确认股票代码和名称，再提交异步
-数据任务。名称查询响应不是行情数据；生产环境提供 App 查询时，不得提交
-未经确认的代码。
+数据任务。名称查询响应不是行情数据；生产环境必须使用当前本地证券目录确认
+代码和名称，不得提交未经确认的代码。
 
 #### 1. 股票代码和名称查询
 
@@ -39,12 +41,12 @@ curl -fsS "http://127.0.0.1:8001/api/v1/symbols/601872"
 - `158/159/160/161/162/163/164/165/166/167/168/169/180`
   → 市场 `36`（深基）
 
-生产实现通过 `FridaParsedValueSource.lookup_symbol()` 调用已运行的同花顺
-App 内部精确搜索桥接。返回结果必须同时满足代码完全一致、市场一致、名称
-非空，并且只能有一个精确结果。不得使用截图 OCR、UI 文本提取或模糊搜索
-结果。同一代码同时返回市场 `19/35` 的债券和市场 `20/36` 的基金时，必须先
-按预期基金市场过滤并忽略债券；预期市场内仍有多个精确结果时才算歧义。
-成功结果可以从已确认股票缓存中复用。
+生产实现通过 `/data/market/symbol-catalog.db` 的版本化 SQLite 证券目录查询。
+目录每天从新浪公开 `hs_a`、`etf_hq_fund`、`lof_hq_fund` 分类同步，完整候选
+版本校验通过后才原子切换；失败时保留旧版本，超过七天则返回 503。返回结果
+必须同时满足六位代码完全一致、`market_code_for_symbol()` 市场一致和名称非空。
+股票代码/名称联想、精确确认、任务提交二次确认和 market 自选添加均不得调用
+App、Frida、截图 OCR 或 UI 文本。
 
 成功响应（`200`）：
 
@@ -58,10 +60,10 @@ App 内部精确搜索桥接。返回结果必须同时满足代码完全一致�
 
 预期错误：
 
-- `422`：代码格式错误或市场前缀不支持；不会调用 App 查询。
+- `422`：代码格式错误或市场前缀不支持；不会查询证券目录。
 - `404`：没有返回精确匹配股票（`{"detail":"symbol not found"}`）。
 - `409`：返回了多个精确匹配结果。
-- `503`：App 查询或 Frida 桥接暂时不可用；稍后重试。
+- `503`：证券目录不存在、超过七天或刷新不可用；稍后重试。
 
 #### 2. 股票数据查询
 
@@ -163,16 +165,28 @@ GET /api/v1/jobs/{public_id}
 - `404`：名称查询没有找到精确股票，或任务 ID 已不存在。
 - `409`：名称查询结果有歧义。
 - `429`：全局待处理队列已满。
-- `503`：生产环境在入队前无法使用 App 股票查询。
+- `503`：生产环境在入队前无法使用有效证券目录。
 
 当 `include_long_capture` 为 `true` 时，长截图生成后可能返回
 `/api/v1/jobs/{public_id}/capture`。OCR 仍只能用于长截图结构校验，例如确认
 必需的图表标题存在；它绝不能作为 `values` 中任何字段的数据来源。
 
+### Market 公开行情契约
+
+- Market 基础报价、当日分时和五日/周/月 K 线使用腾讯公开接口；腾讯基础报价
+  失败时可使用新浪公开报价。
+- 前复权日 K 优先使用同花顺公开 Web K 线，失败时使用腾讯公开 qfq 日 K，
+  再失败只能返回已验证 stale 缓存或 `KLINE_SOURCES_UNAVAILABLE`，不得回退 App。
+- 公开行情统一校验代码、名称、价格精度、交易时段、OHLC、成交量和成交额；
+  股票通常两位价格，沪深基金通常三位。
+- 9528 和资金 HTTP 只可作为 market 的可选 L2 增强，拥有大单、散户、MACDFS
+  和资金流字段；增强失败不得使公开基础行情不可用，也不得覆盖公开报价。
+- Market WebSocket 必须按股票保留最新事件并支持自动重连及 HTTP 快照降级。
+
 ## 本地部署
 
 - 当前 Mac 双设备角色固定如下：
-  - `core_metrics`：`THS_CORE_33_ARM64 / emulator-5556 / 27043`，用于股票名称、原八项指标、自动页面导航和长截图。
+  - `core_metrics`：`THS_CORE_33_ARM64 / emulator-5556 / 27043`，用于人工会话续签、原八项协议材料、显式长截图请求和必要的管理员维护；股票名称和 market 基础行情不再依赖它。
   - `main_fund_flow`：`THS_API_33_ARM64 / emulator-5554 / 27042`，只用于资金 1/3/5 日接口。
 - `emulator-5554` 是受保护的当前资金账号。禁止退出登录、切换账号、克隆 AVD、重装/卸载 App、清数据、`force-stop` 或自动页面导航。
 - 自动任务导航和长截图只能操作 `emulator-5556`。核心设备必须保持 `wm size 1080x1920` 和 `wm density 480`；使用 `scripts/configure-macos-core-display.sh` 校准。
@@ -202,7 +216,9 @@ when a direct client is not selected.
 
 ## Market data collection
 
-- Task values must be obtained only through the Tonghuashun App-internal interface exposed by `FridaParsedValueSource.read_direct()`.
+- Task values must use the selected verified Tonghuashun App-internal contract:
+  `FridaParsedValueSource.read_direct()` by default, or `Core9528Client` when
+  `CORE_METRICS_TRANSPORT=direct`; public quote sources never fill task values.
 - Never use screenshot OCR, UI text extraction, or values parsed from a long screenshot to fill any task metric.
 - If the interface request fails, fail the task with the original interface error code. Do not open the stock search page as a fallback.
 - If the interface returns only some metrics, keep missing metrics empty and return a partial task. Do not fill them with OCR.
@@ -214,7 +230,7 @@ when a direct client is not selected.
 The public API has two separate market-data calls. First confirm the stock code
 and name; then submit an asynchronous data task. Do not treat the name lookup
 response as market data, and do not submit a task with an unverified code when
-the production App lookup is available.
+the production catalog is available.
 
 #### 1. Stock code and name lookup
 
@@ -240,14 +256,13 @@ The service accepts only confirmed stock and current exchange-fund prefixes:
 - `158/159/160/161/162/163/164/165/166/167/168/169/180`
   → market `36` (Shenzhen funds)
 
-The production implementation calls the already running Tonghuashun App's
-internal exact-search bridge through `FridaParsedValueSource.lookup_symbol()`.
-It must find exactly one result whose stock code, market, and non-empty name
-all match the request. It must not use screenshot OCR, UI text extraction, or
-a fuzzy result. When one code has both a market `19/35` bond and a market
-`20/36` fund, filter by the expected fund market and ignore the bond before
-checking uniqueness. Multiple exact results inside the expected market remain
-ambiguous. Successful results may be reused from the verified symbol cache.
+Production lookup uses the versioned SQLite catalog at
+`/data/market/symbol-catalog.db`. It is refreshed daily from Sina's public
+`hs_a`, `etf_hq_fund`, and `lof_hq_fund` categories and activates a candidate
+version only after complete validation. Failed refreshes keep the previous
+version; a catalog older than seven days returns 503. Suggestions, exact
+confirmation, submission re-confirmation, and market watchlist additions must
+not call the App, Frida, screenshots, OCR, or UI text.
 
 Success (`200`):
 
@@ -261,10 +276,10 @@ Success (`200`):
 
 Expected errors:
 
-- `422`: malformed code or unsupported market prefix; the App lookup is not called.
+- `422`: malformed code or unsupported market prefix; the catalog is not queried.
 - `404`: no exact matching stock was returned (`{"detail":"symbol not found"}`).
 - `409`: more than one exact matching result was returned.
-- `503`: the App lookup or Frida bridge is temporarily unavailable; retry later.
+- `503`: the local catalog is unavailable, stale, or cannot be refreshed.
 
 #### 2. Stock data query
 
@@ -376,17 +391,29 @@ Expected submission/status errors:
 - `404`: name lookup found no exact stock, or the task ID no longer exists.
 - `409`: name lookup is ambiguous.
 - `429`: the global pending queue is full.
-- `503`: the production App lookup is unavailable before queueing.
+- `503`: the production symbol catalog is unavailable or stale before queueing.
 
 When `include_long_capture` is `true`, the returned `long_capture` may expose
 `/api/v1/jobs/{public_id}/capture` after the image is ready. OCR remains limited
 to structural validation of that image, such as confirming that the required
 chart heading is present; it is never a source for any field in `values`.
 
+### Public market contract
+
+- Tencent public endpoints own basic quotes, current-day intraday data, and
+  five-day/weekly/monthly series; Sina public quotes are the basic fallback.
+- Front-adjusted daily K-line uses the public Tonghuashun web feed, then
+  Tencent qfq, then validated stale cache. It never falls back to App.
+- Public data validates identity, precision, sessions, OHLC, volume, and amount.
+- 9528/fund HTTP may provide optional L2 enrichment only. Enrichment failure
+  cannot fail or overwrite the public basic snapshot.
+- Market WebSocket delivery keeps the latest event per symbol and reconnects
+  with HTTP snapshot fallback.
+
 ## Local deployment
 
 - The current Mac has two fixed device roles:
-  - `core_metrics`: `THS_CORE_33_ARM64 / emulator-5556 / 27043` for symbol lookup, the eight required values, automated UI navigation, and long captures.
+  - `core_metrics`: `THS_CORE_33_ARM64 / emulator-5556 / 27043` for human session renewal, core protocol material, explicit long captures, and administrator maintenance. Symbol lookup and basic market data no longer depend on it.
   - `main_fund_flow`: `THS_API_33_ARM64 / emulator-5554 / 27042` only for 1/3/5-day fund-flow interface requests.
 - `emulator-5554` holds the protected current fund account. Never log it out, switch accounts, clone the AVD, reinstall/uninstall or clear the App, `force-stop` it, or navigate it automatically.
 - Automated navigation and long captures may operate only on `emulator-5556`. Keep the core device at `wm size 1080x1920` and `wm density 480`; use `scripts/configure-macos-core-display.sh` to calibrate it.

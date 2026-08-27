@@ -24,8 +24,6 @@ button { cursor: pointer; }
   place-items: center;
   padding: 28px;
   background: #ef1f2d;
-  background-image: linear-gradient(110deg, rgba(255,255,255,.07) 1px, transparent 1px);
-  background-size: 42px 42px;
 }
 
 .market-loading { align-content: center; color: white; gap: 14px; }

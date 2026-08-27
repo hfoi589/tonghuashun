@@ -23,6 +23,7 @@ function jsonResponse(body: unknown, status = 200): Response {
 
 afterEach(() => {
   cleanup()
+  vi.useRealTimers()
   vi.restoreAllMocks()
 })
 
@@ -79,6 +80,114 @@ describe('MarketApp', () => {
     expect(screen.getByLabelText('当前临时密码')).toBeInTheDocument()
   })
 
+  it('renders public fund precision and hides unavailable direct L2 sections', async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url === '/api/v1/session') return jsonResponse({
+        id: 7, username: 'wilson', enabled: true, must_change_password: false,
+        created_at: '2026-08-23T00:00:00+00:00',
+      })
+      if (url === '/api/v1/watchlists') return jsonResponse({ groups: [{
+        id: 1, name: '自选', sort_order: 0, is_primary: true,
+        items: [{ symbol: '510300', name: '沪深300ETF', market: '20' }],
+      }] })
+      if (url.includes('/snapshot')) return jsonResponse({
+        symbol: '510300', name: '沪深300ETF', market: '20', sequence: 1,
+        source_time: '15:00', collected_at: '2026-08-27T07:00:00+00:00',
+        stale: false, age_seconds: 0.2, source: 'TENCENT_PUBLIC', price_precision: 3,
+        quote: { price: '4.123', change_percent: '0.56%', open: '4.101', high: '4.130', low: '4.090', previous_close: '4.100' },
+        timeshare: [{ time: '09:30', price: '4.123', average_price: '4.123', volume: '10000' }],
+        intraday_series: {}, order_book: [], trades: [], main_fund_flow: {},
+        capabilities: {
+          timeshare: { available: true }, kline: { available: true, adjustment: 'qfq' },
+          daily_kline: { available: true, adjustment: 'qfq' },
+          l2: { available: false, reason: 'DIRECT_SESSION_UNAVAILABLE' },
+          order_book: { available: false, reason: 'PUBLIC_LEVEL2_UNAVAILABLE' },
+          trades: { available: false, reason: 'PUBLIC_LEVEL2_UNAVAILABLE' },
+        },
+        source_errors: { tencent_public: null, sina_public: null, core_metrics: 'DIRECT_SESSION_UNAVAILABLE', main_fund_flow: null },
+      })
+      if (url.includes('/series?period=day')) return jsonResponse({
+        symbol: '510300', period: 'day', bars: [], indicators: {}, next_cursor: null,
+        source_error: 'KLINE_SOURCES_UNAVAILABLE', adjustment: 'qfq', source: null,
+        cached: false, stale: false,
+        source_errors: { ths_public_kline: 'PUBLIC_KLINE_HTTP_ERROR', tencent_public_kline: 'PUBLIC_KLINE_UNAVAILABLE' },
+      })
+      throw new Error(`unexpected request: ${url}`)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    vi.stubGlobal('WebSocket', undefined)
+
+    render(<MarketApp />)
+
+    const chart = await screen.findByRole('img', { name: '沪深300ETF分时价格图' })
+    expect(within(chart.closest('figure')!).getByText('4.123', { selector: '.market-timeshare-readout strong' })).toBeInTheDocument()
+    expect(screen.queryByText('大单净量')).not.toBeInTheDocument()
+    expect(screen.queryByRole('heading', { name: '主力流向' })).not.toBeInTheDocument()
+    expect(screen.queryByText('当前 App 接口未确认')).not.toBeInTheDocument()
+    expect(screen.getByText('腾讯公开行情')).toBeInTheDocument()
+  })
+
+  it('reconnects the market stream, resubscribes, and refreshes HTTP snapshot', async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url === '/api/v1/session') return jsonResponse({
+        id: 7, username: 'wilson', enabled: true, must_change_password: false,
+        created_at: '2026-08-23T00:00:00+00:00',
+      })
+      if (url === '/api/v1/watchlists') return jsonResponse({ groups: [{
+        id: 1, name: '自选', sort_order: 0, is_primary: true,
+        items: [{ symbol: '601872', name: '招商轮船', market: '17' }],
+      }] })
+      if (url.includes('/snapshot')) return jsonResponse({
+        symbol: '601872', name: '招商轮船', market: '17', sequence: 1,
+        source_time: '15:00', collected_at: '2026-08-27T07:00:00+00:00',
+        source: 'TENCENT_PUBLIC', price_precision: 2, stale: false, age_seconds: 0.2,
+        quote: { price: '18.62', change_percent: '1.31%' },
+        timeshare: [{ time: '15:00', price: '18.62', average_price: '18.40', volume: '1000' }],
+        intraday_series: {}, order_book: [], trades: [], main_fund_flow: {},
+        capabilities: { timeshare: { available: true }, kline: { available: true }, l2: { available: false } },
+        source_errors: { core_metrics: null, main_fund_flow: null },
+      })
+      if (url.includes('/series?period=day')) return jsonResponse({
+        symbol: '601872', period: 'day', bars: [], indicators: {}, next_cursor: null,
+        source_error: 'KLINE_SOURCES_UNAVAILABLE', adjustment: 'qfq', source: null,
+        cached: false, stale: false, source_errors: {},
+      })
+      throw new Error(`unexpected request: ${url}`)
+    })
+    class FakeWebSocket {
+      static instances: FakeWebSocket[] = []
+      onopen: ((event: Event) => void) | null = null
+      onmessage: ((event: MessageEvent) => void) | null = null
+      onclose: ((event: CloseEvent) => void) | null = null
+      onerror: ((event: Event) => void) | null = null
+      send = vi.fn()
+      close = vi.fn()
+      constructor(public url: string) { FakeWebSocket.instances.push(this) }
+    }
+    vi.stubGlobal('fetch', fetchMock)
+    vi.stubGlobal('WebSocket', FakeWebSocket as unknown as typeof WebSocket)
+
+    render(<MarketApp />)
+
+    await waitFor(() => expect(FakeWebSocket.instances).toHaveLength(1))
+    FakeWebSocket.instances[0].onopen?.(new Event('open'))
+    expect(FakeWebSocket.instances[0].send).toHaveBeenCalledWith(JSON.stringify({
+      type: 'subscribe', watchlist: ['601872'], detail: '601872',
+    }))
+
+    FakeWebSocket.instances[0].onclose?.(new CloseEvent('close'))
+
+    expect(await screen.findByText('正在重连')).toBeInTheDocument()
+    await waitFor(() => expect(FakeWebSocket.instances).toHaveLength(2), { timeout: 1600 })
+    FakeWebSocket.instances[1].onopen?.(new Event('open'))
+    expect(FakeWebSocket.instances[1].send).toHaveBeenCalledWith(JSON.stringify({
+      type: 'subscribe', watchlist: ['601872'], detail: '601872',
+    }))
+    expect(fetchMock.mock.calls.filter(([url]) => String(url).includes('/snapshot')).length).toBeGreaterThan(1)
+  })
+
   it('loads grouped watchlists and opens a realtime stock detail', async () => {
     const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
       const url = String(input)
@@ -102,6 +211,8 @@ describe('MarketApp', () => {
         sequence: 12,
         source_time: '14:56',
         collected_at: '2026-08-23T06:56:01+00:00',
+        source: 'TENCENT_PUBLIC',
+        price_precision: 2,
         stale: false,
         age_seconds: 0.4,
         quote: { price: '8.33', previous_close: '8.16', change_percent: '2.08%', turnover_rate: '1.42%' },
@@ -165,6 +276,7 @@ describe('MarketApp', () => {
           timeshare: { available: true, reason: null },
           kline: { available: false, reason: 'DIRECT_KLINE_UNAVAILABLE' },
           daily_kline: { available: true, adjustment: 'qfq' },
+          l2: { available: true, reason: null },
           order_book: { available: false, reason: 'APP_INTERFACE_NOT_CONFIRMED' },
           trades: { available: false, reason: 'APP_INTERFACE_NOT_CONFIRMED' },
         },
@@ -188,7 +300,7 @@ describe('MarketApp', () => {
         source: 'THS_PUBLIC',
         cached: false,
         stale: false,
-        source_errors: { public_kline: null, app_kline: null },
+        source_errors: { ths_public_kline: null, tencent_public_kline: null },
       })
       throw new Error(`unexpected request: ${url}`)
     })
@@ -208,7 +320,7 @@ describe('MarketApp', () => {
     const macdChart = screen.getByRole('img', { name: 'MACD当日分时图' })
     const unifiedChartPanel = priceChart.closest<HTMLElement>('.market-chart-panel')!
     const metricGrid = screen.getByText('大单净量', { selector: '.market-metric-grid span' }).closest<HTMLElement>('.market-metric-grid')!
-    const fundFlow = screen.getByRole('heading', { name: '主力流向' }).closest<HTMLElement>('.market-section')!
+    const fundFlow = screen.getByRole('heading', { name: '主力流向' }).closest<HTMLElement>('.market-fund-flow')!
     expect(unifiedChartPanel).toContainElement(metricGrid)
     expect(unifiedChartPanel).toContainElement(fundFlow)
     expect(metricGrid.compareDocumentPosition(fundFlow) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()

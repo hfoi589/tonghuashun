@@ -280,13 +280,16 @@ def test_daily_source_prefers_public_and_returns_240_aligned_qfq_bars() -> None:
     assert page.source == "THS_PUBLIC"
     assert page.cached is False
     assert page.stale is False
-    assert page.source_errors == {"public_kline": None, "app_kline": None}
+    assert page.source_errors == {
+        "ths_public_kline": None,
+        "tencent_public_kline": None,
+    }
     assert cached.cached is True
     assert public.calls == [("601872", 489)]
     assert app.series_calls == []
 
 
-def test_daily_source_falls_back_to_app_and_recomputes_all_indicators() -> None:
+def test_daily_source_falls_back_to_tencent_and_recomputes_all_indicators() -> None:
     from level2_service.daily_kline import (
         DailyKlineMarketDataSource,
         DailyKlineSourceError,
@@ -294,18 +297,23 @@ def test_daily_source_falls_back_to_app_and_recomputes_all_indicators() -> None:
     from level2_service.market_data import MarketSeriesPage
 
     app = _AppSource(
-        MarketSeriesPage(symbol="601872", period="day", bars=_bars(500))
+        MarketSeriesPage(
+            symbol="601872",
+            period="day",
+            bars=_bars(500),
+            source="TENCENT_PUBLIC",
+        )
     )
     public = _PublicProvider(DailyKlineSourceError("PUBLIC_KLINE_HTTP_ERROR"))
     source = DailyKlineMarketDataSource(app, public)
 
     page = source.read_market_series("601872", "day", None, 240)
 
-    assert page.source == "THS_APP"
+    assert page.source == "TENCENT_PUBLIC"
     assert page.adjustment == "qfq"
     assert page.source_errors == {
-        "public_kline": "PUBLIC_KLINE_HTTP_ERROR",
-        "app_kline": None,
+        "ths_public_kline": "PUBLIC_KLINE_HTTP_ERROR",
+        "tencent_public_kline": None,
     }
     assert app.series_calls == [("601872", "day", None, 489)]
     assert len(page.bars) == len(page.indicators["macd_hist"]) == 240
@@ -337,13 +345,13 @@ def test_daily_source_serves_only_stale_cache_after_both_sources_fail() -> None:
     assert page.source == "THS_PUBLIC"
     assert page.source_error == "KLINE_SOURCES_UNAVAILABLE"
     assert page.source_errors == {
-        "public_kline": "PUBLIC_KLINE_HTTP_ERROR",
-        "app_kline": "DIRECT_KLINE_UNAVAILABLE",
+        "ths_public_kline": "PUBLIC_KLINE_HTTP_ERROR",
+        "tencent_public_kline": "DIRECT_KLINE_UNAVAILABLE",
     }
     assert source.daily_kline_stats() == {
         "cache_entries": 1,
         "public_successes": 1,
-        "app_fallbacks": 0,
+        "fallback_successes": 0,
         "stale_cache_hits": 1,
         "failures": 0,
     }
@@ -389,7 +397,7 @@ def test_daily_source_advertises_only_daily_kline_capability() -> None:
     assert MarketDataBroker(source).stats()["daily_kline"] == {
         "cache_entries": 0,
         "public_successes": 0,
-        "app_fallbacks": 0,
+        "fallback_successes": 0,
         "stale_cache_hits": 0,
         "failures": 0,
     }

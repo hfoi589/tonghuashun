@@ -15,6 +15,7 @@ from fastapi import Depends, FastAPI, HTTPException, Request, Response, WebSocke
 from pydantic import BaseModel, Field
 
 from .market_accounts import DuplicateUserError, MarketUser, WatchlistGroup, WatchlistItem
+from .market_data import MARKET_PERIODS, fixed_market_error_code
 from .parsed_values import SymbolLookup
 
 
@@ -92,17 +93,37 @@ def _user_response(user: MarketUser) -> MarketUserResponse:
     return MarketUserResponse.model_validate(user, from_attributes=True)
 
 
-def _item_response(item: WatchlistItem) -> WatchlistItemResponse:
+def _item_response(
+    item: WatchlistItem,
+    resolve_symbol: Callable[[str], SymbolLookup] | None = None,
+) -> WatchlistItemResponse:
+    if resolve_symbol is not None:
+        try:
+            current = resolve_symbol(item.symbol)
+        except Exception:
+            current = None
+        if current is not None:
+            return WatchlistItemResponse(
+                symbol=current.symbol,
+                name=current.name,
+                market=current.market,
+            )
     return WatchlistItemResponse.model_validate(item, from_attributes=True)
 
 
-def _group_response(group: WatchlistGroup) -> WatchlistGroupResponse:
+def _group_response(
+    group: WatchlistGroup,
+    resolve_symbol: Callable[[str], SymbolLookup] | None = None,
+) -> WatchlistGroupResponse:
     return WatchlistGroupResponse(
         id=group.id,
         name=group.name,
         sort_order=group.sort_order,
         is_primary=group.is_primary,
-        items=[_item_response(item) for item in group.items],
+        items=[
+            _item_response(item, resolve_symbol)
+            for item in group.items
+        ],
     )
 
 
@@ -304,7 +325,12 @@ def install_market_routes(
     @app.get("/api/v1/watchlists", response_model=WatchlistsResponse)
     def get_watchlists(user=Depends(require_ready_user)) -> WatchlistsResponse:
         accounts, _sessions = stores()
-        return WatchlistsResponse(groups=[_group_response(group) for group in accounts.list_watchlists(user.id)])
+        return WatchlistsResponse(
+            groups=[
+                _group_response(group, resolve_symbol)
+                for group in accounts.list_watchlists(user.id)
+            ]
+        )
 
     @app.post("/api/v1/watchlists/groups", status_code=201, response_model=WatchlistGroupResponse)
     def create_watchlist_group(
@@ -313,7 +339,10 @@ def install_market_routes(
     ) -> WatchlistGroupResponse:
         accounts, _sessions = stores()
         try:
-            return _group_response(accounts.create_group(user.id, payload.name))
+            return _group_response(
+                accounts.create_group(user.id, payload.name),
+                resolve_symbol,
+            )
         except ValueError as error:
             raise HTTPException(status_code=409, detail=str(error)) from None
 
@@ -325,7 +354,10 @@ def install_market_routes(
     ) -> WatchlistGroupResponse:
         accounts, _sessions = stores()
         try:
-            return _group_response(accounts.rename_group(user.id, group_id, payload.name))
+            return _group_response(
+                accounts.rename_group(user.id, group_id, payload.name),
+                resolve_symbol,
+            )
         except LookupError:
             raise HTTPException(status_code=404, detail="watchlist group not found") from None
         except ValueError as error:
@@ -368,7 +400,10 @@ def install_market_routes(
         lookup = resolve_symbol(normalized)
         accounts, _sessions = stores()
         try:
-            return _item_response(accounts.add_symbol(user.id, group_id, lookup))
+            return _item_response(
+                accounts.add_symbol(user.id, group_id, lookup),
+                resolve_symbol,
+            )
         except LookupError:
             raise HTTPException(status_code=404, detail="watchlist group not found") from None
         except ValueError as error:
@@ -441,7 +476,23 @@ def install_market_routes(
 
     @app.get("/api/admin/market")
     def admin_market_health(_admin=Depends(require_admin)):
-        return market_broker().stats()
+        health = market_broker().stats()
+        catalog = getattr(app.state, "symbol_catalog", None)
+        status = getattr(catalog, "status", None)
+        if callable(status):
+            current = status()
+            health["symbol_catalog"] = {
+                "active_version": current.active_version,
+                "count": current.count,
+                "activated_at": (
+                    current.activated_at.isoformat()
+                    if current.activated_at is not None
+                    else None
+                ),
+                "stale": current.stale,
+                "checksum": current.checksum,
+            }
+        return health
 
     @app.get("/api/v1/market/symbols/{symbol}/snapshot")
     async def market_snapshot(symbol: str, _user=Depends(require_ready_user)):
@@ -456,8 +507,13 @@ def install_market_routes(
                 max_age_seconds=1.5,
             )
         except Exception as error:
-            error_code = getattr(error, "error_code", None) or str(error)
-            raise HTTPException(status_code=503, detail=error_code) from None
+            raise HTTPException(
+                status_code=503,
+                detail=fixed_market_error_code(
+                    error,
+                    "MARKET_QUOTE_UNAVAILABLE",
+                ),
+            ) from None
         return snapshot.as_public()
 
     @app.get("/api/v1/market/symbols/{symbol}/series")
@@ -471,14 +527,27 @@ def install_market_routes(
         normalized = symbol.strip()
         if not re.fullmatch(r"[0-9]{6}", normalized):
             raise HTTPException(status_code=422, detail="symbol must be a six-digit stock code")
+        if period not in MARKET_PERIODS:
+            raise HTTPException(
+                status_code=422,
+                detail="unsupported market series period",
+            )
+        if not 1 <= limit <= 500:
+            raise HTTPException(
+                status_code=422,
+                detail="series limit must be between 1 and 500",
+            )
         resolve_symbol(normalized)
         try:
             page = await market_broker().series(normalized, period, cursor, limit)
-        except ValueError as error:
-            raise HTTPException(status_code=422, detail=str(error)) from None
         except Exception as error:
-            error_code = getattr(error, "error_code", None) or str(error)
-            raise HTTPException(status_code=503, detail=error_code) from None
+            raise HTTPException(
+                status_code=503,
+                detail=fixed_market_error_code(
+                    error,
+                    "MARKET_SERIES_UNAVAILABLE",
+                ),
+            ) from None
         return page.as_public()
 
     def validated_subscription(value: object) -> tuple[set[str], set[str]] | None:

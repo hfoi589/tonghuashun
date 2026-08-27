@@ -103,9 +103,10 @@ function readout(page: MarketSeriesPage, selectedTime: string | undefined) {
   }
 }
 
-export function DailyKChart({ name, page, onSelectionChange }: {
+export function DailyKChart({ name, page, pricePrecision = 2, onSelectionChange }: {
   name: string,
   page: MarketSeriesPage,
+  pricePrecision?: number,
   onSelectionChange?: (selection: DailyKSelection) => void,
 }) {
   const container = useRef<HTMLDivElement>(null)
@@ -146,6 +147,11 @@ export function DailyKChart({ name, page, onSelectionChange }: {
       borderDownColor: DOWN_COLOR,
       wickUpColor: UP_COLOR,
       wickDownColor: DOWN_COLOR,
+      priceFormat: {
+        type: 'price',
+        precision: pricePrecision,
+        minMove: 10 ** -pricePrecision,
+      },
     }, 0)
     candles.setData(page.bars.flatMap((bar) => {
       const open = number(bar.open)
@@ -213,7 +219,7 @@ export function DailyKChart({ name, page, onSelectionChange }: {
       }
     })
     return () => chart.remove()
-  }, [latestTime, name, page])
+  }, [latestTime, name, page, pricePrecision])
 
   if (!selected.bar) return <div className="market-empty-chart">暂无日 K 数据</div>
   const bar: KlineBar = selected.bar

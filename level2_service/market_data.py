@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import time
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
@@ -11,6 +12,18 @@ from zoneinfo import ZoneInfo
 
 
 MARKET_PERIODS = frozenset({"timeshare", "five_day", "min5", "min15", "min30", "min60", "day", "week", "month"})
+_FIXED_MARKET_ERROR = re.compile(r"[A-Z][A-Z0-9_]{2,63}\Z")
+
+
+def fixed_market_error_code(
+    error: object,
+    fallback: str = "MARKET_SOURCE_FAILED",
+) -> str:
+    raw_code = getattr(error, "error_code", None)
+    if raw_code is None:
+        return fallback
+    candidate = str(raw_code).strip()
+    return candidate if _FIXED_MARKET_ERROR.fullmatch(candidate) else fallback
 
 
 def is_china_market_open(now: datetime | None = None) -> bool:
@@ -67,6 +80,8 @@ class MarketSnapshot:
     source_time: str | None
     collected_at: datetime
     quote: dict[str, str | None]
+    source: str | None = None
+    price_precision: int = 2
     timeshare: tuple[TimesharePoint, ...] = ()
     intraday_series: dict[str, dict[str, Any]] = field(default_factory=dict)
     order_book: tuple[OrderBookLevel, ...] = ()
@@ -74,6 +89,10 @@ class MarketSnapshot:
     main_fund_flow: dict[str, Any] = field(default_factory=dict)
     capabilities: dict[str, dict[str, Any]] = field(default_factory=dict)
     source_errors: dict[str, str | None] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if not 1 <= self.price_precision <= 6:
+            raise ValueError("price_precision must be between 1 and 6")
 
     def as_public(self, *, stale_after_seconds: float = 5.0) -> dict[str, Any]:
         value = asdict(self)
@@ -136,7 +155,11 @@ class MarketDataBroker:
         self.clock = clock
         self.is_market_open = is_market_open
         self._subscriptions: dict[str, tuple[set[str], set[str]]] = {}
-        self._queues: dict[str, asyncio.Queue[dict[str, Any]]] = {}
+        self._queues: dict[str, asyncio.Queue[tuple[str, str]]] = {}
+        self._pending_events: dict[
+            str,
+            dict[tuple[str, str], dict[str, Any]],
+        ] = {}
         self._cache: dict[str, MarketSnapshot] = {}
         self._sequence: dict[str, int] = {}
         self._last_polled: dict[str, float] = {}
@@ -150,11 +173,17 @@ class MarketDataBroker:
         detail_symbols: set[str],
     ) -> None:
         self._subscriptions[client_id] = (set(watchlist_symbols), set(detail_symbols))
-        self._queues.setdefault(client_id, asyncio.Queue(maxsize=1))
+        self._queues.setdefault(client_id, asyncio.Queue())
+        pending = self._pending_events.setdefault(client_id, {})
+        wanted = set(watchlist_symbols) | set(detail_symbols)
+        for key in tuple(pending):
+            if key[0] not in wanted:
+                pending.pop(key, None)
 
     def unsubscribe(self, client_id: str) -> None:
         self._subscriptions.pop(client_id, None)
         self._queues.pop(client_id, None)
+        self._pending_events.pop(client_id, None)
 
     def has_subscriber(self, client_id: str) -> bool:
         return client_id in self._subscriptions
@@ -196,20 +225,29 @@ class MarketDataBroker:
         for client_id, queue in tuple(self._queues.items()):
             if not self._wanted(client_id, symbol):
                 continue
-            if queue.full():
-                try:
-                    queue.get_nowait()
-                except asyncio.QueueEmpty:
-                    pass
-            queue.put_nowait(event)
+            pending = self._pending_events.setdefault(client_id, {})
+            key = (symbol, str(event.get("type", "event")))
+            if key not in pending:
+                queue.put_nowait(key)
+            pending[key] = event
 
     async def next_event(self, client_id: str, *, timeout: float | None = None) -> dict[str, Any]:
         queue = self._queues.get(client_id)
-        if queue is None:
+        pending = self._pending_events.get(client_id)
+        if queue is None or pending is None:
             raise LookupError("market subscriber not found")
-        if timeout is None:
-            return await queue.get()
-        return await asyncio.wait_for(queue.get(), timeout=timeout)
+        async def next_pending() -> dict[str, Any]:
+            while True:
+                key = await queue.get()
+                event = pending.pop(key, None)
+                if event is not None:
+                    return event
+
+        return (
+            await next_pending()
+            if timeout is None
+            else await asyncio.wait_for(next_pending(), timeout=timeout)
+        )
 
     async def refresh(
         self,
@@ -257,7 +295,7 @@ class MarketDataBroker:
                 await self.refresh(symbol, detail=detail)
             except Exception as error:
                 self._last_polled[symbol] = now
-                error_code = getattr(error, "error_code", None) or str(error) or type(error).__name__
+                error_code = fixed_market_error_code(error)
                 self._publish(
                     symbol,
                     {

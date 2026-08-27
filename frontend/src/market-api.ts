@@ -44,6 +44,8 @@ export interface MarketSnapshot {
   sequence: number
   source_time: string | null
   collected_at: string
+  source: 'TENCENT_PUBLIC' | 'SINA_PUBLIC' | null
+  price_precision: number
   stale: boolean
   age_seconds: number
   quote: Record<string, string | null>
@@ -74,7 +76,7 @@ export interface MarketSeriesPage {
   next_cursor: string | null
   source_error: string | null
   adjustment: 'qfq' | null
-  source: 'THS_PUBLIC' | 'THS_APP' | null
+  source: 'THS_PUBLIC' | 'TENCENT_PUBLIC' | 'SINA_PUBLIC' | null
   cached: boolean
   stale: boolean
   source_errors: Record<string, string | null>

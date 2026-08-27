@@ -34,6 +34,7 @@ _CORE_SESSION_MATERIAL_KEYS = (
 _CORE_TEMPLATE_MATERIAL_KEYS = (
     "template_symbol",
     "request_packets_hex",
+    "macdfs_params",
 )
 
 
@@ -74,6 +75,9 @@ var target_symbol = null;
 var target_frames = [];
 var capture_target = false;
 var target_packets = [];
+var macdfs_params_json = null;
+var macdfs_params_conflict = false;
+var capture_macdfs_params = false;
 
 function contains_text(buffer, text) {
   var length = buffer.length;
@@ -114,6 +118,36 @@ function to_hex(buffer, offset, length) {
 }
 
 Java.perform(function () {
+  try {
+    var MacdProcessor = Java.use('wmg');
+    var calculateMacd = MacdProcessor.E.overload(
+      'qxg',
+      'com.hexin.android.finance_chart.domain.CurveLineParser$EQCurveLineDesc'
+    );
+    calculateMacd.implementation = function (indicator, descriptor) {
+      try {
+        if (!capture_macdfs_params || target_symbol === null) {
+          return calculateMacd.call(this, indicator, descriptor);
+        }
+        var source = indicator === null ? null : indicator.g();
+        var sourceSymbol = source === null ? null : String(source.getExtData(4));
+        if (sourceSymbol !== target_symbol) {
+          return calculateMacd.call(this, indicator, descriptor);
+        }
+        var params = descriptor === null ? null : descriptor.getTechParam();
+        if (params !== null && params.length >= 3) {
+          var candidate = JSON.stringify([
+            Number(params[0]),
+            Number(params[1]),
+            Number(params[2])
+          ]);
+          if (macdfs_params_json === null) macdfs_params_json = candidate;
+          else if (macdfs_params_json !== candidate) macdfs_params_conflict = true;
+        }
+      } catch (_) {}
+      return calculateMacd.call(this, indicator, descriptor);
+    };
+  } catch (_) {}
   var CommunicationManager = Java.use('nsv');
   var transform = CommunicationManager.I.overload('[B', 'int', 'int', 'int');
   transform.implementation = function (buffer, frame, sequence, sessionType) {
@@ -185,6 +219,34 @@ rpc.exports = {
           }
           result.base64_alphabet = alphabet;
           try {
+            var Registry = Java.use('rwg');
+            var IntegerClass = Java.use('java.lang.Integer');
+            var CurveXmlConfig = Java.use(
+              'com.hexin.android.finance_chart.domain.CurveXmlConfig'
+            );
+            var configMap = Registry.i()._k.value.c();
+            var rawConfig = configMap.get(IntegerClass.valueOf(2));
+            if (rawConfig !== null) {
+              var config = Java.cast(rawConfig, CurveXmlConfig);
+              var tech = config.getUnit(2).get(IntegerClass.valueOf(7051));
+              if (tech !== null) {
+                var lines = tech.getLines();
+                for (var lineIndex = 0; lineIndex < lines.size(); lineIndex += 1) {
+                  var descriptor = lines.get(lineIndex).getLineDesc();
+                  var params = descriptor === null ? null : descriptor.getTechParam();
+                  if (params !== null && params.length >= 3) {
+                    result.macdfs_params = JSON.stringify([
+                      Number(params[0]),
+                      Number(params[1]),
+                      Number(params[2])
+                    ]);
+                    break;
+                  }
+                }
+              }
+            }
+          } catch (_) {}
+          try {
             Java.use('msv').INSTANCE.value.sendAuthRequest(0);
           } catch (_) {}
         } catch (error) {
@@ -202,10 +264,57 @@ rpc.exports = {
     target_frames = [];
     target_packets = [];
     capture_target = false;
+    macdfs_params_json = null;
+    macdfs_params_conflict = false;
+    capture_macdfs_params = true;
     return true;
   },
   packets: function () {
     return target_packets.slice();
+  },
+  macdfsparams: function () {
+    return new Promise(function (resolve) {
+      Java.perform(function () {
+        var result = null;
+        try {
+          var Registry = Java.use('rwg');
+          var IntegerClass = Java.use('java.lang.Integer');
+          var CurveXmlConfig = Java.use(
+            'com.hexin.android.finance_chart.domain.CurveXmlConfig'
+          );
+          var configMap = Registry.i()._k.value.c();
+          var rawConfig = configMap.get(IntegerClass.valueOf(2));
+          if (rawConfig !== null) {
+            var config = Java.cast(rawConfig, CurveXmlConfig);
+            var tech = config.getUnit(2).get(IntegerClass.valueOf(7051));
+            if (tech !== null) {
+              var lines = tech.getLines();
+              for (var lineIndex = 0; lineIndex < lines.size(); lineIndex += 1) {
+                var descriptor = lines.get(lineIndex).getLineDesc();
+                var params = descriptor === null ? null : descriptor.getTechParam();
+                if (params !== null && params.length >= 3) {
+                  result = JSON.stringify([
+                    Number(params[0]),
+                    Number(params[1]),
+                    Number(params[2])
+                  ]);
+                  break;
+                }
+              }
+            }
+          }
+        } catch (_) {}
+        capture_macdfs_params = false;
+        if (
+          macdfs_params_conflict
+          || (macdfs_params_json !== null && result !== null && macdfs_params_json !== result)
+        ) {
+          resolve('__CONFLICT__');
+          return;
+        }
+        resolve(macdfs_params_json !== null ? macdfs_params_json : result);
+      });
+    });
   }
 };
 """
@@ -220,8 +329,11 @@ def _validated_role(role: str) -> str:
 
 def _validated_core_material(captured: Mapping[str, object]) -> dict[str, str]:
     normalized = {
-        key: str(captured.get(key, "")).strip()
-        for key in (*_CORE_SESSION_MATERIAL_KEYS, *_CORE_TEMPLATE_MATERIAL_KEYS)
+        key: "" if captured.get(key) is None else str(captured.get(key, "")).strip()
+        for key in (
+            *_CORE_SESSION_MATERIAL_KEYS,
+            *_CORE_TEMPLATE_MATERIAL_KEYS,
+        )
     }
     if any(
         not normalized[key]
@@ -230,6 +342,8 @@ def _validated_core_material(captured: Mapping[str, object]) -> dict[str, str]:
     ):
         raise DirectRequestError("DIRECT_SESSION_UNAVAILABLE")
     if not normalized["base64_alphabet"]:
+        raise DirectRequestError("DIRECT_PROTOCOL_HANDSHAKE_FAILED")
+    if any(not normalized[key] for key in _CORE_TEMPLATE_MATERIAL_KEYS):
         raise DirectRequestError("DIRECT_PROTOCOL_HANDSHAKE_FAILED")
     try:
         port = int(normalized["server_port"])
@@ -241,6 +355,31 @@ def _validated_core_material(captured: Mapping[str, object]) -> dict[str, str]:
     alphabet = normalized["base64_alphabet"]
     if len(alphabet) != 64 or len(set(alphabet)) != 64:
         raise DirectRequestError("DIRECT_PROTOCOL_HANDSHAKE_FAILED")
+
+    macdfs_params = normalized["macdfs_params"]
+    if macdfs_params:
+        try:
+            parsed_params = json.loads(macdfs_params)
+        except json.JSONDecodeError:
+            raise DirectRequestError(
+                "DIRECT_PROTOCOL_HANDSHAKE_FAILED"
+            ) from None
+        if (
+            not isinstance(parsed_params, list)
+            or len(parsed_params) != 3
+            or any(
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or value <= 0
+                or value > 1000
+                for value in parsed_params
+            )
+        ):
+            raise DirectRequestError("DIRECT_PROTOCOL_HANDSHAKE_FAILED")
+        normalized["macdfs_params"] = json.dumps(
+            parsed_params,
+            separators=(",", ":"),
+        )
 
     template_symbol = normalized["template_symbol"]
     try:
@@ -570,6 +709,13 @@ def capture_core_session_material(
                 script.exports_sync.packets(),
                 separators=(",", ":"),
             )
+            try:
+                macdfs_params = script.exports_sync.macdfsparams()
+            except Exception:
+                macdfs_params = None
+            if not macdfs_params:
+                raise DirectRequestError("DIRECT_PROTOCOL_HANDSHAKE_FAILED")
+            result["macdfs_params"] = str(macdfs_params)
         except DirectRequestError as error:
             raise DirectRequestError(
                 sanitized_direct_error_code(
@@ -627,6 +773,24 @@ class EncryptedFileSessionProvider:
             if bundle.role != role:
                 self._errors[role] = "DIRECT_SESSION_UNAVAILABLE"
                 return None
+            if role == "core_metrics":
+                try:
+                    validated = _validated_core_material(bundle.core_material)
+                except DirectRequestError as error:
+                    self._errors[role] = sanitized_direct_error_code(
+                        error.error_code,
+                        "DIRECT_SESSION_UNAVAILABLE",
+                    )
+                    return None
+                bundle = AccountSessionBundle(
+                    role=bundle.role,
+                    cookie=bundle.cookie,
+                    user_agent=bundle.user_agent,
+                    platform=bundle.platform,
+                    updated_at=bundle.updated_at,
+                    device_profile=dict(bundle.device_profile),
+                    core_material=validated,
+                )
             return bundle
 
     def put(self, bundle: AccountSessionBundle) -> None:

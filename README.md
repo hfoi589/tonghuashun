@@ -1,16 +1,19 @@
 # 同花顺 Level2 截图服务
 
-This is a single-host deployment: a public web/API service controls two
-administrator-owned Android instances over private ADB connections. It does
-not store THS login details or bypass login/CAPTCHA/device checks. Data-only
-tasks ask the already logged-in App's own curve manager to perform its normal
-authentication, signing, and market-data requests, then read the App-parsed
-callback through Frida; the service does not reimplement or expose the private
-wire protocol. OCR is used only for non-data structural validation of an
-optional long screenshot and never fills task metrics. Data-only tasks skip search, text input, stock
-page switching, scrolling, screenshots, stitching, OCR, and PNG storage. The
-deployment is **not supported yet** until the real APK
-passes the smoke checklist below.
+This single-host deployment serves an asynchronous Level2 task API and a
+multi-user market application. Exact security identity comes from a versioned
+local SQLite catalog refreshed from Sina public lists. Basic market quote,
+intraday, and period data come from Tencent/Sina public endpoints, while daily
+qfq K-line prefers the public Tonghuashun web feed. The original eight task
+metrics remain isolated to the selected verified App-internal transport; in
+the current Mac deployment both core metrics and fund flow use direct
+server-side clients with encrypted bundles captured after normal human login.
+
+The service never accepts THS account passwords or bypasses login, CAPTCHA, or
+device checks. The App is needed only for human session bootstrap/renewal and
+explicit long captures. OCR is limited to structural validation of an optional
+long screenshot and never fills task metrics. Data-only tasks do not navigate
+the App, scroll, capture, stitch, or run OCR.
 
 ## Supported profiles only
 
@@ -110,6 +113,20 @@ port. Dual mode uses `CORE_ADB_SERIAL`, `CORE_FRIDA_SERVER_ENDPOINT`,
 four are required. Legacy `ADB_SERIAL` and `FRIDA_SERVER_ENDPOINT` remain
 available for a single device.
 
+The Mac profile also carries non-secret public-data and warm-connection
+settings:
+
+```dotenv
+SYMBOL_CATALOG_PATH=/data/market/symbol-catalog.db
+SYMBOL_CATALOG_MAX_AGE_SECONDS=604800
+SYMBOL_CATALOG_REFRESH_HOUR=16
+SYMBOL_CATALOG_REFRESH_MINUTE=20
+PUBLIC_MARKET_TIMEOUT_SECONDS=8
+MARKET_DIRECT_ENRICHMENT=1
+MARKET_DIRECT_ENRICHMENT_TTL_SECONDS=15
+CORE_WARM_CONNECTION_MAX_IDLE_SECONDS=25
+```
+
 ## Image, volumes, and HTTP access
 
 The API image includes the built React frontend and uses multi-architecture
@@ -121,8 +138,9 @@ docker buildx build --platform linux/amd64,linux/arm64 --target api -t example/t
 
 Compose persists `capture-data`, `redis-data`, `redroid-data` (Linux only),
 `template-data`, `admin-data`, and `market-data`. The last volume contains the
-SQLite user and grouped-watchlist database; ordinary browser sessions remain
-revocable Redis records. Put only manually calibrated,
+SQLite user/grouped-watchlist database and the versioned public security
+catalog (`symbol-catalog.db`); ordinary browser sessions remain revocable
+Redis records. Put only manually calibrated,
 non-secret PNG anchors under `template-data` (`search.png` and optional tab
 anchors); the API loads them as an OpenCV fallback after selector checks.
 Capture retention remains the API's 24-hour cleanup policy. Task metadata and
@@ -148,18 +166,23 @@ screen, or input events. Use this mode only on a trusted local network. If the
 service is later published through a trusted external HTTPS reverse proxy, set
 `ADMIN_COOKIE_SECURE=1` and restrict direct access to port 8001.
 
-The market transports default to `frida`. Set `FUND_FLOW_TRANSPORT=direct` to
-send the three main-fund-flow requests directly from the API after a human
-administrator has logged into the protected App account. Set
-`CORE_METRICS_TRANSPORT=direct` only after a verified 9528 protocol session
-bundle is available. `shadow` runs both paths but returns the existing Frida
-result while recording only field-name mismatches. Direct or shadow mode
-requires a Fernet `THS_SESSION_ENCRYPTION_KEY`; raw cookies and auth packets are
-stored only in encrypted files under `/data/admin/ths-sessions`.
-The current direct core transport has the authentication/frame state machine
-and an explicit response-decoder gate; until the `StuffCurveStruct` decoder is
-verified, it returns `DIRECT_PROTOCOL_RESPONSE_UNSUPPORTED` and never publishes
-undecoded binary data as metrics.
+The current Mac profile sets both `CORE_METRICS_TRANSPORT=direct` and
+`FUND_FLOW_TRANSPORT=direct`. Direct/shadow modes require a Fernet
+`THS_SESSION_ENCRYPTION_KEY`; cookies, auth packets, templates, and indicator
+parameters are stored only in encrypted bundles under
+`/data/admin/ths-sessions` and never appear in task or management responses.
+
+The core client implements the verified authenticated 9528 frame state machine
+plus pure-Python Snappy, `gov`, `cv3`, HXLONG, retail-count (`216`),
+large-order-net (`33007`), large-order-amount (`33015`), and MACDFS decoding.
+It keeps one single-use pre-authenticated connection: checkout permanently
+removes that socket, every business request closes it, and a background refill
+prepares the next connection. Session refresh invalidates all warm state.
+Unsupported encryption/compression and malformed frames fail closed.
+
+The task Runner is woken immediately after a durable enqueue/retry/resume while
+Redis remains the FIFO authority and the configured poll interval remains an
+external-enqueue fallback.
 
 After manual login, an authenticated administrator can inspect
 `GET /api/admin/account-sessions` and refresh a role with
@@ -167,57 +190,48 @@ After manual login, an authenticated administrator can inspect
 These endpoints never accept account passwords and never return session values.
 
 Public submissions accept `{"symbol":"601872","include_long_capture":true}`.
-The collection form also accepts a stock-name prefix. `GET /api/v1/symbols`
-queries the core Tonghuashun App's internal association list, while choosing a
-candidate still calls `GET /api/v1/symbols/{symbol}` for exact six-digit code,
-market, and name confirmation before submission. Removing an individual stock
-tab affects only that browser's localStorage; it never deletes or cancels the
-server-side canonical task.
+The collection form accepts a stock-name or code prefix. `GET /api/v1/symbols`
+and `GET /api/v1/symbols/{symbol}` read the active local catalog; task
+submission rechecks the same active version before enqueueing. The catalog is
+refreshed daily from Sina public A-share/ETF/LOF categories, activates only a
+complete validated version, retains the previous version on failure, and fails
+closed after seven days. Symbol lookup and suggestions do not call App or
+Frida. Removing a browser tab never deletes or cancels the server-side task.
+
 The screenshot option defaults to `true` for existing clients. Set it to
 `false` to request the eight required values plus optional three-period fund
-flow without any App UI navigation or image creation. Core metrics and symbol
-lookup use only the core account; fund flow uses only the preserved fund
-account. The response also includes current-day intraday curves for large-order
-net volume, large-order amount, and retail count in `values.intraday_series`.
-Those curves come from the same core App-internal direct request; the existing
-scalar fields remain the latest points. Confirmed market mappings are
+flow without App navigation or image creation. The response also includes
+current-day direct curves for large-order net volume, large-order amount, and
+retail count in `values.intraday_series`; scalar fields are their latest points.
+Confirmed market mappings are
 `600/601/603/605/688/689 → 17`,
 `000/001/002/003/300/301 → 33`, `920 → 151`,
 `501/502/506/508/510/511/512/513/515/516/517/518/519/520/526/530/551/560/561/562/563/588/589 → 20`,
 and `158/159/160/161/162/163/164/165/166/167/168/169/180 → 36`; an unknown
-prefix is rejected instead of guessed. If an exact code is shared by a bond
-and a fund, the App result is filtered to the expected fund market and the bond
-market is ignored. Such a result reports `long_capture.status` as `SKIPPED`;
-missing App callback fields make the task `PARTIAL` and never trigger UI,
-screenshot, or OCR fallback.
+prefix is rejected. Missing direct fields make the task `PARTIAL` and never
+trigger UI, screenshot, public-quote, or OCR fallback.
 
 The market PWA shares one server-side subscription broker across users. During
 weekday A-share sessions it refreshes the selected detail symbol every 2
 seconds and watchlist-only symbols every 15 seconds; outside the configured
 09:30–11:30 and 13:00–15:00 Asia/Shanghai windows it uses a 60-second cadence.
-The independently owned fund-flow account is capped at one request per symbol
-per 15 seconds even while the core quote refreshes faster. These are polling
-cadences, not an exchange tick guarantee: measured App callback latency and
-device availability still determine when a fresh frame arrives. The current
-App response provides 241 one-minute points for the trading-day curves. The
-Market detail page separately loads a front-adjusted daily K-line once per
-selected symbol from the 10jqka public yearly line endpoint. It returns 240
-visible bars after 249 hidden warm-up bars and computes MA(5/13/21/60/120/250),
-BOLL(20,2), MACD(12,26,9), and volume server-side. This public chart source is
-isolated from job values: it never fills or replaces any of the eight task
-metrics, which remain App-interface-only. Daily K-line responses expose their
-source, adjustment, cache, stale, and per-source error state. Fresh cache TTL is
-60 seconds during trading sessions and 15 minutes outside them; stale data is
-served only after both the public source and the App fallback path fail.
+Selected/watchlist snapshots use Tencent public quote and minute endpoints;
+Sina public quote is the basic fallback. Five-day, week, and month series use
+Tencent qfq data. Daily K-line prefers the 10jqka public yearly line endpoint,
+falls back to Tencent qfq, and then to validated stale cache—never App. It
+returns 240 visible bars after indicator warm-up and computes
+MA(5/13/21/60/120/250), BOLL(20,2), MACD(12,26,9), and volume server-side.
+Stocks display two price decimals and exchange-traded funds three.
 
-A core-device probe confirmed that the App constructs daily K requests with
-`period=5`, front-adjustment `quan=10`, and data IDs `1/7/8/9/11/13/19` for
-date/open/high/low/close/volume/amount. The independent Frida request path is
-still deliberately gated as `DIRECT_KLINE_UNAVAILABLE` because it has not yet
-completed reliably outside the visible chart controller. It is not enabled by
-guessing or by UI/OCR extraction. Ten-level order book and time-and-sales panels
-also stay explicitly unavailable until their exact App-internal contracts are
-confirmed.
+When both task transports are explicitly `direct`, the market detail snapshot
+may merge a 15-second cached L2 enhancement containing large-order, retail,
+MACDFS, and fund-flow fields. This enhancement cannot overwrite public name,
+price, OHLC, turnover, volume, amount, or public intraday points, and its
+failure cannot make the public snapshot unavailable. Per-client WebSocket
+delivery keeps the latest event for each symbol; the frontend reconnects with
+bounded exponential backoff and refreshes the selected snapshot over HTTP while
+disconnected. Ten-level order book and time-and-sales remain explicitly
+unavailable until an exact supported source exists.
 
 Taking the administrator device lock pauses new Runner work automatically. The
 lock release leaves the queue paused; use the explicit queue-resume control

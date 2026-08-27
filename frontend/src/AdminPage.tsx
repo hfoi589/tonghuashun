@@ -156,8 +156,15 @@ export function DeviceViewport({
   const label = connection === 'ONLINE' ? '设备画面已连接（2 FPS）' : connection === 'CONNECTING' ? '正在连接设备画面…' : connection === 'UNCONFIGURED' ? '设备画面通道尚未配置，当前离线' : '设备画面连接不可用，当前离线'
   const lifecycleBusy = actionPending !== null || lifecycle?.state === 'STARTING' || lifecycle?.state === 'STOPPING'
   const lifecycleUnavailable = !lifecycle || lifecycle.state === 'UNCONFIGURED'
-  const startDisabled = !locked || lifecycleBusy || lifecycleUnavailable || (lifecycle.state === 'RUNNING' && deviceHealth?.app === 'ONLINE')
-  const shutdownDisabled = !locked || lifecycleBusy || lifecycleUnavailable || lifecycle.state === 'STOPPED'
+  const startBlocked = !locked || lifecycleBusy || lifecycleUnavailable || (lifecycle.state === 'RUNNING' && deviceHealth?.app === 'ONLINE')
+  const shutdownBlocked = !locked || lifecycleBusy || lifecycleUnavailable || lifecycle.state === 'STOPPED'
+  const lifecycleError = actionError ?? lifecycle?.error_code ?? null
+  const guardLifecycleKey = (event: KeyboardEvent<HTMLButtonElement>, blocked: boolean) => {
+    if (blocked && (event.key === 'Enter' || event.key === ' ')) {
+      event.preventDefault()
+      event.stopPropagation()
+    }
+  }
   return <section className="device-panel">
     <div className="section-heading"><h2>{title}</h2><span className={`stream-state stream-${connection.toLowerCase()}`}>{label}</span></div>
     {warning && <p className="device-account-warning" role="note">{warning}</p>}
@@ -177,11 +184,28 @@ export function DeviceViewport({
         {!locked && <p className="minor">请先接管设备</p>}
       </div>
       <div className="device-lifecycle-actions">
-        <button type="button" onClick={() => onLifecycleAction?.(role, 'start_and_launch_app')} disabled={startDisabled}>启动虚拟机并打开同花顺</button>
-        <button type="button" className="device-danger-button" onClick={() => onLifecycleAction?.(role, 'shutdown')} disabled={shutdownDisabled}>关闭虚拟机</button>
+        <button
+          type="button"
+          aria-disabled={startBlocked}
+          onKeyDown={(event) => guardLifecycleKey(event, startBlocked)}
+          onClick={(event) => {
+            if (startBlocked) { event.preventDefault(); event.stopPropagation(); return }
+            onLifecycleAction?.(role, 'start_and_launch_app')
+          }}
+        >启动虚拟机并打开同花顺</button>
+        <button
+          type="button"
+          className="device-danger-button"
+          aria-disabled={shutdownBlocked}
+          onKeyDown={(event) => guardLifecycleKey(event, shutdownBlocked)}
+          onClick={(event) => {
+            if (shutdownBlocked) { event.preventDefault(); event.stopPropagation(); return }
+            onLifecycleAction?.(role, 'shutdown')
+          }}
+        >关闭虚拟机</button>
       </div>
       {actionPending && <p className="minor" aria-live="polite">{actionPending === 'shutdown' ? '正在关闭虚拟机…' : '正在启动虚拟机并打开同花顺…'}</p>}
-      {actionError && <p className="error" role="alert">{actionError}</p>}
+      {lifecycleError && <p className="error" role="alert">{lifecycleError}</p>}
     </div>
     <div className="device-session-controls">
       <div>
@@ -305,6 +329,11 @@ function accountSessionStateText(status: AccountSessionStatus | null): string {
   return status.state
 }
 
+function isAdminAuthenticationFailure(reason: unknown): boolean {
+  return (reason instanceof ApiError && reason.status === 401)
+    || (reason instanceof Error && reason.message.includes('authentication'))
+}
+
 export function AdminPage({ deviceStreamUrl }: { deviceStreamUrl?: string }) {
   const [password, setPassword] = useState('')
   const [currentPassword, setCurrentPassword] = useState('')
@@ -330,14 +359,28 @@ export function AdminPage({ deviceStreamUrl }: { deviceStreamUrl?: string }) {
   const [actionPending, setActionPending] = useState<Partial<Record<DeviceRole, DeviceLifecycleAction>>>({})
   const [actionErrors, setActionErrors] = useState<Partial<Record<DeviceRole, string>>>({})
   const [lifecycleDialog, setLifecycleDialog] = useState<DeviceLifecycleDialogState | null>(null)
+  const deviceRefreshGeneration = useRef(0)
+  const authenticationGeneration = useRef(0)
+  const clearAuthenticationState = useCallback(() => {
+    authenticationGeneration.current += 1
+    deviceRefreshGeneration.current += 1
+    setSessionValidated(false)
+    setHealth(null)
+    setQueue(null)
+    setLocked(false)
+    setDevices({})
+    setAccountSessions({})
+    setSessionRefreshPending({})
+    setSessionErrors({})
+    setActionPending({})
+    setActionErrors({})
+    setLifecycleDialog(null)
+    setMarketUsers(null)
+  }, [])
   const invalidateAdminControl = useCallback((reason: unknown) => {
-    const sessionInvalid = (reason instanceof ApiError && reason.status === 401) || (reason instanceof Error && reason.message.includes('authentication'))
-    if (sessionInvalid) {
+    if (isAdminAuthenticationFailure(reason)) {
       setAuthentication('ANONYMOUS')
-      setSessionValidated(false)
-      setHealth(null)
-      setQueue(null)
-      setLocked(false)
+      clearAuthenticationState()
       setMessage('管理会话已失效，请重新登录')
       return
     }
@@ -346,21 +389,47 @@ export function AdminPage({ deviceStreamUrl }: { deviceStreamUrl?: string }) {
       return
     }
     setMessage(reason instanceof Error ? reason.message : '管理会话或运行端不可用')
+  }, [clearAuthenticationState])
+  const refreshDevices = useCallback(async () => {
+    const generation = ++deviceRefreshGeneration.current
+    const authentication = authenticationGeneration.current
+    const nextDevices = await api.devices()
+    if (generation !== deviceRefreshGeneration.current || authentication !== authenticationGeneration.current) return
+    setDevices(Object.fromEntries(nextDevices.devices.map((device) => [device.role, device])))
   }, [])
   const refreshHealth = useCallback(async () => {
+    const authentication = authenticationGeneration.current
     try {
-      const [nextHealth, nextQueue, nextDevices] = await Promise.all([api.runner(), api.queue(), api.devices()])
+      const [nextHealth, nextQueue] = await Promise.all([api.runner(), api.queue()])
+      if (authentication !== authenticationGeneration.current) return
       setHealth(nextHealth)
       setQueue(nextQueue)
-      setDevices(Object.fromEntries(nextDevices.devices.map((device) => [device.role, device])))
-    } catch (reason) { invalidateAdminControl(reason) }
-  }, [invalidateAdminControl])
+      await refreshDevices()
+    } catch (reason) {
+      if (authentication === authenticationGeneration.current) invalidateAdminControl(reason)
+    }
+  }, [invalidateAdminControl, refreshDevices])
 
   const loadDeviceData = useCallback(async () => {
-    const [deviceResult, sessionResult] = await Promise.allSettled([api.devices(), api.accountSessions()])
-    if (deviceResult.status === 'fulfilled') setDevices(Object.fromEntries(deviceResult.value.devices.map((device) => [device.role, device])))
+    const authentication = authenticationGeneration.current
+    const [deviceResult, sessionResult] = await Promise.allSettled([refreshDevices(), api.accountSessions()])
+    if (authentication !== authenticationGeneration.current) return
+    const authenticationFailure = [deviceResult, sessionResult]
+      .find((result): result is PromiseRejectedResult => result.status === 'rejected' && isAdminAuthenticationFailure(result.reason))
+    if (authenticationFailure) {
+      invalidateAdminControl(authenticationFailure.reason)
+      return
+    }
     if (sessionResult.status === 'fulfilled') setAccountSessions(Object.fromEntries(sessionResult.value.sessions.map((status) => [status.role, status])))
-  }, [])
+    if (deviceResult.status === 'rejected') {
+      const message = deviceResult.reason instanceof Error ? deviceResult.reason.message : '设备生命周期状态刷新失败'
+      setActionErrors({ core_metrics: message, main_fund_flow: message })
+    }
+    if (sessionResult.status === 'rejected') {
+      const message = sessionResult.reason instanceof Error ? sessionResult.reason.message : '账号会话状态刷新失败'
+      setSessionErrors({ core_metrics: message, main_fund_flow: message })
+    }
+  }, [invalidateAdminControl, refreshDevices])
 
   async function login(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
@@ -368,9 +437,12 @@ export function AdminPage({ deviceStreamUrl }: { deviceStreamUrl?: string }) {
     try {
       await api.login(password)
       setPassword('')
+      clearAuthenticationState()
+      const authentication = authenticationGeneration.current
       setAuthentication('AUTHENTICATED')
       try {
         const [nextHealth, nextLock, nextQueue] = await Promise.all([api.runner(), api.lock(), api.queue()])
+        if (authentication !== authenticationGeneration.current) return
         setHealth(nextHealth)
         setLocked(nextLock.locked)
         setQueue(nextQueue)
@@ -383,10 +455,7 @@ export function AdminPage({ deviceStreamUrl }: { deviceStreamUrl?: string }) {
     try {
       await api.logout(readCsrfToken())
       setAuthentication('ANONYMOUS')
-      setSessionValidated(false)
-      setHealth(null)
-      setQueue(null)
-      setLocked(false)
+      clearAuthenticationState()
       setMessage('已退出管理台')
     } catch (reason) { invalidateAdminControl(reason) }
   }
@@ -408,10 +477,7 @@ export function AdminPage({ deviceStreamUrl }: { deviceStreamUrl?: string }) {
       setNewPassword('')
       setNewPasswordConfirmation('')
       setAuthentication('ANONYMOUS')
-      setSessionValidated(false)
-      setHealth(null)
-      setQueue(null)
-      setLocked(false)
+      clearAuthenticationState()
       setMessage('密码已修改，请使用新密码重新登录')
     } catch (reason) { setMessage(reason instanceof Error ? reason.message : '密码修改失败') }
   }
@@ -470,14 +536,22 @@ export function AdminPage({ deviceStreamUrl }: { deviceStreamUrl?: string }) {
     } catch (reason) { invalidateAdminControl(reason) }
   }
   async function refreshAccountSession(role: DeviceRole) {
+    const authentication = authenticationGeneration.current
     setSessionErrors((current) => ({ ...current, [role]: undefined }))
     setSessionRefreshPending((current) => ({ ...current, [role]: true }))
     try {
       const status = await api.refreshAccountSession(role, readCsrfToken())
+      if (authentication !== authenticationGeneration.current) return
       setAccountSessions((current) => ({ ...current, [role]: status }))
     } catch (reason) {
+      if (authentication !== authenticationGeneration.current) return
+      if (isAdminAuthenticationFailure(reason)) {
+        invalidateAdminControl(reason)
+        return
+      }
       try {
         const response = await api.accountSessions()
+        if (authentication !== authenticationGeneration.current) return
         const status = response.sessions.find((item) => item.role === role)
         if (status) setAccountSessions((current) => ({ ...current, [role]: status }))
       } catch {
@@ -485,7 +559,7 @@ export function AdminPage({ deviceStreamUrl }: { deviceStreamUrl?: string }) {
       }
       setSessionErrors((current) => ({ ...current, [role]: reason instanceof Error ? reason.message : '账号会话刷新失败' }))
     } finally {
-      setSessionRefreshPending((current) => ({ ...current, [role]: false }))
+      if (authentication === authenticationGeneration.current) setSessionRefreshPending((current) => ({ ...current, [role]: false }))
     }
   }
   function openLifecycleDialog(role: DeviceRole, action: DeviceLifecycleAction) {
@@ -501,10 +575,13 @@ export function AdminPage({ deviceStreamUrl }: { deviceStreamUrl?: string }) {
   async function confirmLifecycleAction() {
     if (!lifecycleDialog) return
     const { role, action } = lifecycleDialog
+    const authentication = authenticationGeneration.current
     setActionPending((current) => ({ ...current, [role]: action }))
     setActionErrors((current) => ({ ...current, [role]: undefined }))
     try {
       const lifecycle = await api.deviceAction(role, action, readCsrfToken())
+      if (authentication !== authenticationGeneration.current) return
+      deviceRefreshGeneration.current += 1
       setDevices((current) => current[role]
         ? { ...current, [role]: { ...current[role]!, lifecycle } }
         : current)
@@ -512,10 +589,17 @@ export function AdminPage({ deviceStreamUrl }: { deviceStreamUrl?: string }) {
         setActionErrors((current) => ({ ...current, [role]: lifecycle.error_code ?? 'DEVICE_LIFECYCLE_FAILED' }))
       }
     } catch (reason) {
+      if (authentication !== authenticationGeneration.current) return
+      if (isAdminAuthenticationFailure(reason)) {
+        invalidateAdminControl(reason)
+        return
+      }
       setActionErrors((current) => ({ ...current, [role]: reason instanceof Error ? reason.message : 'DEVICE_LIFECYCLE_FAILED' }))
     } finally {
-      setActionPending((current) => ({ ...current, [role]: undefined }))
-      closeLifecycleDialog()
+      if (authentication === authenticationGeneration.current) {
+        setActionPending((current) => ({ ...current, [role]: undefined }))
+        closeLifecycleDialog()
+      }
     }
   }
   useEffect(() => {
@@ -535,15 +619,15 @@ export function AdminPage({ deviceStreamUrl }: { deviceStreamUrl?: string }) {
       if (!active) return
       if (reason instanceof ApiError && reason.status === 401) {
         setAuthentication('ANONYMOUS')
-        setSessionValidated(false)
+        clearAuthenticationState()
         return
       }
       setAuthentication('ANONYMOUS')
-      setSessionValidated(false)
+      clearAuthenticationState()
       invalidateAdminControl(reason)
     })
     return () => { active = false }
-  }, [invalidateAdminControl])
+  }, [clearAuthenticationState, invalidateAdminControl])
 
   useEffect(() => {
     if (!authenticated || !sessionValidated) return
@@ -553,8 +637,18 @@ export function AdminPage({ deviceStreamUrl }: { deviceStreamUrl?: string }) {
   const lifecycleTransitioning = Object.values(devices).some((device) => device?.lifecycle.state === 'STARTING' || device?.lifecycle.state === 'STOPPING')
   useEffect(() => {
     if (!authenticated || !sessionValidated) return
-    const timer = window.setInterval(refreshHealth, lifecycleTransitioning ? 2_000 : 15_000)
-    return () => window.clearInterval(timer)
+    let active = true
+    let timer: number | undefined
+    const delay = lifecycleTransitioning ? 2_000 : 15_000
+    const poll = async () => {
+      await refreshHealth()
+      if (active) timer = window.setTimeout(poll, delay)
+    }
+    timer = window.setTimeout(poll, delay)
+    return () => {
+      active = false
+      if (timer !== undefined) window.clearTimeout(timer)
+    }
   }, [authenticated, lifecycleTransitioning, refreshHealth, sessionValidated])
 
   if (!authenticated) return <main className="admin-shell" data-1p-ignore="true" data-lpignore="true"><section className="panel admin-login"><p className="eyebrow">ADMIN CONSOLE</p><h1>设备管理台</h1><form onSubmit={login} data-1p-ignore="true" data-lpignore="true"><label htmlFor="password">管理员密码</label><input id="password" type="password" autoComplete="current-password" data-1p-ignore="true" data-lpignore="true" value={password} onChange={(event) => setPassword(event.target.value)} required /><button type="submit">登录管理台</button></form><p className="notice">管理员用户名固定为 admin；密码仅用于本次请求，不会记录或展示。</p>{message && <p className="error" role="alert">{message}</p>}</section></main>

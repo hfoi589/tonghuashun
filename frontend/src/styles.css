@@ -53,11 +53,11 @@ button {
   transition: background-color 180ms ease, border-color 180ms ease, box-shadow 180ms ease, color 180ms ease;
 }
 
-button:not(:disabled):hover { background: var(--primary-hover); }
-button:not(:disabled):active { box-shadow: inset 0 2px 5px rgba(0, 0, 0, .14); }
-button:disabled { cursor: not-allowed; opacity: .5; }
+button:not(:disabled):not([aria-disabled="true"]):hover { background: var(--primary-hover); }
+button:not(:disabled):not([aria-disabled="true"]):active { box-shadow: inset 0 2px 5px rgba(0, 0, 0, .14); }
+button:disabled, button[aria-disabled="true"] { cursor: not-allowed; opacity: .5; }
 button.secondary { border-color: var(--border); background: #edf3f3; color: #27434b; }
-button.secondary:not(:disabled):hover { border-color: var(--border-strong); background: #e5eded; }
+button.secondary:not(:disabled):not([aria-disabled="true"]):hover { border-color: var(--border-strong); background: #e5eded; }
 
 button:focus-visible, input:focus-visible, a:focus-visible, .device-canvas:focus-visible, .intraday-chart svg:focus-visible {
   outline: 3px solid rgba(31, 132, 148, .34);
@@ -975,7 +975,7 @@ button.capture-toggle:active { box-shadow: inset 0 2px 5px rgba(18, 49, 54, .08)
   gap: .6rem;
 }
 button.device-danger-button { background: var(--danger); }
-button.device-danger-button:not(:disabled):hover { background: #7f2919; }
+button.device-danger-button:not(:disabled):not([aria-disabled="true"]):hover { background: #7f2919; }
 .device-protection-note {
   margin: .7rem 0 0;
   color: #8a3a2b;

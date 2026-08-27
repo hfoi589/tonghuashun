@@ -105,8 +105,8 @@ describe('AdminPage', () => {
     await waitFor(() => expect(within(corePanel).getByText('生命周期：运行中')).toBeInTheDocument())
     expect(within(fundPanel).getByText('生命周期：已关闭')).toBeInTheDocument()
     for (const panel of [corePanel, fundPanel]) {
-      expect(within(panel).getByRole('button', { name: '启动虚拟机并打开同花顺' })).toBeDisabled()
-      expect(within(panel).getByRole('button', { name: '关闭虚拟机' })).toBeDisabled()
+      expect(within(panel).getByRole('button', { name: '启动虚拟机并打开同花顺' })).toHaveAttribute('aria-disabled', 'true')
+      expect(within(panel).getByRole('button', { name: '关闭虚拟机' })).toHaveAttribute('aria-disabled', 'true')
     }
     expect(within(corePanel).getByText('账号会话：已就绪')).toBeInTheDocument()
     expect(within(corePanel).getByRole('button', { name: '刷新八项账号会话' })).toBeInTheDocument()
@@ -167,8 +167,8 @@ describe('AdminPage', () => {
     expect(within(pendingDialog).getByRole('button', { name: '提交中…' })).toBeDisabled()
     await waitFor(() => expect(pendingDialog).toHaveFocus())
     expect(within(corePanel).getByText('正在关闭虚拟机…')).toBeInTheDocument()
-    expect(within(corePanel).getByRole('button', { name: '启动虚拟机并打开同花顺' })).toBeDisabled()
-    expect(within(fundPanel).getByRole('button', { name: '启动虚拟机并打开同花顺' })).toBeEnabled()
+    expect(within(corePanel).getByRole('button', { name: '启动虚拟机并打开同花顺' })).toHaveAttribute('aria-disabled', 'true')
+    expect(within(fundPanel).getByRole('button', { name: '启动虚拟机并打开同花顺' })).toHaveAttribute('aria-disabled', 'false')
     expect(fetch).toHaveBeenCalledWith('/api/admin/devices/core_metrics/actions', expect.objectContaining({
       method: 'POST',
       headers: expect.objectContaining({ 'X-CSRF-Token': 'test-csrf' }),
@@ -180,6 +180,105 @@ describe('AdminPage', () => {
     expect(within(corePanel).getByRole('alert')).toHaveTextContent('DEVICE_SHUTDOWN_FAILED')
     expect(within(fundPanel).queryByRole('alert')).not.toBeInTheDocument()
     await waitFor(() => expect(shutdown).toHaveFocus())
+  })
+
+  it('surfaces a lifecycle error returned by a later device refresh in only the matching card', async () => {
+    let deviceReads = 0
+    vi.mocked(fetch).mockImplementation(async (input) => {
+      const url = String(input)
+      if (url === '/api/admin/session') return new Response(null, { status: 204 })
+      if (url === '/api/admin/runner') return jsonResponse({ state: 'ADMIN_CONTROL', last_heartbeat: null, queue_paused: true })
+      if (url === '/api/admin/lock') return jsonResponse({ locked: true })
+      if (url === '/api/admin/queue') return jsonResponse({ paused: true })
+      if (url === '/api/admin/account-sessions') return jsonResponse({ sessions: [] })
+      if (url === '/api/admin/devices/core_metrics/actions') return jsonResponse({ state: 'STARTING', operation_id: 'op-core', error_code: null, updated_at: null }, 202)
+      if (url === '/api/admin/devices') {
+        deviceReads += 1
+        const failed = deviceReads > 1
+        return jsonResponse({ devices: [
+          {
+            role: 'core_metrics', label: '八项账号', adb: 'ONLINE', app: 'OFFLINE', frida: 'ONLINE',
+            lifecycle: failed
+              ? { state: 'ERROR', operation_id: 'op-core', error_code: 'DEVICE_BOOT_TIMEOUT', updated_at: null }
+              : { state: 'STOPPED', operation_id: null, error_code: null, updated_at: null },
+          },
+          {
+            role: 'main_fund_flow', label: '资金账号', adb: 'ONLINE', app: 'ONLINE', frida: 'ONLINE',
+            lifecycle: { state: 'RUNNING', operation_id: null, error_code: null, updated_at: null },
+          },
+        ] })
+      }
+      throw new Error(`unexpected request: ${url}`)
+    })
+    const user = userEvent.setup()
+    render(<AdminPage />)
+    const corePanel = (await screen.findByRole('heading', { name: '八项账号' })).closest('section')!
+    const fundPanel = screen.getByRole('heading', { name: '资金账号' }).closest('section')!
+    const start = within(corePanel).getByRole('button', { name: '启动虚拟机并打开同花顺' })
+    await waitFor(() => expect(start).toBeEnabled())
+    await user.click(start)
+    await user.click(within(screen.getByRole('alertdialog')).getByRole('button', { name: '确认启动' }))
+    await waitFor(() => expect(within(corePanel).getByText('生命周期：启动中')).toBeInTheDocument())
+
+    await user.click(screen.getByRole('button', { name: '刷新运行端状态' }))
+
+    await waitFor(() => expect(within(corePanel).getByRole('alert')).toHaveTextContent('DEVICE_BOOT_TIMEOUT'))
+    expect(within(fundPanel).queryByRole('alert')).not.toBeInTheDocument()
+  })
+
+  it('ignores a stale device refresh that completes after a lifecycle action starts', async () => {
+    let resolveStaleRefresh!: (value: Response) => void
+    const staleRefresh = new Promise<Response>((resolve) => { resolveStaleRefresh = resolve })
+    let deviceReads = 0
+    vi.mocked(fetch).mockImplementation(async (input) => {
+      const url = String(input)
+      if (url === '/api/admin/session') return new Response(null, { status: 204 })
+      if (url === '/api/admin/runner') return jsonResponse({ state: 'ADMIN_CONTROL', last_heartbeat: null, queue_paused: true })
+      if (url === '/api/admin/lock') return jsonResponse({ locked: true })
+      if (url === '/api/admin/queue') return jsonResponse({ paused: true })
+      if (url === '/api/admin/account-sessions') return jsonResponse({ sessions: [] })
+      if (url === '/api/admin/devices/core_metrics/actions') return jsonResponse({ state: 'STARTING', operation_id: 'op-core', error_code: null, updated_at: null }, 202)
+      if (url === '/api/admin/devices') {
+        deviceReads += 1
+        if (deviceReads === 2) return staleRefresh
+        return jsonResponse({ devices: [
+          {
+            role: 'core_metrics', label: '八项账号', adb: 'ONLINE', app: 'OFFLINE', frida: 'ONLINE',
+            lifecycle: { state: 'STOPPED', operation_id: null, error_code: null, updated_at: null },
+          },
+          {
+            role: 'main_fund_flow', label: '资金账号', adb: 'ONLINE', app: 'ONLINE', frida: 'ONLINE',
+            lifecycle: { state: 'RUNNING', operation_id: null, error_code: null, updated_at: null },
+          },
+        ] })
+      }
+      throw new Error(`unexpected request: ${url}`)
+    })
+    const user = userEvent.setup()
+    render(<AdminPage />)
+    const corePanel = (await screen.findByRole('heading', { name: '八项账号' })).closest('section')!
+    const start = within(corePanel).getByRole('button', { name: '启动虚拟机并打开同花顺' })
+    await waitFor(() => expect(within(corePanel).getByText('生命周期：已关闭')).toBeInTheDocument())
+
+    await user.click(screen.getByRole('button', { name: '刷新运行端状态' }))
+    await waitFor(() => expect(deviceReads).toBe(2))
+    await user.click(start)
+    await user.click(within(screen.getByRole('alertdialog')).getByRole('button', { name: '确认启动' }))
+    await waitFor(() => expect(within(corePanel).getByText('生命周期：启动中')).toBeInTheDocument())
+
+    resolveStaleRefresh(jsonResponse({ devices: [
+      {
+        role: 'core_metrics', label: '八项账号', adb: 'ONLINE', app: 'OFFLINE', frida: 'ONLINE',
+        lifecycle: { state: 'STOPPED', operation_id: null, error_code: null, updated_at: null },
+      },
+      {
+        role: 'main_fund_flow', label: '资金账号', adb: 'ONLINE', app: 'ONLINE', frida: 'ONLINE',
+        lifecycle: { state: 'RUNNING', operation_id: null, error_code: null, updated_at: null },
+      },
+    ] }))
+
+    await waitFor(() => expect(start).toHaveAttribute('aria-disabled', 'true'))
+    expect(within(corePanel).getByText('生命周期：启动中')).toBeInTheDocument()
   })
 
   it('routes fund start and both account refreshes to their matching roles with card-local feedback', async () => {
@@ -203,9 +302,14 @@ describe('AdminPage', () => {
     await user.click(fundStart)
     await user.click(within(screen.getByRole('alertdialog')).getByRole('button', { name: '确认启动' }))
     await waitFor(() => expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument())
+    await waitFor(() => expect(fundStart).toHaveFocus())
+    expect(fundStart).toHaveAttribute('aria-disabled', 'true')
     expect(fetch).toHaveBeenCalledWith('/api/admin/devices/main_fund_flow/actions', expect.objectContaining({
       body: JSON.stringify({ action: 'start_and_launch_app' }),
     }))
+    await user.click(fundStart)
+    expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument()
+    expect(vi.mocked(fetch).mock.calls.filter(([input]) => String(input) === '/api/admin/devices/main_fund_flow/actions')).toHaveLength(1)
 
     await user.click(within(corePanel).getByRole('button', { name: '刷新八项账号会话' }))
     await waitFor(() => expect(within(corePanel).getByRole('alert')).toHaveTextContent('DIRECT_APP_OFFLINE'))
@@ -243,14 +347,14 @@ describe('AdminPage', () => {
     const stoppedPanel = screen.getByRole('heading', { name: '关闭设备' }).closest('section')!
     const unconfiguredPanel = screen.getByRole('heading', { name: '未配置设备' }).closest('section')!
     runningSocket.onmessage?.({ data: JSON.stringify({ type: 'device_status', role: 'core_metrics', label: '运行设备', adb: 'ONLINE', app: 'OFFLINE', frida: 'ONLINE' }) } as MessageEvent)
-    await waitFor(() => expect(within(runningPanel).getByRole('button', { name: '启动虚拟机并打开同花顺' })).toBeEnabled())
+    await waitFor(() => expect(within(runningPanel).getByRole('button', { name: '启动虚拟机并打开同花顺' })).toHaveAttribute('aria-disabled', 'false'))
     runningSocket.onmessage?.({ data: JSON.stringify({ type: 'device_status', role: 'core_metrics', label: '运行设备', adb: 'ONLINE', app: 'ONLINE', frida: 'ONLINE' }) } as MessageEvent)
-    await waitFor(() => expect(within(runningPanel).getByRole('button', { name: '启动虚拟机并打开同花顺' })).toBeDisabled())
-    expect(within(runningPanel).getByRole('button', { name: '关闭虚拟机' })).toBeEnabled()
-    expect(within(stoppedPanel).getByRole('button', { name: '启动虚拟机并打开同花顺' })).toBeEnabled()
-    expect(within(stoppedPanel).getByRole('button', { name: '关闭虚拟机' })).toBeDisabled()
-    expect(within(unconfiguredPanel).getByRole('button', { name: '启动虚拟机并打开同花顺' })).toBeDisabled()
-    expect(within(unconfiguredPanel).getByRole('button', { name: '关闭虚拟机' })).toBeDisabled()
+    await waitFor(() => expect(within(runningPanel).getByRole('button', { name: '启动虚拟机并打开同花顺' })).toHaveAttribute('aria-disabled', 'true'))
+    expect(within(runningPanel).getByRole('button', { name: '关闭虚拟机' })).toHaveAttribute('aria-disabled', 'false')
+    expect(within(stoppedPanel).getByRole('button', { name: '启动虚拟机并打开同花顺' })).toHaveAttribute('aria-disabled', 'false')
+    expect(within(stoppedPanel).getByRole('button', { name: '关闭虚拟机' })).toHaveAttribute('aria-disabled', 'true')
+    expect(within(unconfiguredPanel).getByRole('button', { name: '启动虚拟机并打开同花顺' })).toHaveAttribute('aria-disabled', 'true')
+    expect(within(unconfiguredPanel).getByRole('button', { name: '关闭虚拟机' })).toHaveAttribute('aria-disabled', 'true')
   })
 
   it('restores a valid cookie session after a page refresh without browser storage', async () => {
@@ -332,6 +436,82 @@ describe('AdminPage', () => {
 
     expect(screen.getByRole('button', { name: '退出管理台' })).toBeInTheDocument()
     expect(screen.queryByText('正在恢复管理会话…')).not.toBeInTheDocument()
+  })
+
+  it('invalidates authentication when post-auth device-session loading returns 401', async () => {
+    vi.mocked(fetch).mockImplementation(async (input) => {
+      const url = String(input)
+      if (url === '/api/admin/session') return new Response(null, { status: 204 })
+      if (url === '/api/admin/runner') return jsonResponse({ state: 'READY', last_heartbeat: null, queue_paused: false })
+      if (url === '/api/admin/lock') return jsonResponse({ locked: false })
+      if (url === '/api/admin/queue') return jsonResponse({ paused: false })
+      if (url === '/api/admin/devices') return jsonResponse({ devices: [] })
+      if (url === '/api/admin/account-sessions') return jsonResponse({ detail: 'admin authentication required' }, 401)
+      throw new Error(`unexpected request: ${url}`)
+    })
+
+    render(<AdminPage />)
+
+    expect(await screen.findByRole('button', { name: '登录管理台' })).toBeInTheDocument()
+    expect(screen.getByRole('alert')).toHaveTextContent('管理会话已失效，请重新登录')
+  })
+
+  it('clears device, session, pending, error, and dialog state across logout and re-login', async () => {
+    const never = new Promise<Response>(() => undefined)
+    let deviceReads = 0
+    let sessionReads = 0
+    vi.mocked(fetch).mockImplementation(async (input, init) => {
+      const url = String(input)
+      if (url === '/api/admin/session' && init?.method === 'POST') return new Response(null, { status: 204 })
+      if (url === '/api/admin/session') return new Response(null, { status: 204 })
+      if (url === '/api/admin/session/logout') return new Response(null, { status: 204 })
+      if (url === '/api/admin/runner') return jsonResponse({ state: 'ADMIN_CONTROL', last_heartbeat: null, queue_paused: true })
+      if (url === '/api/admin/lock') return jsonResponse({ locked: true })
+      if (url === '/api/admin/queue') return jsonResponse({ paused: true })
+      if (url === '/api/admin/account-sessions/core_metrics/refresh') return never
+      if (url === '/api/admin/devices') {
+        deviceReads += 1
+        if (deviceReads > 1) return never
+        return jsonResponse({ devices: [
+          {
+            role: 'core_metrics', label: '八项账号', adb: 'ONLINE', app: 'OFFLINE', frida: 'ONLINE',
+            lifecycle: { state: 'ERROR', operation_id: 'old-op', error_code: 'DEVICE_BOOT_TIMEOUT', updated_at: null },
+          },
+          {
+            role: 'main_fund_flow', label: '资金账号', adb: 'ONLINE', app: 'ONLINE', frida: 'ONLINE',
+            lifecycle: { state: 'RUNNING', operation_id: null, error_code: null, updated_at: null },
+          },
+        ] })
+      }
+      if (url === '/api/admin/account-sessions') {
+        sessionReads += 1
+        if (sessionReads > 1) return never
+        return jsonResponse({ sessions: [
+          { role: 'core_metrics', state: 'READY', updated_at: null, error_code: null },
+          { role: 'main_fund_flow', state: 'READY', updated_at: null, error_code: null },
+        ] })
+      }
+      throw new Error(`unexpected request: ${url}`)
+    })
+    const user = userEvent.setup()
+    render(<AdminPage />)
+    const corePanel = (await screen.findByRole('heading', { name: '八项账号' })).closest('section')!
+    await waitFor(() => expect(within(corePanel).getByRole('alert')).toHaveTextContent('DEVICE_BOOT_TIMEOUT'))
+    await user.click(within(corePanel).getByRole('button', { name: '刷新八项账号会话' }))
+    expect(within(corePanel).getByRole('button', { name: '刷新中…' })).toBeInTheDocument()
+    await user.click(within(corePanel).getByRole('button', { name: '启动虚拟机并打开同花顺' }))
+    expect(screen.getByRole('alertdialog')).toBeInTheDocument()
+
+    await user.click(screen.getByRole('button', { name: '退出管理台' }))
+    await user.type(await screen.findByLabelText('管理员密码'), 'never-display-this')
+    await user.click(screen.getByRole('button', { name: '登录管理台' }))
+
+    const nextCorePanel = (await screen.findByRole('heading', { name: '八项账号' })).closest('section')!
+    expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument()
+    expect(within(nextCorePanel).getByText('生命周期：待检测')).toBeInTheDocument()
+    expect(within(nextCorePanel).getByText('账号会话：未查询')).toBeInTheDocument()
+    expect(within(nextCorePanel).getByRole('button', { name: '刷新八项账号会话' })).toBeInTheDocument()
+    expect(within(nextCorePanel).queryByRole('alert')).not.toBeInTheDocument()
   })
 
   it('logs in, shows the runner health, and acquires the operator lock', async () => {

@@ -103,11 +103,10 @@ _PROVISIONING_STEPS = (
     "AVD_CREATED",
     "ASSETS_PROVISIONED",
 )
-SESSION_READINESS_MAX_AGE_SECONDS = 86_400
 SESSION_READINESS_PROBE = """\
 import os
 import stat
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 from level2_service.app_sessions import EncryptedFileSessionProvider
 
@@ -129,25 +128,19 @@ try:
         )
     if files_safe:
         provider = EncryptedFileSessionProvider(root, key)
-        now = datetime.now(timezone.utc)
         statuses = [provider.status(role).as_public() for role in roles]
         ready = all(
             status.get("role") == role
             and status.get("state") == "READY"
             and status.get("error_code") is None
             and isinstance(status.get("updated_at"), str)
-            and 0 <= (
-                now - datetime.fromisoformat(status["updated_at"])
-            ).total_seconds() <= __MAX_SESSION_AGE_SECONDS__
+            and datetime.fromisoformat(status["updated_at"]).tzinfo is not None
             for role, status in zip(roles, statuses, strict=True)
         )
 except Exception:
     ready = False
 print("READY" if ready else "NOT_READY")
-""".replace(
-    "__MAX_SESSION_AGE_SECONDS__",
-    str(SESSION_READINESS_MAX_AGE_SECONDS),
-)
+"""
 _FIRST_TIME_LOGIN_INSTRUCTIONS = (
     "Open http://127.0.0.1:8001/#admin.",
     "Manually log in and complete verification for each newly created role.",
@@ -565,13 +558,115 @@ class LoopbackDataOnlyAcceptance:
         self._poll_interval_seconds = poll_interval_seconds
         self._base_url = base_url.rstrip("/")
 
+    @staticmethod
+    def _valid_current_price(value: object) -> bool:
+        return isinstance(value, str) and re.fullmatch(
+            r"(?:0|[1-9][0-9]*)\.[0-9]{2}", value
+        ) is not None
+
+    @staticmethod
+    def _valid_change_percent(value: object) -> bool:
+        return isinstance(value, str) and re.fullmatch(
+            r"-?(?:0|[1-9][0-9]*)\.[0-9]{2}%", value
+        ) is not None
+
+    @staticmethod
+    def _valid_turnover_rate(value: object) -> bool:
+        return isinstance(value, str) and re.fullmatch(
+            r"(?:0|[1-9][0-9]*)\.[0-9]{2}%", value
+        ) is not None
+
+    @staticmethod
+    def _valid_two_decimal_number(value: object) -> bool:
+        return isinstance(value, str) and re.fullmatch(
+            r"-?(?:0|[1-9][0-9]*)\.[0-9]{2}", value
+        ) is not None
+
+    @staticmethod
+    def _valid_large_order_amount(value: object) -> bool:
+        return isinstance(value, str) and re.fullmatch(
+            r"-?(?:0|[1-9][0-9]*)\.[0-9]万", value
+        ) is not None
+
+    @staticmethod
+    def _valid_macdfs(value: object) -> bool:
+        if value == "0.000":
+            return True
+        return (
+            isinstance(value, str)
+            and value not in {"+0.000", "-0.000"}
+            and re.fullmatch(
+                r"[+-](?:0|[1-9][0-9]*)\.[0-9]{3}", value
+            )
+            is not None
+        )
+
+    @staticmethod
+    def _valid_fund_unit(value: object) -> bool:
+        return value in {"万元", "亿元"}
+
+    @staticmethod
+    def _valid_intraday_unit(field: str, value: object) -> bool:
+        expected = {
+            "large_order_net": None,
+            "large_order_amount": "万",
+            "retail_count": None,
+        }
+        return field in expected and value == expected[field]
+
+    @classmethod
+    def _valid_intraday_value(cls, field: str, value: object) -> bool:
+        if value is None:
+            return True
+        if field == "large_order_amount":
+            return isinstance(value, str) and re.fullmatch(
+                r"-?(?:0|[1-9][0-9]*)\.[0-9]", value
+            ) is not None
+        if field in {"large_order_net", "retail_count"}:
+            return cls._valid_two_decimal_number(value)
+        return False
+
+    @staticmethod
+    def _validate_polled_identity(
+        task: dict[str, object], expected_public_id: str
+    ) -> None:
+        if (
+            task.get("public_id") != expected_public_id
+            or task.get("symbol") != _ACCEPTANCE_SYMBOL
+        ):
+            raise DeploymentError("DATA_ONLY_ACCEPTANCE_FAILED")
+
+    @classmethod
+    def _valid_scalar_values(
+        cls,
+        values: dict[str, object],
+        expected_stock_name: str | None,
+    ) -> bool:
+        stock_name = values.get("stock_name")
+        return (
+            isinstance(stock_name, str)
+            and bool(stock_name)
+            and (
+                expected_stock_name is None
+                or stock_name == expected_stock_name
+            )
+            and cls._valid_current_price(values.get("current_price"))
+            and cls._valid_change_percent(values.get("change_percent"))
+            and cls._valid_turnover_rate(values.get("turnover_rate"))
+            and cls._valid_two_decimal_number(values.get("large_order_net"))
+            and cls._valid_large_order_amount(values.get("large_order_amount"))
+            and cls._valid_two_decimal_number(values.get("retail_count"))
+            and cls._valid_macdfs(values.get("macdfs"))
+        )
+
     def verify(self) -> None:
         symbol = self._request_json("GET", f"/api/v1/symbols/{_ACCEPTANCE_SYMBOL}")
+        confirmed_name = symbol.get("name")
         if (
             symbol.get("symbol") != _ACCEPTANCE_SYMBOL
             or symbol.get("market") != "17"
-            or not isinstance(symbol.get("name"), str)
-            or not symbol["name"]
+            or not isinstance(confirmed_name, str)
+            or not confirmed_name.strip()
         ):
             raise DeploymentError("DATA_ONLY_ACCEPTANCE_FAILED")
         submitted = self._request_json(
@@ -588,9 +683,14 @@ class LoopbackDataOnlyAcceptance:
         deadline = time.monotonic() + self._timeout_seconds
         while True:
             task = self._request_json("GET", f"/api/v1/jobs/{public_id}")
+            self._validate_polled_identity(task, public_id)
             status = task.get("status")
             if status == "COMPLETED":
-                self._validate_completed_task(task)
+                self._validate_completed_task(
+                    task,
+                    expected_public_id=public_id,
+                    expected_stock_name=confirmed_name,
+                )
                 return
             if status not in {"QUEUED", "RUNNING"}:
                 raise DeploymentError("DATA_ONLY_ACCEPTANCE_FAILED")
@@ -598,8 +698,14 @@ class LoopbackDataOnlyAcceptance:
                 raise DeploymentError("DATA_ONLY_ACCEPTANCE_FAILED")
             time.sleep(max(0.0, self._poll_interval_seconds))
 
-    @staticmethod
-    def _validate_completed_task(task: dict[str, object]) -> None:
+    @classmethod
+    def _validate_completed_task(
+        cls,
+        task: dict[str, object],
+        *,
+        expected_public_id: str | None = None,
+        expected_stock_name: str | None = None,
+    ) -> None:
         values = task.get("values")
         sources = task.get("value_sources")
         source_errors = task.get("source_errors")
@@ -619,13 +725,14 @@ class LoopbackDataOnlyAcceptance:
             or long_capture.get("url") is not None
             or long_capture.get("expires_at") is not None
             or not isinstance(captures, list)
-            or any(
-                not isinstance(values.get(field), str) or not values[field]
-                for field in _ACCEPTANCE_REQUIRED_VALUES
-            )
+            or not cls._valid_scalar_values(values, expected_stock_name)
             or any(
                 sources.get(field) != "INTERFACE"
                 for field in _ACCEPTANCE_REQUIRED_VALUES
+            )
+            or (
+                expected_public_id is not None
+                and task.get("public_id") != expected_public_id
             )
         ):
             raise DeploymentError("DATA_ONLY_ACCEPTANCE_FAILED")
@@ -652,8 +759,7 @@ class LoopbackDataOnlyAcceptance:
             curve = intraday.get(field)
             if (
                 not isinstance(curve, dict)
-                or not isinstance(curve.get("unit"), str)
-                or not curve["unit"]
+                or not cls._valid_intraday_unit(field, curve.get("unit"))
                 or not isinstance(curve.get("points"), list)
                 or not curve["points"]
                 or intraday_sources.get(field) != "INTERFACE"
@@ -670,16 +776,16 @@ class LoopbackDataOnlyAcceptance:
                     not isinstance(point_time, str)
                     or re.fullmatch(r"(?:[01][0-9]|2[0-3]):[0-5][0-9]", point_time)
                     is None
-                    or (
-                        point_value is not None
-                        and (not isinstance(point_value, str) or not point_value)
-                    )
+                    or not cls._valid_intraday_value(field, point_value)
                 ):
                     raise DeploymentError("DATA_ONLY_ACCEPTANCE_FAILED")
                 times.append(point_time)
                 if isinstance(point_value, str):
                     valid_values += 1
-            if times != sorted(times) or valid_values == 0:
+            if (
+                any(left >= right for left, right in zip(times, times[1:]))
+                or valid_values == 0
+            ):
                 raise DeploymentError("DATA_ONLY_ACCEPTANCE_FAILED")
         fund = values.get("main_fund_flow")
         fund_sources = sources.get("main_fund_flow")
@@ -691,11 +797,9 @@ class LoopbackDataOnlyAcceptance:
             if (
                 not isinstance(period_values, dict)
                 or not isinstance(period_sources, dict)
-                or not isinstance(period_values.get("unit"), str)
-                or not period_values["unit"]
+                or not cls._valid_fund_unit(period_values.get("unit"))
                 or any(
-                    not isinstance(period_values.get(field), str)
-                    or not period_values[field]
+                    not cls._valid_two_decimal_number(period_values.get(field))
                     or period_sources.get(field) != "INTERFACE"
                     for field in _ACCEPTANCE_FUND_FIELDS
                 )

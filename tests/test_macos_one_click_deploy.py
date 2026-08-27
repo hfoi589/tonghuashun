@@ -136,17 +136,17 @@ def valid_acceptance_task() -> dict[str, object]:
     scalar_values = {
         "stock_name": "招商轮船",
         "current_price": "8.12",
-        "change_percent": "+1.25%",
+        "change_percent": "1.25%",
         "turnover_rate": "0.72%",
         "large_order_net": "1.23",
-        "large_order_amount": "456.7",
+        "large_order_amount": "456.7万",
         "retail_count": "12.34",
         "macdfs": "+0.123",
     }
     scalar_sources = {field: "INTERFACE" for field in scalar_values}
     intraday = {
         "large_order_net": {
-            "unit": "%",
+            "unit": None,
             "points": [
                 {"time": "09:30", "value": None},
                 {"time": "09:31", "value": "1.23"},
@@ -157,7 +157,7 @@ def valid_acceptance_task() -> dict[str, object]:
             "points": [{"time": "09:30", "value": "456.7"}],
         },
         "retail_count": {
-            "unit": "户",
+            "unit": None,
             "points": [{"time": "09:30", "value": "12.34"}],
         },
     }
@@ -2155,7 +2155,6 @@ def test_session_readiness_probe_decrypts_both_fixed_role_bundles(
         "symlink",
         "role-swapped",
         "wrong-key",
-        "stale",
         "missing",
     ],
 )
@@ -2163,15 +2162,10 @@ def test_session_readiness_probe_rejects_untrusted_or_invalid_bundles(
     tmp_path: Path,
     invalid_state: str,
 ) -> None:
-    """Existence alone must not accept an unreadable, swapped, stale, or linked secret."""
+    """Existence alone must not accept unreadable, swapped, wrong-key, or linked secrets."""
     module = _load_macos_deploy()
     session_root = tmp_path / "sessions"
-    timestamp = (
-        datetime.now(timezone.utc) - timedelta(days=2)
-        if invalid_state == "stale"
-        else datetime.now(timezone.utc)
-    )
-    key = write_valid_session_bundles(session_root, updated_at=timestamp)
+    key = write_valid_session_bundles(session_root)
     core = session_root / "core_metrics.session"
     fund = session_root / "main_fund_flow.session"
     probe_key = key
@@ -2199,6 +2193,24 @@ def test_session_readiness_probe_rejects_untrusted_or_invalid_bundles(
 
     assert completed.returncode == 0
     assert completed.stdout == "NOT_READY\n"
+    assert completed.stderr == ""
+
+
+def test_session_readiness_probe_accepts_an_older_valid_bundle(
+    tmp_path: Path,
+) -> None:
+    """Session age alone must not override provider READY and live acceptance."""
+    module = _load_macos_deploy()
+    session_root = tmp_path / "sessions"
+    key = write_valid_session_bundles(
+        session_root,
+        updated_at=datetime.now(timezone.utc) - timedelta(days=365),
+    )
+
+    completed = run_session_readiness_probe(module, session_root, key)
+
+    assert completed.returncode == 0
+    assert completed.stdout == "READY\n"
     assert completed.stderr == ""
 
 
@@ -2257,7 +2269,11 @@ def test_data_only_acceptance_uses_the_confirmed_fixed_symbol_and_eight_metrics(
         [
             {"symbol": "601872", "name": "招商轮船", "market": "17"},
             {"public_id": "safe-public-id", "status": "QUEUED"},
-            {"public_id": "safe-public-id", "status": "RUNNING"},
+            {
+                "public_id": "safe-public-id",
+                "symbol": "601872",
+                "status": "RUNNING",
+            },
             valid_acceptance_task(),
         ]
     )
@@ -2301,6 +2317,71 @@ def test_data_only_acceptance_uses_the_confirmed_fixed_symbol_and_eight_metrics(
         "include_long_capture": False,
     }
     assert requests[2].full_url.endswith("/api/v1/jobs/safe-public-id")
+
+
+@pytest.mark.parametrize(
+    "scenario",
+    [
+        "lookup-name-terminal-name-mismatch",
+        "running-public-id-mismatch",
+        "running-symbol-mismatch",
+        "terminal-public-id-mismatch",
+        "unsafe-submitted-id",
+    ],
+)
+def test_data_only_acceptance_binds_lookup_submission_and_polled_identity(
+    scenario: str,
+) -> None:
+    """A task or name from a different identity must never satisfy acceptance."""
+    module = _load_macos_deploy()
+    lookup = {"symbol": "601872", "name": "招商轮船", "market": "17"}
+    submitted = {"public_id": "safe-public-id", "status": "QUEUED"}
+    running = {
+        "public_id": "safe-public-id",
+        "symbol": "601872",
+        "status": "RUNNING",
+    }
+    terminal = valid_acceptance_task()
+    if scenario == "lookup-name-terminal-name-mismatch":
+        lookup["name"] = "错误名称"
+    elif scenario == "running-public-id-mismatch":
+        running["public_id"] = "other-public-id"
+    elif scenario == "running-symbol-mismatch":
+        running["symbol"] = "000001"
+    elif scenario == "terminal-public-id-mismatch":
+        terminal["public_id"] = "other-public-id"
+    else:
+        submitted["public_id"] = "unsafe/id"
+    documents = [lookup, submitted]
+    if scenario != "unsafe-submitted-id":
+        documents.extend([running, terminal])
+    responses = iter(documents)
+
+    class Response:
+        def __init__(self, payload: dict[str, object]) -> None:
+            self.payload = payload
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args) -> None:
+            return None
+
+        def read(self) -> bytes:
+            return json.dumps(self.payload).encode()
+
+    def opener(_request: Request, *, timeout: float):
+        assert timeout > 0
+        return Response(next(responses))
+
+    with pytest.raises(module.DeploymentError) as caught:
+        module.LoopbackDataOnlyAcceptance(
+            opener=opener,
+            timeout_seconds=0.1,
+            poll_interval_seconds=0.0,
+        ).verify()
+
+    assert caught.value.error_code == "DATA_ONLY_ACCEPTANCE_FAILED"
 
 
 def test_data_only_acceptance_uses_real_urlopen_timeout_keyword() -> None:
@@ -2405,6 +2486,110 @@ def test_data_only_acceptance_rejects_non_interface_or_capture_results(
         module.LoopbackDataOnlyAcceptance._validate_completed_task(task)
 
     assert caught.value.error_code == "DATA_ONLY_ACCEPTANCE_FAILED"
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda task: task["values"].update(current_price="8.1"),
+        lambda task: task["values"].update(change_percent="1.2%"),
+        lambda task: task["values"].update(turnover_rate="0.720%"),
+        lambda task: task["values"].update(large_order_net="1.2"),
+        lambda task: task["values"].update(large_order_amount="456.70万"),
+        lambda task: task["values"].update(retail_count="12.3"),
+        lambda task: task["values"].update(macdfs="0.123"),
+        lambda task: task["values"]["main_fund_flow"]["today"].update(unit="万"),
+        lambda task: task["values"]["main_fund_flow"]["today"].update(main_net_inflow="100.0"),
+        lambda task: task["values"]["intraday_series"]["large_order_amount"].update(unit="万元"),
+        lambda task: task["values"]["intraday_series"]["large_order_net"]["points"][1].update(value="1.2"),
+        lambda task: task["values"]["intraday_series"]["large_order_amount"]["points"][0].update(value="456.70"),
+        lambda task: task["values"]["intraday_series"]["retail_count"]["points"][0].update(value="12.3"),
+        lambda task: task["values"]["intraday_series"]["large_order_net"]["points"][0].update(time="9:30"),
+        lambda task: task["values"]["intraday_series"]["large_order_net"].update(
+            points=list(
+                reversed(
+                    task["values"]["intraday_series"]["large_order_net"]["points"]
+                )
+            )
+        ),
+        lambda task: task["values"].update(current_price="NaN"),
+    ],
+    ids=(
+        "price-precision",
+        "change-precision",
+        "turnover-precision",
+        "large-net-precision",
+        "large-amount-precision",
+        "retail-precision",
+        "macdfs-sign",
+        "fund-unit",
+        "fund-precision",
+        "intraday-unit",
+        "intraday-net-precision",
+        "intraday-amount-precision",
+        "intraday-retail-precision",
+        "intraday-time-format",
+        "intraday-time-order",
+        "malformed-number",
+    ),
+)
+def test_data_only_acceptance_rejects_invalid_public_formats(mutate) -> None:
+    """Every accepted value must match the established public formatting contract."""
+    module = _load_macos_deploy()
+    task = copy.deepcopy(valid_acceptance_task())
+    mutate(task)
+
+    with pytest.raises(module.DeploymentError) as caught:
+        module.LoopbackDataOnlyAcceptance._validate_completed_task(task)
+
+    assert caught.value.error_code == "DATA_ONLY_ACCEPTANCE_FAILED"
+
+
+@pytest.mark.parametrize(
+    ("validator_name", "valid", "invalid"),
+    [
+        ("_valid_current_price", "8.12", "8.1"),
+        ("_valid_change_percent", "-1.25%", "+1.25%"),
+        ("_valid_turnover_rate", "0.72%", "-0.72%"),
+        ("_valid_two_decimal_number", "-12.34", "12.3"),
+        ("_valid_large_order_amount", "-2802.6万", "-2802.60万"),
+        ("_valid_macdfs", "+0.123", "0.123"),
+        ("_valid_fund_unit", "亿元", "万"),
+    ],
+)
+def test_data_only_acceptance_exposes_named_strict_format_validators(
+    validator_name: str,
+    valid: str,
+    invalid: str,
+) -> None:
+    """Named validators make each public precision and unit contract auditable."""
+    module = _load_macos_deploy()
+    acceptance = module.LoopbackDataOnlyAcceptance
+
+    assert hasattr(acceptance, validator_name), f"missing {validator_name}"
+    validator = getattr(acceptance, validator_name)
+    assert validator(valid) is True
+    assert validator(invalid) is False
+
+
+def test_data_only_acceptance_exposes_a_strict_polled_identity_validator() -> None:
+    """Every queue and terminal response must stay bound to the submitted task."""
+    module = _load_macos_deploy()
+    acceptance = module.LoopbackDataOnlyAcceptance
+
+    assert hasattr(acceptance, "_validate_polled_identity")
+    validator = acceptance._validate_polled_identity
+    validator(
+        {"public_id": "safe-public-id", "symbol": "601872"},
+        "safe-public-id",
+    )
+    for task in (
+        {"public_id": "other-public-id", "symbol": "601872"},
+        {"public_id": "safe-public-id", "symbol": "000001"},
+    ):
+        with pytest.raises(module.DeploymentError) as caught:
+            validator(task, "safe-public-id")
+        assert caught.value.error_code == "DATA_ONLY_ACCEPTANCE_FAILED"
 
 
 def test_provision_wrapper_resolves_the_project_root_and_forces_provision_mode(

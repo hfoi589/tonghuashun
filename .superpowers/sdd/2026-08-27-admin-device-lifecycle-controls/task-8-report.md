@@ -235,3 +235,95 @@ git diff --check
 All fixes remained fake/local-only: no real SDK, ADB, Emulator, AVD, Docker
 deployment, lifecycle broker, admin session, device action, App navigation,
 session refresh, or market task ran.
+
+## Fix round 2 — acceptance identity, exact formats, and session age ruling
+
+### Corrected findings
+
+- Acceptance now binds the exact catalog confirmation through the entire task:
+  lookup must return symbol `601872` and a nonblank name; submission must return
+  a safe nonempty public ID; every queued/running/terminal response must carry
+  that same public ID and symbol; and terminal `values.stock_name` must exactly
+  equal the confirmed lookup name.
+- Added named strict validators for current price, percentage fields, signed
+  two-decimal values, large-order amount, MACDFS, fund units, intraday units,
+  intraday values, and polled identity. The completed-task validator now
+  requires:
+  - two-decimal stock price;
+  - two-decimal change/turnover percentages with the established sign rules;
+  - two-decimal large-order net and retail values;
+  - one-decimal large-order amount with the API's `万` suffix;
+  - signed three-decimal MACDFS (`+` for positive, `-` for negative, unsigned
+    zero);
+  - only `万元` or `亿元` fund units and four signed two-decimal fields for all
+    three periods;
+  - exact intraday units (`null`, `万`, `null`), field-specific precision,
+    valid `HH:mm`, and strictly increasing times.
+- The encrypted-session probe no longer applies a 24-hour age policy. It still
+  requires safe regular mode-0600 files, successful provider decryption, fixed
+  role/material validation, public `READY`, no provider error, and a valid
+  timezone-aware timestamp. Live strict acceptance is the liveness proof.
+- Journal behavior, lifecycle role scoping, image commands, license handling,
+  human instructions, and frontend behavior were not changed.
+
+### Exact RED evidence
+
+The desired older-session behavior, valid exact-format response, named
+validators, and polled identity validator all failed before implementation:
+
+```text
+/Users/wilson/tonghuashun/.venv/bin/python -m pytest -q \
+  tests/test_macos_one_click_deploy.py \
+  -k 'confirmed_fixed_symbol or named_strict_format or \
+      strict_polled_identity or older_valid_bundle'
+10 failed, 117 deselected in 0.38s
+```
+
+A covering mutation removed lookup-name and queued/running identity binding;
+the dedicated false-positive scenarios then reproduced the acceptance bug:
+
+```text
+/Users/wilson/tonghuashun/.venv/bin/python -m pytest -q \
+  tests/test_macos_one_click_deploy.py -k 'binds_lookup_submission'
+3 failed, 2 passed, 122 deselected in 0.09s
+```
+
+The two passing mutation cases were still protected independently by the safe
+submitted-ID check and terminal public-ID check.
+
+### Exact GREEN and covering evidence
+
+```text
+# Combined identity, strict-format, valid-response, and older-session slice
+31 passed, 96 deselected in 0.21s
+
+# Identity false-positive scenarios after restoring the guards
+5 passed, 122 deselected in 0.03s
+
+# Named validators, exact formats, strict polled identity, and older session
+26 passed, 101 deselected in 0.15s
+
+# Complete Task 8 backend file
+127 passed in 2.46s
+```
+
+Full regression and artifact verification:
+
+```text
+/Users/wilson/tonghuashun/.venv/bin/python -m pytest -q
+752 passed, 24 existing warnings in 28.04s
+
+cd frontend
+npm test -- --run src/AdminPage.test.tsx
+1 file passed, 26 tests passed
+
+npm run build
+TypeScript and Vite build completed successfully
+
+/Users/wilson/tonghuashun/.venv/bin/python -m py_compile scripts/macos_deploy.py
+/bin/sh -n scripts/provision-macos-from-image.sh scripts/deploy-macos-one-click.sh
+git diff --check
+```
+
+No real host, Docker deployment, SDK, AVD, ADB, lifecycle, admin-session,
+device, App, session-refresh, or market action ran.

@@ -1,12 +1,12 @@
-# Admin Dual-Device Lifecycle Controls Implementation Plan
+# Admin Dual-Device Lifecycle and Complete Image Deployment Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Add authenticated administrator controls that safely shut down either macOS Android emulator or start it and open Tonghuashun without clearing data, changing accounts, or exposing arbitrary host commands.
+**Goal:** Add authenticated dual-emulator controls and a complete APK/Frida-bearing Docker image with one-command existing-Mac redeployment plus an interactive fresh-Mac provisioning path.
 
-**Architecture:** A token-authenticated Python standard-library service runs as a macOS LaunchAgent on `127.0.0.1:18765` and owns the fixed AVD/ADB command whitelist. FastAPI proxies only fixed role/action requests through the existing admin-session, CSRF, device-lock, and paused-queue boundary; the React admin page polls lifecycle state and renders per-device controls and confirmations.
+**Architecture:** A token-authenticated Python standard-library service runs as a macOS LaunchAgent on `127.0.0.1:18765` and owns the fixed AVD/ADB command whitelist. FastAPI proxies fixed role/action requests through the existing admin boundary; the React admin page controls and refreshes both roles. The Docker image carries hash-pinned APK/Frida assets, while a host orchestrator preserves existing AVDs or creates only missing fixed AVDs and pauses for normal human login.
 
-**Tech Stack:** Python 3 standard library host service, FastAPI/Pydantic, existing Redis/InMemory task stores, React 19, TypeScript, Vitest/Testing Library, shell/launchd, OrbStack Docker Compose.
+**Tech Stack:** Python 3 standard library host service, FastAPI/Pydantic, existing Redis/InMemory task stores, React 19, TypeScript, Vitest/Testing Library, multi-stage Docker/OCI assets, shell/launchd, Android SDK tools, OrbStack Docker Compose.
 
 **Spec:** `docs/superpowers/specs/2026-08-27-admin-device-lifecycle-controls-design.md`
 
@@ -19,6 +19,12 @@
 - The browser and FastAPI callers never supply AVD names, serials, ports, activities, executable paths, or shell arguments.
 - Host and API responses/logs expose only role, action, lifecycle state, operation id, timestamps, and fixed error codes.
 - Lifecycle controls require an authenticated admin session, valid CSRF, current-session device lock, paused queue, and no running device task.
+- The image contains only the fixed APK SHA-256 `2554490aa3f5e2df17ac0a711311f3f85ee3130008af9bb4ab12510b3d6e971e` and Frida Server 16.7.19 xz SHA-256 `36ec3d7474b1ac69c4e7ec985612fae771d37ffb71cb94858bc6978f69f5e581`.
+- The decompressed Frida Server is exactly 53702368 bytes with SHA-256 `4eebf1fbc66ff54aba9a9124c2ef8b32b566616388c60e2caa65148a529d826a`.
+- Existing AVD mode never installs/reinstalls an App; an installed APK mismatch fails closed.
+- Provisioning installs APK/Frida only into roles whose fixed AVD was created by that invocation; pre-existing roles are never overwritten.
+- First-time account login, captcha, device verification, permissions, and Android/third-party license acceptance remain human steps.
+- The APK-bearing image is local/private only; scripts never push, save, export, or publish it.
 - Redis, market, admin, session, capture, emulator, and AVD data must be preserved through deployment and acceptance.
 - Docker deployment continues to use OrbStack, `.env`, `deploy/macos.env`, port 8001, and no Caddy.
 
@@ -27,6 +33,12 @@
 - Create `scripts/macos-device-lifecycle.py`: host-side fixed-role lifecycle manager and loopback HTTP server.
 - Create `scripts/install-macos-device-lifecycle.sh`: secure config, LaunchAgent, and stable bridge watcher installation.
 - Create `tests/test_macos_device_lifecycle.py`: host manager, HTTP authentication, command whitelist, and installer-contract tests.
+- Modify `Dockerfile` and `.dockerignore`: include only the fixed APK, download/verify pinned Frida, and publish a safe asset manifest.
+- Create `scripts/container-provision-device.sh`: image-contained fixed-role installer used only for newly created AVDs.
+- Create `scripts/deploy-macos-one-click.sh`: auto-detect existing/provisioning mode and run the canonical OrbStack deployment.
+- Create `scripts/provision-macos-from-image.sh`: create only missing fixed AVDs and install image assets into those roles.
+- Modify `scripts/setup-admin.py`: generate session encryption and lifecycle secrets for a new deployment.
+- Create `tests/test_macos_one_click_deploy.py`: image, existing-mode, provisioning, fail-closed, and forbidden-command contracts.
 - Create `level2_service/device_lifecycle.py`: sanitized FastAPI-to-host client and lifecycle types.
 - Create `tests/test_device_lifecycle.py`: client parsing, timeout, and error-redaction tests.
 - Create `tests/test_device_lifecycle_api.py`: admin auth/CSRF/lock/busy/action API tests.
@@ -34,7 +46,7 @@
 - Modify `level2_service/api.py`: inject lifecycle client, extend device response, add fixed action endpoint.
 - Modify `level2_service/main.py`: parse lifecycle configuration and wire the production client.
 - Modify `frontend/src/api.ts`: lifecycle types, device list, and action requests.
-- Modify `frontend/src/AdminPage.tsx`: device polling, two per-device buttons, pending/error state, accessible confirmation dialog.
+- Modify `frontend/src/AdminPage.tsx`: device polling, two per-device buttons, both-role session refresh, pending/error state, accessible confirmation dialog.
 - Modify `frontend/src/AdminPage.test.tsx`: lifecycle button, dialog, role routing, state, and error regressions.
 - Modify `frontend/src/styles.css`: existing admin-style lifecycle controls, danger action, dialog, and mobile layout.
 - Modify `deploy/compose.yml` and `deploy/macos.env.example`: lifecycle URL/token/timeout wiring.
@@ -704,7 +716,8 @@ export interface AdminDeviceHealth {
 
 In `AdminPage.test.tsx`, mock `/api/admin/devices` with one running and one stopped device.
 Assert both cards render both button labels, role-specific lifecycle text, and that controls
-are disabled before lock acquisition.
+are disabled before lock acquisition. Mock `/api/admin/account-sessions` with both roles and
+assert each device card shows its own session state and refresh button.
 
 - [ ] **Step 2: Run the focused frontend test and verify failure**
 
@@ -736,7 +749,9 @@ deviceAction: (
 In `AdminPage`, load devices after login/session restoration and during manual health refresh.
 Poll every 2 seconds while any device is `STARTING`/`STOPPING`; otherwise use the existing
 15-second health cadence. Store pending/error state keyed by role so simultaneous cards do
-not overwrite each other.
+not overwrite each other. Replace the fund-only session state with a role-keyed session map;
+load both roles after authentication and let each device card call the existing
+`refreshAccountSession(role, csrf)` endpoint.
 
 - [ ] **Step 4: Write failing confirmation, pending, and routing tests**
 
@@ -747,6 +762,8 @@ Test:
 - Tab/Shift+Tab remain inside the dialog;
 - Confirm sends core + `shutdown` + CSRF;
 - fund start sends fund + `start_and_launch_app`;
+- core session refresh calls `core_metrics` and fund session refresh calls
+  `main_fund_flow`, with pending/error text scoped to the matching card;
 - pending text and disabled buttons are scoped to the selected card;
 - a safe API error renders a card-local `role="alert"`;
 - fund warning says the action never switches account, clears data, reinstalls, or navigates;
@@ -768,7 +785,10 @@ interface DeviceViewportProps {
   lifecycle?: AdminDeviceHealth['lifecycle']
   actionPending?: DeviceLifecycleAction | null
   actionError?: string | null
+  sessionStatus?: AccountSessionStatus | null
+  sessionRefreshPending?: boolean
   onLifecycleAction?: (role: DeviceRole, action: DeviceLifecycleAction) => void
+  onRefreshSession?: (role: DeviceRole) => void
 }
 ```
 
@@ -813,8 +833,8 @@ git commit -m "feat: add admin virtual machine controls"
 - Modify: `tests/test_deploy_configuration.py`
 
 **Interfaces:**
-- Consumes: all Task 1-5 behavior.
-- Produces: operator installation, authorization boundary, rollback, and acceptance documentation.
+- Consumes: all Task 1-5 behavior and the approved complete-image/provisioning design.
+- Produces: operator installation, image asset policy, existing/fresh Mac flows, authorization boundary, rollback, and acceptance documentation.
 
 - [ ] **Step 1: Write failing deployment/rules assertions**
 
@@ -828,7 +848,8 @@ Add tests that assert:
   navigation on fund;
 - handoff documents LaunchAgent installation, state/error semantics, standard deployment,
   manual queue recovery, and rollback without deleting data volumes;
-- README documents first-time installation and safe operation.
+- README documents the APK/Frida-bearing image, existing-AVD one-command deployment,
+  interactive first-time provisioning, and local/private-only image boundary.
 
 - [ ] **Step 2: Run documentation contract tests and verify failure**
 
@@ -843,17 +864,17 @@ Expected: FAIL on missing lifecycle documentation assertions.
 
 - [ ] **Step 3: Update rules and operator documentation**
 
-Document the exact install command:
+Document the normal one-command entry:
 
 ```bash
-scripts/install-macos-device-lifecycle.sh \
-  --project-root /Users/wilson/tonghuashun \
-  --env-file /Users/wilson/tonghuashun/.env
+scripts/deploy-macos-one-click.sh --mode auto
 ```
 
 Document that operators must acquire the device lock, wait for running tasks to finish, use
 one device action at a time, release the lock, and explicitly resume the queue. Record all
-fixed error codes and the rollback sequence from the spec.
+fixed error codes and the rollback sequence from the spec. Correct the prior README claim
+that the APK is absent from Git history; state instead that it is excluded from the old image
+but deliberately included in the new local/private image after fixed digest verification.
 
 - [ ] **Step 4: Run documentation/deployment tests**
 
@@ -875,14 +896,338 @@ git add -- AGENTS.md README.md handoff.md deploy/macos.env.example \
 git commit -m "docs: document dual device lifecycle operations"
 ```
 
-### Task 7: Full Verification, Installation, Deployment, and Real Dual-Device Acceptance
+### Task 7: Complete APK/Frida Image and Existing-Mac One-Command Deployment
 
 **Files:**
-- Modify only if verification finds a defect in Task 1-6 files.
+- Modify: `Dockerfile`
+- Modify: `.dockerignore`
+- Create: `scripts/container-provision-device.sh`
+- Create: `scripts/macos_deploy.py`
+- Create: `scripts/deploy-macos-one-click.sh`
+- Modify: `scripts/setup-admin.py`
+- Create: `tests/test_macos_one_click_deploy.py`
+- Modify: `tests/test_deploy_configuration.py`
+
+**Interfaces:**
+- Consumes: Task 2's lifecycle installer/broker and the fixed asset hashes from the approved spec.
+- Produces: image assets under `/opt/ths/assets`, fixed-role container provisioner, `MacDeploymentOrchestrator`, and `scripts/deploy-macos-one-click.sh --mode auto|existing|provision`.
+- Produces: `MacDeploymentOrchestrator.deploy_existing() -> DeploymentResult` for Task 8 and Task 9.
+
+- [ ] **Step 1: Write failing image asset contract tests**
+
+In `tests/test_macos_one_click_deploy.py`, assert the tracked APK exists and matches the exact
+size, digest, and ARM ABI preflight. Read Dockerfile and `.dockerignore` and assert:
+
+```python
+APK_SHA256 = "2554490aa3f5e2df17ac0a711311f3f85ee3130008af9bb4ab12510b3d6e971e"
+FRIDA_SHA256 = "36ec3d7474b1ac69c4e7ec985612fae771d37ffb71cb94858bc6978f69f5e581"
+FRIDA_BINARY_SHA256 = "4eebf1fbc66ff54aba9a9124c2ef8b32b566616388c60e2caa65148a529d826a"
+
+
+def test_image_contains_only_the_pinned_mobile_assets() -> None:
+    dockerfile = Path("Dockerfile").read_text()
+    dockerignore = Path(".dockerignore").read_text()
+    assert "!ths_android_V11_59_03.apk" in dockerignore
+    assert "COPY --chmod=0444 ths_android_V11_59_03.apk /opt/ths/assets/ths.apk" in dockerfile
+    assert APK_SHA256 in dockerfile
+    assert "frida-server-16.7.19-android-arm64.xz" in dockerfile
+    assert FRIDA_SHA256 in dockerfile
+    for forbidden in ("COPY .env", "COPY deploy/macos.env", "docker push", "docker save"):
+        assert forbidden not in dockerfile
+```
+
+Also assert no `ARG` can override the two URLs/digests and that the final stage copies a
+read-only `manifest.json`, APK, Frida binary, and `container-provision-device` executable.
+
+- [ ] **Step 2: Run image contract tests and verify failure**
+
+Run:
+
+```bash
+/Users/wilson/tonghuashun/.venv/bin/python -m pytest -q \
+  tests/test_macos_one_click_deploy.py -k image
+```
+
+Expected: FAIL because the APK is ignored and the image has no asset stage.
+
+- [ ] **Step 3: Implement the hash-pinned asset stage**
+
+Keep the existing frontend/API stages. Add a `mobile-assets` stage that installs only
+`ca-certificates curl xz-utils`, copies the exact APK, downloads the exact Frida URL, verifies
+both digests, decompresses Frida, and writes:
+
+```json
+{
+  "apk": {
+    "filename": "ths.apk",
+    "size": 214088292,
+    "sha256": "2554490aa3f5e2df17ac0a711311f3f85ee3130008af9bb4ab12510b3d6e971e",
+    "abis": ["arm64-v8a", "armeabi-v7a"]
+  },
+  "frida_server": {
+    "version": "16.7.19",
+    "size": 53702368,
+    "sha256_xz": "36ec3d7474b1ac69c4e7ec985612fae771d37ffb71cb94858bc6978f69f5e581",
+    "sha256": "4eebf1fbc66ff54aba9a9124c2ef8b32b566616388c60e2caa65148a529d826a"
+  }
+}
+```
+
+Copy assets into the API stage with APK/manifest mode 0444 and Frida mode 0555. Add OCI
+labels for both digests. Change `.dockerignore` by retaining `*.apk` and adding only
+`!ths_android_V11_59_03.apk` immediately after it.
+
+- [ ] **Step 4: Write failing setup-secret and fixed container-provisioner tests**
+
+Extend tests to run `scripts/setup-admin.py` with patched `getpass.getpass` and assert a new
+0600 env contains exactly one each of:
+
+- `ADMIN_PASSWORD_HASH`;
+- `ADMIN_SESSION_SECRET`;
+- `THS_SESSION_ENCRYPTION_KEY` as a valid 32-byte URL-safe Fernet key;
+- `THS_DEVICE_LIFECYCLE_TOKEN`.
+
+For `scripts/container-provision-device.sh`, assert the only input is one role, role mapping is
+fixed, and commands are limited to install the read-only APK, root/push/chmod/start fixed Frida,
+and fixed port forwarding. Assert it contains no reinstall flag `-r`, clear/uninstall/wipe,
+account action, navigation, arbitrary serial variable, or shell-evaluated caller input.
+
+- [ ] **Step 5: Implement secret setup and image-contained provisioner**
+
+Use Python `base64.urlsafe_b64encode(os.urandom(32))` for
+`THS_SESSION_ENCRYPTION_KEY`; keep the existing exclusive 0600 creation behavior.
+
+`container-provision-device.sh ROLE` must map:
+
+```sh
+core_metrics) serial=emulator-5556; host_port=27043 ;;
+main_fund_flow) serial=emulator-5554; host_port=27042 ;;
+*) exit 2 ;;
+```
+
+It must verify `sys.boot_completed=1`, refuse when the package already exists, execute
+`adb install /opt/ths/assets/ths.apk` without `-r`, push the fixed Frida binary, chmod 0755,
+start it, and create the fixed forward. It never opens the App; the lifecycle broker does that
+after installation.
+
+- [ ] **Step 6: Write failing existing-AVD orchestrator tests**
+
+Import `scripts/macos_deploy.py` with an injected `CommandRunner`, `LifecycleBroker`, and
+`FileSystem`. Test:
+
+```python
+def test_existing_mode_preserves_both_avds_and_uses_canonical_compose() -> None:
+    runner = existing_mac_runner(apk_sha256=APK_SHA256)
+    result = make_orchestrator(runner).deploy_existing()
+    assert result.mode == "existing"
+    rendered = "\n".join(" ".join(call) for call in runner.calls)
+    assert "docker --context orbstack compose" in rendered
+    assert "--env-file .env --env-file deploy/macos.env" in rendered
+    for forbidden in ("install -r", " install ", "pm clear", "wipe-data", "delete avd", "docker push", "docker save", "down -v"):
+        assert forbidden not in rendered
+```
+
+Add tests for:
+
+- exact two AVD detection;
+- APK mismatch returns `INSTALLED_APK_MISMATCH` before Compose rebuild;
+- missing prerequisite returns a fixed error;
+- `.env` missing invokes setup-admin once; existing `.env` is never overwritten;
+- lifecycle installer runs before broker start calls;
+- broker starts only a stopped role and waits for `RUNNING`;
+- Compose health timeout is sanitized;
+- default mode is `auto`, and two existing AVDs choose `existing`.
+
+- [ ] **Step 7: Implement the existing-AVD deployment path**
+
+Implement exact result/error types:
+
+```python
+@dataclass(frozen=True)
+class DeploymentResult:
+    mode: str
+    state: str
+    error_code: str | None = None
+
+
+class DeploymentError(RuntimeError):
+    def __init__(self, error_code: str):
+        super().__init__(error_code)
+        self.error_code = error_code
+```
+
+`MacDeploymentOrchestrator.deploy_existing()` must:
+
+1. validate Apple Silicon and required commands;
+2. validate both fixed AVD names from `emulator -list-avds`;
+3. create `.env` only when absent and validate its mode/required keys;
+4. build `ths-level2-api:local` with OrbStack Compose;
+5. read `/opt/ths/assets/manifest.json` from the image without exposing secrets;
+6. install/update the host lifecycle service from Task 2;
+7. start stopped roles through the broker and wait for `RUNNING`;
+8. retrieve each installed base-APK path with fixed ADB calls, validate the path format,
+   execute fixed `sha256sum` on-device, and require the manifest digest;
+9. run the canonical Compose `up -d --build` command without `down`;
+10. wait for API/Redis health and return `READY`.
+
+The wrapper is exactly:
+
+```sh
+#!/bin/sh
+set -eu
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+exec "${PYTHON_BIN:-python3}" "$script_dir/macos_deploy.py" "$@"
+```
+
+The CLI supports `--mode auto|existing|provision`, `--project-root`, and `--env-file`; it
+accepts no AVD, serial, image, APK, Frida, port, URL, or command overrides.
+
+- [ ] **Step 8: Run focused deployment tests and an image build**
+
+Run:
+
+```bash
+/Users/wilson/tonghuashun/.venv/bin/python -m pytest -q \
+  tests/test_macos_one_click_deploy.py tests/test_deploy_configuration.py
+docker --context orbstack build --target api -t ths-level2-api:asset-test .
+docker --context orbstack run --rm --entrypoint python \
+  ths-level2-api:asset-test -c \
+  'import hashlib,json,pathlib; p=pathlib.Path("/opt/ths/assets"); m=json.loads((p/"manifest.json").read_text()); assert hashlib.sha256((p/"ths.apk").read_bytes()).hexdigest()==m["apk"]["sha256"]; print("assets=verified")'
+```
+
+Expected: tests pass, image builds, and output is only `assets=verified`.
+
+- [ ] **Step 9: Commit Task 7**
+
+```bash
+git add -- Dockerfile .dockerignore scripts/container-provision-device.sh \
+  scripts/macos_deploy.py scripts/deploy-macos-one-click.sh scripts/setup-admin.py \
+  tests/test_macos_one_click_deploy.py tests/test_deploy_configuration.py
+git commit -m "feat: package mobile assets for one-command deployment"
+```
+
+### Task 8: Fresh-Mac and Partial-AVD Interactive Provisioning
+
+**Files:**
+- Modify: `scripts/macos_deploy.py`
+- Create: `scripts/provision-macos-from-image.sh`
+- Modify: `tests/test_macos_one_click_deploy.py`
+- Modify: `frontend/src/AdminPage.tsx`
+- Modify: `frontend/src/AdminPage.test.tsx`
+
+**Interfaces:**
+- Consumes: Task 7's image assets, container provisioner, orchestrator, and Task 5's both-role session UI.
+- Produces: `MacDeploymentOrchestrator.provision_missing() -> DeploymentResult` and a recoverable first-time onboarding state.
+
+- [ ] **Step 1: Write failing missing-AVD classification tests**
+
+Test `--mode auto` with exact AVD sets:
+
+| Existing AVDs | Expected behavior |
+| --- | --- |
+| both fixed AVDs | `deploy_existing()` |
+| neither | create/install both roles |
+| fund only | preserve fund, create/install core only |
+| core only | preserve core, create/install fund only |
+| unknown extra AVDs plus fixed subset | ignore unknown names; operate only fixed roles |
+
+Assert the orchestrator records the initially missing roles immutably and never changes that
+set after commands run.
+
+- [ ] **Step 2: Write failing provisioning command and preservation tests**
+
+Using a fake runner, assert for each initially missing role:
+
+- `sdkmanager` uses only `system-images;android-33;google_apis;arm64-v8a`;
+- `avdmanager create avd` uses the fixed name and contains no `--force`;
+- fixed `launchctl submit` starts the role and waits for boot;
+- the one-shot asset container calls `container-provision-device ROLE`;
+- core display calibration runs only for core;
+- lifecycle broker opens the App after asset installation.
+
+For each pre-existing role, assert none of create/install/push/chmod commands occur and its
+installed APK digest is checked exactly as in existing mode.
+
+Test missing SDK license maps to `ANDROID_LICENSE_REQUIRED`, missing system image download to
+`ANDROID_SYSTEM_IMAGE_UNAVAILABLE`, boot timeout to `DEVICE_BOOT_TIMEOUT`, and partial failure
+leaves all created AVD files intact.
+
+- [ ] **Step 3: Implement provisioning with fixed commands only**
+
+`provision_missing()` must:
+
+1. perform common preflight but never install OrbStack/Homebrew/JDK and never pipe `yes` into
+   Android licenses;
+2. run `sdkmanager --list_installed`; when the fixed system image is absent, call
+   `sdkmanager <fixed-image>` and sanitize a license failure;
+3. create only the initial missing-role set with fixed `avdmanager create avd --name ...
+   --package ...`, without `--force`;
+4. start each new role sequentially and wait for boot;
+5. run the image-contained provisioner only for that new role through a short-lived container
+   using `ADB_SERVER_SOCKET=tcp:host.docker.internal:5037`;
+6. install/update the host lifecycle service, then call the broker to open the App;
+7. run the standard Compose deployment;
+8. return `FIRST_TIME_LOGIN_REQUIRED` while either encrypted role session file is absent;
+9. on a later run, preserve the now-existing AVDs and return `READY` only after both session
+   files exist and a data-only acceptance task completes.
+
+The host shell wrapper must contain only stable project-root resolution and execute:
+
+```sh
+python3 scripts/macos_deploy.py --mode provision "$@"
+```
+
+- [ ] **Step 4: Write failing human-gate and resumability tests**
+
+Assert provisioning output contains only safe instructions:
+
+- open `http://127.0.0.1:8001/#admin`;
+- manually log in/verify each newly created role;
+- click the matching role's session refresh;
+- rerun the same one-command script.
+
+It must not print admin password, lifecycle Token, session key, Cookie, AVD data path, command
+stderr, or account identity. A rerun with AVDs present but missing session files must not create
+or install again and must remain `FIRST_TIME_LOGIN_REQUIRED`.
+
+- [ ] **Step 5: Extend both-role session UI tests if Task 5 did not fully cover onboarding**
+
+Verify each device card shows its `AccountSessionStatus`, refresh button, updated timestamp,
+pending state, and fixed-error response. This step may add only missing onboarding assertions;
+do not redesign the Task 5 controls.
+
+- [ ] **Step 6: Run provisioning and frontend tests**
+
+Run:
+
+```bash
+/Users/wilson/tonghuashun/.venv/bin/python -m pytest -q \
+  tests/test_macos_one_click_deploy.py
+cd frontend
+npm test -- --run src/AdminPage.test.tsx
+npm run build
+```
+
+Expected: all pass; no real AVD/ADB/SDK command runs in automated tests.
+
+- [ ] **Step 7: Commit Task 8**
+
+```bash
+git add -- scripts/macos_deploy.py scripts/provision-macos-from-image.sh \
+  tests/test_macos_one_click_deploy.py frontend/src/AdminPage.tsx \
+  frontend/src/AdminPage.test.tsx
+git commit -m "feat: add interactive fresh mac provisioning"
+```
+
+### Task 9: Full Verification, Installation, Deployment, and Real Dual-Device Acceptance
+
+**Files:**
+- Modify only if verification finds a defect in Task 1-8 files or measured evidence must be
+  updated in `handoff.md`.
 - Do not add generated LaunchAgent, host config, Token, `.env`, logs, or `graphify-out/` to Git.
 
 **Interfaces:**
-- Consumes: complete feature branch.
+- Consumes: complete Task 1-8 feature branch.
 - Produces: installed host helper, deployed API/frontend, and acceptance evidence.
 
 - [ ] **Step 1: Run the complete automated verification**
@@ -910,45 +1255,43 @@ HEAD_SHA=$(git rev-parse HEAD)
 Fix every Critical and Important finding. Re-run the covering tests after each fix and the
 complete verification after the final fix.
 
-- [ ] **Step 3: Install the macOS lifecycle service**
+- [ ] **Step 3: Run the current-Mac one-command redeployment**
 
-Run from the feature worktree; the installer copies runtime files into the stable
-`~/.local/lib/ths-device-lifecycle/` directory before loading LaunchAgent:
+Record the two AVD names, data-directory identities, installed APK digests, session-file
+presence, and Docker named-volume identities using read-only commands. Then run from the
+feature worktree:
 
 ```bash
-scripts/install-macos-device-lifecycle.sh \
+scripts/deploy-macos-one-click.sh \
+  --mode auto \
   --project-root "$(pwd)" \
   --env-file /Users/wilson/tonghuashun/.env
 ```
 
-Verify without printing the Token:
+Expected: existing mode, no install/reinstall command, and `READY`. Verify without printing
+the Token:
 
 ```bash
 launchctl print "gui/$UID/com.ths.device-lifecycle"
 test "$(stat -f '%Lp' "$HOME/.config/ths-device-lifecycle.env")" = "600"
 ```
 
-- [ ] **Step 4: Verify broker reachability from OrbStack**
+- [ ] **Step 4: Verify image assets and broker reachability from OrbStack**
 
-After Compose receives the Token, call the broker from the API container using Python and the
-container environment. Print only status code and safe device states; never print headers or
-environment values.
+From the API container, verify `/opt/ths/assets/manifest.json`, APK digest, executable Frida
+binary, and broker `/v1/devices`. Use the container environment for authentication but print
+only `assets=verified`, HTTP status, and safe role/state values; never print headers or env.
 
-Expected: HTTP 200 and two role entries.
+Expected: assets verified, HTTP 200, and two role entries.
 
-- [ ] **Step 5: Rebuild with the standard deployment command**
+- [ ] **Step 5: Verify deployed service and stored state preservation**
 
-From the stable project checkout containing the final code:
+The one-command script already ran the canonical Compose build. Wait until API and Redis are
+healthy and verify `/openapi.json`, `/market`, and the admin page return 200. Compare the
+recorded AVD/data/session/volume identities from Step 3 and assert none changed or disappeared.
 
-```bash
-docker --context orbstack compose \
-  --env-file .env \
-  --env-file deploy/macos.env \
-  -f deploy/compose.yml up -d --build
-```
-
-Preserve Redis and all named volumes. Wait until API and Redis are healthy and verify
-`/openapi.json` and the admin page return 200.
+Confirm the deployed container environment has lifecycle URL/timeout and direct transports,
+but do not print any secret value.
 
 - [ ] **Step 6: Run core real lifecycle acceptance**
 
@@ -976,11 +1319,17 @@ Keeping the queue paused and operating sequentially:
 
 Assert API responses, task records, API logs, broker logs, and admin DOM contain no lifecycle
 Token, Cookie, auth packet, request packet, serial, AVD name, command, stdout, or stderr.
-Confirm Redis, market, admin/session, capture volumes and both AVD data directories remain.
+Confirm the image contains no `.env`, session bundle, AVD directory, Redis/market/admin data,
+capture, or logs. Confirm Redis, market, admin/session, capture volumes and both AVD data
+directories remain.
+
+Run the complete provisioning test suite with fake commands and record that fresh/partial Mac
+paths pass. Unless a separate clean Mac is actually available, report first-time provisioning
+as automated-path verified rather than claiming a real clean-Mac acceptance.
 
 - [ ] **Step 9: Commit final verified adjustments**
 
-If Task 7 changed tracked documentation or fixes, stage only those exact files and commit:
+If Task 9 changed tracked documentation or fixes, stage only those exact files and commit:
 
 ```bash
 git commit -m "fix: complete device lifecycle acceptance"
@@ -988,7 +1337,7 @@ git commit -m "fix: complete device lifecycle acceptance"
 
 If no tracked files changed, do not create an empty commit.
 
-### Task 8: Final Branch Review and Integration Handoff
+### Task 10: Final Branch Review and Integration Handoff
 
 **Files:**
 - No planned code changes.
@@ -1014,10 +1363,14 @@ Report:
 
 - branch and HEAD SHA;
 - automated test counts and build result;
+- image asset manifest/digest verification and final image size;
+- existing-Mac one-command deployment result and proof that neither App was reinstalled;
+- fresh/partial-Mac provisioning test result and whether a real clean Mac was available;
 - LaunchAgent and broker health;
 - real core/fund stop-start results;
 - login/data preservation evidence;
 - post-restart direct task timing and completeness;
 - sensitive-information scan result;
 - remaining maintenance risk: Android/AVD/App upgrades may require updating fixed startup
-  assumptions, but never automatic AVD recreation or App reinstall.
+  assumptions and pinned image assets, but never automatic replacement of existing AVDs or
+  automatic reinstall into an existing logged-in device.

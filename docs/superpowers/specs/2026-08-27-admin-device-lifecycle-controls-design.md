@@ -1,4 +1,4 @@
-# 管理员双设备生命周期控制设计
+# 管理员双设备生命周期与完整镜像部署设计
 
 日期：2026-08-27
 状态：已批准
@@ -19,6 +19,14 @@ Linux 容器内执行 macOS 的 Android Emulator 或 `launchctl`，因此目前�
 该授权只放开上述两个固定生命周期动作，不放开退出账号、切换账号、清数据、
 克隆 AVD、安装或卸载 App、`force-stop`、自动搜索或其他 App 内导航。
 
+用户随后要求把已验证 APK 封装进完整 Docker 镜像，并同时支持：
+
+- 当前 Mac 保留双 AVD 和登录状态的一键重部署；
+- 全新 Apple Silicon Mac 的交互式首次开通流程。
+
+“首次开通”可以自动准备固定 AVD、APK、Frida 和服务，但账号登录、验证码、
+设备验证、业务权限确认和 Android/第三方许可接受仍必须由用户人工完成。
+
 ## 2. 目标
 
 - 在管理员页面的每张设备卡中提供独立的“关闭虚拟机”和
@@ -31,6 +39,10 @@ Linux 容器内执行 macOS 的 Android Emulator 或 `launchctl`，因此目前�
 - 控制服务不可接收任意命令、可执行文件、AVD 名、serial、端口或 shell 参数。
 - 主机控制服务不可用时，只禁用生命周期按钮，不影响公开 Market、直连任务、
   Redis、管理登录或其他 API。
+- Docker 镜像内置固定 APK、Frida Server 和部署辅助资产，构建时验证哈希。
+- 提供一个幂等入口，自动识别已有 AVD 重部署、缺失 AVD 首次开通和混合状态。
+- 已存在 AVD 永不被删除、替换、wipe 或自动重装 App；新创建 AVD 才安装镜像资产。
+- 镜像默认只在本机或私有环境使用，不自动推送、导出或发布到公共 Registry。
 
 ## 3. 非目标
 
@@ -38,8 +50,11 @@ Linux 容器内执行 macOS 的 Android Emulator 或 `launchctl`，因此目前�
 - 不在启动后自动进入股票页、资金页或任何业务页面。
 - 不改变 9528 和资金 HTTP 直连的会话模型。
 - 不让浏览器直接连接 macOS 主机控制服务。
-- 不远程创建、复制、删除或重置 AVD。
+- 生命周期管理 API 不创建、复制、删除或重置 AVD；首次开通脚本只允许创建缺失的
+  两个固定 AVD，绝不替换或重置已经存在的 AVD。
 - 不允许调用方自定义 ADB 命令或 Emulator 参数。
+- 不封装账号密码、Cookie、认证包、加密会话包、AVD 数据目录或已登录快照。
+- 不把全新 Mac 宣称为无人值守可用；首次登录与验证始终是人工关口。
 
 ## 4. 已验证的环境事实
 
@@ -50,6 +65,16 @@ Linux 容器内执行 macOS 的 Android Emulator 或 `launchctl`，因此目前�
   但它还承担创建/安装等初始化职责，不能直接暴露给管理 API。
 - 已用临时只读探测验证：OrbStack API 容器能够通过
   `host.docker.internal` 访问仅监听 macOS `127.0.0.1` 的 HTTP 服务。
+- `ths_android_V11_59_03.apk` 已存在于项目历史，大小 214088292 bytes，SHA-256
+  为 `2554490aa3f5e2df17ac0a711311f3f85ee3130008af9bb4ab12510b3d6e971e`，
+  包含 `arm64-v8a` 和 `armeabi-v7a`；当前 `.dockerignore` 的 `*.apk` 仍将其排除
+  在镜像构建上下文之外。
+- 官方 `frida-server-16.7.19-android-arm64.xz` 大小 15972776 bytes，SHA-256
+  为 `36ec3d7474b1ac69c4e7ec985612fae771d37ffb71cb94858bc6978f69f5e581`；
+  解压后大小 53702368 bytes，SHA-256 为
+  `4eebf1fbc66ff54aba9a9124c2ef8b32b566616388c60e2caa65148a529d826a`。
+- 当前 API 镜像约 597 MB；加入 APK 和解压后的 Frida Server 后预计约
+  800–850 MB。
 
 ## 5. 方案比较
 
@@ -407,3 +432,129 @@ POST /api/admin/devices/{role}/actions
 - 不删除 AVD、登录数据、会话包或 Docker 数据卷；
 - 公开 Market 和直连采集继续运行；
 - 必要时按现有人工方式启动 AVD。
+
+## 14. 完整 Docker 镜像资产
+
+### 14.1 镜像内容
+
+镜像固定包含：
+
+- `/opt/ths/assets/ths.apk`；
+- `/opt/ths/assets/ths-frida-server`；
+- `/opt/ths/assets/manifest.json`；
+- lifecycle、bridge、显示校准和首次开通所需的只读脚本副本。
+
+`manifest.json` 只记录版本、文件大小、APK SHA-256、APK 支持 ABI、Frida 版本和
+Frida SHA-256，不包含路径、账号或秘密。
+
+Dockerfile 必须：
+
+- 只对白名单文件 `ths_android_V11_59_03.apk` 解除 `.dockerignore`；
+- 使用 `COPY --chmod=0444` 复制 APK；
+- 在独立资产 stage 从固定官方 URL 下载 Frida `16.7.19`；
+- 在构建时校验两个固定 SHA-256，任何不一致都终止构建；
+- 解压 Frida 后设置 `0555`，资产目录不可写；
+- 使用 OCI label 记录资产版本和摘要；
+- 不复制 `.env`、`deploy/macos.env`、session、AVD、capture、Redis 或日志。
+
+镜像构建参数不得覆盖 APK/Frida URL、摘要或文件名。升级必须修改受审查的源码常量、
+manifest 和测试，不能通过部署环境临时替换。
+
+### 14.2 分发边界
+
+默认只构建本机镜像 `ths-level2-api:local`。一键脚本不得执行 `docker push`、
+`docker save` 或创建公共发布。若未来需要共享 Registry，必须单独取得 APK 分发授权
+并建立私有仓库访问控制、镜像签名和删除策略。
+
+## 15. 一键部署模式
+
+统一入口：
+
+```bash
+scripts/deploy-macos-one-click.sh --mode auto
+```
+
+脚本只支持 Apple Silicon macOS，并始终使用显式 OrbStack context。
+
+### 15.1 公共前置检查
+
+所有模式先验证：
+
+- Apple Silicon、OrbStack、Docker、Java 17、Android command-line tools；
+- `adb`、`emulator`、`sdkmanager`、`avdmanager` 和可用磁盘；
+- Android 33 ARM64 system image许可已由用户接受；
+- APK/Frida 镜像资产摘要与 manifest 一致；
+- `.env` 权限为 `0600`，并包含管理员秘密、会话加密密钥和 lifecycle Token；
+- `deploy/macos.env` 的双角色配置完整；
+- 不存在正在使用设备的任务。
+
+缺少 OrbStack、Java、Android 工具或未接受许可时，脚本以固定错误码退出并打印人工
+安装/许可命令；不自动安装 Homebrew、OrbStack，不自动接受许可。
+
+### 15.2 已有双 AVD 重部署
+
+当两个固定 AVD 都存在时：
+
+1. 绝不创建、删除、复制或重置 AVD；
+2. 构建包含资产的本机镜像；
+3. 校验两台设备已安装同花顺，读取已安装 base APK 的 SHA-256；
+4. 若摘要不等于镜像 APK，返回 `INSTALLED_APK_MISMATCH`，不自动覆盖安装；
+5. 安装/更新稳定 host lifecycle 和 bridge LaunchAgent；
+6. 通过 lifecycle 服务启动已关闭的 AVD 并只打开同花顺入口页；
+7. 使用标准 OrbStack Compose 命令重建 API/Redis，保留全部卷；
+8. 验证 API、Redis、双角色设备、直连会话和数据任务。
+
+该模式不执行 `adb install`、`install -r` 或任何 App 数据变更，因此保留两个账号的
+登录状态。
+
+### 15.3 全新或部分缺失 AVD 首次开通
+
+当一个或两个固定 AVD 不存在时，`auto` 进入交互式 provisioning：
+
+1. 记录每个角色在开始时是否已经存在；
+2. 仅使用固定 Android 33 ARM64 system image 创建缺失角色；
+3. 已存在角色继续执行摘要校验，绝不重装或重置；
+4. 启动新创建 AVD，等待 `boot_completed=1`；
+5. 通过一次性资产容器，仅对新创建角色安装 `/opt/ths/assets/ths.apk`；
+6. 仅对新创建角色推送固定 Frida Server，并恢复固定端口转发；
+7. 校准 core 显示，打开两台设备的同花顺入口页；
+8. 启动 Web/API/Redis，使管理员页面可访问；
+9. 对每个新角色暂停并要求用户人工登录、处理验证码/设备验证和确认权限；
+10. 管理页面同时显示 core/fund 加密会话状态和刷新按钮；用户完成登录后分别刷新；
+11. 两个会话均为 READY 后，运行完整直连验收。
+
+若新建 AVD 安装或登录未完成，系统保持可恢复状态并返回
+`FIRST_TIME_LOGIN_REQUIRED`，下次执行从现有状态继续，不删除已创建 AVD。
+
+### 15.4 密钥与配置初始化
+
+`.env` 不存在时，一键脚本调用增强后的 `scripts/setup-admin.sh`，交互式读取管理员
+密码，并一次生成：
+
+- `ADMIN_PASSWORD_HASH`；
+- `ADMIN_SESSION_SECRET`；
+- `THS_SESSION_ENCRYPTION_KEY`；
+- `THS_DEVICE_LIFECYCLE_TOKEN`。
+
+所有秘密只写入 `0600` 的 `.env`，不打印值。已有 `.env` 只补缺失的新键，绝不
+重置管理员密码、会话加密密钥或 lifecycle Token。
+
+## 16. 扩展测试与验收
+
+自动测试新增：
+
+- Dockerfile/.dockerignore 精确白名单和构建摘要失败测试；
+- 资产 manifest、APK ABI、Frida 版本及禁止秘密文件测试；
+- 一键脚本 `auto` 的已有、全新、部分缺失、版本不一致和恢复路径；
+- 断言 existing 模式永不出现 install/clear/reset；
+- 断言 provisioning 只向本次新建角色安装资产；
+- 断言任何脚本都不 push/save 镜像、不自动接受许可；
+- 管理页面同时刷新 core/fund 会话。
+
+真实验收除第 12 节外还包括：
+
+1. 在当前 Mac 运行 `--mode auto`，确认双 AVD ID、数据目录和登录状态未变化；
+2. 确认镜像中的 APK/Frida 摘要与 manifest 一致；
+3. 在隔离的临时配置/模拟命令环境验证首次开通脚本的全路径；
+4. 真实新 Mac 首次开通仅在具备目标设备和人工登录条件时执行；没有该环境时不得
+   宣称完成真实新 Mac 验收，只能报告自动测试和当前 Mac 结果。

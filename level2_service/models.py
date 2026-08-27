@@ -166,6 +166,8 @@ class TaskRecord:
         default_factory=lambda: normalized_intraday_series(None)
     )
     long_capture: LongCaptureRecord = field(default_factory=LongCaptureRecord)
+    maintenance_namespace: str | None = None
+    maintenance_owner_digest: str | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         if not self.include_long_capture and self.long_capture.status == CaptureStatus.PENDING:

@@ -6,6 +6,7 @@ from collections import defaultdict, deque
 from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import datetime
+import hashlib
 import hmac
 import json
 from pathlib import Path
@@ -26,7 +27,9 @@ class InvalidTransitionError(ValueError):
 
 
 _DEPLOYMENT_OWNER = re.compile(r"[A-Za-z0-9_-]{32,256}")
+_MAINTENANCE_OWNER_DIGEST = re.compile(r"[0-9a-f]{64}")
 _MAX_DEPLOYMENT_LEASE_SECONDS = 7200.0
+_DEPLOYMENT_ACCEPTANCE_NAMESPACE = "deployment_acceptance"
 
 
 @dataclass(frozen=True)
@@ -50,6 +53,17 @@ def _valid_lease_request(owner_token: str, ttl_seconds: float) -> bool:
     )
 
 
+def _maintenance_owner_digest(owner_token: str) -> str:
+    return hashlib.sha256(owner_token.encode("utf-8")).hexdigest()
+
+
+def _has_maintenance_metadata(task: TaskRecord) -> bool:
+    return (
+        task.maintenance_namespace is not None
+        or task.maintenance_owner_digest is not None
+    )
+
+
 def _valid_acceptance_task(task: TaskRecord) -> bool:
     return (
         isinstance(task, TaskRecord)
@@ -57,6 +71,43 @@ def _valid_acceptance_task(task: TaskRecord) -> bool:
         and task.include_long_capture is False
         and task.status == TaskStatus.QUEUED
         and task.completed_at is None
+        and not _has_maintenance_metadata(task)
+    )
+
+
+def _mark_deployment_acceptance(task: TaskRecord, owner_token: str) -> None:
+    task.maintenance_namespace = _DEPLOYMENT_ACCEPTANCE_NAMESPACE
+    task.maintenance_owner_digest = _maintenance_owner_digest(owner_token)
+
+
+def _valid_bound_acceptance(
+    task: TaskRecord,
+    *,
+    bound_task_id: str,
+    owner_digest: str,
+    require_queued: bool = False,
+) -> bool:
+    return (
+        task.task_id == bound_task_id
+        and task.symbol == "601872"
+        and task.include_long_capture is False
+        and task.maintenance_namespace == _DEPLOYMENT_ACCEPTANCE_NAMESPACE
+        and isinstance(task.maintenance_owner_digest, str)
+        and _MAINTENANCE_OWNER_DIGEST.fullmatch(task.maintenance_owner_digest)
+        is not None
+        and hmac.compare_digest(task.maintenance_owner_digest, owner_digest)
+        and (not require_queued or task.status == TaskStatus.QUEUED)
+    )
+
+
+def _valid_legacy_bound_acceptance(
+    task: TaskRecord, *, bound_task_id: str
+) -> bool:
+    return (
+        task.task_id == bound_task_id
+        and task.symbol == "601872"
+        and task.include_long_capture is False
+        and not _has_maintenance_metadata(task)
     )
 
 
@@ -183,7 +234,16 @@ class InMemoryStreams:
         with self._claim_lock:
             self._enqueue_locked(task)
 
-    def _enqueue_locked(self, task: TaskRecord) -> None:
+    def _enqueue_locked(
+        self, task: TaskRecord, *, maintenance: bool = False
+    ) -> None:
+        if maintenance:
+            if task.maintenance_namespace != _DEPLOYMENT_ACCEPTANCE_NAMESPACE:
+                raise InvalidTransitionError("invalid maintenance task")
+        elif _has_maintenance_metadata(task):
+            raise InvalidTransitionError(
+                "maintenance task requires the maintenance binding path"
+            )
         pending = sum(
             item.status in {TaskStatus.QUEUED, TaskStatus.RUNNING, TaskStatus.WAITING_ADMIN}
             for item in self._tasks.values()
@@ -195,6 +255,10 @@ class InMemoryStreams:
         self._emit(task)
 
     def submit_or_refresh(self, task: TaskRecord) -> TaskRecord:
+        if _has_maintenance_metadata(task):
+            raise InvalidTransitionError(
+                "maintenance task requires the maintenance binding path"
+            )
         with self._claim_lock:
             existing = self._find_by_symbol_raw(task.symbol)
             if existing is None:
@@ -212,10 +276,18 @@ class InMemoryStreams:
             lease = self._active_deployment_lease_locked()
             if lease is not None:
                 bound_task_id = lease.get("bound_task_id")
-                if not isinstance(bound_task_id, str):
+                owner_digest = lease.get("owner_digest")
+                if not isinstance(bound_task_id, str) or not isinstance(
+                    owner_digest, str
+                ):
                     return None
                 task = self._tasks.get(bound_task_id)
-                if task is None or task.status != TaskStatus.QUEUED:
+                if task is None or not _valid_bound_acceptance(
+                    task,
+                    bound_task_id=bound_task_id,
+                    owner_digest=owner_digest,
+                    require_queued=True,
+                ):
                     return None
                 self._fifo = deque(
                     task_id for task_id in self._fifo if task_id != bound_task_id
@@ -226,7 +298,11 @@ class InMemoryStreams:
                 return task
             for task_id in self._fifo:
                 task = self._tasks.get(task_id)
-                if task and task.status == TaskStatus.QUEUED:
+                if (
+                    task
+                    and task.status == TaskStatus.QUEUED
+                    and not _has_maintenance_metadata(task)
+                ):
                     task.status = TaskStatus.RUNNING
                     task.updated_at = utc_now()
                     self._emit(task)
@@ -245,10 +321,19 @@ class InMemoryStreams:
         return resolved
 
     def find_by_symbol(self, symbol: str) -> TaskRecord | None:
-        return self._find_by_symbol_raw(symbol)
+        with self._claim_lock:
+            return self._find_by_symbol_raw(symbol)
 
     def _find_by_symbol_raw(self, symbol: str) -> TaskRecord | None:
-        candidates = [task for task in self._tasks.values() if task.symbol == symbol]
+        lease = self._active_deployment_lease_locked()
+        bound_task_id = lease.get("bound_task_id") if lease is not None else None
+        candidates = [
+            task
+            for task in self._tasks.values()
+            if task.symbol == symbol
+            and not _has_maintenance_metadata(task)
+            and task.task_id != bound_task_id
+        ]
         return max(
             candidates,
             key=lambda task: (task.updated_at, task.created_at, task.task_id),
@@ -258,7 +343,16 @@ class InMemoryStreams:
     def deduplicate_by_symbol(self) -> dict[str, int]:
         with self._claim_lock:
             groups: dict[str, list[TaskRecord]] = defaultdict(list)
+            lease = self._active_deployment_lease_locked()
+            bound_task_id = (
+                lease.get("bound_task_id") if lease is not None else None
+            )
             for task in self._tasks.values():
+                if (
+                    _has_maintenance_metadata(task)
+                    or task.task_id == bound_task_id
+                ):
+                    continue
                 _restore_expired_task(task)
                 groups[task.symbol].append(task)
             deleted = 0
@@ -334,6 +428,7 @@ class InMemoryStreams:
                 return False
             self._deployment_lease = {
                 "owner_token": owner_token,
+                "owner_digest": _maintenance_owner_digest(owner_token),
                 "bound_task_id": None,
                 "expires_at": self._lease_clock() + float(ttl_seconds),
             }
@@ -350,6 +445,13 @@ class InMemoryStreams:
                 str(lease["owner_token"]), owner_token
             ):
                 return False
+            owner_digest = _maintenance_owner_digest(owner_token)
+            stored_digest = lease.get("owner_digest")
+            if stored_digest is not None and not hmac.compare_digest(
+                str(stored_digest), owner_digest
+            ):
+                return False
+            lease["owner_digest"] = owner_digest
             lease["expires_at"] = self._lease_clock() + float(ttl_seconds)
             return True
 
@@ -382,14 +484,30 @@ class InMemoryStreams:
                 str(lease["owner_token"]), owner_token
             ):
                 return None
+            owner_digest = _maintenance_owner_digest(owner_token)
+            stored_digest = lease.get("owner_digest")
+            if stored_digest is not None and not hmac.compare_digest(
+                str(stored_digest), owner_digest
+            ):
+                return None
+            lease["owner_digest"] = owner_digest
             bound_task_id = lease.get("bound_task_id")
             if isinstance(bound_task_id, str):
                 existing = self._tasks.get(bound_task_id)
-                if (
-                    existing is None
-                    or existing.symbol != "601872"
-                    or existing.include_long_capture is not False
+                if existing is None:
+                    return None
+                if _has_maintenance_metadata(existing):
+                    if not _valid_bound_acceptance(
+                        existing,
+                        bound_task_id=bound_task_id,
+                        owner_digest=owner_digest,
+                    ):
+                        return None
+                elif _valid_legacy_bound_acceptance(
+                    existing, bound_task_id=bound_task_id
                 ):
+                    _mark_deployment_acceptance(existing, owner_token)
+                else:
                     return None
                 if existing.status in _REFRESHABLE_STATUSES:
                     try:
@@ -399,8 +517,9 @@ class InMemoryStreams:
                 return existing
             if task.task_id in self._tasks:
                 return None
+            _mark_deployment_acceptance(task, owner_token)
             try:
-                self._enqueue_locked(task)
+                self._enqueue_locked(task, maintenance=True)
             except QueueFullError:
                 return None
             lease["bound_task_id"] = task.task_id
@@ -413,6 +532,29 @@ class InMemoryStreams:
                 return False
             if not hmac.compare_digest(str(lease["owner_token"]), owner_token):
                 return False
+            owner_digest = _maintenance_owner_digest(owner_token)
+            stored_digest = lease.get("owner_digest")
+            if stored_digest is not None and not hmac.compare_digest(
+                str(stored_digest), owner_digest
+            ):
+                return False
+            bound_task_id = lease.get("bound_task_id")
+            if isinstance(bound_task_id, str):
+                task = self._tasks.get(bound_task_id)
+                if task is None:
+                    return False
+                if _has_maintenance_metadata(task):
+                    if not _valid_bound_acceptance(
+                        task,
+                        bound_task_id=bound_task_id,
+                        owner_digest=owner_digest,
+                    ):
+                        return False
+                elif not _valid_legacy_bound_acceptance(
+                    task, bound_task_id=bound_task_id
+                ):
+                    return False
+                self._remove_maintenance_task_locked(bound_task_id)
             self._deployment_lease = None
             return True
 
@@ -426,51 +568,74 @@ class InMemoryStreams:
         return lease
 
     def queue_position(self, task_id: str) -> int | None:
-        task_id = self.resolve_task_id(task_id)
-        task = self._tasks.get(task_id)
-        if task is None or task.status != TaskStatus.QUEUED:
-            return None
-        position = 0
-        for queued_id in self._fifo:
-            candidate = self._tasks.get(queued_id)
-            if candidate is None or candidate.status != TaskStatus.QUEUED:
-                continue
-            position += 1
-            if queued_id == task_id:
-                return position
+        with self._claim_lock:
+            task_id = self.resolve_task_id(task_id)
+            task = self._tasks.get(task_id)
+            lease = self._active_deployment_lease_locked()
+            bound_task_id = (
+                lease.get("bound_task_id") if lease is not None else None
+            )
+            if (
+                task is None
+                or task.status != TaskStatus.QUEUED
+                or _has_maintenance_metadata(task)
+                or task.task_id == bound_task_id
+            ):
+                return None
+            position = 0
+            for queued_id in self._fifo:
+                candidate = self._tasks.get(queued_id)
+                if (
+                    candidate is None
+                    or candidate.status != TaskStatus.QUEUED
+                    or _has_maintenance_metadata(candidate)
+                    or candidate.task_id == bound_task_id
+                ):
+                    continue
+                position += 1
+                if queued_id == task_id:
+                    return position
         return None
 
     def requeue_waiting(self, task_id: str) -> TaskRecord:
-        task = self._tasks[task_id]
-        if task.status != TaskStatus.WAITING_ADMIN:
-            raise InvalidTransitionError(f"{task.status.value} cannot be requeued")
-        self._move_to_fifo_tail(task_id)
-        task.status = TaskStatus.QUEUED
-        task.error_code = None
-        task.source_errors = _normalized_source_errors(None)
-        task.updated_at = utc_now()
-        self._emit(task)
-        return task
+        with self._claim_lock:
+            task = self._tasks[task_id]
+            if self._is_maintenance_task_locked(task):
+                raise InvalidTransitionError("maintenance task cannot be requeued")
+            if task.status != TaskStatus.WAITING_ADMIN:
+                raise InvalidTransitionError(f"{task.status.value} cannot be requeued")
+            self._move_to_fifo_tail(task_id)
+            task.status = TaskStatus.QUEUED
+            task.error_code = None
+            task.source_errors = _normalized_source_errors(None)
+            task.updated_at = utc_now()
+            self._emit(task)
+            return task
 
     def retry_failed(self, task_id: str) -> TaskRecord:
-        task = self._tasks[task_id]
-        if task.status == TaskStatus.QUEUED:
+        with self._claim_lock:
+            task = self._tasks[task_id]
+            if self._is_maintenance_task_locked(task):
+                raise InvalidTransitionError("maintenance task cannot be retried")
+            if task.status == TaskStatus.QUEUED:
+                return task
+            if task.status != TaskStatus.FAILED:
+                raise InvalidTransitionError(f"{task.status.value} cannot be retried")
+            self._move_to_fifo_tail(task_id)
+            task.status = TaskStatus.QUEUED
+            task.error_code = None
+            task.completed_at = None
+            task.source_errors = _normalized_source_errors(None)
+            task.updated_at = utc_now()
+            self._emit(task)
             return task
-        if task.status != TaskStatus.FAILED:
-            raise InvalidTransitionError(f"{task.status.value} cannot be retried")
-        self._move_to_fifo_tail(task_id)
-        task.status = TaskStatus.QUEUED
-        task.error_code = None
-        task.completed_at = None
-        task.source_errors = _normalized_source_errors(None)
-        task.updated_at = utc_now()
-        self._emit(task)
-        return task
 
     def refresh_task(self, task_id: str, include_long_capture: bool | None = None) -> TaskRecord:
         with self._claim_lock:
             task_id = self.resolve_task_id(task_id)
             task = self._tasks[task_id]
+            if self._is_maintenance_task_locked(task):
+                raise InvalidTransitionError("maintenance task cannot be refreshed")
             if task.status in _ACTIVE_STATUSES:
                 return task
             if task.status not in _REFRESHABLE_STATUSES:
@@ -578,25 +743,61 @@ class InMemoryStreams:
         return self._events.get(self.resolve_task_id(task_id), [])[event_index:]
 
     def cleanup(self, now: datetime) -> list[TaskRecord]:
-        removed: list[TaskRecord] = []
-        for task in list(self._tasks.values()):
-            long_capture = task.long_capture
-            if (
-                long_capture.status == CaptureStatus.READY
-                and long_capture.expires_at is not None
-                and now >= long_capture.expires_at
-            ):
-                self._unlink_capture(long_capture)
-                long_capture.status = CaptureStatus.EXPIRED
-            for capture in task.captures.values():
+        with self._claim_lock:
+            removed: list[TaskRecord] = []
+            lease = self._active_deployment_lease_locked()
+            bound_task_id = (
+                lease.get("bound_task_id") if lease is not None else None
+            )
+            owner_digest = lease.get("owner_digest") if lease is not None else None
+            for task in list(self._tasks.values()):
+                if _has_maintenance_metadata(task):
+                    if (
+                        isinstance(bound_task_id, str)
+                        and isinstance(owner_digest, str)
+                        and _valid_bound_acceptance(
+                            task,
+                            bound_task_id=bound_task_id,
+                            owner_digest=owner_digest,
+                        )
+                    ):
+                        continue
+                    removed.append(task)
+                    self._remove_maintenance_task_locked(task.task_id)
+                    continue
+                long_capture = task.long_capture
                 if (
-                    capture.status == CaptureStatus.READY
-                    and capture.expires_at is not None
-                    and now >= capture.expires_at
+                    long_capture.status == CaptureStatus.READY
+                    and long_capture.expires_at is not None
+                    and now >= long_capture.expires_at
                 ):
-                    self._unlink_capture(capture)
-                    capture.status = CaptureStatus.EXPIRED
-        return removed
+                    self._unlink_capture(long_capture)
+                    long_capture.status = CaptureStatus.EXPIRED
+                for capture in task.captures.values():
+                    if (
+                        capture.status == CaptureStatus.READY
+                        and capture.expires_at is not None
+                        and now >= capture.expires_at
+                    ):
+                        self._unlink_capture(capture)
+                        capture.status = CaptureStatus.EXPIRED
+            return removed
+
+    def _is_maintenance_task_locked(self, task: TaskRecord) -> bool:
+        if _has_maintenance_metadata(task):
+            return True
+        lease = self._active_deployment_lease_locked()
+        return lease is not None and lease.get("bound_task_id") == task.task_id
+
+    def _remove_maintenance_task_locked(self, task_id: str) -> None:
+        task = self._tasks.pop(task_id, None)
+        if task is None:
+            return
+        for capture in task.captures.values():
+            self._unlink_capture(capture)
+        self._unlink_capture(task.long_capture)
+        self._fifo = deque(item for item in self._fifo if item != task_id)
+        self._events.pop(task_id, None)
 
     def _emit(self, task: TaskRecord) -> None:
         self._events.setdefault(task.task_id, []).append({"event": "status", "data": task.status.value})
@@ -642,36 +843,50 @@ return true
 """
     _SUBMIT_OR_REFRESH_SCRIPT = """
 -- THS_SUBMIT_OR_REFRESH
+local lease_bound_id = false
+local lease_payload = redis.call('GET', KEYS[6])
+if lease_payload then
+  local lease = cjson.decode(lease_payload)
+  if lease.bound_task_id and lease.bound_task_id ~= cjson.null then
+    lease_bound_id = lease.bound_task_id
+  end
+end
 local existing_id = redis.call('HGET', KEYS[5], ARGV[2])
 if existing_id then
   local existing_payload = redis.call('GET', KEYS[2] .. existing_id)
   if existing_payload then
     local existing = cjson.decode(existing_payload)
-    if existing.status == 'QUEUED' or existing.status == 'RUNNING' or existing.status == 'WAITING_ADMIN' then
-      return existing_payload
-    end
-    local pending = 0
-    for _, task_id in ipairs(redis.call('SMEMBERS', KEYS[3])) do
-      local payload = redis.call('GET', KEYS[2] .. task_id)
-      if payload then
-        local task = cjson.decode(payload)
-        if task.status == 'QUEUED' or task.status == 'RUNNING' or task.status == 'WAITING_ADMIN' then
-          pending = pending + 1
+    local maintenance = existing.maintenance
+    if existing_id == lease_bound_id or (maintenance and maintenance ~= cjson.null) then
+      redis.call('HDEL', KEYS[5], ARGV[2])
+    else
+      if existing.status == 'QUEUED' or existing.status == 'RUNNING' or existing.status == 'WAITING_ADMIN' then
+        return existing_payload
+      end
+      local pending = 0
+      for _, task_id in ipairs(redis.call('SMEMBERS', KEYS[3])) do
+        local payload = redis.call('GET', KEYS[2] .. task_id)
+        if payload then
+          local queued = cjson.decode(payload)
+          if queued.status == 'QUEUED' or queued.status == 'RUNNING' or queued.status == 'WAITING_ADMIN' then
+            pending = pending + 1
+          end
         end
       end
+      if pending >= tonumber(ARGV[1]) then return 'QUEUE_FULL' end
+      local refreshed = cjson.decode(ARGV[5])
+      refreshed.task_id = existing_id
+      refreshed.symbol = ARGV[2]
+      local updated = cjson.encode(refreshed)
+      redis.call('LREM', KEYS[1], 0, existing_id)
+      redis.call('SET', KEYS[2] .. existing_id, updated)
+      redis.call('RPUSH', KEYS[1], existing_id)
+      redis.call('XADD', KEYS[4], '*', 'event', 'status', 'task_id', existing_id, 'data', 'QUEUED')
+      return updated
     end
-    if pending >= tonumber(ARGV[1]) then return 'QUEUE_FULL' end
-    local refreshed = cjson.decode(ARGV[5])
-    refreshed.task_id = existing_id
-    refreshed.symbol = ARGV[2]
-    local updated = cjson.encode(refreshed)
-    redis.call('LREM', KEYS[1], 0, existing_id)
-    redis.call('SET', KEYS[2] .. existing_id, updated)
-    redis.call('RPUSH', KEYS[1], existing_id)
-    redis.call('XADD', KEYS[4], '*', 'event', 'status', 'task_id', existing_id, 'data', 'QUEUED')
-    return updated
+  else
+    redis.call('HDEL', KEYS[5], ARGV[2])
   end
-  redis.call('HDEL', KEYS[5], ARGV[2])
 end
 local pending = 0
 for _, task_id in ipairs(redis.call('SMEMBERS', KEYS[3])) do
@@ -697,12 +912,14 @@ local lease_payload = redis.call('GET', KEYS[4])
 if lease_payload then
   local lease = cjson.decode(lease_payload)
   local task_id = lease.bound_task_id
-  if not task_id or task_id == cjson.null then return false end
+  local owner_digest = lease.owner_digest
+  if not task_id or task_id == cjson.null or not owner_digest or owner_digest == cjson.null then return false end
   local key = KEYS[2] .. task_id
   local payload = redis.call('GET', key)
   if not payload then return false end
   local task = cjson.decode(payload)
-  if task.status ~= 'QUEUED' or task.symbol ~= '601872' or task.include_long_capture ~= false then
+  local maintenance = task.maintenance
+  if task.task_id ~= task_id or task.status ~= 'QUEUED' or task.symbol ~= '601872' or task.include_long_capture ~= false or not maintenance or maintenance == cjson.null or maintenance.namespace ~= 'deployment_acceptance' or maintenance.owner_digest ~= owner_digest then
     return false
   end
   task.status = 'RUNNING'
@@ -719,7 +936,8 @@ while task_id do
   local payload = redis.call('GET', key)
   if payload then
     local task = cjson.decode(payload)
-    if task.status == 'QUEUED' then
+    local maintenance = task.maintenance
+    if task.status == 'QUEUED' and (not maintenance or maintenance == cjson.null) then
       task.status = 'RUNNING'
       task.updated_at = ARGV[1]
       local updated = cjson.encode(task)
@@ -744,8 +962,8 @@ for _, task_id in ipairs(redis.call('SMEMBERS', KEYS[3])) do
     end
   end
 end
-local lease = cjson.encode({owner_token = ARGV[1], bound_task_id = cjson.null})
-local accepted = redis.call('SET', KEYS[1], lease, 'NX', 'PX', ARGV[2])
+local lease = cjson.encode({owner_token = ARGV[1], owner_digest = ARGV[2], bound_task_id = cjson.null})
+local accepted = redis.call('SET', KEYS[1], lease, 'NX', 'PX', ARGV[3])
 if accepted then return 1 end
 return 0
 """
@@ -755,7 +973,10 @@ local payload = redis.call('GET', KEYS[1])
 if not payload then return 0 end
 local lease = cjson.decode(payload)
 if lease.owner_token ~= ARGV[1] then return 0 end
-return redis.call('PEXPIRE', KEYS[1], ARGV[2])
+if lease.owner_digest and lease.owner_digest ~= cjson.null and lease.owner_digest ~= ARGV[2] then return 0 end
+lease.owner_digest = ARGV[2]
+redis.call('SET', KEYS[1], cjson.encode(lease), 'KEEPTTL')
+return redis.call('PEXPIRE', KEYS[1], ARGV[3])
 """
     _DEPLOYMENT_LEASE_STATUS_SCRIPT = """
 -- THS_DEPLOYMENT_LEASE_STATUS
@@ -771,12 +992,31 @@ local lease_payload = redis.call('GET', KEYS[1])
 if not lease_payload then return false end
 local lease = cjson.decode(lease_payload)
 if lease.owner_token ~= ARGV[1] then return false end
+if lease.owner_digest and lease.owner_digest ~= cjson.null and lease.owner_digest ~= ARGV[2] then return false end
+lease.owner_digest = ARGV[2]
+local candidate = cjson.decode(ARGV[4])
+local candidate_maintenance = candidate.maintenance
+if candidate.task_id ~= ARGV[3] or candidate.symbol ~= '601872' or candidate.include_long_capture ~= false or candidate.status ~= 'QUEUED' or not candidate_maintenance or candidate_maintenance == cjson.null or candidate_maintenance.namespace ~= 'deployment_acceptance' or candidate_maintenance.owner_digest ~= ARGV[2] then
+  return false
+end
+redis.call('SET', KEYS[1], cjson.encode(lease), 'KEEPTTL')
 if lease.bound_task_id and lease.bound_task_id ~= cjson.null then
   local existing = redis.call('GET', KEYS[3] .. lease.bound_task_id)
   if not existing then return false end
   local existing_task = cjson.decode(existing)
-  if existing_task.symbol ~= '601872' or existing_task.include_long_capture ~= false then
+  if existing_task.task_id ~= lease.bound_task_id or existing_task.symbol ~= '601872' or existing_task.include_long_capture ~= false then
     return false
+  end
+  local existing_maintenance = existing_task.maintenance
+  if existing_maintenance and existing_maintenance ~= cjson.null then
+    if existing_maintenance.namespace ~= 'deployment_acceptance' or existing_maintenance.owner_digest ~= ARGV[2] then return false end
+  else
+    existing_task.maintenance = candidate_maintenance
+    existing = cjson.encode(existing_task)
+    redis.call('SET', KEYS[3] .. lease.bound_task_id, existing)
+  end
+  if redis.call('HGET', KEYS[6], existing_task.symbol) == lease.bound_task_id then
+    redis.call('HDEL', KEYS[6], existing_task.symbol)
   end
   if existing_task.status == 'COMPLETED' or existing_task.status == 'FAILED' or existing_task.status == 'EXPIRED' or (existing_task.status == 'PARTIAL' and existing_task.completed_at and existing_task.completed_at ~= cjson.null) then
     local pending = 0
@@ -789,8 +1029,8 @@ if lease.bound_task_id and lease.bound_task_id ~= cjson.null then
         end
       end
     end
-    if pending >= tonumber(ARGV[5]) then return 'QUEUE_FULL' end
-    local refreshed = cjson.decode(ARGV[3])
+    if pending >= tonumber(ARGV[6]) then return 'QUEUE_FULL' end
+    local refreshed = candidate
     refreshed.task_id = lease.bound_task_id
     local updated = cjson.encode(refreshed)
     redis.call('SET', KEYS[3] .. lease.bound_task_id, updated)
@@ -802,7 +1042,7 @@ if lease.bound_task_id and lease.bound_task_id ~= cjson.null then
   end
   return existing
 end
-if redis.call('GET', KEYS[3] .. ARGV[2]) then return false end
+if redis.call('GET', KEYS[3] .. ARGV[3]) then return false end
 local pending = 0
 for _, task_id in ipairs(redis.call('SMEMBERS', KEYS[4])) do
   local payload = redis.call('GET', KEYS[3] .. task_id)
@@ -813,15 +1053,14 @@ for _, task_id in ipairs(redis.call('SMEMBERS', KEYS[4])) do
     end
   end
 end
-if pending >= tonumber(ARGV[5]) then return 'QUEUE_FULL' end
-redis.call('SET', KEYS[3] .. ARGV[2], ARGV[3])
-redis.call('SADD', KEYS[4], ARGV[2])
-redis.call('RPUSH', KEYS[2], ARGV[2])
-redis.call('HSET', KEYS[6], ARGV[4], ARGV[2])
-redis.call('XADD', KEYS[5], '*', 'event', 'status', 'task_id', ARGV[2], 'data', 'QUEUED')
-lease.bound_task_id = ARGV[2]
+if pending >= tonumber(ARGV[6]) then return 'QUEUE_FULL' end
+redis.call('SET', KEYS[3] .. ARGV[3], ARGV[4])
+redis.call('SADD', KEYS[4], ARGV[3])
+redis.call('RPUSH', KEYS[2], ARGV[3])
+redis.call('XADD', KEYS[5], '*', 'event', 'status', 'task_id', ARGV[3], 'data', 'QUEUED')
+lease.bound_task_id = ARGV[3]
 redis.call('SET', KEYS[1], cjson.encode(lease), 'KEEPTTL')
-return ARGV[3]
+return ARGV[4]
 """
     _RELEASE_DEPLOYMENT_LEASE_SCRIPT = """
 -- THS_RELEASE_DEPLOYMENT_LEASE
@@ -829,6 +1068,33 @@ local payload = redis.call('GET', KEYS[1])
 if not payload then return 0 end
 local lease = cjson.decode(payload)
 if lease.owner_token ~= ARGV[1] then return 0 end
+if lease.owner_digest and lease.owner_digest ~= cjson.null and lease.owner_digest ~= ARGV[2] then return 0 end
+local task_id = lease.bound_task_id
+if task_id and task_id ~= cjson.null then
+  local task_payload = redis.call('GET', KEYS[3] .. task_id)
+  if not task_payload then return 0 end
+  local task = cjson.decode(task_payload)
+  if task.task_id ~= task_id or task.symbol ~= '601872' or task.include_long_capture ~= false then return 0 end
+  local maintenance = task.maintenance
+  if maintenance and maintenance ~= cjson.null then
+    if maintenance.namespace ~= 'deployment_acceptance' or maintenance.owner_digest ~= ARGV[2] then return 0 end
+  end
+  redis.call('LREM', KEYS[2], 0, task_id)
+  redis.call('DEL', KEYS[3] .. task_id)
+  redis.call('SREM', KEYS[4], task_id)
+  if redis.call('HGET', KEYS[6], task.symbol) == task_id then
+    redis.call('HDEL', KEYS[6], task.symbol)
+  end
+  for _, entry in ipairs(redis.call('XRANGE', KEYS[5], '-', '+')) do
+    local fields = entry[2]
+    for index = 1, #fields, 2 do
+      if fields[index] == 'task_id' and fields[index + 1] == task_id then
+        redis.call('XDEL', KEYS[5], entry[1])
+        break
+      end
+    end
+  end
+end
 return redis.call('DEL', KEYS[1])
 """
     _RECOVER_RUNNING_SCRIPT = """
@@ -866,9 +1132,17 @@ end
 return updated
 """
     _REQUEUE_WAITING_SCRIPT = """
+-- THS_REQUEUE_WAITING
 local payload = redis.call('GET', KEYS[2] .. ARGV[1])
 if not payload then return false end
 local task = cjson.decode(payload)
+local maintenance = task.maintenance
+if maintenance and maintenance ~= cjson.null then return 'MAINTENANCE' end
+local lease_payload = redis.call('GET', KEYS[4])
+if lease_payload then
+  local lease = cjson.decode(lease_payload)
+  if lease.bound_task_id == ARGV[1] then return 'MAINTENANCE' end
+end
 if task.status ~= 'WAITING_ADMIN' then return false end
 task.status = 'QUEUED'
 task.error_code = cjson.null
@@ -881,9 +1155,17 @@ redis.call('XADD', KEYS[3], '*', 'event', 'status', 'task_id', ARGV[1], 'data', 
 return updated
 """
     _RETRY_FAILED_SCRIPT = """
+-- THS_RETRY_FAILED
 local payload = redis.call('GET', KEYS[2] .. ARGV[1])
 if not payload then return false end
 local task = cjson.decode(payload)
+local maintenance = task.maintenance
+if maintenance and maintenance ~= cjson.null then return 'MAINTENANCE' end
+local lease_payload = redis.call('GET', KEYS[4])
+if lease_payload then
+  local lease = cjson.decode(lease_payload)
+  if lease.bound_task_id == ARGV[1] then return 'MAINTENANCE' end
+end
 if task.status == 'QUEUED' then return payload end
 if task.status ~= 'FAILED' then return false end
 task.status = 'QUEUED'
@@ -903,6 +1185,13 @@ local key = KEYS[2] .. ARGV[1]
 local payload = redis.call('GET', key)
 if not payload then return false end
 local current = cjson.decode(payload)
+local maintenance = current.maintenance
+if maintenance and maintenance ~= cjson.null then return 'MAINTENANCE' end
+local lease_payload = redis.call('GET', KEYS[5])
+if lease_payload then
+  local lease = cjson.decode(lease_payload)
+  if lease.bound_task_id == ARGV[1] then return 'MAINTENANCE' end
+end
 if current.status == 'QUEUED' or current.status == 'RUNNING' or current.status == 'WAITING_ADMIN' then
   return payload
 end
@@ -947,6 +1236,10 @@ return ARGV[2]
         self.capture_root = capture_root.resolve()
 
     def enqueue(self, task: TaskRecord) -> None:
+        if _has_maintenance_metadata(task):
+            raise InvalidTransitionError(
+                "maintenance task requires the maintenance binding path"
+            )
         accepted = self.client.eval(
             self._ENQUEUE_SCRIPT,
             5,
@@ -964,14 +1257,19 @@ return ARGV[2]
             raise QueueFullError("global pending queue cap reached")
 
     def submit_or_refresh(self, task: TaskRecord) -> TaskRecord:
+        if _has_maintenance_metadata(task):
+            raise InvalidTransitionError(
+                "maintenance task requires the maintenance binding path"
+            )
         payload = self.client.eval(
             self._SUBMIT_OR_REFRESH_SCRIPT,
-            5,
+            6,
             self._queue_key,
             self._prefix,
             self._index_key,
             self._event_stream,
             self._symbol_index_key,
+            self._deployment_lease_key,
             self.pending_cap,
             task.symbol,
             task.task_id,
@@ -1005,15 +1303,28 @@ return ARGV[2]
         return resolved
 
     def find_by_symbol(self, symbol: str) -> TaskRecord | None:
+        lease = self.deployment_lease_status()
+        bound_task_id = lease.bound_task_id if lease is not None else None
         indexed = self.client.hget(self._symbol_index_key, symbol)
         if indexed:
-            task = self._get_raw(self._text(indexed))
-            if task is not None:
+            indexed_id = self._text(indexed)
+            task = self._get_raw(indexed_id)
+            if (
+                task is not None
+                and not _has_maintenance_metadata(task)
+                and task.task_id != bound_task_id
+            ):
                 return task
+            self.client.hdel(self._symbol_index_key, symbol)
         candidates = []
         for raw_task_id in self.client.smembers(self._index_key):
             task = self._get_raw(self._text(raw_task_id))
-            if task is not None and task.symbol == symbol:
+            if (
+                task is not None
+                and task.symbol == symbol
+                and not _has_maintenance_metadata(task)
+                and task.task_id != bound_task_id
+            ):
                 candidates.append(task)
         result = max(
             candidates,
@@ -1026,10 +1337,19 @@ return ARGV[2]
 
     def deduplicate_by_symbol(self) -> dict[str, int]:
         groups: dict[str, list[TaskRecord]] = defaultdict(list)
+        lease = self.deployment_lease_status()
+        bound_task_id = lease.bound_task_id if lease is not None else None
+        excluded_ids: dict[str, set[str]] = defaultdict(set)
         for raw_task_id in list(self.client.smembers(self._index_key)):
             task = self._get_raw(self._text(raw_task_id))
             if task is None:
                 self.client.srem(self._index_key, self._text(raw_task_id))
+                continue
+            if (
+                _has_maintenance_metadata(task)
+                or task.task_id == bound_task_id
+            ):
+                excluded_ids[task.symbol].add(task.task_id)
                 continue
             _restore_expired_task(task)
             groups[task.symbol].append(task)
@@ -1069,6 +1389,12 @@ return ARGV[2]
                 self.client.hset(self._alias_key, duplicate.task_id, canonical.task_id)
                 deleted += 1
                 aliases += 1
+        for symbol, task_ids in excluded_ids.items():
+            if symbol in groups:
+                continue
+            indexed = self.client.hget(self._symbol_index_key, symbol)
+            if indexed and self._text(indexed) in task_ids:
+                self.client.hdel(self._symbol_index_key, symbol)
         return {
             "total": sum(len(tasks) for tasks in groups.values()),
             "kept": len(groups),
@@ -1079,13 +1405,25 @@ return ARGV[2]
     def queue_position(self, task_id: str) -> int | None:
         task_id = self.resolve_task_id(task_id)
         task = self.get(task_id)
-        if task is None or task.status != TaskStatus.QUEUED:
+        lease = self.deployment_lease_status()
+        bound_task_id = lease.bound_task_id if lease is not None else None
+        if (
+            task is None
+            or task.status != TaskStatus.QUEUED
+            or _has_maintenance_metadata(task)
+            or task.task_id == bound_task_id
+        ):
             return None
         position = 0
         for raw_task_id in self.client.lrange(self._queue_key, 0, -1):
             queued_id = self._text(raw_task_id)
             candidate = self.get(queued_id)
-            if candidate is None or candidate.status != TaskStatus.QUEUED:
+            if (
+                candidate is None
+                or candidate.status != TaskStatus.QUEUED
+                or _has_maintenance_metadata(candidate)
+                or candidate.task_id == bound_task_id
+            ):
                 continue
             position += 1
             if queued_id == task_id:
@@ -1147,6 +1485,7 @@ return ARGV[2]
             self._prefix,
             self._index_key,
             owner_token,
+            _maintenance_owner_digest(owner_token),
             max(1, int(float(ttl_seconds) * 1000)),
         )
         return result == 1
@@ -1161,6 +1500,7 @@ return ARGV[2]
             1,
             self._deployment_lease_key,
             owner_token,
+            _maintenance_owner_digest(owner_token),
             max(1, int(float(ttl_seconds) * 1000)),
         )
         return result == 1
@@ -1198,6 +1538,9 @@ return ARGV[2]
     ) -> TaskRecord | None:
         if not _valid_acceptance_task(task) or not isinstance(owner_token, str):
             return None
+        owner_digest = _maintenance_owner_digest(owner_token)
+        candidate = deepcopy(task)
+        _mark_deployment_acceptance(candidate, owner_token)
         payload = self.client.eval(
             self._BIND_DEPLOYMENT_ACCEPTANCE_SCRIPT,
             6,
@@ -1208,9 +1551,10 @@ return ARGV[2]
             self._event_stream,
             self._symbol_index_key,
             owner_token,
-            task.task_id,
-            self._serialize(task),
-            task.symbol,
+            owner_digest,
+            candidate.task_id,
+            self._serialize(candidate),
+            candidate.symbol,
             self.pending_cap,
         )
         if not payload or self._text(payload) == "QUEUE_FULL":
@@ -1219,7 +1563,11 @@ return ARGV[2]
             bound = self._deserialize(payload)
         except (KeyError, TypeError, ValueError):
             return None
-        if bound.symbol != "601872" or bound.include_long_capture is not False:
+        if not _valid_bound_acceptance(
+            bound,
+            bound_task_id=bound.task_id,
+            owner_digest=owner_digest,
+        ):
             return None
         return bound
 
@@ -1228,22 +1576,32 @@ return ARGV[2]
             return False
         result = self.client.eval(
             self._RELEASE_DEPLOYMENT_LEASE_SCRIPT,
-            1,
+            6,
             self._deployment_lease_key,
+            self._queue_key,
+            self._prefix,
+            self._index_key,
+            self._event_stream,
+            self._symbol_index_key,
             owner_token,
+            _maintenance_owner_digest(owner_token),
         )
         return result == 1
 
     def requeue_waiting(self, task_id: str) -> TaskRecord:
         payload = self.client.eval(
             self._REQUEUE_WAITING_SCRIPT,
-            3,
+            4,
             self._queue_key,
             self._prefix,
             self._event_stream,
+            self._deployment_lease_key,
             task_id,
             utc_now().isoformat(),
         )
+        marker = self._text(payload) if payload else ""
+        if marker == "MAINTENANCE":
+            raise InvalidTransitionError("maintenance task cannot be requeued")
         if payload:
             return self._deserialize(payload)
         task = self._required(task_id)
@@ -1254,13 +1612,17 @@ return ARGV[2]
     def retry_failed(self, task_id: str) -> TaskRecord:
         payload = self.client.eval(
             self._RETRY_FAILED_SCRIPT,
-            3,
+            4,
             self._queue_key,
             self._prefix,
             self._event_stream,
+            self._deployment_lease_key,
             task_id,
             utc_now().isoformat(),
         )
+        marker = self._text(payload) if payload else ""
+        if marker == "MAINTENANCE":
+            raise InvalidTransitionError("maintenance task cannot be retried")
         if payload:
             return self._deserialize(payload)
         task = self._required(task_id)
@@ -1271,6 +1633,8 @@ return ARGV[2]
     def refresh_task(self, task_id: str, include_long_capture: bool | None = None) -> TaskRecord:
         task_id = self.resolve_task_id(task_id)
         task = self._required(task_id)
+        if self._is_maintenance_task(task):
+            raise InvalidTransitionError("maintenance task cannot be refreshed")
         if task.status in _ACTIVE_STATUSES:
             return task
         if task.status not in _REFRESHABLE_STATUSES:
@@ -1279,11 +1643,12 @@ return ARGV[2]
         _reset_task_for_refresh(candidate, include_long_capture)
         payload = self.client.eval(
             self._REFRESH_TASK_SCRIPT,
-            4,
+            5,
             self._queue_key,
             self._prefix,
             self._event_stream,
             self._index_key,
+            self._deployment_lease_key,
             task_id,
             self._serialize(candidate),
             self.pending_cap,
@@ -1291,6 +1656,8 @@ return ARGV[2]
         marker = self._text(payload) if payload else ""
         if marker == "QUEUE_FULL":
             raise QueueFullError("global pending queue cap reached")
+        if marker == "MAINTENANCE":
+            raise InvalidTransitionError("maintenance task cannot be refreshed")
         if payload:
             return self._deserialize(payload)
         current = self._required(task_id)
@@ -1389,11 +1756,32 @@ return ARGV[2]
 
     def cleanup(self, now: datetime) -> list[TaskRecord]:
         removed: list[TaskRecord] = []
+        lease = self.deployment_lease_status()
+        bound_task_id = lease.bound_task_id if lease is not None else None
+        owner_digest = (
+            _maintenance_owner_digest(lease.owner_token)
+            if lease is not None
+            else None
+        )
         for raw_task_id in list(self.client.smembers(self._index_key)):
             task_id = self._text(raw_task_id)
             task = self.get(task_id)
             if task is None:
                 self.client.srem(self._index_key, task_id)
+                continue
+            if _has_maintenance_metadata(task):
+                if (
+                    isinstance(bound_task_id, str)
+                    and isinstance(owner_digest, str)
+                    and _valid_bound_acceptance(
+                        task,
+                        bound_task_id=bound_task_id,
+                        owner_digest=owner_digest,
+                    )
+                ):
+                    continue
+                removed.append(task)
+                self._remove_maintenance_task(task)
                 continue
             changed = False
             if task.long_capture.status == CaptureStatus.READY and task.long_capture.expires_at and now >= task.long_capture.expires_at:
@@ -1408,6 +1796,35 @@ return ARGV[2]
             if changed:
                 self._save(task)
         return removed
+
+    def _is_maintenance_task(self, task: TaskRecord) -> bool:
+        if _has_maintenance_metadata(task):
+            return True
+        lease = self.deployment_lease_status()
+        return lease is not None and lease.bound_task_id == task.task_id
+
+    def _remove_maintenance_task(self, task: TaskRecord) -> None:
+        for capture in task.captures.values():
+            self._unlink_capture(capture)
+        self._unlink_capture(task.long_capture)
+        self.client.lrem(self._queue_key, 0, task.task_id)
+        self.client.delete(self._key(task.task_id))
+        self.client.srem(self._index_key, task.task_id)
+        indexed = self.client.hget(self._symbol_index_key, task.symbol)
+        if indexed and self._text(indexed) == task.task_id:
+            self.client.hdel(self._symbol_index_key, task.symbol)
+        event_ids = []
+        for event_id, fields in self.client.xrange(
+            self._event_stream, "-", "+"
+        ):
+            normalized = {
+                self._text(key): self._text(value)
+                for key, value in fields.items()
+            }
+            if normalized.get("task_id") == task.task_id:
+                event_ids.append(event_id)
+        if event_ids:
+            self.client.xdel(self._event_stream, *event_ids)
 
     def _required(self, task_id: str) -> TaskRecord:
         task = self.get(task_id)
@@ -1444,6 +1861,14 @@ return ARGV[2]
             "task_id": task.task_id,
             "symbol": task.symbol,
             "include_long_capture": task.include_long_capture,
+            "maintenance": (
+                {
+                    "namespace": task.maintenance_namespace,
+                    "owner_digest": task.maintenance_owner_digest,
+                }
+                if _has_maintenance_metadata(task)
+                else None
+            ),
             "status": task.status.value,
             "created_at": task.created_at.isoformat(),
             "updated_at": task.updated_at.isoformat(),
@@ -1482,10 +1907,25 @@ return ARGV[2]
     @staticmethod
     def _deserialize(payload: object) -> TaskRecord:
         raw = json.loads(RedisStreamsStore._text(payload))
+        maintenance = raw.get("maintenance")
+        if maintenance is None:
+            maintenance_namespace = None
+            maintenance_owner_digest = None
+        elif isinstance(maintenance, dict):
+            maintenance_namespace = maintenance.get("namespace")
+            maintenance_owner_digest = maintenance.get("owner_digest")
+            if not isinstance(maintenance_namespace, str) or not isinstance(
+                maintenance_owner_digest, str
+            ):
+                raise ValueError("invalid task maintenance metadata")
+        else:
+            raise ValueError("invalid task maintenance metadata")
         task = TaskRecord(
             task_id=raw["task_id"],
             symbol=raw["symbol"],
             include_long_capture=raw.get("include_long_capture", True),
+            maintenance_namespace=maintenance_namespace,
+            maintenance_owner_digest=maintenance_owner_digest,
             status=TaskStatus(raw["status"]),
             created_at=datetime.fromisoformat(raw["created_at"]),
             updated_at=datetime.fromisoformat(raw["updated_at"]),

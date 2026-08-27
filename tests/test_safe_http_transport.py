@@ -158,6 +158,139 @@ def test_lifecycle_client_caps_response_before_json_parsing() -> None:
     assert caught.value.__cause__ is None
 
 
+def test_deployment_broker_ignores_host_proxy_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The host lifecycle bearer token must never be sent to an ambient proxy."""
+    module = _load_macos_deploy()
+    proxy_authorization: list[str | None] = []
+
+    class Target(QuietHandler):
+        def do_GET(self) -> None:
+            body = b'{"devices":[]}'
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    class Proxy(QuietHandler):
+        def do_GET(self) -> None:
+            proxy_authorization.append(self.headers.get("Authorization"))
+            self.send_response(502)
+            self.end_headers()
+
+    with serve(Target) as target, serve(Proxy) as proxy:
+        monkeypatch.setenv("HTTP_PROXY", f"http://127.0.0.1:{proxy.server_port}")
+        monkeypatch.setenv("http_proxy", f"http://127.0.0.1:{proxy.server_port}")
+        monkeypatch.delenv("NO_PROXY", raising=False)
+        monkeypatch.delenv("no_proxy", raising=False)
+        broker = module.LoopbackLifecycleBroker(
+            "host-secret",
+            base_url=f"http://127.0.0.1:{target.server_port}",
+        )
+
+        assert broker.device_states() == {}
+
+    assert proxy_authorization == []
+
+
+def test_deployment_broker_rejects_redirect_without_forwarding_authorization() -> None:
+    """A broker redirect cannot move its bearer capability to another origin."""
+    module = _load_macos_deploy()
+    redirected_authorization: list[str | None] = []
+
+    class RedirectTarget(QuietHandler):
+        def do_GET(self) -> None:
+            redirected_authorization.append(self.headers.get("Authorization"))
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b'{"devices":[]}')
+
+    with serve(RedirectTarget) as target:
+        location = f"http://127.0.0.1:{target.server_port}/stolen"
+
+        class RedirectSource(QuietHandler):
+            def do_GET(self) -> None:
+                self.send_response(302)
+                self.send_header("Location", location)
+                self.end_headers()
+
+        with serve(RedirectSource) as source:
+            broker = module.LoopbackLifecycleBroker(
+                "host-secret",
+                base_url=f"http://127.0.0.1:{source.server_port}",
+            )
+            with pytest.raises(module.DeploymentError) as caught:
+                broker.device_states()
+
+    assert caught.value.error_code == "DEVICE_LIFECYCLE_UNAVAILABLE"
+    assert caught.value.__cause__ is None
+    assert redirected_authorization == []
+
+
+@pytest.mark.parametrize(
+    "final_url",
+    [
+        "http://localhost:18765/v1/devices",
+        "http://127.0.0.1:18766/v1/devices",
+        "https://127.0.0.1:18765/v1/devices",
+    ],
+)
+def test_deployment_broker_rejects_wrong_final_origin(final_url: str) -> None:
+    """Injected responses must still prove the configured exact origin."""
+    module = _load_macos_deploy()
+    broker = module.LoopbackLifecycleBroker(
+        "host-secret",
+        opener=lambda _request, **_kwargs: FinalUrlResponse(
+            b'{"devices":[]}', final_url
+        ),
+    )
+
+    with pytest.raises(module.DeploymentError) as caught:
+        broker.device_states()
+
+    assert caught.value.error_code == "DEVICE_LIFECYCLE_UNAVAILABLE"
+    assert caught.value.__cause__ is None
+
+
+def test_deployment_broker_caps_response_before_json_parsing() -> None:
+    """The authenticated broker never parses a response beyond the shared cap."""
+    module = _load_macos_deploy()
+    body = b'{"devices":[]}' + b" " * 70_000
+    broker = module.LoopbackLifecycleBroker(
+        "host-secret",
+        opener=lambda _request, **_kwargs: FinalUrlResponse(
+            body, "http://127.0.0.1:18765/v1/devices"
+        ),
+    )
+
+    with pytest.raises(module.DeploymentError) as caught:
+        broker.device_states()
+
+    assert caught.value.error_code == "DEVICE_LIFECYCLE_UNAVAILABLE"
+    assert caught.value.__cause__ is None
+
+
+def test_deployment_broker_allows_an_ordinary_same_origin_response() -> None:
+    """Safe transport preserves the broker's fixed authenticated JSON request."""
+    module = _load_macos_deploy()
+    response = FinalUrlResponse(
+        b'{"devices":[{"role":"core_metrics","state":"RUNNING"}]}',
+        "http://127.0.0.1:18765/v1/devices",
+    )
+    requests: list[Request] = []
+
+    def opener(request: Request, **_kwargs):
+        requests.append(request)
+        return response
+
+    broker = module.LoopbackLifecycleBroker("host-secret", opener=opener)
+
+    assert broker.device_states() == {"core_metrics": "RUNNING"}
+    assert requests[0].full_url == "http://127.0.0.1:18765/v1/devices"
+    assert requests[0].get_header("Authorization") == "Bearer host-secret"
+
+
 def test_acceptance_client_ignores_host_proxy_environment(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

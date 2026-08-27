@@ -583,6 +583,30 @@ local payload = redis.call('GET', KEYS[1])
 if not payload then return 0 end
 local lease = cjson.decode(payload)
 if lease.owner_token ~= ARGV[1] then return 0 end
+local task_id = lease.bound_task_id
+if task_id and task_id ~= cjson.null then
+  local task_payload = redis.call('GET', KEYS[3] .. task_id)
+  if not task_payload then return 0 end
+  local task = cjson.decode(task_payload)
+  if task.task_id ~= task_id or task.symbol ~= '601872' or task.include_long_capture ~= false then return 0 end
+  local maintenance = task.maintenance
+  if maintenance and maintenance ~= cjson.null and maintenance.namespace ~= 'deployment_acceptance' then return 0 end
+  redis.call('LREM', KEYS[2], 0, task_id)
+  redis.call('DEL', KEYS[3] .. task_id)
+  redis.call('SREM', KEYS[4], task_id)
+  if redis.call('HGET', KEYS[6], task.symbol) == task_id then
+    redis.call('HDEL', KEYS[6], task.symbol)
+  end
+  for _, entry in ipairs(redis.call('XRANGE', KEYS[5], '-', '+')) do
+    local fields = entry[2]
+    for index = 1, #fields, 2 do
+      if fields[index] == 'task_id' and fields[index + 1] == task_id then
+        redis.call('XDEL', KEYS[5], entry[1])
+        break
+      end
+    end
+  end
+end
 return redis.call('DEL', KEYS[1])
 """
 
@@ -662,8 +686,15 @@ class HostDeploymentMaintenance:
     def release(self) -> None:
         result = self._lease_eval(
             _HOST_RELEASE_LEASE_SCRIPT,
-            1,
-            (self._LEASE_KEY,),
+            6,
+            (
+                self._LEASE_KEY,
+                "ths:jobs:pending",
+                self._TASK_PREFIX,
+                self._TASK_INDEX,
+                "ths:jobs:events",
+                "ths:jobs:symbols",
+            ),
             (),
             self.owner_token,
         )
@@ -1012,12 +1043,32 @@ class ProvisioningJournal:
 class LoopbackLifecycleBroker:
     """Minimal client for the authenticated fixed-role host lifecycle service."""
 
-    def __init__(self, token: str, *, timeout_seconds: float = 5.0) -> None:
+    def __init__(
+        self,
+        token: str,
+        *,
+        opener: Callable[..., object] | None = None,
+        base_url: str = "http://127.0.0.1:18765",
+        timeout_seconds: float = 5.0,
+    ) -> None:
         if not token:
             raise DeploymentError("ROOT_ENV_INVALID")
         self._token = token
         self._timeout_seconds = timeout_seconds
-        self._base_url = "http://127.0.0.1:18765"
+        self._base_url = base_url.rstrip("/")
+        wrapped_opener = None
+        if opener is not None:
+            wrapped_opener = lambda request, timeout: opener(
+                request, timeout=timeout
+            )
+        try:
+            self._transport = SafeHttpTransport(
+                self._base_url,
+                max_body_bytes=64 * 1024,
+                opener=wrapped_opener,
+            )
+        except ValueError:
+            raise DeploymentError("DEVICE_LIFECYCLE_UNAVAILABLE") from None
 
     def device_states(self) -> Mapping[str, str]:
         document = self._request("GET", "/v1/devices")
@@ -1089,9 +1140,11 @@ class LoopbackLifecycleBroker:
             method=method,
         )
         try:
-            with urlopen(request, timeout=self._timeout_seconds) as response:
-                raw = response.read()
-        except (HTTPError, URLError, TimeoutError, OSError, ValueError):
+            response = self._transport.request(request, self._timeout_seconds)
+            if not 200 <= response.status < 300:
+                raise DeploymentError("DEVICE_LIFECYCLE_UNAVAILABLE")
+            raw = response.body
+        except (SafeHttpError, DeploymentError):
             raise DeploymentError("DEVICE_LIFECYCLE_UNAVAILABLE") from None
         try:
             document = json.loads(raw.decode("utf-8"))

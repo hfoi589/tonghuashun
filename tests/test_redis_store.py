@@ -120,7 +120,7 @@ class FakeRedis:
         args = values[key_count:]
         if "THS_ACQUIRE_DEPLOYMENT_LEASE" in script:
             lease_key, prefix, index_key = keys
-            owner, ttl_ms = args
+            owner, owner_digest, ttl_ms = args
             with self._lock:
                 if self.get(lease_key) is not None:
                     return 0
@@ -143,14 +143,32 @@ class FakeRedis:
                     nx=True,
                     px=int(ttl_ms),
                 )
+                lease = json.loads(self.values[lease_key])
+                lease["owner_digest"] = owner_digest
+                self.set(
+                    lease_key,
+                    json.dumps(lease, separators=(",", ":")),
+                    keepttl=True,
+                )
                 return 1
         if "THS_RENEW_DEPLOYMENT_LEASE" in script:
             (lease_key,) = keys
-            owner, ttl_ms = args
+            owner, owner_digest, ttl_ms = args
             with self._lock:
                 payload = self.get(lease_key)
-                if not payload or json.loads(payload)["owner_token"] != owner:
+                if not payload:
                     return 0
+                lease = json.loads(payload)
+                if lease["owner_token"] != owner or lease.get(
+                    "owner_digest", owner_digest
+                ) != owner_digest:
+                    return 0
+                lease["owner_digest"] = owner_digest
+                self.set(
+                    lease_key,
+                    json.dumps(lease, separators=(",", ":")),
+                    keepttl=True,
+                )
                 return self.pexpire(lease_key, int(ttl_ms))
         if "THS_DEPLOYMENT_LEASE_STATUS" in script:
             (lease_key,) = keys
@@ -160,7 +178,7 @@ class FakeRedis:
                 return [payload, ttl] if payload and ttl > 0 else False
         if "THS_BIND_DEPLOYMENT_ACCEPTANCE" in script:
             lease_key, queue_key, prefix, index_key, event_stream, symbol_index = keys
-            owner, task_id, payload, symbol, cap = args
+            owner, owner_digest, task_id, payload, symbol, cap = args
             with self._lock:
                 lease_payload = self.get(lease_key)
                 if not lease_payload:
@@ -168,6 +186,27 @@ class FakeRedis:
                 lease = json.loads(lease_payload)
                 if lease["owner_token"] != owner:
                     return False
+                if lease.get("owner_digest", owner_digest) != owner_digest:
+                    return False
+                lease["owner_digest"] = owner_digest
+                candidate = json.loads(payload)
+                candidate_maintenance = candidate.get("maintenance")
+                if not (
+                    candidate["task_id"] == task_id
+                    and candidate["symbol"] == "601872"
+                    and candidate["include_long_capture"] is False
+                    and candidate["status"] == "QUEUED"
+                    and candidate_maintenance
+                    and candidate_maintenance.get("namespace")
+                    == "deployment_acceptance"
+                    and candidate_maintenance.get("owner_digest") == owner_digest
+                ):
+                    return False
+                self.set(
+                    lease_key,
+                    json.dumps(lease, separators=(",", ":")),
+                    keepttl=True,
+                )
                 bound = lease.get("bound_task_id")
                 if bound:
                     existing = self.get(prefix + bound)
@@ -175,10 +214,26 @@ class FakeRedis:
                         return False
                     task = json.loads(existing)
                     if not (
+                        task["task_id"] == bound
+                        and
                         task["symbol"] == "601872"
                         and task["include_long_capture"] is False
                     ):
                         return False
+                    maintenance = task.get("maintenance")
+                    if maintenance:
+                        if not (
+                            maintenance.get("namespace")
+                            == "deployment_acceptance"
+                            and maintenance.get("owner_digest") == owner_digest
+                        ):
+                            return False
+                    else:
+                        task["maintenance"] = candidate_maintenance
+                        existing = json.dumps(task)
+                        self.set(prefix + bound, existing)
+                    if self.hget(symbol_index, task["symbol"]) == bound:
+                        self.hdel(symbol_index, task["symbol"])
                     if task["status"] in {"COMPLETED", "FAILED", "EXPIRED"} or (
                         task["status"] == "PARTIAL"
                         and task.get("completed_at") is not None
@@ -191,7 +246,7 @@ class FakeRedis:
                         )
                         if pending >= int(cap):
                             return "QUEUE_FULL"
-                        refreshed = json.loads(payload)
+                        refreshed = candidate
                         refreshed["task_id"] = bound
                         updated = json.dumps(refreshed)
                         self.set(prefix + bound, updated)
@@ -217,7 +272,6 @@ class FakeRedis:
                 self.set(prefix + task_id, payload)
                 self.sadd(index_key, task_id)
                 self.rpush(queue_key, task_id)
-                self.hset(symbol_index, symbol, task_id)
                 self.xadd(
                     event_stream,
                     {
@@ -234,12 +288,47 @@ class FakeRedis:
                 )
                 return payload
         if "THS_RELEASE_DEPLOYMENT_LEASE" in script:
-            (lease_key,) = keys
-            (owner,) = args
+            lease_key, queue_key, prefix, index_key, event_stream, symbol_index = keys
+            owner, owner_digest = args
             with self._lock:
                 payload = self.get(lease_key)
-                if not payload or json.loads(payload)["owner_token"] != owner:
+                if not payload:
                     return 0
+                lease = json.loads(payload)
+                if lease["owner_token"] != owner or lease.get(
+                    "owner_digest", owner_digest
+                ) != owner_digest:
+                    return 0
+                task_id = lease.get("bound_task_id")
+                if task_id:
+                    task_payload = self.get(prefix + task_id)
+                    if not task_payload:
+                        return 0
+                    task = json.loads(task_payload)
+                    if not (
+                        task["task_id"] == task_id
+                        and task["symbol"] == "601872"
+                        and task["include_long_capture"] is False
+                    ):
+                        return 0
+                    maintenance = task.get("maintenance")
+                    if maintenance and not (
+                        maintenance.get("namespace") == "deployment_acceptance"
+                        and maintenance.get("owner_digest") == owner_digest
+                    ):
+                        return 0
+                    self.lrem(queue_key, 0, task_id)
+                    self.delete(prefix + task_id)
+                    self.srem(index_key, task_id)
+                    if self.hget(symbol_index, task["symbol"]) == task_id:
+                        self.hdel(symbol_index, task["symbol"])
+                    event_ids = [
+                        event_id
+                        for event_id, fields in self.streams.get(event_stream, [])
+                        if fields.get("task_id") == task_id
+                    ]
+                    if event_ids:
+                        self.xdel(event_stream, *event_ids)
                 return self.delete(lease_key)
         if "THS_CLAIM_WITH_DEPLOYMENT_LEASE" in script:
             queue_key, prefix, event_stream, lease_key = keys
@@ -254,10 +343,17 @@ class FakeRedis:
                     if not payload:
                         return False
                     task = json.loads(payload)
+                    maintenance = task.get("maintenance")
+                    owner_digest = json.loads(lease_payload).get("owner_digest")
                     if (
                         task["status"] != "QUEUED"
                         or task["symbol"] != "601872"
                         or task["include_long_capture"] is not False
+                        or task["task_id"] != task_id
+                        or not maintenance
+                        or maintenance.get("namespace")
+                        != "deployment_acceptance"
+                        or maintenance.get("owner_digest") != owner_digest
                     ):
                         return False
                     task["status"] = "RUNNING"
@@ -279,7 +375,9 @@ class FakeRedis:
                     payload = self.get(prefix + task_id)
                     if payload:
                         task = json.loads(payload)
-                        if task["status"] == "QUEUED":
+                        if task["status"] == "QUEUED" and not task.get(
+                            "maintenance"
+                        ):
                             task["status"] = "RUNNING"
                             task["updated_at"] = timestamp
                             updated = json.dumps(task)
@@ -311,32 +409,61 @@ class FakeRedis:
             self.hset(symbol_index_key, symbol, task_id)
             return True
         if "THS_SUBMIT_OR_REFRESH" in script:
-            queue_key, prefix, index_key, event_stream, symbol_index_key = keys
+            (
+                queue_key,
+                prefix,
+                index_key,
+                event_stream,
+                symbol_index_key,
+                lease_key,
+            ) = keys
             cap, symbol, new_task_id, new_payload, refresh_payload = args
+            lease_payload = self.get(lease_key)
+            lease_bound_id = (
+                json.loads(lease_payload).get("bound_task_id")
+                if lease_payload
+                else None
+            )
             existing_id = self.hget(symbol_index_key, symbol)
             if existing_id:
                 payload = self.values.get(prefix + existing_id)
                 if payload:
                     current = json.loads(payload)
-                    if current["status"] in {"QUEUED", "RUNNING", "WAITING_ADMIN"}:
-                        return payload
-                    pending = sum(
-                        json.loads(self.values[prefix + task_id])["status"] in {"QUEUED", "RUNNING", "WAITING_ADMIN"}
-                        for task_id in self.sets.get(index_key, set())
-                        if prefix + task_id in self.values
-                    )
-                    if pending >= int(cap):
-                        return "QUEUE_FULL"
-                    refreshed = json.loads(refresh_payload)
-                    refreshed["task_id"] = existing_id
-                    refreshed["symbol"] = symbol
-                    updated = json.dumps(refreshed)
-                    self.lrem(queue_key, 0, existing_id)
-                    self.values[prefix + existing_id] = updated
-                    self.rpush(queue_key, existing_id)
-                    self.xadd(event_stream, {"event": "status", "task_id": existing_id, "data": "QUEUED"})
-                    return updated
-                self.hdel(symbol_index_key, symbol)
+                    if existing_id == lease_bound_id or current.get("maintenance"):
+                        self.hdel(symbol_index_key, symbol)
+                    else:
+                        if current["status"] in {
+                            "QUEUED",
+                            "RUNNING",
+                            "WAITING_ADMIN",
+                        }:
+                            return payload
+                        pending = sum(
+                            json.loads(self.values[prefix + task_id])["status"]
+                            in {"QUEUED", "RUNNING", "WAITING_ADMIN"}
+                            for task_id in self.sets.get(index_key, set())
+                            if prefix + task_id in self.values
+                        )
+                        if pending >= int(cap):
+                            return "QUEUE_FULL"
+                        refreshed = json.loads(refresh_payload)
+                        refreshed["task_id"] = existing_id
+                        refreshed["symbol"] = symbol
+                        updated = json.dumps(refreshed)
+                        self.lrem(queue_key, 0, existing_id)
+                        self.values[prefix + existing_id] = updated
+                        self.rpush(queue_key, existing_id)
+                        self.xadd(
+                            event_stream,
+                            {
+                                "event": "status",
+                                "task_id": existing_id,
+                                "data": "QUEUED",
+                            },
+                        )
+                        return updated
+                else:
+                    self.hdel(symbol_index_key, symbol)
             pending = sum(
                 json.loads(self.values[prefix + task_id])["status"] in {"QUEUED", "RUNNING", "WAITING_ADMIN"}
                 for task_id in self.sets.get(index_key, set())
@@ -377,13 +504,19 @@ class FakeRedis:
                 self.lpush(queue_key, task_id)
             return updated_payloads
         if "THS_REFRESH_TASK" in script:
-            queue_key, prefix, event_stream, index_key = keys
+            queue_key, prefix, event_stream, index_key, lease_key = keys
             task_id, updated_payload, cap = args
             key = prefix + task_id
             payload = self.values.get(key)
             if not payload:
                 return False
             current = json.loads(payload)
+            lease_payload = self.get(lease_key)
+            if current.get("maintenance") or (
+                lease_payload
+                and json.loads(lease_payload).get("bound_task_id") == task_id
+            ):
+                return "MAINTENANCE"
             if current["status"] in {"QUEUED", "RUNNING", "WAITING_ADMIN"}:
                 return payload
             if current["status"] not in {"COMPLETED", "PARTIAL", "FAILED", "EXPIRED"}:
@@ -400,14 +533,20 @@ class FakeRedis:
             self.rpush(queue_key, task_id)
             self.xadd(event_stream, {"event": "status", "task_id": task_id, "data": "QUEUED"})
             return updated_payload
-        if "task.status ~= 'FAILED'" in script:
-            queue_key, prefix, event_stream = keys
+        if "THS_RETRY_FAILED" in script:
+            queue_key, prefix, event_stream, lease_key = keys
             task_id, timestamp = args
             key = prefix + task_id
             payload = self.values.get(key)
             if not payload:
                 return False
             task = json.loads(payload)
+            lease_payload = self.get(lease_key)
+            if task.get("maintenance") or (
+                lease_payload
+                and json.loads(lease_payload).get("bound_task_id") == task_id
+            ):
+                return "MAINTENANCE"
             if task["status"] == "QUEUED":
                 return payload
             if task["status"] != "FAILED":
@@ -421,14 +560,20 @@ class FakeRedis:
             self.rpush(queue_key, task_id)
             self.xadd(event_stream, {"event": "status", "task_id": task_id, "data": "QUEUED"})
             return updated
-        if "WAITING_ADMIN" in script:
-            queue_key, prefix, event_stream = keys
+        if "THS_REQUEUE_WAITING" in script:
+            queue_key, prefix, event_stream, lease_key = keys
             task_id, timestamp = args
             key = prefix + task_id
             payload = self.values.get(key)
             if not payload:
                 return False
             task = json.loads(payload)
+            lease_payload = self.get(lease_key)
+            if task.get("maintenance") or (
+                lease_payload
+                and json.loads(lease_payload).get("bound_task_id") == task_id
+            ):
+                return "MAINTENANCE"
             if task["status"] != "WAITING_ADMIN":
                 return False
             task["status"] = "QUEUED"

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import json
 from threading import Barrier, Thread
 
 from argon2 import PasswordHasher
@@ -15,7 +16,11 @@ from level2_service.device_lifecycle import (
     DeviceLifecycleStatus,
 )
 from level2_service.models import TaskRecord, TaskStatus
-from level2_service.queue import InMemoryStreams, RedisStreamsStore
+from level2_service.queue import (
+    InMemoryStreams,
+    InvalidTransitionError,
+    RedisStreamsStore,
+)
 from level2_service.runner import FakeDeviceBridge, RunnerControl
 from tests.test_redis_store import FakeRedis
 
@@ -23,6 +28,7 @@ from tests.test_redis_store import FakeRedis
 NOW = datetime(2026, 8, 28, 6, 0, tzinfo=timezone.utc)
 OWNER = "deployment-owner-token-abcdefghijklmnopqrstuvwxyz"
 OTHER_OWNER = "other-deployment-owner-token-abcdefghijklmnop"
+MAINTENANCE_NAMESPACE = "deployment_acceptance"
 
 
 class ManualClock:
@@ -47,6 +53,37 @@ def stores() -> list[tuple[object, object | None]]:
         (memory_store(clock), clock),
         (RedisStreamsStore(redis), redis),
     ]
+
+
+def store_for_kind(kind: str, clock: ManualClock):
+    if kind == "memory":
+        return memory_store(clock), clock
+    redis = FakeRedis(clock=clock)
+    return RedisStreamsStore(redis), redis
+
+
+def persist_task_mutation(store, backing, task_id: str, mutation) -> None:
+    task = store.get(task_id)
+    assert task is not None
+    mutation(task)
+    if isinstance(store, RedisStreamsStore):
+        backing.set(store._key(task_id), store._serialize(task))
+
+
+def bind_legacy_task_id(store, backing, task_id: str) -> None:
+    if isinstance(store, InMemoryStreams):
+        assert store._deployment_lease is not None
+        store._deployment_lease["bound_task_id"] = task_id
+        return
+    payload = backing.get(store._deployment_lease_key)
+    assert payload is not None
+    lease = json.loads(payload)
+    lease["bound_task_id"] = task_id
+    backing.set(
+        store._deployment_lease_key,
+        json.dumps(lease, separators=(",", ":")),
+        keepttl=True,
+    )
 
 
 @pytest.mark.parametrize("kind", ["memory", "redis"])
@@ -161,6 +198,304 @@ def test_binding_is_idempotent_and_rejects_wrong_owner_or_mismatched_task(
         )
         is None
     )
+
+
+@pytest.mark.parametrize("kind", ["memory", "redis"])
+def test_bound_acceptance_is_namespaced_away_from_public_same_symbol_work(
+    kind: str,
+) -> None:
+    """A public 601872 submission must never reuse or mutate the maintenance task."""
+    clock = ManualClock()
+    store, _backing = store_for_kind(kind, clock)
+    assert store.acquire_deployment_lease(OWNER, 60.0)
+    bound = store.bind_deployment_acceptance(
+        OWNER,
+        TaskRecord(
+            task_id="maintenance-601872",
+            symbol="601872",
+            include_long_capture=False,
+        ),
+    )
+    assert bound is not None
+    assert bound.maintenance_namespace == MAINTENANCE_NAMESPACE
+    assert bound.maintenance_owner_digest is not None
+    assert OWNER not in repr(bound)
+    if kind == "redis":
+        raw = json.loads(_backing.get(store._key(bound.task_id)))
+        assert raw["maintenance"]["namespace"] == MAINTENANCE_NAMESPACE
+        assert raw["maintenance"]["owner_digest"] == bound.maintenance_owner_digest
+
+    public = store.submit_or_refresh(
+        TaskRecord(
+            task_id="public-601872",
+            symbol="601872",
+            include_long_capture=True,
+        )
+    )
+    store.transition(public.task_id, TaskStatus.FAILED, error_code="PUBLIC_FAILED")
+    refreshed = store.refresh_task(public.task_id, include_long_capture=False)
+
+    assert public.task_id == refreshed.task_id == "public-601872"
+    assert store.find_by_symbol("601872").task_id == "public-601872"
+    maintenance = store.get("maintenance-601872")
+    assert maintenance is not None
+    assert maintenance.status == TaskStatus.QUEUED
+    assert maintenance.include_long_capture is False
+    assert maintenance.maintenance_namespace == MAINTENANCE_NAMESPACE
+
+
+@pytest.mark.parametrize("kind", ["memory", "redis"])
+def test_startup_dedup_ignores_terminal_bound_acceptance_and_owner_requeues_it(
+    kind: str,
+) -> None:
+    """Startup symbol repair deduplicates public history without deleting its bound peer."""
+    clock = ManualClock()
+    store, _backing = store_for_kind(kind, clock)
+    older = TaskRecord(
+        task_id="public-older", symbol="601872", include_long_capture=False
+    )
+    older.created_at = older.created_at.replace(year=2024)
+    older.updated_at = older.created_at
+    newer = TaskRecord(
+        task_id="public-newer", symbol="601872", include_long_capture=True
+    )
+    newer.created_at = newer.created_at.replace(year=2025)
+    newer.updated_at = newer.created_at
+    store.enqueue(older)
+    store.enqueue(newer)
+    assert store.acquire_deployment_lease(OWNER, 60.0)
+    bound = store.bind_deployment_acceptance(
+        OWNER,
+        TaskRecord(
+            task_id="maintenance-terminal",
+            symbol="601872",
+            include_long_capture=False,
+        ),
+    )
+    assert bound is not None
+    assert store.next_runnable().task_id == "maintenance-terminal"
+    store.transition(
+        "maintenance-terminal",
+        TaskStatus.FAILED,
+        error_code="DIRECT_APP_OFFLINE",
+    )
+    if isinstance(store, RedisStreamsStore):
+        store = RedisStreamsStore(_backing)
+
+    result = store.deduplicate_by_symbol()
+
+    assert result == {"total": 2, "kept": 1, "deleted": 1, "aliases": 1}
+    terminal = store.get("maintenance-terminal")
+    assert terminal is not None and terminal.status == TaskStatus.FAILED
+    assert store.find_by_symbol("601872").task_id == "public-newer"
+    rebound = store.bind_deployment_acceptance(
+        OWNER,
+        TaskRecord(
+            task_id="discarded-new-id",
+            symbol="601872",
+            include_long_capture=False,
+        ),
+    )
+    assert rebound is not None
+    assert rebound.task_id == "maintenance-terminal"
+    assert rebound.status == TaskStatus.QUEUED
+    assert store.next_runnable().task_id == "maintenance-terminal"
+
+
+@pytest.mark.parametrize("kind", ["memory", "redis"])
+def test_public_refresh_and_retry_cannot_requeue_a_terminal_bound_acceptance(
+    kind: str,
+) -> None:
+    """Only the lease owner binding path may reset the fixed maintenance task."""
+    clock = ManualClock()
+    store, _backing = store_for_kind(kind, clock)
+    assert store.acquire_deployment_lease(OWNER, 60.0)
+    bound = store.bind_deployment_acceptance(
+        OWNER,
+        TaskRecord(
+            task_id="maintenance-retry",
+            symbol="601872",
+            include_long_capture=False,
+        ),
+    )
+    assert bound is not None
+    assert store.next_runnable().task_id == "maintenance-retry"
+    store.transition(
+        "maintenance-retry", TaskStatus.FAILED, error_code="DIRECT_APP_OFFLINE"
+    )
+
+    with pytest.raises(InvalidTransitionError):
+        store.refresh_task("maintenance-retry", include_long_capture=True)
+    with pytest.raises(InvalidTransitionError):
+        store.retry_failed("maintenance-retry")
+
+    terminal = store.get("maintenance-retry")
+    assert terminal is not None
+    assert terminal.status == TaskStatus.FAILED
+    assert terminal.include_long_capture is False
+    rebound = store.bind_deployment_acceptance(
+        OWNER,
+        TaskRecord(
+            task_id="new-id-is-ignored",
+            symbol="601872",
+            include_long_capture=False,
+        ),
+    )
+    assert rebound is not None
+    assert rebound.task_id == "maintenance-retry"
+    assert rebound.status == TaskStatus.QUEUED
+
+
+def test_public_retry_endpoint_cannot_mutate_bound_acceptance_task() -> None:
+    """The public retry route preserves the maintenance marker and options."""
+    store = memory_store()
+    assert store.acquire_deployment_lease(OWNER, 60.0)
+    bound = store.bind_deployment_acceptance(
+        OWNER,
+        TaskRecord(
+            task_id="maintenance-public-route",
+            symbol="601872",
+            include_long_capture=False,
+        ),
+    )
+    assert bound is not None
+    assert store.next_runnable().task_id == bound.task_id
+    store.transition(bound.task_id, TaskStatus.FAILED, error_code="DIRECT_APP_OFFLINE")
+    client = TestClient(lease_app(store), base_url="http://testserver")
+
+    response = client.post(f"/api/v1/jobs/{bound.task_id}/retry")
+
+    assert response.status_code == 409
+    unchanged = store.get(bound.task_id)
+    assert unchanged is not None
+    assert unchanged.status == TaskStatus.FAILED
+    assert unchanged.include_long_capture is False
+    assert unchanged.maintenance_namespace == MAINTENANCE_NAMESPACE
+
+
+@pytest.mark.parametrize("kind", ["memory", "redis"])
+@pytest.mark.parametrize(
+    "mutation",
+    ["symbol", "capture", "marker", "owner", "task_id", "status"],
+)
+def test_bound_claim_validates_every_maintenance_invariant(
+    kind: str,
+    mutation: str,
+) -> None:
+    """A lease cannot claim a task whose identity, ownership, or state was altered."""
+    clock = ManualClock()
+    store, backing = store_for_kind(kind, clock)
+    assert store.acquire_deployment_lease(OWNER, 60.0)
+    bound = store.bind_deployment_acceptance(
+        OWNER,
+        TaskRecord(
+            task_id="maintenance-claim",
+            symbol="601872",
+            include_long_capture=False,
+        ),
+    )
+    assert bound is not None
+
+    def mutate(task: TaskRecord) -> None:
+        if mutation == "symbol":
+            task.symbol = "000001"
+        elif mutation == "capture":
+            task.include_long_capture = True
+        elif mutation == "marker":
+            task.maintenance_namespace = None
+            task.maintenance_owner_digest = None
+        elif mutation == "owner":
+            task.maintenance_owner_digest = "0" * 64
+        elif mutation == "task_id":
+            task.task_id = "different-task-id"
+        elif mutation == "status":
+            task.status = TaskStatus.FAILED
+
+    persist_task_mutation(store, backing, "maintenance-claim", mutate)
+
+    assert store.next_runnable() is None
+    stored = store.get("maintenance-claim")
+    assert stored is not None
+    assert stored.status != TaskStatus.RUNNING
+
+
+@pytest.mark.parametrize("kind", ["memory", "redis"])
+def test_legacy_bound_task_is_migrated_but_unbound_legacy_tasks_stay_ordinary(
+    kind: str,
+) -> None:
+    """The active lease identifies one pre-marker task without reclassifying old history."""
+    clock = ManualClock()
+    store, backing = store_for_kind(kind, clock)
+    assert store.acquire_deployment_lease(OWNER, 60.0)
+    store.enqueue(
+        TaskRecord(
+            task_id="legacy-bound",
+            symbol="601872",
+            include_long_capture=False,
+        )
+    )
+    bind_legacy_task_id(store, backing, "legacy-bound")
+
+    assert store.find_by_symbol("601872") is None
+    public = store.submit_or_refresh(
+        TaskRecord(
+            task_id="legacy-public",
+            symbol="601872",
+            include_long_capture=True,
+        )
+    )
+    migrated = store.bind_deployment_acceptance(
+        OWNER,
+        TaskRecord(
+            task_id="ignored-migration-id",
+            symbol="601872",
+            include_long_capture=False,
+        ),
+    )
+
+    assert public.task_id == "legacy-public"
+    assert migrated is not None and migrated.task_id == "legacy-bound"
+    assert migrated.maintenance_namespace == MAINTENANCE_NAMESPACE
+    assert store.find_by_symbol("601872").task_id == "legacy-public"
+
+
+@pytest.mark.parametrize("kind", ["memory", "redis"])
+@pytest.mark.parametrize("cleanup_mode", ["release", "expired"])
+def test_maintenance_cleanup_removes_only_the_bound_task(
+    kind: str,
+    cleanup_mode: str,
+) -> None:
+    """Lease cleanup cannot delete or alias the ordinary 601872 history."""
+    clock = ManualClock()
+    store, backing = store_for_kind(kind, clock)
+    assert store.acquire_deployment_lease(OWNER, 10.0)
+    bound = store.bind_deployment_acceptance(
+        OWNER,
+        TaskRecord(
+            task_id="maintenance-cleanup",
+            symbol="601872",
+            include_long_capture=False,
+        ),
+    )
+    assert bound is not None
+    public = store.submit_or_refresh(
+        TaskRecord(
+            task_id="public-history",
+            symbol="601872",
+            include_long_capture=True,
+        )
+    )
+
+    if cleanup_mode == "release":
+        assert store.release_deployment_lease(OWNER) is True
+    else:
+        backing.advance(11.0)
+        store.cleanup(NOW)
+
+    assert store.get("maintenance-cleanup") is None
+    assert store.get("public-history") is not None
+    assert store.find_by_symbol("601872").task_id == public.task_id
+    assert store.next_runnable().task_id == "public-history"
 
 
 @pytest.mark.parametrize("kind", ["memory", "redis"])

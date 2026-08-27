@@ -47,6 +47,11 @@ ensure_bridge() {
         *)
             adb_for root >/dev/null 2>&1 || return 1
             wait_for_adb_after_root || return 1
+            identity=$(adb_for shell id 2>/dev/null) || return 1
+            case "$identity" in
+                uid=0*) ;;
+                *) return 1 ;;
+            esac
             ;;
     esac
 
@@ -60,8 +65,11 @@ ensure_bridge() {
 }
 
 if [ "$once" -eq 1 ]; then
-    ensure_bridge
-    exit $?
+    if ensure_bridge; then
+        exit 0
+    fi
+    printf '%s\n' 'DEVICE_LIFECYCLE_FAILED' >&2
+    exit 1
 fi
 
 while :; do

@@ -225,6 +225,40 @@ def test_host_maintenance_waits_idle_and_passes_owner_only_over_stdin() -> None:
     assert owner_inputs == [OWNER.encode(), OWNER.encode(), OWNER.encode()]
 
 
+def test_host_release_script_cleans_only_the_bound_maintenance_task() -> None:
+    """Host rollback/release must atomically remove its fixed task, not just the lease."""
+    module = _load_macos_deploy()
+    runner = LeaseRunner()
+    maintenance = module.HostDeploymentMaintenance(
+        runner,
+        compose_prefix,
+        FakeAdminMaintenance(),
+        MemoryOwnerState(),
+        password_reader=lambda: "private-admin-password",
+        owner_factory=lambda: OWNER,
+        poll_interval_seconds=0.0,
+    )
+
+    maintenance.prepare()
+    maintenance.release()
+
+    release_call = next(
+        call
+        for call in runner.calls
+        if "THS_HOST_RELEASE_DEPLOYMENT_LEASE" in " ".join(call)
+    )
+    assert release_call[release_call.index("EVAL") + 2] == "6"
+    key_start = release_call.index("EVAL") + 3
+    assert release_call[key_start:key_start + 6] == (
+        "ths:jobs:deployment-maintenance",
+        "ths:jobs:pending",
+        "ths:jobs:task:",
+        "ths:jobs:tasks",
+        "ths:jobs:events",
+        "ths:jobs:symbols",
+    )
+
+
 def test_host_maintenance_rejects_busy_or_conflicting_lease_without_mutation() -> None:
     """The final Redis acquisition check closes the old-runner race."""
     module = _load_macos_deploy()

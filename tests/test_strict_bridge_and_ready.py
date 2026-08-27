@@ -88,6 +88,99 @@ esac
     assert "command detail" not in completed.stdout + completed.stderr
 
 
+@pytest.mark.parametrize(
+    ("post_root_mode", "expected_returncode"),
+    [("nonroot", 1), ("failure", 1), ("root", 0)],
+)
+def test_bridge_once_strictly_verifies_uid_after_adb_root(
+    tmp_path: Path,
+    post_root_mode: str,
+    expected_returncode: int,
+) -> None:
+    """A successful adb-root command is not proof that the reconnected shell is root."""
+    fake_adb = tmp_path / "adb"
+    command_log = tmp_path / "adb.log"
+    root_state = tmp_path / "root.state"
+    frida_state = tmp_path / "frida.state"
+    fake_adb.write_text(
+        """#!/bin/sh
+set -u
+printf '%s\n' "$*" >> "$ADB_COMMAND_LOG"
+case "$*" in
+  *" get-state") printf '%s\n' device ;;
+  *" shell getprop sys.boot_completed") printf '%s\n' 1 ;;
+  *" shell id")
+    if [ ! -f "$ADB_ROOT_STATE" ]; then
+      printf '%s\n' 'uid=2000(shell)'
+    elif [ "$POST_ROOT_MODE" = failure ]; then
+      exit 9
+    elif [ "$POST_ROOT_MODE" = nonroot ]; then
+      printf '%s\n' 'uid=2000(shell)'
+    else
+      printf '%s\n' 'uid=0(root)'
+    fi
+    ;;
+  *" root") : > "$ADB_ROOT_STATE" ;;
+  *" shell pidof ths-frida-server")
+    [ -f "$ADB_FRIDA_STATE" ] || exit 1
+    printf '%s\n' 4321
+    ;;
+  *" shell nohup /data/local/tmp/ths-frida-server"*)
+    : > "$ADB_FRIDA_STATE"
+    ;;
+  *" forward tcp:27043 tcp:27042") ;;
+  *) exit 9 ;;
+esac
+""",
+        encoding="utf-8",
+    )
+    fake_adb.chmod(0o755)
+    fake_sleep = tmp_path / "sleep"
+    fake_sleep.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    fake_sleep.chmod(0o755)
+    watcher = ROOT / "scripts/watch-macos-device-bridge.sh"
+
+    completed = subprocess.run(
+        [str(watcher), "--once", "emulator-5556", "27043", str(fake_adb)],
+        cwd=ROOT,
+        env=os.environ
+        | {
+            "ADB_COMMAND_LOG": str(command_log),
+            "ADB_ROOT_STATE": str(root_state),
+            "ADB_FRIDA_STATE": str(frida_state),
+            "POST_ROOT_MODE": post_root_mode,
+            "PATH": f"{tmp_path}:/usr/bin:/bin:/usr/sbin:/sbin",
+        },
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+
+    commands = command_log.read_text(encoding="utf-8").splitlines()
+    assert completed.returncode == expected_returncode
+    assert commands.count("-s emulator-5556 shell id") == 2
+    if expected_returncode:
+        assert completed.stdout == ""
+        assert completed.stderr == "DEVICE_LIFECYCLE_FAILED\n"
+        assert not any("pidof ths-frida-server" in command for command in commands)
+        assert not any(" forward " in f" {command} " for command in commands)
+    else:
+        assert completed.stdout == completed.stderr == ""
+        second_id = len(commands) - 1 - commands[::-1].index(
+            "-s emulator-5556 shell id"
+        )
+        frida = next(
+            index
+            for index, command in enumerate(commands)
+            if "shell nohup /data/local/tmp/ths-frida-server" in command
+        )
+        forward = commands.index(
+            "-s emulator-5556 forward tcp:27043 tcp:27042"
+        )
+        assert second_id < frida < forward
+
+
 def test_existing_mode_repairs_running_and_stopped_roles_before_ready() -> None:
     """A broker RUNNING label alone is not bridge/App readiness proof."""
     events: list[str] = []

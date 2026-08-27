@@ -90,11 +90,12 @@ class StaticCatalogSource:
         return [SymbolLookup("601872", "招商轮船", "17")]
 
 
-def static_catalog_factory(path, source):
+def static_catalog_factory(path, source, **kwargs):
     return SQLiteSymbolCatalog(
         path,
         source,
         minimum_security_count=1,
+        **kwargs,
     )
 
 
@@ -147,6 +148,13 @@ def test_settings_parse_frontend_root_and_admin_cookie_secure(tmp_path: Path) ->
     assert settings.admin_cookie_secure is False
     assert secure_defaults.frontend_root is None
     assert secure_defaults.admin_cookie_secure is True
+    assert secure_defaults.symbol_catalog_max_age_seconds == 604800
+    assert secure_defaults.symbol_catalog_refresh_hour == 16
+    assert secure_defaults.symbol_catalog_refresh_minute == 20
+    assert secure_defaults.public_market_timeout_seconds == 8
+    assert secure_defaults.market_direct_enrichment is True
+    assert secure_defaults.market_direct_enrichment_ttl_seconds == 15
+    assert secure_defaults.core_warm_connection_max_idle_seconds == 25
 
 
 def test_production_factory_wires_the_configured_frida_runtime_source(tmp_path: Path) -> None:

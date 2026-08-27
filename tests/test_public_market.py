@@ -345,6 +345,89 @@ def test_public_market_rejects_provider_identity_mismatch_with_fixed_error() -> 
     assert "错误股票" not in str(caught.value)
 
 
+def test_tencent_quote_rejects_incompatible_name_and_impossible_price_range() -> None:
+    from level2_service.public_market import PublicMarketError, TencentPublicMarketProvider
+
+    fields = _tencent_quote_fields(
+        "601872",
+        "完全错误名称",
+        price="100.00",
+        previous_close="9.90",
+        open_price="9.95",
+        high="10.10",
+        low="9.80",
+        volume_lots="1",
+        amount_wan="0.10",
+        turnover="0.01",
+        change_percent="1.01",
+    )
+    provider = TencentPublicMarketProvider(
+        fetch=lambda _url, _timeout: _quote_wire("sh601872", fields),
+    )
+
+    with pytest.raises(PublicMarketError) as caught:
+        provider.read_snapshot(
+            SymbolLookup("601872", "招商轮船", "17"),
+            detail=False,
+        )
+
+    assert caught.value.error_code == "PUBLIC_MARKET_RESPONSE_INVALID"
+
+
+def test_tencent_minute_rejects_non_monotonic_times() -> None:
+    from level2_service.public_market import PublicMarketError, TencentPublicMarketProvider
+
+    fields = _tencent_quote_fields(
+        "601872", "招商轮船", price="18.62", previous_close="18.38",
+        open_price="17.80", high="18.68", low="17.80", volume_lots="20",
+        amount_wan="36.80", turnover="1.12", change_percent="1.31",
+    )
+    payload = {"data": {"sh601872": {
+        "qt": {"sh601872": fields},
+        "data": {"data": ["1000 18.00 10 18000", "0930 17.80 20 35800"]},
+    }}}
+    provider = TencentPublicMarketProvider(
+        fetch=lambda _url, _timeout: json.dumps(payload).encode(),
+    )
+
+    with pytest.raises(PublicMarketError) as caught:
+        provider.read_snapshot(
+            SymbolLookup("601872", "招商轮船", "17"),
+            detail=True,
+        )
+
+    assert caught.value.error_code == "PUBLIC_MARKET_RESPONSE_INVALID"
+
+
+@pytest.mark.parametrize(
+    "rows",
+    [
+        [],
+        [["not-a-date", "4.10", "4.12", "4.13", "4.09", "100"]],
+        [
+            ["2026-08-20", "4.10", "4.12", "4.13", "4.09", "100"],
+            ["2026-08-20", "4.10", "4.12", "4.13", "4.09", "100"],
+        ],
+    ],
+)
+def test_tencent_kline_rejects_empty_invalid_or_duplicate_dates(rows) -> None:
+    from level2_service.public_market import PublicMarketError, TencentPublicMarketProvider
+
+    payload = {"data": {"sh510300": {"qfqday": rows}}}
+    provider = TencentPublicMarketProvider(
+        fetch=lambda _url, _timeout: json.dumps(payload).encode(),
+    )
+
+    with pytest.raises(PublicMarketError) as caught:
+        provider.read_series(
+            SymbolLookup("510300", "沪深300ETF华泰柏瑞", "20"),
+            "day",
+            5,
+        )
+
+    assert caught.value.error_code == "PUBLIC_MARKET_RESPONSE_INVALID"
+
+
 def test_direct_enrichment_merges_only_l2_owned_fields_and_is_cached() -> None:
     from level2_service.public_market import DirectEnrichedMarketDataSource
 
@@ -459,3 +542,40 @@ def test_direct_enrichment_failure_keeps_the_public_snapshot_available() -> None
     assert result.quote["price"] == "18.62"
     assert result.capabilities["l2"]["available"] is False
     assert result.source_errors["core_metrics"] == "DIRECT_SESSION_UNAVAILABLE"
+
+
+def test_empty_direct_enrichment_does_not_mark_l2_available() -> None:
+    from level2_service.public_market import DirectEnrichedMarketDataSource
+
+    snapshot = MarketSnapshot(
+        symbol="601872",
+        name="招商轮船",
+        market="17",
+        sequence=0,
+        source_time="15:00",
+        collected_at=datetime.now(timezone.utc),
+        quote={"price": "18.62"},
+        source="TENCENT_PUBLIC",
+    )
+    values = {kind: None for kind in MetricKind}
+
+    class Base:
+        @staticmethod
+        def read_market_snapshot(_symbol: str, *, detail: bool):
+            return snapshot
+
+    class Direct:
+        @staticmethod
+        def read_direct(_symbol: str):
+            return DirectReadOutcome(
+                values=values,
+                source_errors={"core_metrics": None, "main_fund_flow": None},
+            )
+
+    result = DirectEnrichedMarketDataSource(
+        Base(),
+        Direct(),
+    ).read_market_snapshot("601872", detail=True)
+
+    assert result.capabilities["l2"]["available"] is False
+    assert result.capabilities["l2"]["reason"] == "DIRECT_ENRICHMENT_EMPTY"

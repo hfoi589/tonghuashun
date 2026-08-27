@@ -181,6 +181,8 @@ class SinaSymbolCatalogSource:
         except UnsupportedMarketError:
             return None
         exchange = source_symbol[:2].lower()
+        if source_symbol[2:] != symbol:
+            raise SymbolCatalogError("SYMBOL_CATALOG_SOURCE_INVALID")
         if exchange != _exchange_for_market(market) or market not in _NODE_KINDS[node]:
             return None
         return SymbolLookup(symbol=symbol, name=name, market=market, market_label=_MARKET_LABELS[market])
@@ -375,6 +377,13 @@ class SQLiteSymbolCatalog:
                        ON CONFLICT(singleton) DO UPDATE SET
                          version_id=excluded.version_id, activated_at=excluded.activated_at""",
                     (version, now.isoformat()),
+                )
+                connection.execute(
+                    """DELETE FROM catalog_versions
+                       WHERE id NOT IN (
+                         SELECT id FROM catalog_versions
+                         ORDER BY id DESC LIMIT 3
+                       )"""
                 )
         return CatalogRefresh(
             version=version,

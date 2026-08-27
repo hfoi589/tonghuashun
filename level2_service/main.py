@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import socket
 from dataclasses import dataclass, field
+from datetime import timedelta
 from functools import partial
 from pathlib import Path
 from typing import Callable, Mapping
@@ -25,6 +26,7 @@ from .direct_market import (
     Core9528Client,
     Core9528CurveDecoder,
     Core9528TemplateProtocol,
+    Core9528WarmPool,
     FundFlowHttpClient,
     ShadowParsedValueSource,
 )
@@ -66,6 +68,13 @@ class DeploymentSettings:
     daily_check_state_file: Path
     market_database_path: Path
     symbol_catalog_path: Path
+    symbol_catalog_max_age_seconds: float
+    symbol_catalog_refresh_hour: int
+    symbol_catalog_refresh_minute: int
+    public_market_timeout_seconds: float
+    market_direct_enrichment: bool
+    market_direct_enrichment_ttl_seconds: float
+    core_warm_connection_max_idle_seconds: float
     core_metrics_transport: str
     fund_flow_transport: str
     ths_session_encryption_key: str | None = field(repr=False)
@@ -159,6 +168,50 @@ class DeploymentSettings:
                 str(capture_root.parent / "market" / "market.db"),
             )
         ).expanduser().resolve()
+        positive_values: dict[str, float] = {}
+        for name, default in (
+            ("SYMBOL_CATALOG_MAX_AGE_SECONDS", "604800"),
+            ("PUBLIC_MARKET_TIMEOUT_SECONDS", "8"),
+            ("MARKET_DIRECT_ENRICHMENT_TTL_SECONDS", "15"),
+            ("CORE_WARM_CONNECTION_MAX_IDLE_SECONDS", "25"),
+        ):
+            try:
+                parsed = float(values.get(name, default))
+            except ValueError as error:
+                raise ValueError(f"{name} must be a positive number") from error
+            if parsed <= 0:
+                raise ValueError(f"{name} must be a positive number")
+            positive_values[name] = parsed
+        try:
+            catalog_refresh_hour = int(
+                values.get("SYMBOL_CATALOG_REFRESH_HOUR", "16")
+            )
+            catalog_refresh_minute = int(
+                values.get("SYMBOL_CATALOG_REFRESH_MINUTE", "20")
+            )
+        except ValueError as error:
+            raise ValueError(
+                "SYMBOL_CATALOG_REFRESH_HOUR and "
+                "SYMBOL_CATALOG_REFRESH_MINUTE must be integers"
+            ) from error
+        if not 0 <= catalog_refresh_hour <= 23:
+            raise ValueError(
+                "SYMBOL_CATALOG_REFRESH_HOUR must be between 0 and 23"
+            )
+        if not 0 <= catalog_refresh_minute <= 59:
+            raise ValueError(
+                "SYMBOL_CATALOG_REFRESH_MINUTE must be between 0 and 59"
+            )
+        enrichment_value = values.get(
+            "MARKET_DIRECT_ENRICHMENT",
+            "1",
+        ).strip().lower()
+        if enrichment_value in {"1", "true", "yes", "on"}:
+            market_direct_enrichment = True
+        elif enrichment_value in {"0", "false", "no", "off"}:
+            market_direct_enrichment = False
+        else:
+            raise ValueError("MARKET_DIRECT_ENRICHMENT must be a boolean value")
         return cls(
             redis_url=values.get("REDIS_URL", "redis://redis:6379/0"),
             capture_root=capture_root,
@@ -188,6 +241,21 @@ class DeploymentSettings:
                     str(market_database_path.with_name("symbol-catalog.db")),
                 )
             ).expanduser().resolve(),
+            symbol_catalog_max_age_seconds=positive_values[
+                "SYMBOL_CATALOG_MAX_AGE_SECONDS"
+            ],
+            symbol_catalog_refresh_hour=catalog_refresh_hour,
+            symbol_catalog_refresh_minute=catalog_refresh_minute,
+            public_market_timeout_seconds=positive_values[
+                "PUBLIC_MARKET_TIMEOUT_SECONDS"
+            ],
+            market_direct_enrichment=market_direct_enrichment,
+            market_direct_enrichment_ttl_seconds=positive_values[
+                "MARKET_DIRECT_ENRICHMENT_TTL_SECONDS"
+            ],
+            core_warm_connection_max_idle_seconds=positive_values[
+                "CORE_WARM_CONNECTION_MAX_IDLE_SECONDS"
+            ],
             core_metrics_transport=transport_modes["CORE_METRICS_TRANSPORT"],
             fund_flow_transport=transport_modes["FUND_FLOW_TRANSPORT"],
             ths_session_encryption_key=session_encryption_key or None,
@@ -242,7 +310,7 @@ def create_production_app(
     bridge_factory: Callable[..., ADBDeviceBridge] = ADBDeviceBridge,
     runner_factory: Callable[..., Level2Runner] = Level2Runner,
     symbol_catalog_source: object | None = None,
-    symbol_catalog_factory: Callable[[Path, object], SQLiteSymbolCatalog] = (
+    symbol_catalog_factory: Callable[..., SQLiteSymbolCatalog] = (
         SQLiteSymbolCatalog
     ),
 ) -> FastAPI:
@@ -254,6 +322,9 @@ def create_production_app(
     symbol_catalog = symbol_catalog_factory(
         config.symbol_catalog_path,
         symbol_catalog_source or SinaSymbolCatalogSource(),
+        stale_after=timedelta(
+            seconds=config.symbol_catalog_max_age_seconds
+        ),
     )
     adb_environment = os.environ.copy()
     if config.adb_server_socket:
@@ -350,10 +421,17 @@ def create_production_app(
             core_source = frida_core_source
         else:
             assert account_session_provider is not None
+            core_protocol = Core9528TemplateProtocol(
+                response_decoder=Core9528CurveDecoder(),
+            )
             direct_core_source = Core9528Client(
                 account_session_provider,
-                protocol=Core9528TemplateProtocol(
-                    response_decoder=Core9528CurveDecoder(),
+                protocol=core_protocol,
+                warm_pool=Core9528WarmPool(
+                    core_protocol,
+                    max_idle_seconds=(
+                        config.core_warm_connection_max_idle_seconds
+                    ),
                 ),
             )
             core_source = (
@@ -403,12 +481,17 @@ def create_production_app(
     market_sessions = RedisMarketSessionStore(redis_client)
     public_market_source = PublicMarketDataSource(
         symbol_catalog,
-        TencentPublicMarketProvider(),
-        SinaPublicQuoteProvider(),
+        TencentPublicMarketProvider(
+            timeout_seconds=config.public_market_timeout_seconds
+        ),
+        SinaPublicQuoteProvider(
+            timeout_seconds=config.public_market_timeout_seconds
+        ),
     )
     direct_market_enrichment = (
         parsed_value_source
-        if config.core_metrics_transport == "direct"
+        if config.market_direct_enrichment
+        and config.core_metrics_transport == "direct"
         and config.fund_flow_transport == "direct"
         else None
     )
@@ -417,6 +500,7 @@ def create_production_app(
             DirectEnrichedMarketDataSource(
                 public_market_source,
                 direct_market_enrichment,
+                ttl_seconds=config.market_direct_enrichment_ttl_seconds,
             ),
             TonghuashunPublicDailyKlineProvider(),
             is_market_open=is_china_market_open,
@@ -441,6 +525,8 @@ def create_production_app(
         symbol_lookup=symbol_catalog.lookup,
         symbol_lookup_cache=None,
         symbol_catalog=symbol_catalog,
+        symbol_catalog_refresh_hour=config.symbol_catalog_refresh_hour,
+        symbol_catalog_refresh_minute=config.symbol_catalog_refresh_minute,
         core_prewarmer=(
             direct_core_source.prewarm
             if direct_core_source is not None
@@ -450,6 +536,11 @@ def create_production_app(
             direct_core_source.invalidate
             if direct_core_source is not None
             else None
+        ),
+        managed_resources=(
+            (direct_core_source,)
+            if direct_core_source is not None
+            else ()
         ),
         market_account_store=market_accounts,
         market_session_store=market_sessions,

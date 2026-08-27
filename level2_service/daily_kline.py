@@ -13,7 +13,12 @@ from datetime import date
 from decimal import Decimal, InvalidOperation
 from typing import Any, Callable
 
-from .market_data import KlineBar, MarketSeriesPage, MarketSnapshot
+from .market_data import (
+    KlineBar,
+    MarketSeriesPage,
+    MarketSnapshot,
+    fixed_market_error_code,
+)
 
 
 _MA_WINDOWS = (5, 13, 21, 60, 120, 250)
@@ -388,7 +393,7 @@ class DailyKlineMarketDataSource:
 
     @staticmethod
     def _error_code(error: Exception) -> str:
-        return str(getattr(error, "error_code", None) or str(error) or type(error).__name__)
+        return fixed_market_error_code(error, "PUBLIC_KLINE_FAILED")
 
     def _lock_for(self, key: tuple[str, str]) -> threading.Lock:
         with self._state_lock:

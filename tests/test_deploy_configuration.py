@@ -84,6 +84,14 @@ def test_compose_publishes_only_the_fastapi_frontend_and_api() -> None:
     assert api["environment"]["FUND_FLOW_TRANSPORT"] == "frida"
     assert api["environment"]["THS_SESSION_ROOT"] == "/data/admin/ths-sessions"
     assert api["environment"]["DAILY_CHECK_STATE_FILE"] == "/data/admin/daily-check.json"
+    assert api["environment"]["SYMBOL_CATALOG_PATH"] == "/data/market/symbol-catalog.db"
+    assert api["environment"]["SYMBOL_CATALOG_MAX_AGE_SECONDS"] == "604800"
+    assert api["environment"]["SYMBOL_CATALOG_REFRESH_HOUR"] == "16"
+    assert api["environment"]["SYMBOL_CATALOG_REFRESH_MINUTE"] == "20"
+    assert api["environment"]["PUBLIC_MARKET_TIMEOUT_SECONDS"] == "8"
+    assert api["environment"]["MARKET_DIRECT_ENRICHMENT"] == "1"
+    assert api["environment"]["MARKET_DIRECT_ENRICHMENT_TTL_SECONDS"] == "15"
+    assert api["environment"]["CORE_WARM_CONNECTION_MAX_IDLE_SECONDS"] == "25"
 
 
 def test_api_image_embeds_frontend_without_a_caddy_stage() -> None:
@@ -106,6 +114,8 @@ def test_macos_environment_example_contains_no_caddy_settings() -> None:
     assert "CORE_METRICS_TRANSPORT=frida" in example
     assert "FUND_FLOW_TRANSPORT=frida" in example
     assert "THS_SESSION_ROOT=/data/admin/ths-sessions" in example
+    assert "SYMBOL_CATALOG_PATH=/data/market/symbol-catalog.db" in example
+    assert "MARKET_DIRECT_ENRICHMENT=1" in example
     assert "CADDY_" not in example
 
 

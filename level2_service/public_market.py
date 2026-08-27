@@ -7,7 +7,7 @@ import re
 import time
 from dataclasses import replace
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from threading import RLock
 from typing import Callable
@@ -111,6 +111,17 @@ def _session_time(value: str) -> str | None:
     return f"{compact[:2]}:{compact[2:]}"
 
 
+def _names_compatible(expected: str, actual: str) -> bool:
+    expected_normalized = re.sub(r"\s+", "", expected).casefold()
+    actual_normalized = re.sub(r"\s+", "", actual).casefold()
+    if expected_normalized == actual_normalized:
+        return True
+    return min(len(expected_normalized), len(actual_normalized)) >= 3 and (
+        expected_normalized.startswith(actual_normalized)
+        or actual_normalized.startswith(expected_normalized)
+    )
+
+
 def _quote_snapshot(
     identity: SymbolLookup,
     fields: list[str],
@@ -122,7 +133,7 @@ def _quote_snapshot(
     if len(fields) < 39 or fields[2].strip() != identity.symbol:
         raise PublicMarketError("PUBLIC_MARKET_RESPONSE_INVALID")
     name = fields[1].strip()
-    if not name:
+    if not name or not _names_compatible(identity.name, name):
         raise PublicMarketError("PUBLIC_MARKET_RESPONSE_INVALID")
     precision = _precision(identity)
     price = _decimal(fields[3])
@@ -134,7 +145,20 @@ def _quote_snapshot(
     amount_wan = _decimal(fields[37])
     if any(value is not None and value < 0 for value in (price, previous_close, open_price, high, low, volume_lots, amount_wan)):
         raise PublicMarketError("PUBLIC_MARKET_RESPONSE_INVALID")
-    if high is not None and low is not None and high < low:
+    comparable = [
+        value
+        for value in (price, open_price, high, low)
+        if value is not None
+    ]
+    if (
+        high is not None
+        and comparable
+        and high < max(comparable)
+    ) or (
+        low is not None
+        and comparable
+        and low > min(comparable)
+    ):
         raise PublicMarketError("PUBLIC_MARKET_RESPONSE_INVALID")
     quote = {
         "price": _number(price, precision),
@@ -260,10 +284,13 @@ class TencentPublicMarketProvider:
             raise PublicMarketError("PUBLIC_MARKET_RESPONSE_INVALID") from None
         points: list[TimesharePoint] = []
         previous_volume = Decimal(0)
+        previous_time: str | None = None
         for raw_row in rows:
             parts = str(raw_row).split()
             if len(parts) < 3 or (point_time := _session_time(parts[0])) is None:
                 continue
+            if previous_time is not None and point_time <= previous_time:
+                raise PublicMarketError("PUBLIC_MARKET_RESPONSE_INVALID")
             price = _decimal(parts[1])
             cumulative_lots = _decimal(parts[2])
             cumulative_amount = _decimal(parts[3]) if len(parts) >= 4 else None
@@ -280,6 +307,7 @@ class TencentPublicMarketProvider:
                 raise PublicMarketError("PUBLIC_MARKET_RESPONSE_INVALID")
             delta_lots = cumulative_lots - previous_volume
             previous_volume = cumulative_lots
+            previous_time = point_time
             shares = cumulative_lots * Decimal(100)
             average = (
                 cumulative_amount / shares
@@ -333,9 +361,24 @@ class TencentPublicMarketProvider:
             raise PublicMarketError("PUBLIC_MARKET_RESPONSE_INVALID") from None
         precision = _precision(identity)
         bars: list[KlineBar] = []
+        seen_dates: set[str] = set()
+        previous_date: str | None = None
         for row in rows:
             if not isinstance(row, list) or len(row) < 6:
                 raise PublicMarketError("PUBLIC_MARKET_RESPONSE_INVALID")
+            raw_date = str(row[0])
+            try:
+                date.fromisoformat(raw_date)
+            except ValueError:
+                raise PublicMarketError(
+                    "PUBLIC_MARKET_RESPONSE_INVALID"
+                ) from None
+            if raw_date in seen_dates or (
+                previous_date is not None and raw_date <= previous_date
+            ):
+                raise PublicMarketError("PUBLIC_MARKET_RESPONSE_INVALID")
+            seen_dates.add(raw_date)
+            previous_date = raw_date
             open_price = _decimal(row[1])
             close = _decimal(row[2])
             high = _decimal(row[3])
@@ -350,7 +393,7 @@ class TencentPublicMarketProvider:
                 raise PublicMarketError("PUBLIC_MARKET_RESPONSE_INVALID")
             bars.append(
                 KlineBar(
-                    time=str(row[0]),
+                    time=raw_date,
                     open=_number(open_price, precision),
                     high=_number(high, precision),
                     low=_number(low, precision),
@@ -359,6 +402,8 @@ class TencentPublicMarketProvider:
                     amount=None,
                 )
             )
+        if not bars:
+            raise PublicMarketError("PUBLIC_MARKET_RESPONSE_INVALID")
         bars = bars[-5:] if period == "five_day" else bars[-limit:]
         return MarketSeriesPage(
             symbol=identity.symbol,
@@ -622,6 +667,23 @@ class DirectEnrichedMarketDataSource:
                     "unit": unit,
                     **period_values,
                 }
+        has_l2_values = any(
+            quote.get(name) is not None
+            for name in (
+                "large_order_net",
+                "large_order_amount",
+                "retail_count",
+                "macdfs",
+            )
+        ) or any(
+            series.get("points")
+            for series in outcome.intraday_series.values()
+        ) or bool(main_fund_flow)
+        if not has_l2_values:
+            return self._without_enrichment(
+                snapshot,
+                "DIRECT_ENRICHMENT_EMPTY",
+            )
         capabilities = dict(snapshot.capabilities)
         capabilities["l2"] = {"available": True, "reason": None}
         source_errors = dict(snapshot.source_errors)

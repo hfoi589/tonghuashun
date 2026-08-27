@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import time
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
@@ -11,6 +12,18 @@ from zoneinfo import ZoneInfo
 
 
 MARKET_PERIODS = frozenset({"timeshare", "five_day", "min5", "min15", "min30", "min60", "day", "week", "month"})
+_FIXED_MARKET_ERROR = re.compile(r"[A-Z][A-Z0-9_]{2,63}\Z")
+
+
+def fixed_market_error_code(
+    error: object,
+    fallback: str = "MARKET_SOURCE_FAILED",
+) -> str:
+    raw_code = getattr(error, "error_code", None)
+    if raw_code is None:
+        return fallback
+    candidate = str(raw_code).strip()
+    return candidate if _FIXED_MARKET_ERROR.fullmatch(candidate) else fallback
 
 
 def is_china_market_open(now: datetime | None = None) -> bool:
@@ -142,8 +155,11 @@ class MarketDataBroker:
         self.clock = clock
         self.is_market_open = is_market_open
         self._subscriptions: dict[str, tuple[set[str], set[str]]] = {}
-        self._queues: dict[str, asyncio.Queue[str]] = {}
-        self._pending_events: dict[str, dict[str, dict[str, Any]]] = {}
+        self._queues: dict[str, asyncio.Queue[tuple[str, str]]] = {}
+        self._pending_events: dict[
+            str,
+            dict[tuple[str, str], dict[str, Any]],
+        ] = {}
         self._cache: dict[str, MarketSnapshot] = {}
         self._sequence: dict[str, int] = {}
         self._last_polled: dict[str, float] = {}
@@ -160,9 +176,9 @@ class MarketDataBroker:
         self._queues.setdefault(client_id, asyncio.Queue())
         pending = self._pending_events.setdefault(client_id, {})
         wanted = set(watchlist_symbols) | set(detail_symbols)
-        for symbol in tuple(pending):
-            if symbol not in wanted:
-                pending.pop(symbol, None)
+        for key in tuple(pending):
+            if key[0] not in wanted:
+                pending.pop(key, None)
 
     def unsubscribe(self, client_id: str) -> None:
         self._subscriptions.pop(client_id, None)
@@ -210,24 +226,28 @@ class MarketDataBroker:
             if not self._wanted(client_id, symbol):
                 continue
             pending = self._pending_events.setdefault(client_id, {})
-            if symbol not in pending:
-                queue.put_nowait(symbol)
-            pending[symbol] = event
+            key = (symbol, str(event.get("type", "event")))
+            if key not in pending:
+                queue.put_nowait(key)
+            pending[key] = event
 
     async def next_event(self, client_id: str, *, timeout: float | None = None) -> dict[str, Any]:
         queue = self._queues.get(client_id)
         pending = self._pending_events.get(client_id)
         if queue is None or pending is None:
             raise LookupError("market subscriber not found")
-        symbol = (
-            await queue.get()
+        async def next_pending() -> dict[str, Any]:
+            while True:
+                key = await queue.get()
+                event = pending.pop(key, None)
+                if event is not None:
+                    return event
+
+        return (
+            await next_pending()
             if timeout is None
-            else await asyncio.wait_for(queue.get(), timeout=timeout)
+            else await asyncio.wait_for(next_pending(), timeout=timeout)
         )
-        event = pending.pop(symbol, None)
-        if event is None:
-            raise LookupError("market event was removed")
-        return event
 
     async def refresh(
         self,
@@ -275,7 +295,7 @@ class MarketDataBroker:
                 await self.refresh(symbol, detail=detail)
             except Exception as error:
                 self._last_polled[symbol] = now
-                error_code = getattr(error, "error_code", None) or str(error) or type(error).__name__
+                error_code = fixed_market_error_code(error)
                 self._publish(
                     symbol,
                     {

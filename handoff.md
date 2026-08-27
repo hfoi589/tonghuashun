@@ -1,274 +1,241 @@
-# 同花顺 Level2 双账号采集交接
+# 同花顺 Level2 直连与公开行情交接
 
-更新日期：2026-08-23
+更新日期：2026-08-27
 
-本文记录当前已经实现并在真实 App 上验收的双设备架构。后续维护以
-`AGENTS.md` 的采集红线为最高约束：所有任务数值只能来自同花顺 App 内部接口，
-不得使用 UI 文本、截图或 OCR 补值。
+## 1. 当前结论
 
-## 1. 当前运行基线
+普通业务已经不要求虚拟机中的同花顺 App 持续运行：
 
-- 服务地址：`http://127.0.0.1:8001/`
-- 管理页面：`http://127.0.0.1:8001/#admin`
+- 股票代码/名称联想和精确确认：本地版本化 SQLite 证券目录。
+- Market 基础报价、分时、五日/周/月 K：腾讯公开行情，新浪公开报价备用。
+- 前复权日 K：同花顺公开 Web K 线，腾讯 qfq 备用，最后使用 stale 缓存。
+- 原八项任务指标和三条 241 点 L2 曲线：服务端 9528 直连。
+- 主力流向当日/3日/5日：服务端资金 HTTP 直连。
+
+App 仅保留以下用途：
+
+- 管理员人工登录、验证码和设备验证；
+- 私有直连会话材料过期后的人工续签；
+- 用户显式请求 `include_long_capture=true` 时由核心设备生成长截图；
+- 管理员主动打开设备控制页面进行维护。
+
+任务指标仍严禁使用公开行情、UI 文本、OCR 或截图补值。
+
+## 2. 生产运行基线
+
+- 服务：`http://127.0.0.1:8001/`
+- 管理页：`http://127.0.0.1:8001/#admin`
+- Market：`http://127.0.0.1:8001/market`
 - Compose 项目：`ths-level2`
-- API：FastAPI、Runner 和 React 前端位于同一个 `api` 容器。
-- Redis：FIFO 队列、任务、SSE 状态事件和已确认股票缓存。
-- Android：两台 API 33 ARM64 AVD 原生运行在 Apple Silicon Mac，不在 Docker 中。
-- 同花顺 App：11.59.03。
-- Frida Server/Python 客户端：16.7.19。
-- Caddy 已移除；本机部署继续使用 HTTP 8001。
+- Docker context：`orbstack`
+- API 和 React：`ths-level2-api-1`
+- Redis：`ths-level2-redis-1`
+- Git 远端：`https://github.com/hfoi589/tonghuashun.git`
+- 发布目标分支：`main`（开发来源：`codex/symbol-search-tab-delete`）
 
-当前 Git 远端为 `https://github.com/hfoi589/tonghuashun.git`，默认分支为
-`main`。`.env`、`deploy/macos.env`、APK、Frida Server、Docker 卷和 AVD 数据
-都不在 Git 中，迁移时必须单独处理。
-
-## 2. 两台设备的固定职责
-
-| 角色 | AVD / ADB | Frida | 责任 |
-| --- | --- | --- | --- |
-| `core_metrics` | `THS_CORE_33_ARM64 / emulator-5556` | `host.docker.internal:27043` | 股票名称确认、原八项指标、自动页面导航、长截图 |
-| `main_fund_flow` | `THS_API_33_ARM64 / emulator-5554` | `host.docker.internal:27042` | 主力流向当日/3日/5日接口 |
-
-### 资金设备保护规则
-
-`emulator-5554` 保存当前资金账号登录状态，是受保护设备：
-
-- 禁止退出或切换账号。
-- 禁止克隆 AVD 数据目录。
-- 禁止安装、卸载、重装、清数据或 `force-stop` 同花顺。
-- 禁止任务自动点击、搜索、切换页面或生成长截图。
-- 设备停止时只能从原 AVD 数据目录重新启动。
-- 所有 ADB 命令必须显式带 `-s emulator-5554`，并先确认操作确实属于资金接口维护。
-
-股票页面导航和长截图只能操作 `emulator-5556`。第二账号的登录、验证码、
-设备验证和大单权限由管理员人工完成，项目不接收或保存账号密码。
-
-## 3. 数据采集架构
-
-公开 API 仍采用“先确认代码和名称，再提交异步任务”的两步契约：
+标准部署命令：
 
 ```sh
-curl -fsS http://127.0.0.1:8001/api/v1/symbols/601872
-
-curl -fsS 'http://127.0.0.1:8001/api/v1/symbols?query=国盾&limit=8'
-
-curl -fsS -X POST http://127.0.0.1:8001/api/v1/jobs \
-  -H 'Content-Type: application/json' \
-  -d '{"symbol":"601872","include_long_capture":false}'
-
-curl -fsS http://127.0.0.1:8001/api/v1/jobs/PUBLIC_ID
+docker --context orbstack compose \
+  --env-file .env \
+  --env-file deploy/macos.env \
+  -f deploy/compose.yml up -d --build
 ```
 
-采集输入框接受六位代码或至少两个字符的股票名称关键词。名称候选只来自
-`core_metrics` App 内部联想接口；选择候选后仍必须调用六位代码精确确认接口，
-确认成功后才能提交。单个股票页签的删除只移除当前浏览器 `localStorage` 记录，
-不会删除、取消或改变服务端唯一任务。
+禁止使用 `desktop-linux`，禁止执行 `down -v`，禁止删除 Redis、market、admin、
+session 或 capture 卷。
 
-Runner 对外仍只有一个 `read_direct(symbol)` 数据入口，内部并行连接两台 App：
+## 3. 设备角色与保护边界
 
-1. `core_metrics` 使用 App 内部精确搜索桥接确认股票，并查询报价和四个技术指标。
-2. `main_fund_flow` 创建独立资金 `QueryClient`，在同一客户端内严格顺序执行
-   `win_size=1`、`3`、`5`。
-3. 聚合器按字段白名单合并结果，两个来源不能互相覆盖。
-4. 两台 Frida 使用独立 endpoint、会话和锁；初次连接设备的 Frida 枚举操作有
-   模块级短锁，实际数据请求仍并行。
-5. `-2147483648` 等无权限哨兵在格式化前变为 `null`。
+| 角色 | AVD / ADB | Frida | 当前责任 |
+| --- | --- | --- | --- |
+| `core_metrics` | `THS_CORE_33_ARM64 / emulator-5556` | `host.docker.internal:27043` | 人工会话续签、核心协议材料、显式长截图、管理员维护 |
+| `main_fund_flow` | `THS_API_33_ARM64 / emulator-5554` | `host.docker.internal:27042` | 人工资金会话续签；普通资金请求由服务端 HTTP 直连 |
 
-原八项必填字段为：
+`emulator-5554` 仍是受保护资金账号：
 
-- `stock_name`
-- `current_price`
-- `change_percent`
-- `turnover_rate`
-- `large_order_net`
-- `large_order_amount`
-- `retail_count`
-- `macdfs`
+- 禁止退出、切号、克隆、重装、卸载、清数据或 `force-stop`。
+- 禁止自动导航、搜索和长截图。
+- 任何 ADB 命令必须显式 `-s emulator-5554`，并且只能用于用户明确授权的维护。
 
-当前交易日分时曲线位于 `values.intraday_series`，包含
-`large_order_net`、`large_order_amount`、`retail_count` 三条独立曲线。
-每条曲线保存 `unit` 和按时间排序的 `points`（`time` 为 `HH:mm`，`value`
-为格式化字符串或 `null`）；大单金额单位为 `万`。这些点与最新值一样，只能由
-核心设备的 `read_direct()` App 内部接口返回，严禁用 UI、OCR 或截图补齐。
-曲线缺失不改变原八项字段决定的任务状态。
+本轮实现、部署和验收没有向 `emulator-5554` 发送操作命令。
 
-资金增强数据位于 `values.main_fund_flow`，周期为 `today`、`three_day`、
-`five_day`。每个周期保存独立动态单位 `万元` 或 `亿元`，以及：
+## 4. 核心 9528 直连
 
-- `main_net_inflow`：直接使用 `charge_main_capital`。
-- `main_visible_inflow`：`charge_main_listed_capital`。
-- `main_hidden_inflow`：`charge_main_grey_capital`。
-- `retail_inflow`：App 模型定义的 `-main_net_inflow`。
+### 协议能力
 
-所有成功值的 `value_sources` 都是 `INTERFACE`；缺失值及其来源保持 `null`。
-主力净流入不能用已经四舍五入的明盘、暗盘重新相加。
+`Core9528TemplateProtocol` 已实现：
 
-### 状态规则
+- 认证帧读取和业务请求分段；
+- HSSL 外层帧校验；
+- Snappy、`gov`、`cv3`、HXLONG 解码；
+- 主报价、换手率、涨跌幅；
+- 大单净量 `33007`；
+- 大单金额 `33015`；
+- 散户数量 `216`；
+- MACDFS 参数捕获与计算；
+- 三条 241 点 L2 分时曲线。
 
-- 原八项接口明确失败：`FAILED`，保留原始接口错误码。
-- 原八项接口有效响应但必填值缺失：`PARTIAL / VALUE_RECOGNITION_FAILED`。
-- 资金接口明确失败：保留原八项数据，任务为 `PARTIAL`，错误写入
-  `source_errors.main_fund_flow`。
-- 资金接口有效响应但个别值缺失：缺失项为 `null`；原八项完整时仍可
-  `COMPLETED`。
-- 不使用页面、OCR 或截图作为任何失败接口的降级路径。
+未知加密、压缩、半帧、残帧、身份漂移和错误长度继续 fail closed。
 
-`include_long_capture=false` 不做页面导航、滚动、截图、拼接或 OCR。
-`include_long_capture=true` 只额外让核心设备生成长截图；接口数据路径不变。
-OCR 仅能检查长图是否出现“净量”或基金页面的“大单占比”等结构标题。
+### 一次性预认证池
 
-## 4. 双设备管理页面
+- 池目标容量为 1。
+- 预认证连接只允许使用一次，业务完成后永久关闭，绝不归池。
+- 业务读取期间不并行发起下一次认证；连接关闭后才异步补池。
+- 会话 fingerprint 变化、管理员 refresh、超过 25 秒、EOF、超时、解码失败和
+  服务关闭都会销毁旧连接。
+- 同步认证和会话失效之间使用 generation 校验；客户端读取 session、prewarm、
+  invalidate、close 共用生命周期锁。
+- 原错误码保持不变，不产生 warm-pool 专用公共错误码。
 
-- `GET /api/admin/devices` 返回两台设备的 ADB、App 和 Frida 健康状态，不返回账号信息。
-- `WS /api/admin/devices/core_metrics` 控制和预览核心设备。
-- `WS /api/admin/devices/main_fund_flow` 控制和预览资金设备。
-- 旧 `WS /api/admin/device` 兼容映射到 `core_metrics`。
-- 桌面端双列、窄屏上下排列，两路画面保持同时在线并各自约 2 FPS。
-- 点击、滑动和键盘输入只发送到产生事件的设备，不广播。
-- 资金面板固定显示“当前账号，禁止退出”。
-- 两个画面共享一个管理员锁；获取锁会暂停任务队列，释放锁后需显式恢复队列。
-- 一台设备离线只影响自己的画面和健康状态。
+### Runner 唤醒
 
-## 5. 本 Mac 启动与恢复
+API 入队、公开 retry、管理员 retry/resume 和队列 resume 会即时唤醒 Runner。
+Redis 仍是持久 FIFO 权威，`RUNNER_POLL_INTERVAL_SECONDS` 只作为外部 Redis
+入队的兜底。
 
-### 5.1 本机配置
+## 5. 股票目录
 
-`deploy/macos.env` 应至少包含：
+目录文件：`/data/market/symbol-catalog.db`
+
+公开来源：
+
+- `https://money.finance.sina.com.cn/.../Market_Center.getHQNodeStockCount`
+- `hs_a`
+- `etf_hq_fund`
+- `lof_hq_fund`
+
+刷新流程：
+
+1. 读取每个分类总数；
+2. 固定每页 100 条分页，防止新浪静默把大页截成 100 条；
+3. 过滤项目允许的代码前缀并校验 `sh/sz/bj` 与市场代码；
+4. 同名重复去重，冲突名称拒绝；
+5. 首版至少 5000 条，后续不得缩小到上一版的 90% 以下；
+6. 生成 SHA-256 checksum；
+7. 完整写入新版本后原子切换 active 指针。
+
+启动时目录不存在或超过 18 小时会后台刷新；每天 16:20 Asia/Shanghai 再刷新。
+刷新失败保留旧版，超过 7 天后 lookup/search 返回固定 503。
+
+2026-08-27 真实同步结果：
+
+- 7574 条；
+- 完整刷新约 30.7 秒；
+- `601872 / 300750 / 920002 / 510300 / 159919` 五类样本均命中；
+- checksum 前缀：`2ef0e96eb7e2`。
+
+## 6. Market 公开数据平面
+
+### 基础快照
+
+- 轻量自选报价：`https://qt.gtimg.cn/q=<sh|sz|bj><symbol>`。
+- 详情和当日分时：腾讯 `minute/query`，沪深/基金为四列累计量额，北交所为
+  三列累计量；统一换算为分钟增量和股。
+- 腾讯失败时使用新浪 `hq.sinajs.cn` 基础报价；没有分时时明确标记能力缺失。
+- 股票价格通常两位，沪深基金三位。
+
+### K 线
+
+- 日 K：同花顺公开 qfq 年线主源，腾讯 qfq 备用。
+- 五日/周/月：腾讯公开 qfq。
+- 日 K 两个公开源都失败时使用 stale 缓存；无缓存返回空页和
+  `KLINE_SOURCES_UNAVAILABLE`。
+- 不存在 App K 线 fallback。
+
+### 可选 L2 增强
+
+只有 `CORE_METRICS_TRANSPORT=direct`、`FUND_FLOW_TRANSPORT=direct` 且
+`MARKET_DIRECT_ENRICHMENT=1` 时启用。每股票 15 秒缓存，只合并：
+
+- 大单净量/金额；
+- 散户数量；
+- MACDFS；
+- 三周期资金流；
+- 对应 L2 分时曲线。
+
+它不得覆盖公开名称、价格、OHLC、涨跌幅、换手率、成交量、成交额或公开分时。
+增强失败只更新 `source_errors`，公开快照仍返回。
+
+### 推送和前端
+
+- Broker 按 client+symbol 保留最新事件，不同股票不再互相覆盖。
+- WebSocket 断开后按 1/2/4/8/15 秒退避重连、重新订阅，并用 HTTP 刷新当前股票。
+- L2 无有效数据时隐藏增强卡片和资金区。
+- 前端不再出现“正在读取 App 接口”“App 内部 K 线”等误导文案。
+
+## 7. 当前非秘密配置
+
+`deploy/macos.env` 当前包含：
 
 ```dotenv
 CORE_ADB_SERIAL=emulator-5556
 CORE_FRIDA_SERVER_ENDPOINT=host.docker.internal:27043
 FUND_ADB_SERIAL=emulator-5554
 FUND_FRIDA_SERVER_ENDPOINT=host.docker.internal:27042
-ADB_SERIAL=
-ADB_SERVER_SOCKET=tcp:host.docker.internal:5037
-ADB_CONNECT=0
-ADMIN_PASSWORD_FILE=/data/admin/password.hash
-APP_PORT=8001
-ADMIN_COOKIE_SECURE=0
-FRIDA_SERVER_ENDPOINT=
+CORE_METRICS_TRANSPORT=direct
+FUND_FLOW_TRANSPORT=direct
+SYMBOL_CATALOG_PATH=/data/market/symbol-catalog.db
+SYMBOL_CATALOG_MAX_AGE_SECONDS=604800
+SYMBOL_CATALOG_REFRESH_HOUR=16
+SYMBOL_CATALOG_REFRESH_MINUTE=20
+PUBLIC_MARKET_TIMEOUT_SECONDS=8
+MARKET_DIRECT_ENRICHMENT=1
+MARKET_DIRECT_ENRICHMENT_TTL_SECONDS=15
+CORE_WARM_CONNECTION_MAX_IDLE_SECONDS=25
 ```
 
-四个双账号变量必须一起设置。旧 `ADB_SERIAL` 和
-`FRIDA_SERVER_ENDPOINT` 只用于单设备兼容模式。
+`.env` 继续只保存管理员秘密和 `THS_SESSION_ENCRYPTION_KEY`，不得提交。
 
-### 5.2 一键启动双 AVD 和桥接
+## 8. 2026-08-27 验收证据
 
-```sh
-./scripts/bootstrap-macos-dual-avd.sh \
-  /绝对路径/ths.apk \
-  /绝对路径/frida-server-16.7.19-android-arm64
-```
+本地测试：
 
-脚本会：
+- Python：509 passed；
+- 前端：80 passed；
+- `npm run build` 成功；
+- `git diff --check` 成功。
 
-- 仅从原数据目录启动已存在的资金 AVD，不修改其 App 或数据。
-- 缺失时创建干净的 `THS_CORE_33_ARM64`，并只在核心设备缺 App 时安装 APK。
-- 首次创建/安装后暂停，等待管理员人工登录和确认大单权限。
-- 把核心设备校准为 `1080x1920 / 480 dpi`。
-- 启动两台设备的 Frida，建立 `27042→27042`、`27043→27042` 转发。
-- 通过 launchctl 运行 bridge watcher，在模拟器/Frida 重启后恢复 root Frida 和转发。
+部署：
 
-只重新校准核心显示可执行：
+- 标准 OrbStack 全量构建成功；
+- API 和 Redis healthy；
+- 证券目录 active version 1 / 7574 条。
 
-```sh
-./scripts/configure-macos-core-display.sh emulator-5556 /opt/homebrew/bin/adb
-```
+公开 market 五类实测：
 
-长截图代码按 `1080x1920`、固定顶部 215 px 和底部 154 px 标定。核心设备
-若回到物理 `320x640 / 160 dpi`，导航虽然可能成功，但首张截图会报
-`device screenshot must be 1080x1920` 并表现为 `NAVIGATION_FAILED`。
+| 代码 | 市场 | 价格精度 | 分时点 | 日/周/月 |
+| --- | --- | ---: | ---: | --- |
+| 601872 | 沪A | 2 | 242 | 5/5/5 |
+| 300750 | 深A | 2 | 242 | 5/5/5 |
+| 920002 | 北交 | 2 | 242 | 1/1/1（腾讯该标的历史限制，日 K 主路径仍优先同花顺公开源） |
+| 510300 | 沪基 | 3 | 242 | 5/5/5 |
+| 159919 | 深基 | 3 | 242 | 5/5/5 |
 
-### 5.3 启动 Web/API/Redis
+纯数据任务：
 
-```sh
-docker compose --env-file deploy/macos.env -f deploy/compose.yml config --quiet
-docker compose --env-file deploy/macos.env -f deploy/compose.yml up -d --build api redis
-```
+| 代码 | 状态 | 端到端 | 八项 | L2 曲线 | 资金周期 |
+| --- | --- | ---: | ---: | --- | ---: |
+| 601872 | COMPLETED | 0.660s | 8/8 | 3 × 241 | 3 |
+| 300750 | COMPLETED | 0.980s | 8/8 | 3 × 241 | 3 |
+| 000001 | COMPLETED | 0.570s | 8/8 | 3 × 241 | 3 |
 
-不得加入 Caddy，不得使用 `down -v`。重建必须保留：
+三任务同时进入 FIFO 的最后完成时间约 1.94 秒，均为 COMPLETED。
 
-- `ths-level2_redis-data`
-- `ths-level2_capture-data`
-- `ths-level2_template-data`
-- `ths-level2_admin-data`
-
-Android 登录状态保存在宿主机 AVD 数据目录，不在 Docker 卷中。Docker Hub
-偶发 TLS 超时时不要删除现有镜像或容器；先保留运行服务，网络恢复后再重建。
-
-### 5.4 快速健康检查
+## 9. 常用检查
 
 ```sh
-/opt/homebrew/bin/adb devices -l
-/opt/homebrew/bin/adb -s emulator-5556 shell pidof com.hexin.plat.android
-/opt/homebrew/bin/adb -s emulator-5554 shell pidof com.hexin.plat.android
-/opt/homebrew/bin/adb -s emulator-5556 shell pidof ths-frida-server
-/opt/homebrew/bin/adb -s emulator-5554 shell pidof ths-frida-server
-/opt/homebrew/bin/adb -s emulator-5556 shell wm size
-/opt/homebrew/bin/adb -s emulator-5556 shell wm density
-/opt/homebrew/bin/adb forward --list
 curl -fsS http://127.0.0.1:8001/openapi.json >/dev/null
+curl -fsS http://127.0.0.1:8001/api/v1/symbols/601872
+curl -fsS 'http://127.0.0.1:8001/api/v1/symbols?query=5103&limit=8'
+
+docker --context orbstack compose \
+  --env-file .env \
+  --env-file deploy/macos.env \
+  -f deploy/compose.yml ps
 ```
 
-应看到核心 `27043→27042`、资金 `27042→27042`，核心显示覆盖为
-`1080x1920 / 480`。不要为了健康检查停止资金 App。
-
-## 6. 真实验收记录
-
-2026-08-23 的当前 Mac 验收结果：
-
-- 两台 AVD、两台 App、两台 Frida Server 和两个转发同时在线。
-- `600938` 纯数据任务完成，原八项和三周期资金数据均通过接口返回。
-- 杀掉核心 Frida 后，bridge watcher 能恢复 root Frida 和 `27043` 转发，随后
-  `600938` 再次完成。
-- `160723` 数据任务完成：原八项完整，三个资金周期各四项均返回
-  `0.00 万元`。
-- `160723` 长截图任务
-  `B6zOMpOpqQkvhPLxor_jgSZshBwdVbi9` 为 `COMPLETED`，长图为
-  `1080x4868` PNG，HTTP 下载返回 200。
-- 资金 App 在修复和验收期间未退出、未重装、未清数据，进程保持运行。
-- 后端：`PYTHONPATH=. uv run pytest -q` → `258 passed`。
-- 前端：`npm test` → `40 passed`；`npm run build` 成功。
-
-旧任务 `hW6lnm_Ge5FLGiF8c_L_KGSOi6F68iyS` 的
-`NAVIGATION_FAILED` 根因是新核心 AVD 没有显示覆盖，实际截图为
-`320x640`。历史失败记录不会被修改，替代验收任务已经成功。
-
-## 7. 排障顺序
-
-### `DIRECT_*` 或某个 `source_errors` 非空
-
-1. 根据 `source_errors.core_metrics` / `main_fund_flow` 判断设备角色。
-2. 检查对应 ADB、App PID、Frida PID 和端口转发。
-3. 保留 App 内部回调的原始错误码；不得打开股票页或用 OCR 补值。
-4. 资金错误只处理资金 Frida/网络，禁止退出资金账号。
-
-### `NAVIGATION_FAILED`
-
-1. 只观察/操作 `emulator-5556`。
-2. 检查 `wm size` 和 `wm density`，必要时运行显示校准脚本。
-3. 确认核心账号能搜索目标代码，股票页可以滚动到底部。
-4. 检查第一帧是否为可读 `1080x1920` PNG、滚动是否产生偏移、拼接图是否有
-   必需结构标题。
-5. 不要把导航错误误诊为市场数据接口失败，也不要操作资金页面。
-
-### 管理页面单路离线
-
-1. 调用 `GET /api/admin/devices` 区分 ADB、App 或 Frida。
-2. 检查该角色 WebSocket；不要关闭另一条正常连接。
-3. 管理员锁释放后，显式恢复任务队列。
-
-## 8. 安全与迁移注意事项
-
-- `.env` 包含管理员哈希和会话密钥，权限保持 `0600`。
-- 不要提交 APK、Frida Server、账号信息、AVD 数据或未脱敏日志。
-- 不要运行 `adb -a`，不要把 5037、27042、27043 或 Redis 6379 暴露到公网。
-- 当前 HTTP 只适用于可信本地网络；对外发布必须使用可信 HTTPS 代理并设置
-  `ADMIN_COOKIE_SECURE=1`。
-- 长截图保留 24 小时；任务元数据和接口指标不自动过期。每个浏览器的股票页签
-  永久保存在当前 Origin 的 `localStorage`，不会随 Redis 卷迁移。服务启动时
-  每个股票只保留一个最新任务，旧重复任务和截图会被物理删除并留下 ID 别名。
-- 迁移另一台 Mac 时推荐新建核心 AVD 并人工登录；资金账号是否迁移由管理员
-  单独决定，不能未经确认复制其 AVD 数据。
-- 下线旧环境前，先验收两台 App、两个接口来源、双设备管理画面、纯数据任务和
-  长截图任务，并确认 Docker 卷已备份。
+目录异常先检查 `/data/market/symbol-catalog.db` 和 API 日志；公开行情异常检查
+腾讯/新浪网络与 stale 缓存。只有 `DIRECT_SESSION_*` 或核心协议错误才需要管理员
+人工打开 App 续签。不要把公开源故障误诊为 App 故障，也不要操作资金设备。

@@ -131,6 +131,56 @@ def test_broker_keeps_the_latest_event_for_each_subscribed_symbol() -> None:
     }
 
 
+def test_broker_skips_removed_pending_tokens_after_resubscription() -> None:
+    source = FakeMarketSource()
+    broker = MarketDataBroker(source)
+    broker.subscribe(
+        "client",
+        watchlist_symbols={"601872", "300750"},
+        detail_symbols=set(),
+    )
+    asyncio.run(broker.refresh("601872", detail=False))
+    broker.subscribe(
+        "client",
+        watchlist_symbols={"300750"},
+        detail_symbols=set(),
+    )
+    asyncio.run(broker.refresh("300750", detail=False))
+
+    event = asyncio.run(broker.next_event("client", timeout=0.1))
+
+    assert event["data"]["symbol"] == "300750"
+
+
+def test_broker_keeps_snapshot_and_source_status_for_the_same_symbol() -> None:
+    broker = MarketDataBroker(FakeMarketSource())
+    broker.subscribe(
+        "client",
+        watchlist_symbols={"601872"},
+        detail_symbols=set(),
+    )
+    broker._publish("601872", {
+        "type": "snapshot",
+        "data": {"symbol": "601872", "sequence": 1},
+    })
+    broker._publish("601872", {
+        "type": "source_status",
+        "symbol": "601872",
+        "status": "OFFLINE",
+        "error_code": "MARKET_QUOTE_UNAVAILABLE",
+    })
+
+    events = [
+        asyncio.run(broker.next_event("client", timeout=0.1)),
+        asyncio.run(broker.next_event("client", timeout=0.1)),
+    ]
+
+    assert {event["type"] for event in events} == {
+        "snapshot",
+        "source_status",
+    }
+
+
 def test_broker_pages_series_through_the_app_source_and_validates_periods() -> None:
     source = FakeMarketSource()
     broker = MarketDataBroker(source)
@@ -167,5 +217,20 @@ def test_broker_retains_the_last_snapshot_and_publishes_source_errors() -> None:
         "type": "source_status",
         "symbol": "601872",
         "status": "OFFLINE",
-        "error_code": "DIRECT_APP_OFFLINE",
+        "error_code": "MARKET_SOURCE_FAILED",
     }
+
+
+def test_broker_redacts_nonfixed_source_error_details() -> None:
+    class FailingSource(FakeMarketSource):
+        def read_market_snapshot(self, symbol: str, *, detail: bool) -> MarketSnapshot:
+            raise RuntimeError("PRIVATE_SECRET_TOKEN")
+
+    broker = MarketDataBroker(FailingSource())
+    broker.subscribe("client", watchlist_symbols={"601872"}, detail_symbols=set())
+
+    asyncio.run(broker.poll_due())
+    event = asyncio.run(broker.next_event("client", timeout=0.1))
+
+    assert event["error_code"] == "MARKET_SOURCE_FAILED"
+    assert "private" not in str(event)

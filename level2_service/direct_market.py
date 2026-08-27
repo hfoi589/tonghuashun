@@ -1881,6 +1881,9 @@ class Core9528WarmPool:
         )
         self._schedule_refill(prepared)
 
+    def replenish(self, prepared: CoreRequestMaterial) -> None:
+        self._schedule_refill(prepared)
+
     def acquire(
         self,
         session: object,
@@ -1924,10 +1927,7 @@ class Core9528WarmPool:
                 and self._session_fingerprint
                 == prepared.session_fingerprint
             )
-        if not valid or not self._schedule_refill(
-            prepared,
-            expected_generation=generation,
-        ):
+        if not valid:
             self.close_connection(warm)
             raise DirectRequestError("DIRECT_PROTOCOL_HANDSHAKE_FAILED")
         return prepared, warm
@@ -2001,30 +2001,37 @@ class Core9528Client:
             assert self.protocol is not None
             if self.warm_pool is not None:
                 prepared, warm = self.warm_pool.acquire(session, symbol)
-                read_authenticated = getattr(
-                    self.protocol,
-                    "read_authenticated",
-                    None,
-                )
-                if not callable(read_authenticated):
-                    self.warm_pool.close_connection(warm)
-                    raise DirectRequestError(
-                        "DIRECT_PROTOCOL_HANDSHAKE_FAILED"
+                try:
+                    read_authenticated = getattr(
+                        self.protocol,
+                        "read_authenticated",
+                        None,
                     )
-                return read_authenticated(
-                    warm,
-                    prepared,
-                    symbol,
-                    market,
-                )
+                    if not callable(read_authenticated):
+                        self.warm_pool.close_connection(warm)
+                        raise DirectRequestError(
+                            "DIRECT_PROTOCOL_HANDSHAKE_FAILED"
+                        )
+                    return read_authenticated(
+                        warm,
+                        prepared,
+                        symbol,
+                        market,
+                    )
+                finally:
+                    self.warm_pool.replenish(prepared)
             return self.protocol.read_direct(session, symbol, market)
 
     def prewarm(self, symbol: str | None = None) -> None:
         if self.warm_pool is None:
             return
-        with self._request_lock:
+        if not self._request_lock.acquire(blocking=False):
+            return
+        try:
             session = self._session()
             self.warm_pool.prewarm(session, symbol)
+        finally:
+            self._request_lock.release()
 
     def invalidate(self) -> None:
         with self._request_lock:

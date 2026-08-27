@@ -1,7 +1,7 @@
 # App-Independent Market and Warm Direct Transport Design
 
-**Date:** 2026-08-27  
-**Status:** Approved in chat  
+**Date:** 2026-08-27
+**Status:** Approved in chat
 **Scope:** Core 9528 request latency, symbol confirmation/search, market data, lifecycle scheduling, documentation, deployment, and release
 
 ## 1. Goal
@@ -81,7 +81,8 @@ read_authenticated(
 - atomically remove a connection on acquire;
 - discard ready connections older than 25 seconds;
 - invalidate all ready connections when the encrypted session bundle fingerprint changes;
-- asynchronously replenish after checkout;
+- asynchronously replenish only after the checked-out business request has
+  completed and the socket has closed;
 - allow a synchronous cold authentication when no ready connection exists;
 - expose `prewarm()`, `invalidate()`, and `close()` lifecycle methods.
 
@@ -93,7 +94,7 @@ Prewarming occurs without App interaction:
 
 - after a successful exact symbol confirmation;
 - immediately before a job is enqueued;
-- after a warm connection is checked out;
+- after a checked-out connection finishes its single business request;
 - after a successful administrator refresh of the core session bundle;
 - during service startup when a valid core bundle exists.
 

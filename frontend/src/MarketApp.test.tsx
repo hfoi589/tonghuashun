@@ -228,7 +228,9 @@ describe('MarketApp', () => {
         },
         order_book: [],
         trades: [],
-        main_fund_flow: {},
+        main_fund_flow: {
+          today: { unit: '亿元', main_net_inflow: '1.23', main_visible_inflow: '0.80', main_hidden_inflow: '0.43', retail_inflow: '-1.23' },
+        },
         capabilities: {
           timeshare: { available: true, reason: null },
           kline: { available: false, reason: 'DIRECT_KLINE_UNAVAILABLE' },
@@ -276,6 +278,8 @@ describe('MarketApp', () => {
     const retailChart = screen.getByRole('img', { name: '散户数量当日分时图' })
     const macdChart = screen.getByRole('img', { name: 'MACD当日分时图' })
     const unifiedChartPanel = priceChart.closest('.market-chart-panel')
+    const fundFlow = screen.getByRole('heading', { name: '主力流向' }).closest('.market-fund-flow')!
+    expect(fundFlow.compareDocumentPosition(priceChart) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
     expect(unifiedChartPanel).toContainElement(netChart)
     expect(unifiedChartPanel).toContainElement(amountChart)
     expect(unifiedChartPanel).toContainElement(retailChart)

@@ -79,6 +79,25 @@ def test_sina_source_keeps_paging_when_the_server_caps_a_500_request_at_100_reco
     assert all("num=100" in url for url in page_calls)
 
 
+def test_sina_source_rejects_symbol_and_code_mismatch() -> None:
+    from level2_service.symbol_catalog import SinaSymbolCatalogSource, SymbolCatalogError
+
+    rows = {
+        "hs_a": [{"symbol": "sh600001", "code": "600000", "name": "错误绑定"}],
+        "etf_hq_fund": [],
+        "lof_hq_fund": [],
+    }
+
+    def fetch(url: str, _timeout: float) -> str:
+        node = url.split("node=")[1].split("&", 1)[0]
+        if "getHQNodeStockCount" in url:
+            return str(len(rows[node]))
+        return json.dumps(rows[node], ensure_ascii=False)
+
+    with pytest.raises(SymbolCatalogError, match="SYMBOL_CATALOG_SOURCE_INVALID"):
+        SinaSymbolCatalogSource(fetch=fetch).fetch_symbols()
+
+
 def test_refresh_activates_a_complete_version_for_exact_lookup(tmp_path):
     from level2_service.symbol_catalog import SQLiteSymbolCatalog
 

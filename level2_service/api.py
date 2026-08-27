@@ -297,6 +297,7 @@ def create_app(
     symbol_catalog_refresh_minute: int = 20,
     core_prewarmer: Callable[[str | None], None] | None = None,
     core_session_invalidator: Callable[[], None] | None = None,
+    managed_resources: tuple[object, ...] = (),
     market_account_store: object | None = None,
     market_session_store: object | None = None,
     market_data_broker: object | None = None,
@@ -323,6 +324,13 @@ def create_app(
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         stop = Event()
         app.state.runner_wake.bind()
+        for resource in app.state.managed_resources:
+            prewarm = getattr(resource, "prewarm", None)
+            if callable(prewarm):
+                try:
+                    prewarm()
+                except Exception:
+                    pass
         app.state.store.recover_running()
         deduplicate = getattr(app.state.store, "deduplicate_by_symbol", None)
         app.state.task_migration = (
@@ -443,6 +451,13 @@ def create_app(
                 await app.state.market_task
             if app.state.symbol_catalog_task is not None:
                 await app.state.symbol_catalog_task
+            for resource in reversed(app.state.managed_resources):
+                close = getattr(resource, "close", None)
+                if callable(close):
+                    try:
+                        close()
+                    except Exception:
+                        pass
 
     app = FastAPI(title="THS Level2 Capture Service", lifespan=lifespan)
     app.state.store = store or InMemoryStreams()
@@ -471,6 +486,7 @@ def create_app(
     app.state.symbol_catalog = symbol_catalog
     app.state.core_prewarmer = core_prewarmer
     app.state.core_session_invalidator = core_session_invalidator
+    app.state.managed_resources = tuple(managed_resources)
     app.state.market_account_store = market_account_store
     app.state.market_session_store = market_session_store
     app.state.market_data_broker = market_data_broker

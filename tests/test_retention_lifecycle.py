@@ -64,6 +64,24 @@ def test_app_lifespan_refreshes_an_uninitialized_symbol_catalog() -> None:
     assert app.state.symbol_catalog_task.done()
 
 
+def test_app_lifespan_prewarms_and_closes_managed_resources() -> None:
+    calls: list[str] = []
+
+    class Resource:
+        @staticmethod
+        def prewarm() -> None:
+            calls.append("prewarm")
+
+        @staticmethod
+        def close() -> None:
+            calls.append("close")
+
+    with TestClient(create_app(managed_resources=(Resource(),))):
+        assert calls == ["prewarm"]
+
+    assert calls == ["prewarm", "close"]
+
+
 def test_app_lifespan_runs_retention_and_stops_its_background_task(tmp_path: Path) -> None:
     """Screenshot retention must run without expiring the persistent task result."""
     capture = tmp_path / "net.png"

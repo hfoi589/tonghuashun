@@ -620,6 +620,43 @@ def test_core_client_reads_the_session_inside_the_lifecycle_lock() -> None:
     assert seen == ["new"]
 
 
+def test_core_client_prewarm_does_not_block_behind_an_active_request() -> None:
+    provider = StaticSessionProvider(
+        replace(session(), role="core_metrics", core_material={"marker": "one"})
+    )
+
+    class Pool:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def prewarm(self, _session, _symbol=None) -> None:
+            self.calls += 1
+
+        def invalidate(self) -> None:
+            pass
+
+        def close(self) -> None:
+            pass
+
+    class Protocol:
+        @staticmethod
+        def read_direct(_session, _symbol, _market):
+            raise AssertionError("not used")
+
+    pool = Pool()
+    client = Core9528Client(provider, protocol=Protocol(), warm_pool=pool)
+    finished = Thread(target=lambda: client.prewarm("601872"))
+    client._request_lock.acquire()
+    finished.start()
+    finished.join(timeout=0.1)
+    blocked = finished.is_alive()
+    client._request_lock.release()
+    finished.join(timeout=1)
+
+    assert blocked is False
+    assert pool.calls == 0
+
+
 def test_core_base64_round_trips_with_the_app_alphabet() -> None:
     payload = bytes(range(256))
 
@@ -1086,6 +1123,9 @@ def test_core_warm_pool_consumes_a_ready_connection_only_once() -> None:
     assert prepared.session_fingerprint == b"session-one"
     assert first is authenticated[0]
     assert pool.ready_count == 0
+    assert pending_refills == []
+
+    pool.replenish(prepared)
     assert len(pending_refills) == 1
 
     pending_refills.pop()()

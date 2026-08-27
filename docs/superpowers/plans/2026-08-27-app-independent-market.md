@@ -147,7 +147,7 @@ Expected: fail because the pool does not exist.
 
 - [ ] **Step 4: Implement `Core9528WarmPool` and integrate the client**
 
-Use a lock only for deque/fingerprint/refill/closed state. Perform connect/auth outside the lock. `acquire()` consumes a ready connection once or authenticates synchronously. After checkout, schedule one daemon refill worker. Never return a used connection.
+Use a lock only for deque/fingerprint/refill/closed state. Perform connect/auth outside the lock. `acquire()` consumes a ready connection once or authenticates synchronously. Schedule the refill worker only after the business request completes and the consumed socket closes; live verification showed that parallel authentication during a business read can invalidate the response. Never return a used connection.
 
 Serialize `Core9528Client.read_direct()` with a request lock so task and market enrichment do not issue concurrent core sequences.
 

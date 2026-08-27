@@ -24,8 +24,6 @@ button { cursor: pointer; }
   place-items: center;
   padding: 28px;
   background: #ef1f2d;
-  background-image: linear-gradient(110deg, rgba(255,255,255,.07) 1px, transparent 1px);
-  background-size: 42px 42px;
 }
 
 .market-loading { align-content: center; color: white; gap: 14px; }
@@ -234,6 +232,11 @@ button { cursor: pointer; }
 .market-metric-grid article:last-child { border: 0; }
 .market-metric-grid span { color: var(--market-muted); font-size: 11px; }
 .market-metric-grid strong { font: 700 20px ui-monospace, SFMono-Regular, monospace; }
+.market-chart-panel > .market-metric-grid { margin: 0; border: 0; border-bottom: 1px solid var(--market-line); }
+.market-chart-panel > .market-metric-grid article { padding: 12px 14px; gap: 5px; }
+.market-chart-panel > .market-fund-flow { margin: 0; padding: 14px 16px 12px; border: 0; border-bottom: 1px solid var(--market-line); }
+.market-chart-panel > .market-fund-flow .market-section-title { margin-bottom: 9px; }
+.market-chart-panel > .market-fund-flow .market-section-title h3 { font-size: 16px; }
 .market-section { margin-top: 16px; padding: 19px 20px 20px; border: 1px solid var(--market-line); background: white; }
 .market-section-title { display: flex; align-items: center; justify-content: space-between; margin-bottom: 14px; }
 .market-section-title span { display: block; margin: 0 0 3px; }

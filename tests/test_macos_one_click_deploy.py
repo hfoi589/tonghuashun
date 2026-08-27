@@ -1,14 +1,19 @@
 from __future__ import annotations
 
 import base64
+import copy
 import hashlib
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from importlib.util import module_from_spec, spec_from_file_location
 import json
 import os
 import re
 from pathlib import Path
+import struct
 import subprocess
 import sys
+import threading
+from datetime import datetime, timedelta, timezone
 from zipfile import ZipFile
 
 import pytest
@@ -42,6 +47,173 @@ VALID_COMPOSE_ENVIRONMENT = {
     "THS_DEVICE_LIFECYCLE_TOKEN": "lifecycle-secret-value",
     "THS_SESSION_ENCRYPTION_KEY": "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=",
 }
+
+def session_encryption_key(material: bytes = b"session-encryption-key-material!") -> str:
+    return base64.urlsafe_b64encode(material).decode("ascii")
+
+
+def core_template_packet_hex(symbol: str = "600519") -> str:
+    from level2_service.direct_market import encode_core_base64
+
+    body = f"[frame]\r\nid=6001\r\nstockcode={symbol}\r\n".encode("utf-16-be")
+    header = struct.pack("<HiiHiiiI", 76, 1, 262144, 65283, 0, 6001, len(body), 0)
+    header += b"\x00" * (76 - len(header))
+    payload = header + encode_core_base64(body)
+    packet = b"\xfd" * 4 + f"{len(payload):08x}".encode("ascii") + b"\x00"
+    return (packet + payload).hex()
+
+
+def core_auth_packet_hex(payload: bytes = b"synthetic-auth") -> str:
+    return (
+        b"\xfd" * 4
+        + f"{len(payload):08x}".encode("ascii")
+        + b"\x00"
+        + payload
+    ).hex()
+
+
+def write_valid_session_bundles(
+    root: Path,
+    *,
+    updated_at: datetime | None = None,
+    encryption_key: str | None = None,
+) -> str:
+    from level2_service.app_sessions import (
+        AccountSessionBundle,
+        CoreAccountSessionRefresher,
+        EncryptedFileSessionProvider,
+    )
+    from level2_service.direct_market import CORE_BASE64_ALPHABET
+
+    timestamp = updated_at or datetime.now(timezone.utc)
+    key = encryption_key or session_encryption_key()
+    provider = EncryptedFileSessionProvider(root, key)
+    core = CoreAccountSessionRefresher(
+        lambda: {
+            "server_ip": "60.204.184.46",
+            "server_port": "9528",
+            "auth_packet_hex": core_auth_packet_hex(),
+            "base64_alphabet": CORE_BASE64_ALPHABET,
+            "template_symbol": "600519",
+            "request_packets_hex": json.dumps([core_template_packet_hex()]),
+            "macdfs_params": json.dumps([10, 20, 5]),
+        },
+        now=lambda: timestamp,
+    )("core_metrics")
+    fund = AccountSessionBundle(
+        role="main_fund_flow",
+        cookie="user=secret-user; sess_tk=secret-ticket",
+        user_agent="private-app-user-agent",
+        platform="android",
+        updated_at=timestamp,
+    )
+    provider.put(core)
+    provider.put(fund)
+    return key
+
+
+def run_session_readiness_probe(
+    module,
+    root: Path,
+    encryption_key: str,
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [sys.executable, "-c", module.SESSION_READINESS_PROBE],
+        cwd=ROOT,
+        env=os.environ
+        | {
+            "PYTHONPATH": str(ROOT),
+            "THS_SESSION_ROOT": str(root),
+            "THS_SESSION_ENCRYPTION_KEY": encryption_key,
+        },
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+
+def valid_acceptance_task() -> dict[str, object]:
+    scalar_values = {
+        "stock_name": "招商轮船",
+        "current_price": "8.12",
+        "change_percent": "+1.25%",
+        "turnover_rate": "0.72%",
+        "large_order_net": "1.23",
+        "large_order_amount": "456.7",
+        "retail_count": "12.34",
+        "macdfs": "+0.123",
+    }
+    scalar_sources = {field: "INTERFACE" for field in scalar_values}
+    intraday = {
+        "large_order_net": {
+            "unit": "%",
+            "points": [
+                {"time": "09:30", "value": None},
+                {"time": "09:31", "value": "1.23"},
+            ],
+        },
+        "large_order_amount": {
+            "unit": "万",
+            "points": [{"time": "09:30", "value": "456.7"}],
+        },
+        "retail_count": {
+            "unit": "户",
+            "points": [{"time": "09:30", "value": "12.34"}],
+        },
+    }
+    fund_period = {
+        "unit": "万元",
+        "main_net_inflow": "100.00",
+        "main_visible_inflow": "60.00",
+        "main_hidden_inflow": "40.00",
+        "retail_inflow": "-100.00",
+    }
+    fund_sources = {
+        "main_net_inflow": "INTERFACE",
+        "main_visible_inflow": "INTERFACE",
+        "main_hidden_inflow": "INTERFACE",
+        "retail_inflow": "INTERFACE",
+    }
+    return {
+        "public_id": "safe-public-id",
+        "symbol": "601872",
+        "include_long_capture": False,
+        "status": "COMPLETED",
+        "error_code": None,
+        "source_errors": {"core_metrics": None, "main_fund_flow": None},
+        "captures": [
+            {
+                "kind": kind,
+                "status": "SKIPPED",
+                "url": None,
+                "expires_at": None,
+            }
+            for kind in ("LARGE_ORDER_NET", "LARGE_ORDER_AMOUNT", "RETAIL_COUNT")
+        ],
+        "values": {
+            **scalar_values,
+            "intraday_series": intraday,
+            "main_fund_flow": {
+                period: dict(fund_period)
+                for period in ("today", "three_day", "five_day")
+            },
+        },
+        "value_sources": {
+            **scalar_sources,
+            "intraday_series": {
+                field: "INTERFACE" for field in intraday
+            },
+            "main_fund_flow": {
+                period: dict(fund_sources)
+                for period in ("today", "three_day", "five_day")
+            },
+        },
+        "long_capture": {
+            "status": "SKIPPED",
+            "url": None,
+            "expires_at": None,
+        },
+    }
 
 
 def test_tracked_image_apk_matches_the_approved_mobile_asset() -> None:
@@ -591,11 +763,11 @@ class FakeCommandRunner:
         if (
             "exec" in args
             and "api" in args
-            and "core_metrics.session" in " ".join(args)
+            and "EncryptedFileSessionProvider" in " ".join(args)
         ):
             return _completed(
                 args,
-                stdout=b"READY\n" if self.sessions_ready else b"MISSING\n",
+                stdout=b"READY\n" if self.sessions_ready else b"NOT_READY\n",
             )
         if "ps" in args and "--format" in args:
             health = "healthy" if self.healthy else "starting"
@@ -672,6 +844,34 @@ class FakeDataOnlyAcceptance:
             raise self.error
 
 
+class FakeProvisioningJournal:
+    def __init__(
+        self,
+        steps: dict[str, str] | None = None,
+        *,
+        events: list[str] | None = None,
+    ) -> None:
+        self.steps = dict(steps or {})
+        self.events = events if events is not None else []
+
+    def load(self) -> dict[str, str]:
+        return dict(self.steps)
+
+    def record_initial_missing(self, roles: frozenset[str]) -> dict[str, str]:
+        for role in roles:
+            self.steps.setdefault(role, "PENDING_CREATE")
+            self.events.append(f"journal-record:{role}")
+        return dict(self.steps)
+
+    def set_step(self, role: str, step: str) -> None:
+        self.steps[role] = step
+        self.events.append(f"journal-step:{role}:{step}")
+
+    def complete(self, role: str) -> None:
+        self.steps.pop(role)
+        self.events.append(f"journal-complete:{role}")
+
+
 def existing_mac_runner(
     *,
     apk_sha256: str = APK_SHA256,
@@ -720,6 +920,7 @@ def make_orchestrator(
     broker: FakeLifecycleBroker | None = None,
     process_executable_resolver: FakeProcessExecutableResolver | None = None,
     acceptance: FakeDataOnlyAcceptance | None = None,
+    journal=None,
     health_timeout_seconds: float = 0.05,
     boot_timeout_seconds: float = 0.05,
     env_file: Path = Path(".env"),
@@ -737,6 +938,7 @@ def make_orchestrator(
             process_executable_resolver or FakeProcessExecutableResolver()
         ),
         data_only_acceptance=acceptance or FakeDataOnlyAcceptance(),
+        provisioning_journal=journal or FakeProvisioningJournal(),
         health_timeout_seconds=health_timeout_seconds,
         boot_timeout_seconds=boot_timeout_seconds,
         poll_interval_seconds=0.0,
@@ -1516,8 +1718,13 @@ def test_provisioning_uses_only_fixed_image_avd_launch_and_asset_commands() -> N
         events=events,
     )
     broker = FakeLifecycleBroker(events=events)
+    journal = FakeProvisioningJournal(events=events)
 
-    result = make_orchestrator(runner, broker=broker).deploy("auto")
+    result = make_orchestrator(
+        runner,
+        broker=broker,
+        journal=journal,
+    ).deploy("auto")
 
     assert result.state == "FIRST_TIME_LOGIN_REQUIRED"
     sdk_install = (
@@ -1621,13 +1828,13 @@ def test_provisioning_uses_only_fixed_image_avd_launch_and_asset_commands() -> N
         for call in runner.calls
         if call and call[0].endswith("configure-macos-core-display.sh")
     ]
-    assert display_calls == [
-        (
-            str(ROOT / "scripts/configure-macos-core-display.sh"),
-            "emulator-5556",
-            "adb",
-        )
-    ]
+    assert display_calls == []
+    assert events.index("journal-record:core_metrics") < events.index(
+        "avd-created:THS_CORE_33_ARM64"
+    )
+    assert events.index("journal-record:main_fund_flow") < events.index(
+        "avd-created:THS_API_33_ARM64"
+    )
     assert events.index("container-provision:core_metrics") < events.index("installer")
     assert events.index("container-provision:main_fund_flow") < events.index("installer")
     assert events.index("container-provision:core_metrics") < events.index(
@@ -1635,6 +1842,12 @@ def test_provisioning_uses_only_fixed_image_avd_launch_and_asset_commands() -> N
     )
     assert events.index("installer") < events.index("broker-start:core_metrics")
     assert events.index("installer") < events.index("broker-start:main_fund_flow")
+    assert events.index("broker-wait:operation-core_metrics") < events.index(
+        "journal-complete:core_metrics"
+    )
+    assert events.index("broker-wait:operation-main_fund_flow") < events.index(
+        "journal-complete:main_fund_flow"
+    )
     assert broker.start_calls == ["core_metrics", "main_fund_flow"]
     assert not any(
         call and call[0] in {"brew", "open", "softwareupdate"}
@@ -1645,8 +1858,9 @@ def test_provisioning_uses_only_fixed_image_avd_launch_and_asset_commands() -> N
 def test_partial_provisioning_preserves_and_validates_the_existing_role() -> None:
     """A mixed host must not install or push image assets onto its preserved account."""
     runner = existing_mac_runner(avds=("THS_API_33_ARM64",))
+    broker = FakeLifecycleBroker()
 
-    make_orchestrator(runner).deploy("auto")
+    make_orchestrator(runner, broker=broker).deploy("auto")
 
     assert [
         call[-1] for call in runner.calls if "container-provision-device" in call
@@ -1663,6 +1877,36 @@ def test_partial_provisioning_preserves_and_validates_the_existing_role() -> Non
         any(token in call for token in ("install", "push", "chmod"))
         for call in fund_calls
     )
+    assert broker.start_calls == ["core_metrics"]
+    assert not any(
+        call and call[0].endswith("configure-macos-core-display.sh")
+        for call in runner.calls
+    )
+
+
+def test_partial_provisioning_never_lifecycle_touches_a_preexisting_core() -> None:
+    """Provisioning a missing fund role must leave the existing core role untouched."""
+    runner = existing_mac_runner(avds=("THS_CORE_33_ARM64",))
+    broker = FakeLifecycleBroker()
+
+    make_orchestrator(runner, broker=broker).deploy("auto")
+
+    assert broker.start_calls == ["main_fund_flow"]
+    assert not any(
+        call and call[0].endswith("configure-macos-core-display.sh")
+        for call in runner.calls
+    )
+
+
+def test_provision_rerun_without_incomplete_roles_performs_no_lifecycle_action() -> None:
+    """A completed onboarding rerun must not reopen either pre-existing App."""
+    runner = existing_mac_runner(sessions_ready=False)
+    broker = FakeLifecycleBroker()
+
+    result = make_orchestrator(runner, broker=broker).deploy("provision")
+
+    assert result.state == "FIRST_TIME_LOGIN_REQUIRED"
+    assert broker.start_calls == []
 
 
 @pytest.mark.parametrize(
@@ -1719,6 +1963,144 @@ def test_provisioning_boot_timeout_preserves_the_created_avd_without_cleanup() -
     assert not any("container-provision-device" in call for call in runner.calls)
 
 
+def test_provisioning_journal_persists_exact_schema_and_atomic_steps(
+    tmp_path: Path,
+) -> None:
+    """A restart must recover only fixed roles, AVD names, and reviewed step states."""
+    module = _load_macos_deploy()
+    path = tmp_path / "ths-device-provisioning.json"
+    journal = module.ProvisioningJournal(path)
+
+    journal.record_initial_missing(frozenset({"core_metrics", "main_fund_flow"}))
+
+    assert path.stat().st_mode & 0o777 == 0o600
+    assert json.loads(path.read_text(encoding="utf-8")) == {
+        "version": 1,
+        "roles": {
+            "core_metrics": {
+                "avd_name": "THS_CORE_33_ARM64",
+                "step": "PENDING_CREATE",
+            },
+            "main_fund_flow": {
+                "avd_name": "THS_API_33_ARM64",
+                "step": "PENDING_CREATE",
+            },
+        },
+    }
+    journal.set_step("core_metrics", "AVD_CREATED")
+    journal.set_step("core_metrics", "ASSETS_PROVISIONED")
+    journal.complete("core_metrics")
+
+    assert journal.load() == {"main_fund_flow": "PENDING_CREATE"}
+    assert list(tmp_path.glob(".ths-device-provisioning.json.*")) == []
+
+
+@pytest.mark.parametrize("invalid_journal", ["corrupt", "wrong-mode", "symlink", "extra-field"])
+def test_provisioning_journal_rejects_corrupted_or_untrusted_state(
+    tmp_path: Path,
+    invalid_journal: str,
+) -> None:
+    """Untrusted host state must fail closed before any fixed AVD command runs."""
+    module = _load_macos_deploy()
+    path = tmp_path / "ths-device-provisioning.json"
+    payload = {
+        "version": 1,
+        "roles": {
+            "core_metrics": {
+                "avd_name": "THS_CORE_33_ARM64",
+                "step": "AVD_CREATED",
+            }
+        },
+    }
+    if invalid_journal == "corrupt":
+        path.write_text("not-json", encoding="utf-8")
+    elif invalid_journal == "extra-field":
+        payload["unexpected"] = True
+        path.write_text(json.dumps(payload), encoding="utf-8")
+    elif invalid_journal == "symlink":
+        target = tmp_path / "journal-target.json"
+        target.write_text(json.dumps(payload), encoding="utf-8")
+        target.chmod(0o600)
+        path.symlink_to(target)
+    else:
+        path.write_text(json.dumps(payload), encoding="utf-8")
+    if invalid_journal != "symlink":
+        path.chmod(0o644 if invalid_journal == "wrong-mode" else 0o600)
+    journal = module.ProvisioningJournal(path)
+
+    with pytest.raises(module.DeploymentError) as caught:
+        journal.load()
+
+    assert caught.value.error_code == "PROVISIONING_JOURNAL_INVALID"
+
+
+def test_corrupted_provisioning_journal_blocks_all_device_mutation(
+    tmp_path: Path,
+) -> None:
+    """Journal validation must happen before create, launch, provision, or lifecycle work."""
+    module = _load_macos_deploy()
+    path = tmp_path / "ths-device-provisioning.json"
+    path.write_text("not-json", encoding="utf-8")
+    path.chmod(0o600)
+    runner = existing_mac_runner(avds=("THS_API_33_ARM64",))
+    broker = FakeLifecycleBroker()
+
+    with pytest.raises(module.DeploymentError) as caught:
+        make_orchestrator(
+            runner,
+            broker=broker,
+            journal=module.ProvisioningJournal(path),
+        ).deploy("auto")
+
+    assert caught.value.error_code == "PROVISIONING_JOURNAL_INVALID"
+    assert not any(call[:3] == ("avdmanager", "create", "avd") for call in runner.calls)
+    assert not any("container-provision-device" in call for call in runner.calls)
+    assert broker.start_calls == []
+
+
+def test_boot_timeout_rerun_resumes_the_journaled_role_without_recreate(
+    tmp_path: Path,
+) -> None:
+    """An AVD created before a failed boot must remain provisionable on the next run."""
+    module = _load_macos_deploy()
+    path = tmp_path / "ths-device-provisioning.json"
+    runner = existing_mac_runner(
+        avds=("THS_API_33_ARM64",),
+        boot_completed={"emulator-5556": "0"},
+        sessions_ready=False,
+    )
+    first_journal = module.ProvisioningJournal(path)
+
+    with pytest.raises(module.DeploymentError) as caught:
+        make_orchestrator(
+            runner,
+            journal=first_journal,
+            boot_timeout_seconds=0.001,
+        ).deploy("auto")
+
+    assert caught.value.error_code == "DEVICE_BOOT_TIMEOUT"
+    assert first_journal.load() == {"core_metrics": "AVD_CREATED"}
+    first_call_count = len(runner.calls)
+    runner.boot_completed["emulator-5556"] = "1"
+    broker = FakeLifecycleBroker()
+    second_journal = module.ProvisioningJournal(path)
+
+    result = make_orchestrator(
+        runner,
+        broker=broker,
+        journal=second_journal,
+    ).deploy("auto")
+
+    resumed_calls = runner.calls[first_call_count:]
+    assert result.state == "FIRST_TIME_LOGIN_REQUIRED"
+    assert not any(call[:3] == ("avdmanager", "create", "avd") for call in resumed_calls)
+    assert [call[-1] for call in resumed_calls if "container-provision-device" in call] == [
+        "core_metrics"
+    ]
+    assert broker.start_calls == ["core_metrics"]
+    assert second_journal.load() == {}
+
+
 def test_missing_sessions_return_only_safe_human_onboarding_instructions() -> None:
     """The human gate must be actionable without exposing deployment or account secrets."""
     acceptance = FakeDataOnlyAcceptance()
@@ -1748,6 +2130,93 @@ def test_missing_sessions_return_only_safe_human_onboarding_instructions() -> No
     ):
         assert forbidden.lower() not in output.lower()
     assert acceptance.calls == 0
+
+
+def test_session_readiness_probe_decrypts_both_fixed_role_bundles(
+    tmp_path: Path,
+) -> None:
+    """READY must come from the production provider's decrypted public statuses."""
+    module = _load_macos_deploy()
+    session_root = tmp_path / "sessions"
+    key = write_valid_session_bundles(session_root)
+
+    completed = run_session_readiness_probe(module, session_root, key)
+
+    assert completed.returncode == 0
+    assert completed.stdout == "READY\n"
+    assert completed.stderr == ""
+
+
+@pytest.mark.parametrize(
+    "invalid_state",
+    [
+        "empty",
+        "corrupt",
+        "symlink",
+        "role-swapped",
+        "wrong-key",
+        "stale",
+        "missing",
+    ],
+)
+def test_session_readiness_probe_rejects_untrusted_or_invalid_bundles(
+    tmp_path: Path,
+    invalid_state: str,
+) -> None:
+    """Existence alone must not accept an unreadable, swapped, stale, or linked secret."""
+    module = _load_macos_deploy()
+    session_root = tmp_path / "sessions"
+    timestamp = (
+        datetime.now(timezone.utc) - timedelta(days=2)
+        if invalid_state == "stale"
+        else datetime.now(timezone.utc)
+    )
+    key = write_valid_session_bundles(session_root, updated_at=timestamp)
+    core = session_root / "core_metrics.session"
+    fund = session_root / "main_fund_flow.session"
+    probe_key = key
+    if invalid_state == "empty":
+        core.write_bytes(b"")
+    elif invalid_state == "corrupt":
+        core.write_bytes(b"not-an-encrypted-session")
+    elif invalid_state == "symlink":
+        target = tmp_path / "linked-core.session"
+        target.write_bytes(core.read_bytes())
+        target.chmod(0o600)
+        core.unlink()
+        core.symlink_to(target)
+    elif invalid_state == "role-swapped":
+        core_bytes = core.read_bytes()
+        fund_bytes = fund.read_bytes()
+        core.write_bytes(fund_bytes)
+        fund.write_bytes(core_bytes)
+    elif invalid_state == "wrong-key":
+        probe_key = session_encryption_key(b"different-session-key-material!!")
+    elif invalid_state == "missing":
+        fund.unlink()
+
+    completed = run_session_readiness_probe(module, session_root, probe_key)
+
+    assert completed.returncode == 0
+    assert completed.stdout == "NOT_READY\n"
+    assert completed.stderr == ""
+
+
+def test_orchestrator_runs_only_the_fixed_in_container_session_status_probe() -> None:
+    """Host path checks could bypass decryption and role validation in the API image."""
+    runner = existing_mac_runner(sessions_ready=False)
+
+    make_orchestrator(runner).deploy("provision")
+
+    probe_calls = [
+        call
+        for call in runner.calls
+        if "exec" in call and "api" in call and "EncryptedFileSessionProvider" in " ".join(call)
+    ]
+    assert len(probe_calls) == 1
+    probe = probe_calls[0][-1]
+    assert "Path.is_file" not in probe
+    assert "core_metrics" in probe and "main_fund_flow" in probe
 
 
 def test_provisioning_rerun_does_not_recreate_or_reinstall_existing_roles() -> None:
@@ -1784,28 +2253,12 @@ def test_provisioning_becomes_ready_only_after_sessions_and_data_acceptance() ->
 def test_data_only_acceptance_uses_the_confirmed_fixed_symbol_and_eight_metrics() -> None:
     """A READY provisioning result must come from a real data-only completed job."""
     module = _load_macos_deploy()
-    required_values = {
-        "stock_name": "招商轮船",
-        "current_price": "8.12",
-        "change_percent": "+1.25%",
-        "turnover_rate": "0.72%",
-        "large_order_net": "1.23",
-        "large_order_amount": "456.7",
-        "retail_count": "12.34",
-        "macdfs": "+0.123",
-    }
     responses = iter(
         [
             {"symbol": "601872", "name": "招商轮船", "market": "17"},
             {"public_id": "safe-public-id", "status": "QUEUED"},
             {"public_id": "safe-public-id", "status": "RUNNING"},
-            {
-                "public_id": "safe-public-id",
-                "symbol": "601872",
-                "include_long_capture": False,
-                "status": "COMPLETED",
-                "values": required_values,
-            },
+            valid_acceptance_task(),
         ]
     )
     requests: list[Request] = []
@@ -1823,7 +2276,7 @@ def test_data_only_acceptance_uses_the_confirmed_fixed_symbol_and_eight_metrics(
         def read(self) -> bytes:
             return json.dumps(self.payload).encode()
 
-    def opener(request: Request, timeout: float):
+    def opener(request: Request, *, timeout: float):
         assert timeout > 0
         requests.append(request)
         return Response(next(responses))
@@ -1848,6 +2301,110 @@ def test_data_only_acceptance_uses_the_confirmed_fixed_symbol_and_eight_metrics(
         "include_long_capture": False,
     }
     assert requests[2].full_url.endswith("/api/v1/jobs/safe-public-id")
+
+
+def test_data_only_acceptance_uses_real_urlopen_timeout_keyword() -> None:
+    """Passing timeout as positional request data breaks the real urllib boundary."""
+    module = _load_macos_deploy()
+    requests: list[tuple[str, str, bytes]] = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            requests.append(("GET", self.path, b""))
+            payload = (
+                {"symbol": "601872", "name": "招商轮船", "market": "17"}
+                if self.path == "/api/v1/symbols/601872"
+                else valid_acceptance_task()
+            )
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps(payload).encode())
+
+        def do_POST(self) -> None:
+            length = int(self.headers.get("Content-Length", "0"))
+            body = self.rfile.read(length)
+            requests.append(("POST", self.path, body))
+            self.send_response(202)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(
+                json.dumps({"public_id": "safe-public-id", "status": "QUEUED"}).encode()
+            )
+
+        def log_message(self, _format: str, *_args) -> None:
+            return None
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        acceptance = module.LoopbackDataOnlyAcceptance(
+            base_url=f"http://127.0.0.1:{server.server_port}",
+            timeout_seconds=1.0,
+            poll_interval_seconds=0.0,
+        )
+
+        acceptance.verify()
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=1.0)
+
+    assert requests == [
+        ("GET", "/api/v1/symbols/601872", b""),
+        (
+            "POST",
+            "/api/v1/jobs",
+            b'{"symbol":"601872","include_long_capture":false}',
+        ),
+        ("GET", "/api/v1/jobs/safe-public-id", b""),
+    ]
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda task: task.update(status="PARTIAL"),
+        lambda task: task.update(include_long_capture=True),
+        lambda task: task.update(error_code="VALUE_RECOGNITION_FAILED"),
+        lambda task: task["source_errors"].update(core_metrics="DIRECT_APP_OFFLINE"),
+        lambda task: task["long_capture"].update(status="READY", url="/capture"),
+        lambda task: task["captures"][0].update(status="READY", url="/capture/one"),
+        lambda task: task["values"].update(macdfs=None),
+        lambda task: task["value_sources"].update(macdfs="OCR"),
+        lambda task: task["values"]["intraday_series"]["large_order_net"].update(points=[]),
+        lambda task: task["value_sources"]["intraday_series"].update(large_order_net=None),
+        lambda task: task["values"]["main_fund_flow"]["today"].update(main_net_inflow=None),
+        lambda task: task["value_sources"]["main_fund_flow"]["today"].update(main_net_inflow=None),
+    ],
+    ids=(
+        "partial-status",
+        "capture-requested",
+        "task-error",
+        "source-error",
+        "long-capture",
+        "scalar-capture",
+        "missing-scalar",
+        "ocr-source",
+        "empty-intraday",
+        "intraday-source",
+        "missing-fund-value",
+        "fund-source",
+    ),
+)
+def test_data_only_acceptance_rejects_non_interface_or_capture_results(
+    mutate,
+) -> None:
+    """Any capture, fallback source, or incomplete App result must block READY."""
+    module = _load_macos_deploy()
+    task = copy.deepcopy(valid_acceptance_task())
+    mutate(task)
+
+    with pytest.raises(module.DeploymentError) as caught:
+        module.LoopbackDataOnlyAcceptance._validate_completed_task(task)
+
+    assert caught.value.error_code == "DATA_ONLY_ACCEPTANCE_FAILED"
 
 
 def test_provision_wrapper_resolves_the_project_root_and_forces_provision_mode(

@@ -17,6 +17,7 @@ import shutil
 import stat
 import subprocess
 import sys
+from tempfile import NamedTemporaryFile
 import time
 from typing import Callable, Mapping, Protocol
 from urllib.error import HTTPError, URLError
@@ -79,6 +80,74 @@ _ACCEPTANCE_REQUIRED_VALUES = (
     "retail_count",
     "macdfs",
 )
+_ACCEPTANCE_CAPTURE_KINDS = frozenset(
+    {"LARGE_ORDER_NET", "LARGE_ORDER_AMOUNT", "RETAIL_COUNT"}
+)
+_ACCEPTANCE_INTRADAY_FIELDS = (
+    "large_order_net",
+    "large_order_amount",
+    "retail_count",
+)
+_ACCEPTANCE_FUND_PERIODS = ("today", "three_day", "five_day")
+_ACCEPTANCE_FUND_FIELDS = (
+    "main_net_inflow",
+    "main_visible_inflow",
+    "main_hidden_inflow",
+    "retail_inflow",
+)
+PROVISIONING_JOURNAL_PATH = (
+    Path.home() / ".config/ths-device-provisioning.json"
+)
+_PROVISIONING_STEPS = (
+    "PENDING_CREATE",
+    "AVD_CREATED",
+    "ASSETS_PROVISIONED",
+)
+SESSION_READINESS_MAX_AGE_SECONDS = 86_400
+SESSION_READINESS_PROBE = """\
+import os
+import stat
+from datetime import datetime, timezone
+from pathlib import Path
+from level2_service.app_sessions import EncryptedFileSessionProvider
+
+ready = False
+try:
+    root = Path(os.environ["THS_SESSION_ROOT"])
+    key = os.environ["THS_SESSION_ENCRYPTION_KEY"]
+    roles = ("core_metrics", "main_fund_flow")
+    files_safe = True
+    for role in roles:
+        path = root / f"{role}.session"
+        metadata = path.lstat()
+        files_safe = files_safe and (
+            stat.S_ISREG(metadata.st_mode)
+            and not stat.S_ISLNK(metadata.st_mode)
+            and stat.S_IMODE(metadata.st_mode) == 0o600
+            and metadata.st_uid == os.getuid()
+            and metadata.st_size > 0
+        )
+    if files_safe:
+        provider = EncryptedFileSessionProvider(root, key)
+        now = datetime.now(timezone.utc)
+        statuses = [provider.status(role).as_public() for role in roles]
+        ready = all(
+            status.get("role") == role
+            and status.get("state") == "READY"
+            and status.get("error_code") is None
+            and isinstance(status.get("updated_at"), str)
+            and 0 <= (
+                now - datetime.fromisoformat(status["updated_at"])
+            ).total_seconds() <= __MAX_SESSION_AGE_SECONDS__
+            for role, status in zip(roles, statuses, strict=True)
+        )
+except Exception:
+    ready = False
+print("READY" if ready else "NOT_READY")
+""".replace(
+    "__MAX_SESSION_AGE_SECONDS__",
+    str(SESSION_READINESS_MAX_AGE_SECONDS),
+)
 _FIRST_TIME_LOGIN_INSTRUCTIONS = (
     "Open http://127.0.0.1:8001/#admin.",
     "Manually log in and complete verification for each newly created role.",
@@ -122,6 +191,18 @@ class LifecycleBroker(Protocol):
 
 class DataOnlyAcceptance(Protocol):
     def verify(self) -> None: ...
+
+
+class ProvisioningJournalStore(Protocol):
+    def load(self) -> dict[str, str]: ...
+
+    def record_initial_missing(
+        self, roles: frozenset[str]
+    ) -> dict[str, str]: ...
+
+    def set_step(self, role: str, step: str) -> None: ...
+
+    def complete(self, role: str) -> None: ...
 
 
 class FileSystem(Protocol):
@@ -209,6 +290,170 @@ class PathFileSystem:
 
     def which(self, command: str) -> str | None:
         return shutil.which(command)
+
+
+class ProvisioningJournal:
+    """Atomic, mode-0600 journal for only the fixed provisioning roles."""
+
+    _MAX_BYTES = 16_384
+
+    def __init__(self, path: Path = PROVISIONING_JOURNAL_PATH) -> None:
+        expanded = path.expanduser()
+        self.path = (
+            expanded
+            if expanded.is_absolute()
+            else Path(os.path.abspath(expanded))
+        )
+
+    def load(self) -> dict[str, str]:
+        try:
+            metadata = os.lstat(self.path)
+        except FileNotFoundError:
+            return {}
+        except OSError:
+            raise DeploymentError("PROVISIONING_JOURNAL_INVALID") from None
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+            or metadata.st_uid != os.getuid()
+            or metadata.st_size <= 0
+            or metadata.st_size > self._MAX_BYTES
+        ):
+            raise DeploymentError("PROVISIONING_JOURNAL_INVALID")
+        flags = os.O_RDONLY
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        try:
+            descriptor = os.open(self.path, flags)
+            with os.fdopen(descriptor, "rb") as handle:
+                current = os.fstat(handle.fileno())
+                if (
+                    not stat.S_ISREG(current.st_mode)
+                    or stat.S_IMODE(current.st_mode) != 0o600
+                    or current.st_uid != os.getuid()
+                    or current.st_size != metadata.st_size
+                ):
+                    raise DeploymentError("PROVISIONING_JOURNAL_INVALID")
+                raw = handle.read(self._MAX_BYTES + 1)
+            document = json.loads(raw.decode("utf-8"))
+        except DeploymentError:
+            raise
+        except Exception:
+            raise DeploymentError("PROVISIONING_JOURNAL_INVALID") from None
+        if len(raw) > self._MAX_BYTES:
+            raise DeploymentError("PROVISIONING_JOURNAL_INVALID")
+        return self._validate_document(document)
+
+    def record_initial_missing(
+        self, roles: frozenset[str]
+    ) -> dict[str, str]:
+        if not roles.issubset(FIXED_ROLES):
+            raise DeploymentError("PROVISIONING_JOURNAL_INVALID")
+        steps = self.load()
+        changed = False
+        for role in FIXED_ROLES:
+            if role in roles and role not in steps:
+                steps[role] = "PENDING_CREATE"
+                changed = True
+        if changed:
+            self._write(steps)
+        return dict(steps)
+
+    def set_step(self, role: str, step: str) -> None:
+        steps = self.load()
+        current = steps.get(role)
+        transitions = {
+            "PENDING_CREATE": "AVD_CREATED",
+            "AVD_CREATED": "ASSETS_PROVISIONED",
+        }
+        if (
+            role not in FIXED_ROLES
+            or step not in _PROVISIONING_STEPS
+            or current is None
+            or (step != current and transitions.get(current) != step)
+        ):
+            raise DeploymentError("PROVISIONING_JOURNAL_INVALID")
+        if step != current:
+            steps[role] = step
+            self._write(steps)
+
+    def complete(self, role: str) -> None:
+        steps = self.load()
+        if steps.get(role) != "ASSETS_PROVISIONED":
+            raise DeploymentError("PROVISIONING_JOURNAL_INVALID")
+        del steps[role]
+        self._write(steps)
+
+    @staticmethod
+    def _validate_document(document: object) -> dict[str, str]:
+        if (
+            not isinstance(document, dict)
+            or set(document) != {"version", "roles"}
+            or document.get("version") != 1
+            or not isinstance(document.get("roles"), dict)
+        ):
+            raise DeploymentError("PROVISIONING_JOURNAL_INVALID")
+        raw_roles = document["roles"]
+        steps: dict[str, str] = {}
+        for role, entry in raw_roles.items():
+            if (
+                role not in FIXED_ROLES
+                or not isinstance(entry, dict)
+                or set(entry) != {"avd_name", "step"}
+                or entry.get("avd_name") != FIXED_ROLES[role][0]
+                or entry.get("step") not in _PROVISIONING_STEPS
+            ):
+                raise DeploymentError("PROVISIONING_JOURNAL_INVALID")
+            steps[role] = entry["step"]
+        return steps
+
+    def _write(self, steps: dict[str, str]) -> None:
+        if not set(steps).issubset(FIXED_ROLES) or any(
+            step not in _PROVISIONING_STEPS for step in steps.values()
+        ):
+            raise DeploymentError("PROVISIONING_JOURNAL_INVALID")
+        document = {
+            "version": 1,
+            "roles": {
+                role: {"avd_name": FIXED_ROLES[role][0], "step": steps[role]}
+                for role in FIXED_ROLES
+                if role in steps
+            },
+        }
+        encoded = json.dumps(
+            document,
+            ensure_ascii=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        if len(encoded) > self._MAX_BYTES:
+            raise DeploymentError("PROVISIONING_JOURNAL_INVALID")
+        temporary: Path | None = None
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            with NamedTemporaryFile(
+                dir=self.path.parent,
+                prefix=f".{self.path.name}.",
+                delete=False,
+            ) as handle:
+                temporary = Path(handle.name)
+                os.chmod(temporary, 0o600)
+                handle.write(encoded)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, self.path)
+            os.chmod(self.path, 0o600)
+            directory = os.open(self.path.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
+        except Exception:
+            if temporary is not None:
+                try:
+                    temporary.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            raise DeploymentError("PROVISIONING_JOURNAL_INVALID") from None
 
 
 class LoopbackLifecycleBroker:
@@ -311,13 +556,14 @@ class LoopbackDataOnlyAcceptance:
         self,
         *,
         opener: Callable[..., object] | None = None,
+        base_url: str = "http://127.0.0.1:8001",
         timeout_seconds: float = 180.0,
         poll_interval_seconds: float = 2.0,
     ) -> None:
         self._opener = opener or urlopen
         self._timeout_seconds = timeout_seconds
         self._poll_interval_seconds = poll_interval_seconds
-        self._base_url = "http://127.0.0.1:8001"
+        self._base_url = base_url.rstrip("/")
 
     def verify(self) -> None:
         symbol = self._request_json("GET", f"/api/v1/symbols/{_ACCEPTANCE_SYMBOL}")
@@ -355,16 +601,106 @@ class LoopbackDataOnlyAcceptance:
     @staticmethod
     def _validate_completed_task(task: dict[str, object]) -> None:
         values = task.get("values")
+        sources = task.get("value_sources")
+        source_errors = task.get("source_errors")
+        long_capture = task.get("long_capture")
+        captures = task.get("captures")
         if (
-            task.get("symbol") != _ACCEPTANCE_SYMBOL
+            task.get("status") != "COMPLETED"
+            or task.get("symbol") != _ACCEPTANCE_SYMBOL
             or task.get("include_long_capture") is not False
+            or task.get("error_code") is not None
             or not isinstance(values, dict)
+            or not isinstance(sources, dict)
+            or source_errors
+            != {"core_metrics": None, "main_fund_flow": None}
+            or not isinstance(long_capture, dict)
+            or long_capture.get("status") != "SKIPPED"
+            or long_capture.get("url") is not None
+            or long_capture.get("expires_at") is not None
+            or not isinstance(captures, list)
             or any(
                 not isinstance(values.get(field), str) or not values[field]
                 for field in _ACCEPTANCE_REQUIRED_VALUES
             )
+            or any(
+                sources.get(field) != "INTERFACE"
+                for field in _ACCEPTANCE_REQUIRED_VALUES
+            )
         ):
             raise DeploymentError("DATA_ONLY_ACCEPTANCE_FAILED")
+        capture_kinds: set[str] = set()
+        for capture in captures:
+            if (
+                not isinstance(capture, dict)
+                or not isinstance(capture.get("kind"), str)
+                or capture.get("status") != "SKIPPED"
+                or capture.get("url") is not None
+                or capture.get("expires_at") is not None
+            ):
+                raise DeploymentError("DATA_ONLY_ACCEPTANCE_FAILED")
+            capture_kinds.add(capture["kind"])
+        if capture_kinds != _ACCEPTANCE_CAPTURE_KINDS or len(captures) != len(
+            _ACCEPTANCE_CAPTURE_KINDS
+        ):
+            raise DeploymentError("DATA_ONLY_ACCEPTANCE_FAILED")
+        intraday = values.get("intraday_series")
+        intraday_sources = sources.get("intraday_series")
+        if not isinstance(intraday, dict) or not isinstance(intraday_sources, dict):
+            raise DeploymentError("DATA_ONLY_ACCEPTANCE_FAILED")
+        for field in _ACCEPTANCE_INTRADAY_FIELDS:
+            curve = intraday.get(field)
+            if (
+                not isinstance(curve, dict)
+                or not isinstance(curve.get("unit"), str)
+                or not curve["unit"]
+                or not isinstance(curve.get("points"), list)
+                or not curve["points"]
+                or intraday_sources.get(field) != "INTERFACE"
+            ):
+                raise DeploymentError("DATA_ONLY_ACCEPTANCE_FAILED")
+            times: list[str] = []
+            valid_values = 0
+            for point in curve["points"]:
+                if not isinstance(point, dict):
+                    raise DeploymentError("DATA_ONLY_ACCEPTANCE_FAILED")
+                point_time = point.get("time")
+                point_value = point.get("value")
+                if (
+                    not isinstance(point_time, str)
+                    or re.fullmatch(r"(?:[01][0-9]|2[0-3]):[0-5][0-9]", point_time)
+                    is None
+                    or (
+                        point_value is not None
+                        and (not isinstance(point_value, str) or not point_value)
+                    )
+                ):
+                    raise DeploymentError("DATA_ONLY_ACCEPTANCE_FAILED")
+                times.append(point_time)
+                if isinstance(point_value, str):
+                    valid_values += 1
+            if times != sorted(times) or valid_values == 0:
+                raise DeploymentError("DATA_ONLY_ACCEPTANCE_FAILED")
+        fund = values.get("main_fund_flow")
+        fund_sources = sources.get("main_fund_flow")
+        if not isinstance(fund, dict) or not isinstance(fund_sources, dict):
+            raise DeploymentError("DATA_ONLY_ACCEPTANCE_FAILED")
+        for period in _ACCEPTANCE_FUND_PERIODS:
+            period_values = fund.get(period)
+            period_sources = fund_sources.get(period)
+            if (
+                not isinstance(period_values, dict)
+                or not isinstance(period_sources, dict)
+                or not isinstance(period_values.get("unit"), str)
+                or not period_values["unit"]
+                or any(
+                    not isinstance(period_values.get(field), str)
+                    or not period_values[field]
+                    or period_sources.get(field) != "INTERFACE"
+                    for field in _ACCEPTANCE_FUND_FIELDS
+                )
+            ):
+                raise DeploymentError("DATA_ONLY_ACCEPTANCE_FAILED")
 
     def _request_json(
         self,
@@ -387,7 +723,9 @@ class LoopbackDataOnlyAcceptance:
         )
         request_timeout = max(0.1, min(10.0, self._timeout_seconds))
         try:
-            with self._opener(request, request_timeout) as response:  # type: ignore[attr-defined]
+            with self._opener(  # type: ignore[attr-defined]
+                request, timeout=request_timeout
+            ) as response:
                 raw = response.read()
             document = json.loads(raw.decode("utf-8"))
         except Exception:
@@ -408,6 +746,7 @@ class MacDeploymentOrchestrator:
         env_file: Path = Path(".env"),
         process_executable_resolver: ProcessExecutableResolver | None = None,
         data_only_acceptance: DataOnlyAcceptance | None = None,
+        provisioning_journal: ProvisioningJournalStore | None = None,
         health_timeout_seconds: float = 180.0,
         boot_timeout_seconds: float = 180.0,
         poll_interval_seconds: float = 2.0,
@@ -429,6 +768,7 @@ class MacDeploymentOrchestrator:
         self._root_environment: dict[str, str] = {}
         self._trusted_emulator_path: Path | None = None
         self._data_only_acceptance = data_only_acceptance
+        self._provisioning_journal = provisioning_journal or ProvisioningJournal()
         self._initial_missing_roles: frozenset[str] | None = None
         self._process_executable_resolver = (
             process_executable_resolver or DarwinProcessExecutableResolver()
@@ -446,11 +786,10 @@ class MacDeploymentOrchestrator:
             return self.provision_missing()
         if mode != "auto":
             raise DeploymentError("DEPLOYMENT_MODE_INVALID")
+        journaled = self._provisioning_journal.load()
         self._validate_command_presence()
-        initial_missing = self._record_initial_missing_roles(
-            self._missing_fixed_roles()
-        )
-        if not initial_missing:
+        initial_missing = self._missing_fixed_roles()
+        if not initial_missing and not journaled:
             return self.deploy_existing()
         return self.provision_missing(initial_missing)
 
@@ -463,10 +802,16 @@ class MacDeploymentOrchestrator:
     ) -> DeploymentResult:
         self._validate_env_file_location()
         self._validate_command_presence()
-        missing_roles = self._record_initial_missing_roles(
+        actual_missing = (
             initial_missing_roles
             if initial_missing_roles is not None
             else self._missing_fixed_roles()
+        )
+        journal_steps = self._provisioning_journal.record_initial_missing(
+            actual_missing
+        )
+        provisioning_roles = self._record_initial_missing_roles(
+            frozenset(journal_steps)
         )
         self._validate_host_prerequisites(provision_system_image=True)
         self._root_environment = self._ensure_root_environment()
@@ -475,20 +820,39 @@ class MacDeploymentOrchestrator:
         self._build_local_image()
         manifest = self._read_image_manifest()
         preserved_roles = tuple(
-            role for role in FIXED_ROLES if role not in missing_roles
+            role for role in FIXED_ROLES if role not in provisioning_roles
         )
         self._verify_preinstall_fixed_avd_identities(preserved_roles)
         for role in FIXED_ROLES:
-            if role not in missing_roles:
+            if role not in provisioning_roles:
                 continue
-            self._create_fixed_avd(role)
-            self._start_created_avd(role)
-            self._provision_created_avd(role)
-            if role == "core_metrics":
-                self._calibrate_created_core()
+            step = journal_steps[role]
+            if role in actual_missing:
+                if step == "ASSETS_PROVISIONED":
+                    raise DeploymentError("PROVISIONING_JOURNAL_INVALID")
+                self._create_fixed_avd(role)
+                self._provisioning_journal.set_step(role, "AVD_CREATED")
+                step = "AVD_CREATED"
+            elif step == "PENDING_CREATE":
+                self._provisioning_journal.set_step(role, "AVD_CREATED")
+                step = "AVD_CREATED"
+            if step == "AVD_CREATED":
+                self._ensure_provisioning_avd_booted(role)
+                self._provision_created_avd(role)
+                self._provisioning_journal.set_step(
+                    role, "ASSETS_PROVISIONED"
+                )
+            elif step != "ASSETS_PROVISIONED":
+                raise DeploymentError("PROVISIONING_JOURNAL_INVALID")
         self._install_lifecycle_service()
-        self._start_and_launch_roles(tuple(FIXED_ROLES))
-        self._verify_fixed_avd_identities()
+        for role in FIXED_ROLES:
+            if role not in provisioning_roles:
+                continue
+            self._start_and_launch_roles((role,))
+            self._provisioning_journal.complete(role)
+        self._verify_fixed_avd_identities(
+            tuple(role for role in FIXED_ROLES if role in provisioning_roles)
+        )
         self._verify_installed_apks(manifest["apk"]["sha256"])
         self._validate_effective_compose_config()
         self._compose_up()
@@ -893,6 +1257,26 @@ class MacDeploymentOrchestrator:
         )
         self._wait_for_created_avd_boot(role)
 
+    def _ensure_provisioning_avd_booted(self, role: str) -> None:
+        _avd_name, serial = FIXED_ROLES[role]
+        try:
+            state_result = self._runner.run(
+                ("adb", "-s", serial, "get-state"), 15.0
+            )
+        except Exception:
+            raise DeploymentError("FIXED_AVD_IDENTITY_MISMATCH") from None
+        if state_result.returncode == 0:
+            state = self._stdout_text(state_result).strip()
+            if state not in _SAFE_ADB_STATES:
+                raise DeploymentError("FIXED_AVD_IDENTITY_MISMATCH")
+            attached = True
+        else:
+            attached = serial in self._list_adb_devices()
+        if attached:
+            self._wait_for_created_avd_boot(role)
+            return
+        self._start_created_avd(role)
+
     def _wait_for_created_avd_boot(self, role: str) -> None:
         expected_avd, serial = FIXED_ROLES[role]
         deadline = time.monotonic() + self._boot_timeout_seconds
@@ -944,14 +1328,6 @@ class MacDeploymentOrchestrator:
             ),
             300.0,
             "DEVICE_PROVISION_FAILED",
-        )
-
-    def _calibrate_created_core(self) -> None:
-        calibrator = self._project_root / "scripts/configure-macos-core-display.sh"
-        self._run(
-            (str(calibrator), FIXED_ROLES["core_metrics"][1], "adb"),
-            30.0,
-            "DEVICE_DISPLAY_CALIBRATION_FAILED",
         )
 
     def _verify_fixed_avd_identities(
@@ -1202,22 +1578,23 @@ class MacDeploymentOrchestrator:
         )
 
     def _session_bundles_ready(self) -> bool:
-        probe = (
-            "from pathlib import Path; "
-            "root=Path('/data/admin/ths-sessions'); "
-            "names=('core_metrics.session','main_fund_flow.session'); "
-            "print('READY' if all((root/name).is_file() for name in names) else 'MISSING')"
-        )
         result = self._run(
             self._compose_prefix()
-            + ("exec", "-T", "api", "python", "-c", probe),
+            + (
+                "exec",
+                "-T",
+                "api",
+                "python",
+                "-c",
+                SESSION_READINESS_PROBE,
+            ),
             30.0,
             "SESSION_STATUS_UNAVAILABLE",
         )
         state = self._stdout_text(result).strip()
         if state == "READY":
             return True
-        if state == "MISSING":
+        if state == "NOT_READY":
             return False
         raise DeploymentError("SESSION_STATUS_UNAVAILABLE")
 

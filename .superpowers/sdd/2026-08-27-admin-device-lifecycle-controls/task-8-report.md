@@ -120,3 +120,118 @@ Homebrew/OrbStack/JDK installer, reinstall, clear/reset, AVD deletion,
   device action, App navigation, login, session refresh, or market task ran.
 - Neither real AVD, emulator, account, session bundle, Docker volume, `.env`, nor
   `deploy/macos.env` state was changed.
+
+## Fix round 1 — acceptance, session validation, journal recovery, and role scope
+
+### Corrected findings
+
+- `LoopbackDataOnlyAcceptance` now calls its opener with
+  `timeout=<seconds>` as a keyword. The injected opener is keyword-only, and a
+  loopback `ThreadingHTTPServer` regression exercises the real `urllib`
+  request/response boundary.
+- Acceptance requires the full data-only contract: `COMPLETED`, no task/source
+  errors, `include_long_capture=false`, all capture records and long capture
+  `SKIPPED` with no URL, eight nonempty scalar values with `INTERFACE` sources,
+  three valid ordered App-internal intraday curves with `INTERFACE` sources, and
+  complete 1/3/5-day fund periods with `INTERFACE` sources. Capture, OCR/public
+  fallback, missing values, and partial results are rejected.
+- Session readiness now runs a fixed Python probe inside the deployed API
+  container. It uses `EncryptedFileSessionProvider` and each fixed role's public
+  status, decrypts and role-validates both bundles, requires regular owned
+  mode-0600 nonempty files and a READY timestamp no older than 24 hours, and
+  emits only `READY` or `NOT_READY`. Empty, corrupt, symlinked, role-swapped,
+  wrong-key, stale, and missing states are rejected.
+- Added the fixed host journal
+  `~/.config/ths-device-provisioning.json`. It is written atomically as mode
+  `0600`, owned by the current user, and accepts only version 1, the two fixed
+  roles/AVD names, and `PENDING_CREATE`, `AVD_CREATED`, or
+  `ASSETS_PROVISIONED`. Corruption, extra fields, wrong modes, symlinks, wrong
+  roles/names, and invalid transitions fail with
+  `PROVISIONING_JOURNAL_INVALID`.
+- Initial missing roles are journaled before AVD creation. A boot-timeout rerun
+  resumes the journaled AVD without `--force`, recreation, deletion, or reset;
+  asset installation and lifecycle work continue from the recorded step. A role
+  is removed only after its fixed lifecycle action reaches `RUNNING`.
+- Provisioning lifecycle actions now target only current or journaled
+  provisioning roles. Pre-existing core/fund roles receive no lifecycle action.
+  Direct core calibration was removed; one fixed lifecycle action performs the
+  new core calibration. A rerun with no missing or incomplete roles performs no
+  lifecycle action.
+
+### Exact RED evidence
+
+Acceptance transport and strict result validation:
+
+```text
+/Users/wilson/tonghuashun/.venv/bin/python -m pytest -q \
+  tests/test_macos_one_click_deploy.py -k 'data_only_acceptance'
+12 failed, 2 passed, 66 deselected
+```
+
+The keyword-only fake rejected the positional timeout, the real loopback server
+constructor was unavailable, and the incomplete/capture/fallback mutations were
+accepted by the old scalar-only validator.
+
+Encrypted session readiness:
+
+```text
+/Users/wilson/tonghuashun/.venv/bin/python -m pytest -q \
+  tests/test_macos_one_click_deploy.py \
+  -k 'session_readiness_probe or fixed_in_container_session'
+9 failed, 80 deselected
+```
+
+The production probe constant and provider-based command did not exist; the old
+implementation performed only `Path.is_file()` checks.
+
+Journal recovery and lifecycle scope:
+
+```text
+/Users/wilson/tonghuashun/.venv/bin/python -m pytest -q \
+  tests/test_macos_one_click_deploy.py \
+  -k 'provisioning_journal or boot_timeout_rerun or lifecycle_touches or \
+      rerun_without_incomplete or partial_provisioning_preserves or \
+      provisioning_uses_only_fixed'
+11 failed, 87 deselected
+```
+
+The journal interface/class was absent, direct core calibration still ran, and
+provisioning still sent lifecycle actions to both roles.
+
+### Exact GREEN and covering evidence
+
+```text
+# Acceptance transport and strictness
+14 passed, 84 deselected in 0.55s
+
+# Encrypted session readiness
+9 passed, 89 deselected in 0.47s
+
+# Journal recovery and lifecycle scope
+11 passed, 87 deselected in 0.05s
+
+# Complete Task 8 backend file
+98 passed in 2.66s
+```
+
+Full regression and artifact checks:
+
+```text
+/Users/wilson/tonghuashun/.venv/bin/python -m pytest -q
+723 passed, 24 existing warnings in 27.69s
+
+cd frontend
+npm test -- --run src/AdminPage.test.tsx
+1 file passed, 26 tests passed
+
+npm run build
+TypeScript and Vite build completed successfully
+
+/Users/wilson/tonghuashun/.venv/bin/python -m py_compile scripts/macos_deploy.py
+/bin/sh -n scripts/provision-macos-from-image.sh scripts/deploy-macos-one-click.sh
+git diff --check
+```
+
+All fixes remained fake/local-only: no real SDK, ADB, Emulator, AVD, Docker
+deployment, lifecycle broker, admin session, device action, App navigation,
+session refresh, or market task ran.

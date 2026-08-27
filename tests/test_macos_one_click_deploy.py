@@ -531,8 +531,27 @@ class FakeFileSystem:
     def which(self, command: str) -> str | None:
         return f"/fake/{command}" if command in self.commands else None
 
+    def free_bytes(self, _path: Path) -> int:
+        return 30 * 1024**3
+
+    def is_secure_owner_file(self, path: Path) -> bool:
+        resolved = path.resolve()
+        return resolved in self.files and self.files[resolved][1] == 0o600
+
     def write_env(self) -> None:
         self.files[(ROOT / ".env").resolve()] = (REQUIRED_ROOT_ENV, 0o600)
+
+    def upgrade_env(self) -> None:
+        path = (ROOT / ".env").resolve()
+        content, _mode = self.files[path]
+        if "THS_SESSION_ENCRYPTION_KEY=" not in content:
+            content += (
+                "THS_SESSION_ENCRYPTION_KEY="
+                "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=\n"
+            )
+        if "THS_DEVICE_LIFECYCLE_TOKEN=" not in content:
+            content += "THS_DEVICE_LIFECYCLE_TOKEN=lifecycle-secret-value\n"
+        self.files[path] = (content, 0o600)
 
 
 class FakeCommandRunner:
@@ -716,9 +735,44 @@ class FakeCommandRunner:
             return _completed(args, stdout=f"{identity}\nOK\n".encode())
         if "config" in args and "--format" in args:
             payload = {
+                "name": "ths-level2",
                 "services": {
-                    "api": {"environment": self.compose_environment},
-                }
+                    "api": {
+                        "environment": {
+                            **self.compose_environment,
+                            "THS_SESSION_ROOT": "/data/admin/ths-sessions",
+                        },
+                        "ports": [
+                            {
+                                "mode": "ingress",
+                                "target": 8000,
+                                "published": "8001",
+                                "protocol": "tcp",
+                            }
+                        ],
+                        "volumes": [
+                            {"type": "volume", "source": "capture-data", "target": "/data/captures"},
+                            {"type": "volume", "source": "template-data", "target": "/data/templates"},
+                            {"type": "volume", "source": "admin-data", "target": "/data/admin"},
+                            {"type": "volume", "source": "market-data", "target": "/data/market"},
+                        ],
+                    },
+                    "redis": {
+                        "volumes": [
+                            {"type": "volume", "source": "redis-data", "target": "/data"}
+                        ]
+                    },
+                },
+                "volumes": {
+                    name: {"name": f"ths-level2_{name}"}
+                    for name in (
+                        "capture-data",
+                        "template-data",
+                        "admin-data",
+                        "market-data",
+                        "redis-data",
+                    )
+                },
             }
             return _completed(args, stdout=json.dumps(payload).encode())
         if "/opt/ths/assets/manifest.json" in args:
@@ -746,7 +800,10 @@ class FakeCommandRunner:
         if args and args[0].endswith("setup-admin.sh"):
             self.events.append("setup-admin")
             assert self.filesystem is not None
-            self.filesystem.write_env()
+            if "--upgrade-existing" in args:
+                self.filesystem.upgrade_env()
+            else:
+                self.filesystem.write_env()
             return _completed(args)
         if "pm" in args and "path" in args:
             return _completed(

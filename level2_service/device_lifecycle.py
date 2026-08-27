@@ -8,11 +8,11 @@ import re
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import StrEnum
-from socket import timeout as SocketTimeout
 from typing import Callable, Protocol
-from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
-from urllib.request import Request, urlopen
+from urllib.request import Request
+
+from .safe_http import SafeHttpError, SafeHttpStatusError, SafeHttpTransport
 
 
 _ALLOWED_HOSTS = frozenset({"host.docker.internal", "127.0.0.1", "localhost"})
@@ -82,10 +82,6 @@ class _Response(Protocol):
 _Opener = Callable[[Request, float], _Response]
 
 
-def _open(request: Request, timeout_seconds: float) -> _Response:
-    return urlopen(request, timeout=timeout_seconds)
-
-
 @dataclass(frozen=True, init=False)
 class DeviceLifecycleClient:
     """Narrow, token-redacting transport to the local lifecycle broker."""
@@ -94,6 +90,7 @@ class DeviceLifecycleClient:
     _token: str = field(repr=False)
     _timeout_seconds: float
     _opener: _Opener = field(repr=False, compare=False)
+    _transport: SafeHttpTransport = field(repr=False, compare=False)
 
     def __init__(
         self,
@@ -101,7 +98,7 @@ class DeviceLifecycleClient:
         token: str,
         *,
         timeout_seconds: float = 5.0,
-        opener: _Opener = _open,
+        opener: _Opener | None = None,
     ) -> None:
         normalized_url = self.validate_base_url(base_url)
         if not isinstance(token, str) or not token:
@@ -115,7 +112,16 @@ class DeviceLifecycleClient:
         object.__setattr__(self, "_base_url", normalized_url)
         object.__setattr__(self, "_token", token)
         object.__setattr__(self, "_timeout_seconds", float(timeout_seconds))
-        object.__setattr__(self, "_opener", opener)
+        object.__setattr__(self, "_opener", opener or (lambda *_args: None))
+        object.__setattr__(
+            self,
+            "_transport",
+            SafeHttpTransport(
+                normalized_url,
+                max_body_bytes=64 * 1024,
+                opener=opener,
+            ),
+        )
 
     @staticmethod
     def validate_base_url(base_url: str) -> str:
@@ -193,32 +199,21 @@ class DeviceLifecycleClient:
         request = Request(
             f"{self._base_url}{path}", data=data, headers=headers, method=method
         )
-        response: _Response | None = None
         try:
-            response = self._opener(request, self._timeout_seconds)
+            response = self._transport.request(request, self._timeout_seconds)
             if response.status != expected_status:
                 raise DeviceLifecycleError(
                     self._status_error_code(response.status)
                 )
-            raw_body = response.read()
+            raw_body = response.body
         except DeviceLifecycleError:
             raise
-        except HTTPError as error:
-            raise DeviceLifecycleError(self._status_error_code(error.code)) from None
-        except (TimeoutError, SocketTimeout, URLError, OSError):
+        except SafeHttpStatusError as error:
+            raise DeviceLifecycleError(self._status_error_code(error.status)) from None
+        except SafeHttpError:
             raise DeviceLifecycleError("DEVICE_LIFECYCLE_UNAVAILABLE") from None
         except Exception:
             raise DeviceLifecycleError("DEVICE_LIFECYCLE_UNAVAILABLE") from None
-        finally:
-            if response is not None:
-                close = getattr(response, "close", None)
-                if callable(close):
-                    try:
-                        close()
-                    except Exception:
-                        raise DeviceLifecycleError(
-                            "DEVICE_LIFECYCLE_UNAVAILABLE"
-                        ) from None
         try:
             document = json.loads(raw_body.decode("utf-8"))
         except (UnicodeDecodeError, ValueError):

@@ -20,8 +20,14 @@ import sys
 from tempfile import NamedTemporaryFile
 import time
 from typing import Callable, Mapping, Protocol
-from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
+from urllib.request import Request
+
+
+PROJECT_IMPORT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_IMPORT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_IMPORT_ROOT))
+
+from level2_service.safe_http import SafeHttpError, SafeHttpStatusError, SafeHttpTransport
 
 
 APK_SHA256 = "2554490aa3f5e2df17ac0a711311f3f85ee3130008af9bb4ab12510b3d6e971e"
@@ -29,6 +35,8 @@ FRIDA_SHA256 = "36ec3d7474b1ac69c4e7ec985612fae771d37ffb71cb94858bc6978f69f5e581
 FRIDA_BINARY_SHA256 = "4eebf1fbc66ff54aba9a9124c2ef8b32b566616388c60e2caa65148a529d826a"
 ANDROID_SYSTEM_IMAGE = "system-images;android-33;google_apis;arm64-v8a"
 IMAGE_NAME = "ths-level2-api:local"
+COMPOSE_PROJECT_NAME = "ths-level2"
+MINIMUM_FREE_BYTES = 30 * 1024**3
 PACKAGE_NAME = "com.hexin.plat.android"
 FIXED_ROLES = {
     "core_metrics": ("THS_CORE_33_ARM64", "emulator-5556"),
@@ -207,6 +215,10 @@ class FileSystem(Protocol):
 
     def which(self, command: str) -> str | None: ...
 
+    def free_bytes(self, path: Path) -> int: ...
+
+    def is_secure_owner_file(self, path: Path) -> bool: ...
+
 
 class ProcessExecutableResolver(Protocol):
     def resolve(self, pid: int) -> Path: ...
@@ -249,6 +261,9 @@ class SubprocessCommandRunner:
     def __init__(self, project_root: Path) -> None:
         self._project_root = project_root
         self._environment = dict(os.environ)
+        for key in tuple(self._environment):
+            if key.startswith("COMPOSE_"):
+                self._environment.pop(key, None)
         for key in SANITIZED_AMBIENT_KEYS:
             self._environment.pop(key, None)
 
@@ -283,6 +298,24 @@ class PathFileSystem:
 
     def which(self, command: str) -> str | None:
         return shutil.which(command)
+
+    def free_bytes(self, path: Path) -> int:
+        candidate = path.expanduser().resolve()
+        while not candidate.exists() and candidate != candidate.parent:
+            candidate = candidate.parent
+        return shutil.disk_usage(candidate).free
+
+    def is_secure_owner_file(self, path: Path) -> bool:
+        try:
+            metadata = os.lstat(path)
+        except OSError:
+            return False
+        return (
+            stat.S_ISREG(metadata.st_mode)
+            and not stat.S_ISLNK(metadata.st_mode)
+            and stat.S_IMODE(metadata.st_mode) == 0o600
+            and metadata.st_uid == os.getuid()
+        )
 
 
 class ProvisioningJournal:
@@ -553,10 +586,22 @@ class LoopbackDataOnlyAcceptance:
         timeout_seconds: float = 180.0,
         poll_interval_seconds: float = 2.0,
     ) -> None:
-        self._opener = opener or urlopen
         self._timeout_seconds = timeout_seconds
         self._poll_interval_seconds = poll_interval_seconds
         self._base_url = base_url.rstrip("/")
+        wrapped_opener = None
+        if opener is not None:
+            wrapped_opener = lambda request, timeout: opener(
+                request, timeout=timeout
+            )
+        try:
+            self._transport = SafeHttpTransport(
+                self._base_url,
+                max_body_bytes=1024 * 1024,
+                opener=wrapped_opener,
+            )
+        except ValueError:
+            raise DeploymentError("DATA_ONLY_ACCEPTANCE_FAILED") from None
 
     @staticmethod
     def _valid_current_price(value: object) -> bool:
@@ -831,11 +876,14 @@ class LoopbackDataOnlyAcceptance:
         )
         request_timeout = max(0.1, min(10.0, self._timeout_seconds))
         try:
-            with self._opener(  # type: ignore[attr-defined]
-                request, timeout=request_timeout
-            ) as response:
-                raw = response.read()
-            document = json.loads(raw.decode("utf-8"))
+            response = self._transport.request(request, request_timeout)
+            if not 200 <= response.status < 300:
+                raise DeploymentError("DATA_ONLY_ACCEPTANCE_FAILED")
+            document = json.loads(response.body.decode("utf-8"))
+        except DeploymentError:
+            raise
+        except (SafeHttpError, SafeHttpStatusError):
+            raise DeploymentError("DATA_ONLY_ACCEPTANCE_FAILED") from None
         except Exception:
             raise DeploymentError("DATA_ONLY_ACCEPTANCE_FAILED") from None
         if not isinstance(document, dict):
@@ -915,13 +963,13 @@ class MacDeploymentOrchestrator:
             if initial_missing_roles is not None
             else self._missing_fixed_roles()
         )
+        self._validate_host_prerequisites(provision_system_image=True)
         journal_steps = self._provisioning_journal.record_initial_missing(
             actual_missing
         )
         provisioning_roles = self._record_initial_missing_roles(
             frozenset(journal_steps)
         )
-        self._validate_host_prerequisites(provision_system_image=True)
         self._root_environment = self._ensure_root_environment()
         self._validate_macos_environment()
         self._validate_effective_compose_config()
@@ -1052,6 +1100,7 @@ class MacDeploymentOrchestrator:
         self, *, provision_system_image: bool = False
     ) -> None:
         self._validate_command_presence()
+        self._validate_disk_space()
         system = self._run(("uname", "-s"), 10.0, "UNSUPPORTED_HOST")
         architecture = self._run(("uname", "-m"), 10.0, "UNSUPPORTED_HOST")
         if self._stdout_text(system).strip() != "Darwin" or self._stdout_text(
@@ -1082,6 +1131,17 @@ class MacDeploymentOrchestrator:
             if not provision_system_image:
                 raise DeploymentError("ANDROID_33_ARM64_UNAVAILABLE")
             self._install_android_system_image()
+
+    def _validate_disk_space(self) -> None:
+        try:
+            free_values = (
+                self._filesystem.free_bytes(self._project_root),
+                self._filesystem.free_bytes(Path.home() / ".android/avd"),
+            )
+        except Exception:
+            raise DeploymentError("INSUFFICIENT_DISK_SPACE") from None
+        if any(value < MINIMUM_FREE_BYTES for value in free_values):
+            raise DeploymentError("INSUFFICIENT_DISK_SPACE")
 
     def _install_android_system_image(self) -> None:
         command = ("sdkmanager", ANDROID_SYSTEM_IMAGE)
@@ -1161,9 +1221,39 @@ class MacDeploymentOrchestrator:
                 )
             if not self._filesystem.exists(self._env_file):
                 raise DeploymentError("ROOT_ENV_INVALID")
-            if self._filesystem.mode(self._env_file) != 0o600:
+            if (
+                self._filesystem.mode(self._env_file) != 0o600
+                or not self._filesystem.is_secure_owner_file(self._env_file)
+            ):
                 raise DeploymentError("ROOT_ENV_INVALID")
             values = self._parse_env(self._filesystem.read_text(self._env_file))
+            missing = {
+                key for key in REQUIRED_ROOT_ENV_KEYS if not values.get(key)
+            }
+            upgradeable = {
+                "THS_SESSION_ENCRYPTION_KEY",
+                "THS_DEVICE_LIFECYCLE_TOKEN",
+            }
+            if missing and missing.issubset(upgradeable):
+                setup = self._project_root / "scripts/setup-admin.sh"
+                self._run(
+                    (
+                        str(setup),
+                        "--upgrade-existing",
+                        str(self._env_file),
+                    ),
+                    300.0,
+                    "ROOT_ENV_SETUP_FAILED",
+                )
+                if (
+                    not self._filesystem.exists(self._env_file)
+                    or self._filesystem.mode(self._env_file) != 0o600
+                    or not self._filesystem.is_secure_owner_file(self._env_file)
+                ):
+                    raise DeploymentError("ROOT_ENV_INVALID")
+                values = self._parse_env(
+                    self._filesystem.read_text(self._env_file)
+                )
         except DeploymentError:
             raise
         except Exception:
@@ -1208,7 +1298,11 @@ class MacDeploymentOrchestrator:
             name, value = line.split("=", 1)
             name = name.strip()
             value = value.strip()
-            if not re.fullmatch(r"[A-Z][A-Z0-9_]*", name) or name in values:
+            if (
+                not re.fullmatch(r"[A-Z][A-Z0-9_]*", name)
+                or name in values
+                or name.startswith("COMPOSE_")
+            ):
                 raise DeploymentError("ROOT_ENV_INVALID")
             if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
                 value = value[1:-1]
@@ -1221,6 +1315,8 @@ class MacDeploymentOrchestrator:
             "--context",
             "orbstack",
             "compose",
+            "--project-name",
+            COMPOSE_PROJECT_NAME,
             "--env-file",
             self._env_argument,
             "--env-file",
@@ -1244,9 +1340,16 @@ class MacDeploymentOrchestrator:
         )
         try:
             document = json.loads(self._stdout_text(result))
-            environment = document["services"]["api"]["environment"]
+            services = document["services"]
+            api = services["api"]
+            redis_service = services["redis"]
+            environment = api["environment"]
+            ports = api["ports"]
+            api_volumes = api["volumes"]
+            redis_volumes = redis_service["volumes"]
+            volumes = document["volumes"]
         except (KeyError, TypeError, ValueError):
-            environment = None
+            raise DeploymentError("COMPOSE_CONFIG_INVALID") from None
         expected = {
             "THS_DEVICE_LIFECYCLE_URL": REQUIRED_MACOS_ENV[
                 "THS_DEVICE_LIFECYCLE_URL"
@@ -1258,9 +1361,65 @@ class MacDeploymentOrchestrator:
                 "THS_SESSION_ENCRYPTION_KEY"
             ],
         }
-        if not isinstance(environment, dict) or any(
+        expected_project_volumes = {
+            name: f"{COMPOSE_PROJECT_NAME}_{name}"
+            for name in (
+                "capture-data",
+                "template-data",
+                "admin-data",
+                "market-data",
+                "redis-data",
+            )
+        }
+
+        def volume_map(items: object) -> dict[str, str]:
+            if not isinstance(items, list):
+                raise DeploymentError("COMPOSE_CONFIG_INVALID")
+            mapped: dict[str, str] = {}
+            for item in items:
+                if (
+                    not isinstance(item, dict)
+                    or item.get("type") != "volume"
+                    or not isinstance(item.get("source"), str)
+                    or not isinstance(item.get("target"), str)
+                ):
+                    raise DeploymentError("COMPOSE_CONFIG_INVALID")
+                mapped[item["target"]] = item["source"]
+            return mapped
+
+        api_mounts = volume_map(api_volumes)
+        redis_mounts = volume_map(redis_volumes)
+        valid_port = (
+            isinstance(ports, list)
+            and len(ports) == 1
+            and isinstance(ports[0], dict)
+            and ports[0].get("target") == 8000
+            and str(ports[0].get("published")) == "8001"
+            and ports[0].get("protocol") == "tcp"
+        )
+        volume_names_valid = isinstance(volumes, dict) and all(
+            isinstance(volumes.get(source), dict)
+            and volumes[source].get("name") == resolved
+            for source, resolved in expected_project_volumes.items()
+        )
+        if (
+            document.get("name") != COMPOSE_PROJECT_NAME
+            or not isinstance(services, dict)
+            or set(services) != {"api", "redis"}
+            or not valid_port
+            or not volume_names_valid
+            or api_mounts.get("/data/captures") != "capture-data"
+            or api_mounts.get("/data/templates") != "template-data"
+            or api_mounts.get("/data/admin") != "admin-data"
+            or api_mounts.get("/data/market") != "market-data"
+            or redis_mounts != {"/data": "redis-data"}
+            or environment.get("THS_SESSION_ROOT")
+            != "/data/admin/ths-sessions"
+            or not isinstance(environment, dict)
+            or any(
             environment.get(key) != value or not value
             for key, value in expected.items()
+            )
         ):
             raise DeploymentError("COMPOSE_CONFIG_INVALID")
 

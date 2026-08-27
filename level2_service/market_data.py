@@ -142,7 +142,8 @@ class MarketDataBroker:
         self.clock = clock
         self.is_market_open = is_market_open
         self._subscriptions: dict[str, tuple[set[str], set[str]]] = {}
-        self._queues: dict[str, asyncio.Queue[dict[str, Any]]] = {}
+        self._queues: dict[str, asyncio.Queue[str]] = {}
+        self._pending_events: dict[str, dict[str, dict[str, Any]]] = {}
         self._cache: dict[str, MarketSnapshot] = {}
         self._sequence: dict[str, int] = {}
         self._last_polled: dict[str, float] = {}
@@ -156,11 +157,17 @@ class MarketDataBroker:
         detail_symbols: set[str],
     ) -> None:
         self._subscriptions[client_id] = (set(watchlist_symbols), set(detail_symbols))
-        self._queues.setdefault(client_id, asyncio.Queue(maxsize=1))
+        self._queues.setdefault(client_id, asyncio.Queue())
+        pending = self._pending_events.setdefault(client_id, {})
+        wanted = set(watchlist_symbols) | set(detail_symbols)
+        for symbol in tuple(pending):
+            if symbol not in wanted:
+                pending.pop(symbol, None)
 
     def unsubscribe(self, client_id: str) -> None:
         self._subscriptions.pop(client_id, None)
         self._queues.pop(client_id, None)
+        self._pending_events.pop(client_id, None)
 
     def has_subscriber(self, client_id: str) -> bool:
         return client_id in self._subscriptions
@@ -202,20 +209,25 @@ class MarketDataBroker:
         for client_id, queue in tuple(self._queues.items()):
             if not self._wanted(client_id, symbol):
                 continue
-            if queue.full():
-                try:
-                    queue.get_nowait()
-                except asyncio.QueueEmpty:
-                    pass
-            queue.put_nowait(event)
+            pending = self._pending_events.setdefault(client_id, {})
+            if symbol not in pending:
+                queue.put_nowait(symbol)
+            pending[symbol] = event
 
     async def next_event(self, client_id: str, *, timeout: float | None = None) -> dict[str, Any]:
         queue = self._queues.get(client_id)
-        if queue is None:
+        pending = self._pending_events.get(client_id)
+        if queue is None or pending is None:
             raise LookupError("market subscriber not found")
-        if timeout is None:
-            return await queue.get()
-        return await asyncio.wait_for(queue.get(), timeout=timeout)
+        symbol = (
+            await queue.get()
+            if timeout is None
+            else await asyncio.wait_for(queue.get(), timeout=timeout)
+        )
+        event = pending.pop(symbol, None)
+        if event is None:
+            raise LookupError("market event was removed")
+        return event
 
     async def refresh(
         self,

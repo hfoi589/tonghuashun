@@ -109,6 +109,28 @@ def test_broker_keeps_only_the_latest_event_for_a_slow_subscriber() -> None:
     assert event["data"]["sequence"] == 2
 
 
+def test_broker_keeps_the_latest_event_for_each_subscribed_symbol() -> None:
+    source = FakeMarketSource()
+    broker = MarketDataBroker(source, is_market_open=lambda: True)
+    broker.subscribe(
+        "multi",
+        watchlist_symbols={"601872", "300750"},
+        detail_symbols=set(),
+    )
+
+    asyncio.run(broker.refresh("601872", detail=False))
+    asyncio.run(broker.refresh("300750", detail=False))
+    events = [
+        asyncio.run(broker.next_event("multi", timeout=0.1)),
+        asyncio.run(broker.next_event("multi", timeout=0.1)),
+    ]
+
+    assert {event["data"]["symbol"] for event in events} == {
+        "601872",
+        "300750",
+    }
+
+
 def test_broker_pages_series_through_the_app_source_and_validates_periods() -> None:
     source = FakeMarketSource()
     broker = MarketDataBroker(source)

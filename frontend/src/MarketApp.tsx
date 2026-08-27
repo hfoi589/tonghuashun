@@ -73,9 +73,10 @@ export function nextIntradaySelectedTime(
     : current
 }
 
-function LineChart({ name, points, selectedTime, onSelectionChange }: {
+function LineChart({ name, points, pricePrecision, selectedTime, onSelectionChange }: {
   name: string,
   points: TimesharePoint[],
+  pricePrecision: number,
   selectedTime?: string,
   onSelectionChange: (time: string) => void,
 }) {
@@ -85,7 +86,7 @@ function LineChart({ name, points, selectedTime, onSelectionChange }: {
     return Number.isFinite(value) ? value : null
   })
   const data = priceValues.flatMap((value, index) => value === null ? [] : [{ index, value }])
-  if (data.length === 0) return <div className="market-empty-chart">暂无 App 内部分时数据</div>
+  if (data.length === 0) return <div className="market-empty-chart">暂无公开分时数据</div>
   const width = 900
   const height = 360
   const pad = { top: 22, right: 18, bottom: 38, left: 58 }
@@ -131,8 +132,8 @@ function LineChart({ name, points, selectedTime, onSelectionChange }: {
       <div><span>当日分时</span><h3>{name}</h3></div>
       <div className="market-timeshare-readout" aria-live="polite">
         <time>{selectedPoint.time}</time>
-        <span>价格</span><strong>{fixed(selectedPoint.price)}</strong>
-        {selectedPoint.average_price !== null && <><span>均价</span><b>{fixed(selectedPoint.average_price)}</b></>}
+        <span>价格</span><strong>{fixed(selectedPoint.price, pricePrecision)}</strong>
+        {selectedPoint.average_price !== null && <><span>均价</span><b>{fixed(selectedPoint.average_price, Math.max(3, pricePrecision))}</b></>}
         {selectedPoint.volume !== null && <><span>量</span><b>{compact(selectedPoint.volume, '股')}</b></>}
       </div>
     </figcaption>
@@ -178,7 +179,7 @@ function LineChart({ name, points, selectedTime, onSelectionChange }: {
       {[0, 1, 2, 3, 4].map((tick) => {
         const py = pad.top + tick / 4 * plotHeight
         const value = max - tick / 4 * (max - min)
-        return <g key={tick}><line x1={pad.left} y1={py} x2={width - pad.right} y2={py} /><text x={pad.left - 9} y={py + 4} textAnchor="end">{value.toFixed(2)}</text></g>
+        return <g key={tick}><line x1={pad.left} y1={py} x2={width - pad.right} y2={py} /><text x={pad.left - 9} y={py + 4} textAnchor="end">{value.toFixed(pricePrecision)}</text></g>
       })}
       {area !== null && <path className="market-chart-area" d={area} />}
       <path className="market-chart-line" d={path} />
@@ -195,7 +196,7 @@ function LineChart({ name, points, selectedTime, onSelectionChange }: {
 
 function CandleChart({ name, bars }: { name: string, bars: KlineBar[] }) {
   const data = bars.filter((bar) => [bar.open, bar.high, bar.low, bar.close].every((value) => Number.isFinite(Number(value))))
-  if (data.length === 0) return <div className="market-empty-chart">暂无 App 内部 K 线数据</div>
+  if (data.length === 0) return <div className="market-empty-chart">暂无公开 K 线数据</div>
   const width = 900
   const height = 360
   const values = data.flatMap((bar) => [Number(bar.high), Number(bar.low)])
@@ -219,9 +220,10 @@ function CandleChart({ name, bars }: { name: string, bars: KlineBar[] }) {
   </svg>
 }
 
-function DailyKPanel({ name, page, loading, error, onSelectionChange, onRetry }: {
+function DailyKPanel({ name, page, pricePrecision, loading, error, onSelectionChange, onRetry }: {
   name: string,
   page?: MarketSeriesPage,
+  pricePrecision: number,
   loading: boolean,
   error?: string,
   onSelectionChange: (selection: DailyKSelection) => void,
@@ -237,8 +239,10 @@ function DailyKPanel({ name, page, loading, error, onSelectionChange, onRetry }:
   </div>
   const sourceLabel = page.source === 'THS_PUBLIC'
     ? '10jqka 公开源'
-    : page.source === 'THS_APP'
-      ? 'core_metrics App'
+    : page.source === 'TENCENT_PUBLIC'
+      ? '腾讯公开源'
+      : page.source === 'SINA_PUBLIC'
+        ? '新浪公开源'
       : '未知来源'
   return <div className="daily-k-panel">
     <div className="daily-k-status">
@@ -249,7 +253,7 @@ function DailyKPanel({ name, page, loading, error, onSelectionChange, onRetry }:
       {page.source_error && <span className="warning">{page.source_error}</span>}
       {page.stale && Object.entries(page.source_errors).map(([source, code]) => code && <span className="warning" key={source}>{source}: {code}</span>)}
     </div>
-    <DailyKChart name={name} onSelectionChange={onSelectionChange} page={page} />
+    <DailyKChart name={name} onSelectionChange={onSelectionChange} page={page} pricePrecision={pricePrecision} />
   </div>
 }
 
@@ -306,7 +310,7 @@ function Login({ onLogin }: { onLogin: (user: MarketUser) => void }) {
       <div className="market-brand-mark" aria-hidden="true">顺</div>
       <p className="market-kicker">THS MARKET</p>
       <h1>登录行情中心</h1>
-      <p>访问你的分组自选和 App 内部实时行情。</p>
+      <p>访问你的分组自选、公开实时行情和可选直连增强。</p>
       <form onSubmit={submit}>
         <label htmlFor="market-username">用户名</label>
         <input id="market-username" autoComplete="username" value={username} onChange={(event) => setUsername(event.target.value)} required />
@@ -324,7 +328,7 @@ function FundFlow({ values }: { values: MarketSnapshot['main_fund_flow'] }) {
   const rows = [['main_net_inflow', '主力净流入'], ['main_visible_inflow', '主力明盘'], ['main_hidden_inflow', '主力暗盘'], ['retail_inflow', '散户流入']] as const
   if (Object.keys(values).length === 0) return null
   return <section className="market-section">
-    <div className="market-section-title"><div><span>CAPITAL FLOW</span><h3>主力流向</h3></div><small>App 内部接口</small></div>
+    <div className="market-section-title"><div><span>CAPITAL FLOW</span><h3>主力流向</h3></div><small>直连接口</small></div>
     <table className="market-fund-table"><thead><tr><th>指标</th>{periods.map(([, label]) => <th key={label}>{label}</th>)}</tr></thead>
       <tbody>{rows.map(([field, label]) => <tr key={field}><th>{label}</th>{periods.map(([period]) => {
         const value = values[period]?.[field]
@@ -380,6 +384,9 @@ function Detail({ item, snapshot, period, setPeriod, series, dailyLoading, daily
   onRetryDaily: () => void,
 }) {
   const quote = snapshot?.quote ?? {}
+  const pricePrecision = snapshot?.price_precision ?? 2
+  const l2Available = snapshot?.capabilities.l2?.available === true
+  const depthAvailable = snapshot?.capabilities.order_book?.available === true || snapshot?.capabilities.trades?.available === true
   const latestIntradayTime = snapshot?.timeshare.at(-1)?.time
   const intradayTimes = snapshot?.timeshare.map((point) => point.time) ?? []
   const intradayTimesKey = intradayTimes.join('|')
@@ -405,16 +412,16 @@ function Detail({ item, snapshot, period, setPeriod, series, dailyLoading, daily
   const selectedDailyChange = selectedDailyBar
     ? percentChange(selectedDailyBar.close, previousDailyClose)
     : null
-  const displayedPrice = selectedDailyBar ? fixed(selectedDailyBar.close) : display(quote.price)
+  const displayedPrice = selectedDailyBar ? fixed(selectedDailyBar.close, pricePrecision) : display(quote.price)
   const displayedChange = selectedDailyBar ? display(selectedDailyChange) : display(quote.change_percent)
   const changeTone = tone(selectedDailyBar ? selectedDailyChange : quote.change_percent)
   const klineAvailable = snapshot?.capabilities.kline?.available === true
   const quoteFields = selectedDailyBar
     ? [
-      ['开盘', fixed(selectedDailyBar.open)],
-      ['最高', fixed(selectedDailyBar.high)],
-      ['最低', fixed(selectedDailyBar.low)],
-      ['收盘', fixed(selectedDailyBar.close)],
+      ['开盘', fixed(selectedDailyBar.open, pricePrecision)],
+      ['最高', fixed(selectedDailyBar.high, pricePrecision)],
+      ['最低', fixed(selectedDailyBar.low, pricePrecision)],
+      ['收盘', fixed(selectedDailyBar.close, pricePrecision)],
       ['成交量', compact(selectedDailyBar.volume, '股')],
       ['成交额', compact(selectedDailyBar.amount, '元')],
     ]
@@ -426,11 +433,16 @@ function Detail({ item, snapshot, period, setPeriod, series, dailyLoading, daily
       ['换手', display(quote.turnover_rate)],
       ['成交量', display(quote.volume)],
     ]
+  const sourceLabel = snapshot?.source === 'TENCENT_PUBLIC'
+    ? '腾讯公开行情'
+    : snapshot?.source === 'SINA_PUBLIC'
+      ? '新浪公开行情'
+      : '公开行情'
   return <section className="market-detail">
     <header className="market-quote-head">
       <div><p>{item.symbol} · {selectedDailyBar ? `${selectedDailyBar.time} 日K` : '实时行情'}</p><h1>{snapshot?.name ?? item.name}</h1></div>
       <div className={`market-last-price market-number-${changeTone}`}><strong>{displayedPrice}</strong><span>{displayedChange}</span></div>
-      <div className="market-live-status"><i className={snapshot?.stale ? 'stale' : ''} />{selectedDailyBar ? '十字线选中日' : snapshot?.source_time ? `${snapshot.source_time} 更新` : '正在读取 App 接口'}</div>
+      <div className="market-live-status"><i className={snapshot?.stale ? 'stale' : ''} /><span>{sourceLabel}</span><span>{selectedDailyBar ? '十字线选中日' : snapshot?.source_time ? `${snapshot.source_time} 更新` : '正在读取公开行情'}</span></div>
     </header>
     <div className="market-quote-strip">
       {quoteFields.map(([label, value]) => <div key={label}><span>{label}</span><strong>{value}</strong></div>)}
@@ -439,28 +451,28 @@ function Detail({ item, snapshot, period, setPeriod, series, dailyLoading, daily
       <nav className="market-period-tabs" aria-label="图表周期">{chartPeriods.map(([value, label]) => <button type="button" key={value} className={period === value ? 'active' : ''} onClick={() => setPeriod(value)}>{label}</button>)}</nav>
       {period === 'timeshare'
         ? <>
-          <LineChart name={snapshot?.name ?? item.name} points={snapshot?.timeshare ?? []} selectedTime={intradaySelectedTime} onSelectionChange={setIntradaySelectedTime} />
-          <MarketIntradayCharts symbol={snapshot?.symbol ?? item.symbol} series={snapshot?.intraday_series ?? {}} selectedTime={intradaySelectedTime} />
+          <LineChart name={snapshot?.name ?? item.name} points={snapshot?.timeshare ?? []} pricePrecision={pricePrecision} selectedTime={intradaySelectedTime} onSelectionChange={setIntradaySelectedTime} />
+          {l2Available && <MarketIntradayCharts symbol={snapshot?.symbol ?? item.symbol} series={snapshot?.intraday_series ?? {}} selectedTime={intradaySelectedTime} />}
         </>
         : period === 'day'
-          ? <DailyKPanel name={snapshot?.name ?? item.name} page={series} loading={dailyLoading} error={dailyError} onSelectionChange={setDailySelection} onRetry={onRetryDaily} />
+          ? <DailyKPanel name={snapshot?.name ?? item.name} page={series} pricePrecision={pricePrecision} loading={dailyLoading} error={dailyError} onSelectionChange={setDailySelection} onRetry={onRetryDaily} />
         : !klineAvailable
-          ? <div className="market-capability-gap"><strong>App 内部 K 线接口尚未确认</strong><span>为避免展示错误行情，这里不会使用网页源、OCR 或猜测参数。</span></div>
+          ? <div className="market-capability-gap"><strong>公开 K 线暂不可用</strong><span>服务会保留最近一次已验证缓存，并允许稍后重试。</span></div>
           : <CandleChart name={snapshot?.name ?? item.name} bars={series?.bars ?? []} />}
     </section>
-    <section className="market-metric-grid">
+    {l2Available && <section className="market-metric-grid">
       {[
         ['大单净量', quote.large_order_net], ['大单金额', quote.large_order_amount], ['散户数量', quote.retail_count], ['MACDFS', quote.macdfs],
       ].map(([label, value]) => <article key={label}><span>{label}</span><strong className={`market-number-${tone(value)}`}>{display(value)}</strong></article>)}
-    </section>
-    {snapshot && <FundFlow values={snapshot.main_fund_flow} />}
-    <section className="market-section market-level2">
+    </section>}
+    {l2Available && snapshot && <FundFlow values={snapshot.main_fund_flow} />}
+    {depthAvailable && <section className="market-section market-level2">
       <div className="market-section-title"><div><span>LEVEL 2</span><h3>盘口与逐笔</h3></div></div>
       <div className="market-capability-grid">
-        <div><strong>十档盘口</strong><span>{snapshot?.capabilities.order_book?.available ? '实时可用' : '当前 App 接口未确认'}</span></div>
-        <div><strong>逐笔成交</strong><span>{snapshot?.capabilities.trades?.available ? '实时可用' : '当前 App 接口未确认'}</span></div>
+        <div><strong>十档盘口</strong><span>{snapshot?.capabilities.order_book?.available ? '实时可用' : '公开源暂不提供'}</span></div>
+        <div><strong>逐笔成交</strong><span>{snapshot?.capabilities.trades?.available ? '实时可用' : '公开源暂不提供'}</span></div>
       </div>
-    </section>
+    </section>}
   </section>
 }
 
@@ -574,23 +586,68 @@ export function MarketApp() {
     if (auth !== 'authenticated' || user?.must_change_password || typeof WebSocket === 'undefined') return
     const url = marketStreamUrl()
     if (!url) return
-    let client: WebSocket
-    try { client = new WebSocket(url) } catch { return }
-    socket.current = client
-    client.onopen = () => {
-      setConnection('live')
-      client.send(JSON.stringify({ type: 'subscribe', watchlist: allItems.map((item) => item.symbol), detail: selected }))
+    let active = true
+    let client: WebSocket | null = null
+    let reconnectTimer: number | undefined
+    let reconnectAttempt = 0
+    const reconnectDelays = [1000, 2000, 4000, 8000, 15000]
+    const refreshSelectedSnapshot = () => {
+      if (!selected) return
+      void marketApi.snapshot(selected).then((snapshot) => {
+        if (active) setSnapshots((current) => ({ ...current, [snapshot.symbol]: snapshot }))
+      }).catch(() => undefined)
     }
-    client.onmessage = (event) => {
-      try {
-        const payload = JSON.parse(String(event.data)) as { type: string, data?: MarketSnapshot, symbol?: string }
-        if (payload.type === 'snapshot' && payload.data) setSnapshots((current) => ({ ...current, [payload.data!.symbol]: payload.data! }))
-        if (payload.type === 'source_status') setConnection('reconnecting')
-      } catch { /* Ignore malformed external frames. */ }
+    const scheduleReconnect = () => {
+      if (!active || reconnectTimer !== undefined) return
+      setConnection('reconnecting')
+      refreshSelectedSnapshot()
+      const delay = reconnectDelays[Math.min(reconnectAttempt, reconnectDelays.length - 1)]
+      reconnectAttempt += 1
+      reconnectTimer = window.setTimeout(() => {
+        reconnectTimer = undefined
+        connect()
+      }, delay)
     }
-    client.onclose = () => setConnection('reconnecting')
-    client.onerror = () => setConnection('reconnecting')
-    return () => client.close()
+    const connect = () => {
+      if (!active) return
+      let reconnectScheduled = false
+      const scheduleOnce = () => {
+        if (reconnectScheduled) return
+        reconnectScheduled = true
+        scheduleReconnect()
+      }
+      try { client = new WebSocket(url) } catch { scheduleOnce(); return }
+      socket.current = client
+      client.onopen = () => {
+        if (!active || client === null) return
+        reconnectAttempt = 0
+        setConnection('live')
+        client.send(JSON.stringify({ type: 'subscribe', watchlist: allItems.map((item) => item.symbol), detail: selected }))
+      }
+      client.onmessage = (event) => {
+        try {
+          const payload = JSON.parse(String(event.data)) as { type: string, data?: MarketSnapshot, symbol?: string }
+          if (payload.type === 'snapshot' && payload.data) setSnapshots((current) => ({ ...current, [payload.data!.symbol]: payload.data! }))
+          if (payload.type === 'source_status') setConnection('reconnecting')
+        } catch { /* Ignore malformed external frames. */ }
+      }
+      client.onclose = scheduleOnce
+      client.onerror = () => {
+        scheduleOnce()
+        client?.close()
+      }
+    }
+    connect()
+    return () => {
+      active = false
+      if (reconnectTimer !== undefined) window.clearTimeout(reconnectTimer)
+      if (client !== null) {
+        client.onclose = null
+        client.onerror = null
+        client.close()
+      }
+      socket.current = null
+    }
   }, [allItems, auth, selected, user?.must_change_password])
 
   async function addSymbol(event: FormEvent) {
@@ -646,12 +703,12 @@ export function MarketApp() {
           return <button type="button" key={item.symbol} className={selected === item.symbol ? 'active' : ''} onClick={() => { setSelected(item.symbol); setPeriod('timeshare') }} aria-label={`${item.name} ${item.symbol}`}>
             <span><strong className="market-symbol-name">{item.name}</strong><small>{item.symbol}</small></span><span className={`market-number-${tone(snapshot?.quote.change_percent)}`}><strong>{display(snapshot?.quote.price)}</strong><small>{display(snapshot?.quote.change_percent)}</small></span>
           </button>
-        }) : <div className="market-watchlist-empty"><strong>还没有自选股</strong><span>在顶部输入代码，股票会先通过 App 精确确认。</span></div>}</div>
+        }) : <div className="market-watchlist-empty"><strong>还没有自选股</strong><span>在顶部输入代码，系统会通过本地证券目录精确确认。</span></div>}</div>
         <footer>每位用户最多 50 只自选股</footer>
       </aside>
       <div className="market-main-pane">
         {message && <div className="market-message" role="status">{message}<button type="button" onClick={() => setMessage('')}>关闭</button></div>}
-        {selectedItem ? <Detail key={selectedItem.symbol} item={selectedItem} snapshot={snapshots[selectedItem.symbol]} period={period} setPeriod={setPeriod} series={period === 'day' ? dailySeries[selectedItem.symbol] : legacySeries} dailyLoading={dailyLoading[selectedItem.symbol] === true} dailyError={dailyErrors[selectedItem.symbol]} onRetryDaily={() => retryDailySeries(selectedItem.symbol)} /> : <section className="market-no-selection"><div className="market-brand-mark">顺</div><h1>从自选中选择一只股票</h1><p>行情会通过当前登录的同花顺 App 内部接口动态更新。</p></section>}
+        {selectedItem ? <Detail key={selectedItem.symbol} item={selectedItem} snapshot={snapshots[selectedItem.symbol]} period={period} setPeriod={setPeriod} series={period === 'day' ? dailySeries[selectedItem.symbol] : legacySeries} dailyLoading={dailyLoading[selectedItem.symbol] === true} dailyError={dailyErrors[selectedItem.symbol]} onRetryDaily={() => retryDailySeries(selectedItem.symbol)} /> : <section className="market-no-selection"><div className="market-brand-mark">顺</div><h1>从自选中选择一只股票</h1><p>基础行情由公开数据源更新，直连指标作为可选增强。</p></section>}
       </div>
     </div>
   </main>

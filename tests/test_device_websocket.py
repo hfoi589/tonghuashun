@@ -5,8 +5,10 @@ from io import BytesIO
 from PIL import Image
 from threading import Event, Thread
 from time import monotonic, sleep
+from datetime import datetime, timezone
 
 from level2_service.api import create_app
+from level2_service.device_lifecycle import DeviceLifecycleState, DeviceLifecycleStatus
 from level2_service.runner import FakeDeviceBridge, RunnerControl
 
 
@@ -86,6 +88,12 @@ def test_admin_devices_reports_both_roles_without_account_or_endpoint_details() 
                 "adb": "ONLINE",
                 "app": "ONLINE",
                 "frida": "UNKNOWN",
+                "lifecycle": {
+                    "state": "UNCONFIGURED",
+                    "operation_id": None,
+                    "error_code": None,
+                    "updated_at": None,
+                },
             },
             {
                 "role": "main_fund_flow",
@@ -93,6 +101,12 @@ def test_admin_devices_reports_both_roles_without_account_or_endpoint_details() 
                 "adb": "ONLINE",
                 "app": "ONLINE",
                 "frida": "UNKNOWN",
+                "lifecycle": {
+                    "state": "UNCONFIGURED",
+                    "operation_id": None,
+                    "error_code": None,
+                    "updated_at": None,
+                },
             },
         ]
     }
@@ -100,6 +114,63 @@ def test_admin_devices_reports_both_roles_without_account_or_endpoint_details() 
     assert "serial" not in serialized
     assert "endpoint" not in serialized
     assert "login" not in serialized
+
+
+def test_device_websocket_initial_status_extends_health_without_changing_frames() -> None:
+    class Lifecycle:
+        def devices(self):
+            return (
+                DeviceLifecycleStatus(
+                    "core_metrics",
+                    DeviceLifecycleState.RUNNING,
+                    "core-start",
+                    None,
+                    datetime(2026, 8, 28, tzinfo=timezone.utc),
+                ),
+            )
+
+    bridge = FakeDeviceBridge(
+        symbol="600938", screenshot=b"\xff\xd8core\xff\xd9"
+    )
+    client = TestClient(
+        create_app(
+            admin_password_hash=PasswordHasher().hash("admin-secret"),
+            device_bridge=bridge,
+            device_lifecycle=Lifecycle(),
+        ),
+        base_url="https://testserver",
+    )
+    assert client.post(
+        "/api/admin/session", json={"password": "admin-secret"}
+    ).status_code == 204
+    assert client.post(
+        "/api/admin/lock/acquire",
+        headers={"X-CSRF-Token": client.cookies.get("ths_csrf")},
+    ).status_code == 200
+
+    with client.websocket_connect(
+        "wss://testserver/api/admin/devices/core_metrics"
+    ) as socket:
+        assert socket.receive_json()["type"] == "runner_status"
+        status = socket.receive_json()
+        frame = socket.receive_json()
+
+    assert status == {
+        "type": "device_status",
+        "role": "core_metrics",
+        "label": "八项账号",
+        "adb": "ONLINE",
+        "app": "ONLINE",
+        "frida": "UNKNOWN",
+        "lifecycle": {
+            "state": "RUNNING",
+            "operation_id": "core-start",
+            "error_code": None,
+            "updated_at": "2026-08-28T00:00:00Z",
+        },
+    }
+    assert frame["type"] == "frame"
+    assert frame["encoding"] == "jpeg"
 
 
 def test_two_device_websockets_route_input_only_to_the_target_device() -> None:

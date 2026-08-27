@@ -31,6 +31,7 @@ class TaskStore(Protocol):
     def queue_position(self, task_id: str) -> int | None: ...
     def next_queued(self) -> TaskRecord | None: ...
     def recover_running(self) -> list[TaskRecord]: ...
+    def has_running_task(self) -> bool: ...
     def requeue_waiting(self, task_id: str) -> TaskRecord: ...
     def retry_failed(self, task_id: str) -> TaskRecord: ...
     def refresh_task(self, task_id: str, include_long_capture: bool | None = None) -> TaskRecord: ...
@@ -231,6 +232,13 @@ class InMemoryStreams:
             task.updated_at = utc_now()
             self._emit(task)
         return recovered
+
+    def has_running_task(self) -> bool:
+        with self._claim_lock:
+            return any(
+                task.status in {TaskStatus.RUNNING, TaskStatus.PARTIAL}
+                for task in self._tasks.values()
+            )
 
     def queue_position(self, task_id: str) -> int | None:
         task_id = self.resolve_task_id(task_id)
@@ -800,6 +808,19 @@ return ARGV[2]
             utc_now().isoformat(),
         )
         return [self._deserialize(payload) for payload in (payloads or [])]
+
+    def has_running_task(self) -> bool:
+        for raw_task_id in self.client.smembers(self._index_key):
+            payload = self.client.get(self._key(self._text(raw_task_id)))
+            if not payload:
+                continue
+            try:
+                task = self._deserialize(payload)
+            except (KeyError, TypeError, ValueError):
+                continue
+            if task.status in {TaskStatus.RUNNING, TaskStatus.PARTIAL}:
+                return True
+        return False
 
     def requeue_waiting(self, task_id: str) -> TaskRecord:
         payload = self.client.eval(

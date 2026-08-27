@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable, Protocol
 from urllib.error import HTTPError, URLError
 from urllib.parse import SplitResult, urlsplit
@@ -68,6 +68,7 @@ def _default_opener() -> OpenerDirector:
 class SafeHttpResponse:
     status: int
     body: bytes
+    headers: object | None = field(default=None, repr=False)
 
 
 class SafeHttpTransport:
@@ -120,7 +121,11 @@ class SafeHttpTransport:
                 raise SafeHttpError()
             self._validate_final_url(response, request.full_url)
             body = self._bounded_read(response)
-            return SafeHttpResponse(status=status, body=body)
+            return SafeHttpResponse(
+                status=status,
+                body=body,
+                headers=getattr(response, "headers", None),
+            )
         except SafeHttpStatusError:
             raise
         except HTTPError as error:

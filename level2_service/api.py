@@ -236,6 +236,10 @@ class TaskResponse(BaseModel):
     long_capture: LongCaptureResponse
 
 
+class DeploymentAcceptanceRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+
 class RunnerHealthResponse(BaseModel):
     state: str
     last_heartbeat: Optional[datetime]
@@ -686,6 +690,43 @@ def create_app(
         notify_runner_if_queued(submitted)
         return task_response(submitted)
 
+    @app.post(
+        "/internal/deployment/acceptance",
+        status_code=202,
+        response_model=TaskResponse,
+    )
+    def bind_deployment_acceptance(
+        _payload: DeploymentAcceptanceRequest,
+        request: Request,
+    ) -> TaskResponse:
+        authorization = request.headers.get("Authorization")
+        if not isinstance(authorization, str) or not authorization.startswith(
+            "Bearer "
+        ):
+            raise HTTPException(
+                status_code=401,
+                detail="DEPLOYMENT_LEASE_AUTH_REQUIRED",
+            )
+        owner_token = authorization.removeprefix("Bearer ")
+        task = TaskRecord(
+            task_id=secrets.token_urlsafe(24),
+            symbol="601872",
+            include_long_capture=False,
+        )
+        try:
+            bound = app.state.store.bind_deployment_acceptance(
+                owner_token, task
+            )
+        except Exception:
+            bound = None
+        if bound is None:
+            raise HTTPException(
+                status_code=409,
+                detail="DEPLOYMENT_LEASE_INVALID",
+            )
+        notify_runner_if_queued(bound)
+        return task_response(bound)
+
     @app.get("/api/v1/jobs/{public_id}", response_model=TaskResponse)
     def get_task(public_id: str) -> TaskResponse:
         task = app.state.store.get(public_id)
@@ -895,7 +936,12 @@ def create_app(
     @app.post("/api/admin/lock/release")
     def release_lock(session=Depends(require_csrf)) -> LockResponse:
         if not app.state.runner_control.release(session.session_id):
-            raise HTTPException(status_code=409, detail="runner lock is not owned by this admin")
+            detail = (
+                "DEVICE_ACTION_IN_PROGRESS"
+                if app.state.runner_control.has_active_operation
+                else "runner lock is not owned by this admin"
+            )
+            raise HTTPException(status_code=409, detail=detail)
         return LockResponse(locked=False)
 
     @app.post("/api/admin/jobs/{public_id}/resume", response_model=TaskResponse)
@@ -934,7 +980,12 @@ def create_app(
     @app.post("/api/admin/queue/resume", response_model=QueueResponse)
     def resume_queue(_session=Depends(require_csrf)) -> QueueResponse:
         if not app.state.runner_control.resume_queue():
-            raise HTTPException(status_code=409, detail="release device control before resuming the queue")
+            detail = (
+                "DEVICE_ACTION_IN_PROGRESS"
+                if app.state.runner_control.has_active_operation
+                else "release device control before resuming the queue"
+            )
+            raise HTTPException(status_code=409, detail=detail)
         app.state.runner_wake.notify()
         return QueueResponse(paused=False)
 
@@ -987,6 +1038,13 @@ def create_app(
             )
         else:
             by_role = {status.role: status for status in statuses}
+            control = app.state.runner_control
+            for status in statuses:
+                control.reconcile_operation(
+                    status.role,
+                    status.operation_id,
+                    status.state.value,
+                )
             return {
                 role: (
                     AdminDeviceLifecycleResponse(
@@ -1071,6 +1129,11 @@ def create_app(
                 if lifecycle is None:
                     raise DeviceLifecycleError("DEVICE_LIFECYCLE_UNAVAILABLE")
                 operation = lifecycle.submit(role, payload.action)
+                if operation.state in {
+                    DeviceLifecycleState.STARTING,
+                    DeviceLifecycleState.STOPPING,
+                } and not control.begin_operation(role, operation.operation_id):
+                    raise DeviceLifecycleError("DEVICE_LIFECYCLE_FAILED")
         except RunnerMaintenanceError as error:
             raise HTTPException(status_code=409, detail=error.error_code) from None
         except DeviceLifecycleError as error:

@@ -1148,6 +1148,7 @@ class RunnerControl:
     _sequence: int = 0
     _listeners: list[Callable[[dict], None]] = field(default_factory=list)
     _socket_disconnectors: dict[str, list[Callable[[], None]]] = field(default_factory=dict)
+    _operation_leases: dict[str, str] = field(default_factory=dict)
     _maintenance_gate: RLock = field(
         default_factory=RLock,
         repr=False,
@@ -1185,7 +1186,7 @@ class RunnerControl:
 
     def release(self, session_id: str) -> bool:
         with self._maintenance_gate:
-            if self._lock_owner != session_id:
+            if self._lock_owner != session_id or self._operation_leases:
                 return False
             self._lock_owner = None
             self._publish()
@@ -1234,7 +1235,7 @@ class RunnerControl:
 
     def resume_queue(self) -> bool:
         with self._maintenance_gate:
-            if self._lock_owner is not None:
+            if self._lock_owner is not None or self._operation_leases:
                 return False
             self.queue_paused = False
             self._publish()
@@ -1243,10 +1244,56 @@ class RunnerControl:
     def claim_next_task(self, store: TaskStore) -> TaskRecord | None:
         """Atomically recheck pause state and claim under the maintenance gate."""
         with self._maintenance_gate:
-            if self.queue_paused:
+            if self.queue_paused or self._operation_leases:
                 return None
             self.heartbeat("BOOTING")
-            return store.next_queued()
+            return store.next_runnable()
+
+    @property
+    def has_active_operation(self) -> bool:
+        with self._maintenance_gate:
+            return bool(self._operation_leases)
+
+    def begin_operation(self, role: str, operation_id: str) -> bool:
+        """Keep runner/device ownership after an asynchronous broker submit."""
+        if (
+            role not in {"core_metrics", "main_fund_flow"}
+            or not isinstance(operation_id, str)
+            or re.fullmatch(r"[A-Za-z0-9_-]{1,256}", operation_id) is None
+        ):
+            return False
+        with self._maintenance_gate:
+            existing = self._operation_leases.get(role)
+            if existing not in {None, operation_id}:
+                return False
+            self._operation_leases[role] = operation_id
+            self.queue_paused = True
+            self._publish()
+            return True
+
+    def reconcile_operation(
+        self, role: str, operation_id: str | None, state: str
+    ) -> bool:
+        """Reconcile only an exact operation ID; stale terminal reports are ignored."""
+        if role not in {"core_metrics", "main_fund_flow"}:
+            return False
+        with self._maintenance_gate:
+            current = self._operation_leases.get(role)
+            if state in {"STARTING", "STOPPING"}:
+                if not isinstance(operation_id, str):
+                    return False
+                if current not in {None, operation_id}:
+                    return False
+                self._operation_leases[role] = operation_id
+                self.queue_paused = True
+                return True
+            if state not in {"RUNNING", "STOPPED", "ERROR"}:
+                return False
+            if current is None or operation_id != current:
+                return False
+            del self._operation_leases[role]
+            self._publish()
+            return True
 
     @contextmanager
     def maintenance(
@@ -1258,7 +1305,11 @@ class RunnerControl:
         with self._maintenance_gate:
             if self._lock_owner != session_id:
                 raise RunnerMaintenanceError("DEVICE_LIFECYCLE_LOCK_REQUIRED")
-            if not self.queue_paused or store.has_running_task():
+            if (
+                not self.queue_paused
+                or self._operation_leases
+                or store.has_running_task()
+            ):
                 raise RunnerMaintenanceError("DEVICE_LIFECYCLE_BUSY")
             yield
 

@@ -411,14 +411,14 @@ def test_runner_claim_cannot_cross_lifecycle_maintenance_acceptance(
     allow_claim = Event()
     processing_entered = Event()
     allow_processing = Event()
-    original_next_queued = store.next_queued
+    original_next_runnable = store.next_runnable
 
-    def blocked_next_queued():
+    def blocked_next_runnable():
         claim_entered.set()
         assert allow_claim.wait(2)
-        return original_next_queued()
+        return original_next_runnable()
 
-    store.next_queued = blocked_next_queued
+    store.next_runnable = blocked_next_runnable
 
     class BlockingValues:
         def read_direct(self, _symbol):
@@ -532,5 +532,6 @@ def test_lock_release_waits_for_lifecycle_submission_to_finish() -> None:
     assert not action_thread.is_alive()
     assert not release_thread.is_alive()
     assert responses["action"].status_code == 202
-    assert responses["release"].status_code == 200
+    assert responses["release"].status_code == 409
+    assert responses["release"].json() == {"detail": "DEVICE_ACTION_IN_PROGRESS"}
     assert control.queue_paused is True

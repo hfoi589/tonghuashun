@@ -4,11 +4,15 @@ from __future__ import annotations
 
 from collections import defaultdict, deque
 from copy import deepcopy
+from dataclasses import dataclass, field
 from datetime import datetime
+import hmac
 import json
 from pathlib import Path
-from threading import Lock
-from typing import Protocol
+import re
+from threading import RLock
+from time import monotonic
+from typing import Callable, Protocol
 
 from .models import CaptureKind, CaptureRecord, CaptureStatus, INTRADAY_METRICS, LongCaptureRecord, MetricKind, REQUIRED_METRICS, SOURCE_ERROR_KEYS, TaskRecord, TaskStatus, ValueSource, normalized_intraday_series, utc_now
 
@@ -21,6 +25,41 @@ class InvalidTransitionError(ValueError):
     pass
 
 
+_DEPLOYMENT_OWNER = re.compile(r"[A-Za-z0-9_-]{32,256}")
+_MAX_DEPLOYMENT_LEASE_SECONDS = 7200.0
+
+
+@dataclass(frozen=True)
+class DeploymentMaintenanceLease:
+    owner_token: str = field(repr=False)
+    bound_task_id: str | None
+    ttl_seconds: float
+
+    def owned_by(self, candidate: str) -> bool:
+        return isinstance(candidate, str) and hmac.compare_digest(
+            self.owner_token, candidate
+        )
+
+
+def _valid_lease_request(owner_token: str, ttl_seconds: float) -> bool:
+    return (
+        isinstance(owner_token, str)
+        and _DEPLOYMENT_OWNER.fullmatch(owner_token) is not None
+        and isinstance(ttl_seconds, (int, float))
+        and 0 < float(ttl_seconds) <= _MAX_DEPLOYMENT_LEASE_SECONDS
+    )
+
+
+def _valid_acceptance_task(task: TaskRecord) -> bool:
+    return (
+        isinstance(task, TaskRecord)
+        and task.symbol == "601872"
+        and task.include_long_capture is False
+        and task.status == TaskStatus.QUEUED
+        and task.completed_at is None
+    )
+
+
 class TaskStore(Protocol):
     def enqueue(self, task: TaskRecord) -> None: ...
     def submit_or_refresh(self, task: TaskRecord) -> TaskRecord: ...
@@ -30,8 +69,14 @@ class TaskStore(Protocol):
     def deduplicate_by_symbol(self) -> dict[str, int]: ...
     def queue_position(self, task_id: str) -> int | None: ...
     def next_queued(self) -> TaskRecord | None: ...
+    def next_runnable(self) -> TaskRecord | None: ...
     def recover_running(self) -> list[TaskRecord]: ...
     def has_running_task(self) -> bool: ...
+    def acquire_deployment_lease(self, owner_token: str, ttl_seconds: float) -> bool: ...
+    def renew_deployment_lease(self, owner_token: str, ttl_seconds: float) -> bool: ...
+    def deployment_lease_status(self) -> DeploymentMaintenanceLease | None: ...
+    def bind_deployment_acceptance(self, owner_token: str, task: TaskRecord) -> TaskRecord | None: ...
+    def release_deployment_lease(self, owner_token: str) -> bool: ...
     def requeue_waiting(self, task_id: str) -> TaskRecord: ...
     def retry_failed(self, task_id: str) -> TaskRecord: ...
     def refresh_task(self, task_id: str, include_long_capture: bool | None = None) -> TaskRecord: ...
@@ -117,14 +162,22 @@ def _restore_expired_task(task: TaskRecord) -> None:
 class InMemoryStreams:
     """A small Redis-Streams-compatible state model for local development and tests."""
 
-    def __init__(self, pending_cap: int = 200, capture_root: Path | None = None) -> None:
+    def __init__(
+        self,
+        pending_cap: int = 200,
+        capture_root: Path | None = None,
+        *,
+        lease_clock: Callable[[], float] = monotonic,
+    ) -> None:
         self.pending_cap = pending_cap
         self.capture_root = capture_root.resolve() if capture_root else None
         self._tasks: dict[str, TaskRecord] = {}
         self._fifo: deque[str] = deque()
         self._events: dict[str, list[dict[str, str]]] = {}
         self._aliases: dict[str, str] = {}
-        self._claim_lock = Lock()
+        self._claim_lock = RLock()
+        self._lease_clock = lease_clock
+        self._deployment_lease: dict[str, object] | None = None
 
     def enqueue(self, task: TaskRecord) -> None:
         with self._claim_lock:
@@ -152,7 +205,25 @@ class InMemoryStreams:
             return self._refresh_locked(existing, task.include_long_capture)
 
     def next_queued(self) -> TaskRecord | None:
+        return self.next_runnable()
+
+    def next_runnable(self) -> TaskRecord | None:
         with self._claim_lock:
+            lease = self._active_deployment_lease_locked()
+            if lease is not None:
+                bound_task_id = lease.get("bound_task_id")
+                if not isinstance(bound_task_id, str):
+                    return None
+                task = self._tasks.get(bound_task_id)
+                if task is None or task.status != TaskStatus.QUEUED:
+                    return None
+                self._fifo = deque(
+                    task_id for task_id in self._fifo if task_id != bound_task_id
+                )
+                task.status = TaskStatus.RUNNING
+                task.updated_at = utc_now()
+                self._emit(task)
+                return task
             for task_id in self._fifo:
                 task = self._tasks.get(task_id)
                 if task and task.status == TaskStatus.QUEUED:
@@ -236,9 +307,118 @@ class InMemoryStreams:
     def has_running_task(self) -> bool:
         with self._claim_lock:
             return any(
-                task.status in {TaskStatus.RUNNING, TaskStatus.PARTIAL}
+                task.status == TaskStatus.RUNNING
+                or (
+                    task.status == TaskStatus.PARTIAL
+                    and task.completed_at is None
+                )
                 for task in self._tasks.values()
             )
+
+    def acquire_deployment_lease(
+        self, owner_token: str, ttl_seconds: float
+    ) -> bool:
+        if not _valid_lease_request(owner_token, ttl_seconds):
+            return False
+        with self._claim_lock:
+            if self._active_deployment_lease_locked() is not None:
+                return False
+            if any(
+                task.status == TaskStatus.RUNNING
+                or (
+                    task.status == TaskStatus.PARTIAL
+                    and task.completed_at is None
+                )
+                for task in self._tasks.values()
+            ):
+                return False
+            self._deployment_lease = {
+                "owner_token": owner_token,
+                "bound_task_id": None,
+                "expires_at": self._lease_clock() + float(ttl_seconds),
+            }
+            return True
+
+    def renew_deployment_lease(
+        self, owner_token: str, ttl_seconds: float
+    ) -> bool:
+        if not _valid_lease_request(owner_token, ttl_seconds):
+            return False
+        with self._claim_lock:
+            lease = self._active_deployment_lease_locked()
+            if lease is None or not hmac.compare_digest(
+                str(lease["owner_token"]), owner_token
+            ):
+                return False
+            lease["expires_at"] = self._lease_clock() + float(ttl_seconds)
+            return True
+
+    def deployment_lease_status(self) -> DeploymentMaintenanceLease | None:
+        with self._claim_lock:
+            lease = self._active_deployment_lease_locked()
+            if lease is None:
+                return None
+            remaining = max(
+                0.0, float(lease["expires_at"]) - self._lease_clock()
+            )
+            return DeploymentMaintenanceLease(
+                owner_token=str(lease["owner_token"]),
+                bound_task_id=(
+                    str(lease["bound_task_id"])
+                    if isinstance(lease.get("bound_task_id"), str)
+                    else None
+                ),
+                ttl_seconds=remaining,
+            )
+
+    def bind_deployment_acceptance(
+        self, owner_token: str, task: TaskRecord
+    ) -> TaskRecord | None:
+        if not _valid_acceptance_task(task):
+            return None
+        with self._claim_lock:
+            lease = self._active_deployment_lease_locked()
+            if lease is None or not hmac.compare_digest(
+                str(lease["owner_token"]), owner_token
+            ):
+                return None
+            bound_task_id = lease.get("bound_task_id")
+            if isinstance(bound_task_id, str):
+                existing = self._tasks.get(bound_task_id)
+                if (
+                    existing is None
+                    or existing.symbol != "601872"
+                    or existing.include_long_capture is not False
+                ):
+                    return None
+                return existing
+            if task.task_id in self._tasks:
+                return None
+            try:
+                self._enqueue_locked(task)
+            except QueueFullError:
+                return None
+            lease["bound_task_id"] = task.task_id
+            return task
+
+    def release_deployment_lease(self, owner_token: str) -> bool:
+        with self._claim_lock:
+            lease = self._active_deployment_lease_locked()
+            if lease is None or not isinstance(owner_token, str):
+                return False
+            if not hmac.compare_digest(str(lease["owner_token"]), owner_token):
+                return False
+            self._deployment_lease = None
+            return True
+
+    def _active_deployment_lease_locked(self) -> dict[str, object] | None:
+        lease = self._deployment_lease
+        if lease is None:
+            return None
+        if self._lease_clock() >= float(lease["expires_at"]):
+            self._deployment_lease = None
+            return None
+        return lease
 
     def queue_position(self, task_id: str) -> int | None:
         task_id = self.resolve_task_id(task_id)
@@ -507,6 +687,27 @@ redis.call('XADD', KEYS[4], '*', 'event', 'status', 'task_id', ARGV[3], 'data', 
 return ARGV[4]
 """
     _CLAIM_SCRIPT = """
+-- THS_CLAIM_WITH_DEPLOYMENT_LEASE
+local lease_payload = redis.call('GET', KEYS[4])
+if lease_payload then
+  local lease = cjson.decode(lease_payload)
+  local task_id = lease.bound_task_id
+  if not task_id or task_id == cjson.null then return false end
+  local key = KEYS[2] .. task_id
+  local payload = redis.call('GET', key)
+  if not payload then return false end
+  local task = cjson.decode(payload)
+  if task.status ~= 'QUEUED' or task.symbol ~= '601872' or task.include_long_capture ~= false then
+    return false
+  end
+  task.status = 'RUNNING'
+  task.updated_at = ARGV[1]
+  local updated = cjson.encode(task)
+  redis.call('SET', key, updated)
+  redis.call('LREM', KEYS[1], 0, task_id)
+  redis.call('XADD', KEYS[3], '*', 'event', 'status', 'task_id', task_id, 'data', 'RUNNING')
+  return updated
+end
 local task_id = redis.call('LPOP', KEYS[1])
 while task_id do
   local key = KEYS[2] .. task_id
@@ -525,6 +726,83 @@ while task_id do
   task_id = redis.call('LPOP', KEYS[1])
 end
 return false
+"""
+    _ACQUIRE_DEPLOYMENT_LEASE_SCRIPT = """
+-- THS_ACQUIRE_DEPLOYMENT_LEASE
+if redis.call('GET', KEYS[1]) then return 0 end
+for _, task_id in ipairs(redis.call('SMEMBERS', KEYS[3])) do
+  local payload = redis.call('GET', KEYS[2] .. task_id)
+  if payload then
+    local task = cjson.decode(payload)
+    if task.status == 'RUNNING' or (task.status == 'PARTIAL' and (not task.completed_at or task.completed_at == cjson.null)) then
+      return -1
+    end
+  end
+end
+local lease = cjson.encode({owner_token = ARGV[1], bound_task_id = cjson.null})
+local accepted = redis.call('SET', KEYS[1], lease, 'NX', 'PX', ARGV[2])
+if accepted then return 1 end
+return 0
+"""
+    _RENEW_DEPLOYMENT_LEASE_SCRIPT = """
+-- THS_RENEW_DEPLOYMENT_LEASE
+local payload = redis.call('GET', KEYS[1])
+if not payload then return 0 end
+local lease = cjson.decode(payload)
+if lease.owner_token ~= ARGV[1] then return 0 end
+return redis.call('PEXPIRE', KEYS[1], ARGV[2])
+"""
+    _DEPLOYMENT_LEASE_STATUS_SCRIPT = """
+-- THS_DEPLOYMENT_LEASE_STATUS
+local payload = redis.call('GET', KEYS[1])
+if not payload then return false end
+local ttl = redis.call('PTTL', KEYS[1])
+if ttl <= 0 then return false end
+return {payload, ttl}
+"""
+    _BIND_DEPLOYMENT_ACCEPTANCE_SCRIPT = """
+-- THS_BIND_DEPLOYMENT_ACCEPTANCE
+local lease_payload = redis.call('GET', KEYS[1])
+if not lease_payload then return false end
+local lease = cjson.decode(lease_payload)
+if lease.owner_token ~= ARGV[1] then return false end
+if lease.bound_task_id and lease.bound_task_id ~= cjson.null then
+  local existing = redis.call('GET', KEYS[3] .. lease.bound_task_id)
+  if not existing then return false end
+  local existing_task = cjson.decode(existing)
+  if existing_task.symbol ~= '601872' or existing_task.include_long_capture ~= false then
+    return false
+  end
+  return existing
+end
+if redis.call('GET', KEYS[3] .. ARGV[2]) then return false end
+local pending = 0
+for _, task_id in ipairs(redis.call('SMEMBERS', KEYS[4])) do
+  local payload = redis.call('GET', KEYS[3] .. task_id)
+  if payload then
+    local task = cjson.decode(payload)
+    if task.status == 'QUEUED' or task.status == 'RUNNING' or task.status == 'WAITING_ADMIN' then
+      pending = pending + 1
+    end
+  end
+end
+if pending >= tonumber(ARGV[5]) then return 'QUEUE_FULL' end
+redis.call('SET', KEYS[3] .. ARGV[2], ARGV[3])
+redis.call('SADD', KEYS[4], ARGV[2])
+redis.call('RPUSH', KEYS[2], ARGV[2])
+redis.call('HSET', KEYS[6], ARGV[4], ARGV[2])
+redis.call('XADD', KEYS[5], '*', 'event', 'status', 'task_id', ARGV[2], 'data', 'QUEUED')
+lease.bound_task_id = ARGV[2]
+redis.call('SET', KEYS[1], cjson.encode(lease), 'KEEPTTL')
+return ARGV[3]
+"""
+    _RELEASE_DEPLOYMENT_LEASE_SCRIPT = """
+-- THS_RELEASE_DEPLOYMENT_LEASE
+local payload = redis.call('GET', KEYS[1])
+if not payload then return 0 end
+local lease = cjson.decode(payload)
+if lease.owner_token ~= ARGV[1] then return 0 end
+return redis.call('DEL', KEYS[1])
 """
     _RECOVER_RUNNING_SCRIPT = """
 -- THS_RECOVER_RUNNING
@@ -636,6 +914,7 @@ return ARGV[2]
         self._event_stream = f"{stream}:events"
         self._symbol_index_key = f"{stream}:symbols"
         self._alias_key = f"{stream}:aliases"
+        self._deployment_lease_key = f"{stream}:deployment-maintenance"
 
     def set_capture_root(self, capture_root: Path) -> None:
         self.capture_root = capture_root.resolve()
@@ -787,12 +1066,16 @@ return ARGV[2]
         return None
 
     def next_queued(self) -> TaskRecord | None:
+        return self.next_runnable()
+
+    def next_runnable(self) -> TaskRecord | None:
         payload = self.client.eval(
             self._CLAIM_SCRIPT,
-            3,
+            4,
             self._queue_key,
             self._prefix,
             self._event_stream,
+            self._deployment_lease_key,
             utc_now().isoformat(),
         )
         return self._deserialize(payload) if payload else None
@@ -818,9 +1101,111 @@ return ARGV[2]
                 task = self._deserialize(payload)
             except (KeyError, TypeError, ValueError):
                 continue
-            if task.status in {TaskStatus.RUNNING, TaskStatus.PARTIAL}:
+            if task.status == TaskStatus.RUNNING or (
+                task.status == TaskStatus.PARTIAL
+                and task.completed_at is None
+            ):
                 return True
         return False
+
+    def acquire_deployment_lease(
+        self, owner_token: str, ttl_seconds: float
+    ) -> bool:
+        if not _valid_lease_request(owner_token, ttl_seconds):
+            return False
+        result = self.client.eval(
+            self._ACQUIRE_DEPLOYMENT_LEASE_SCRIPT,
+            3,
+            self._deployment_lease_key,
+            self._prefix,
+            self._index_key,
+            owner_token,
+            max(1, int(float(ttl_seconds) * 1000)),
+        )
+        return result == 1
+
+    def renew_deployment_lease(
+        self, owner_token: str, ttl_seconds: float
+    ) -> bool:
+        if not _valid_lease_request(owner_token, ttl_seconds):
+            return False
+        result = self.client.eval(
+            self._RENEW_DEPLOYMENT_LEASE_SCRIPT,
+            1,
+            self._deployment_lease_key,
+            owner_token,
+            max(1, int(float(ttl_seconds) * 1000)),
+        )
+        return result == 1
+
+    def deployment_lease_status(self) -> DeploymentMaintenanceLease | None:
+        result = self.client.eval(
+            self._DEPLOYMENT_LEASE_STATUS_SCRIPT,
+            1,
+            self._deployment_lease_key,
+        )
+        if not isinstance(result, (list, tuple)) or len(result) != 2:
+            return None
+        try:
+            document = json.loads(self._text(result[0]))
+            ttl_seconds = float(result[1]) / 1000.0
+            owner_token = document["owner_token"]
+            bound_task_id = document.get("bound_task_id")
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            return None
+        if (
+            not isinstance(owner_token, str)
+            or _DEPLOYMENT_OWNER.fullmatch(owner_token) is None
+            or (bound_task_id is not None and not isinstance(bound_task_id, str))
+            or ttl_seconds <= 0
+        ):
+            return None
+        return DeploymentMaintenanceLease(
+            owner_token=owner_token,
+            bound_task_id=bound_task_id,
+            ttl_seconds=ttl_seconds,
+        )
+
+    def bind_deployment_acceptance(
+        self, owner_token: str, task: TaskRecord
+    ) -> TaskRecord | None:
+        if not _valid_acceptance_task(task) or not isinstance(owner_token, str):
+            return None
+        payload = self.client.eval(
+            self._BIND_DEPLOYMENT_ACCEPTANCE_SCRIPT,
+            6,
+            self._deployment_lease_key,
+            self._queue_key,
+            self._prefix,
+            self._index_key,
+            self._event_stream,
+            self._symbol_index_key,
+            owner_token,
+            task.task_id,
+            self._serialize(task),
+            task.symbol,
+            self.pending_cap,
+        )
+        if not payload or self._text(payload) == "QUEUE_FULL":
+            return None
+        try:
+            bound = self._deserialize(payload)
+        except (KeyError, TypeError, ValueError):
+            return None
+        if bound.symbol != "601872" or bound.include_long_capture is not False:
+            return None
+        return bound
+
+    def release_deployment_lease(self, owner_token: str) -> bool:
+        if not isinstance(owner_token, str):
+            return False
+        result = self.client.eval(
+            self._RELEASE_DEPLOYMENT_LEASE_SCRIPT,
+            1,
+            self._deployment_lease_key,
+            owner_token,
+        )
+        return result == 1
 
     def requeue_waiting(self, task_id: str) -> TaskRecord:
         payload = self.client.eval(

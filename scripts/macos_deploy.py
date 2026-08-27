@@ -8,6 +8,9 @@ import base64
 import ctypes
 from dataclasses import asdict, dataclass
 import fnmatch
+import getpass
+import hmac
+from http.cookies import SimpleCookie
 import json
 import os
 from pathlib import Path, PurePosixPath
@@ -155,6 +158,10 @@ _FIRST_TIME_LOGIN_INSTRUCTIONS = (
     "Click the matching role's session refresh.",
     "Rerun scripts/provision-macos-from-image.sh.",
 )
+_MAINTENANCE_RETAINED_INSTRUCTIONS = (
+    "Deployment maintenance remains active.",
+    "Fix the reported error and rerun the same deployment command, or run the explicit maintenance rollback command.",
+)
 
 
 @dataclass(frozen=True)
@@ -166,9 +173,15 @@ class DeploymentResult:
 
 
 class DeploymentError(RuntimeError):
-    def __init__(self, error_code: str):
+    def __init__(
+        self,
+        error_code: str,
+        *,
+        instructions: tuple[str, ...] = (),
+    ):
         super().__init__(error_code)
         self.error_code = error_code
+        self.instructions = instructions
 
 
 class CommandRunner(Protocol):
@@ -192,6 +205,31 @@ class LifecycleBroker(Protocol):
 
 class DataOnlyAcceptance(Protocol):
     def verify(self) -> None: ...
+
+
+class DeploymentMaintenance(Protocol):
+    @property
+    def owner_token(self) -> str: ...
+
+    def prepare(self) -> None: ...
+
+    def renew(self) -> None: ...
+
+    def release(self) -> None: ...
+
+    def rollback(self) -> None: ...
+
+
+class AdminMaintenanceClient(Protocol):
+    def acquire_device_lock(self, password: str) -> None: ...
+
+
+class DeploymentOwnerState(Protocol):
+    def load(self) -> str | None: ...
+
+    def store(self, owner: str) -> None: ...
+
+    def delete(self) -> None: ...
 
 
 class ProvisioningJournalStore(Protocol):
@@ -316,6 +354,405 @@ class PathFileSystem:
             and stat.S_IMODE(metadata.st_mode) == 0o600
             and metadata.st_uid == os.getuid()
         )
+
+
+class SecureDeploymentOwnerState:
+    """Owner-only recovery state for compare-owner renewal and rollback."""
+
+    _MAX_BYTES = 512
+
+    def __init__(
+        self,
+        path: Path = Path.home()
+        / ".config/ths-deployment-maintenance-owner",
+    ) -> None:
+        self.path = path.expanduser().resolve()
+
+    def load(self) -> str | None:
+        try:
+            metadata = os.lstat(self.path)
+        except FileNotFoundError:
+            return None
+        except OSError:
+            raise DeploymentError("DEPLOYMENT_MAINTENANCE_STATE_INVALID") from None
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or stat.S_ISLNK(metadata.st_mode)
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+            or metadata.st_uid != os.getuid()
+            or metadata.st_size <= 0
+            or metadata.st_size > self._MAX_BYTES
+        ):
+            raise DeploymentError("DEPLOYMENT_MAINTENANCE_STATE_INVALID")
+        flags = os.O_RDONLY
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        try:
+            descriptor = os.open(self.path, flags)
+            with os.fdopen(descriptor, "rb") as handle:
+                current = os.fstat(handle.fileno())
+                if (
+                    not stat.S_ISREG(current.st_mode)
+                    or stat.S_IMODE(current.st_mode) != 0o600
+                    or current.st_uid != os.getuid()
+                    or current.st_size != metadata.st_size
+                ):
+                    raise DeploymentError(
+                        "DEPLOYMENT_MAINTENANCE_STATE_INVALID"
+                    )
+                owner = handle.read(self._MAX_BYTES + 1).decode("ascii").strip()
+        except DeploymentError:
+            raise
+        except Exception:
+            raise DeploymentError("DEPLOYMENT_MAINTENANCE_STATE_INVALID") from None
+        if _SAFE_OPERATION_ID.fullmatch(owner) is None or len(owner) < 32:
+            raise DeploymentError("DEPLOYMENT_MAINTENANCE_STATE_INVALID")
+        return owner
+
+    def store(self, owner: str) -> None:
+        if _SAFE_OPERATION_ID.fullmatch(owner) is None or len(owner) < 32:
+            raise DeploymentError("DEPLOYMENT_MAINTENANCE_STATE_INVALID")
+        temporary: Path | None = None
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            with NamedTemporaryFile(
+                dir=self.path.parent,
+                prefix=f".{self.path.name}.",
+                delete=False,
+            ) as handle:
+                temporary = Path(handle.name)
+                os.chmod(temporary, 0o600)
+                handle.write((owner + "\n").encode("ascii"))
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, self.path)
+            temporary = None
+            os.chmod(self.path, 0o600)
+            directory = os.open(self.path.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
+        except Exception:
+            raise DeploymentError("DEPLOYMENT_MAINTENANCE_STATE_INVALID") from None
+        finally:
+            if temporary is not None:
+                try:
+                    temporary.unlink(missing_ok=True)
+                except OSError:
+                    pass
+
+    def delete(self) -> None:
+        try:
+            if self.path.exists() or self.path.is_symlink():
+                metadata = os.lstat(self.path)
+                if (
+                    not stat.S_ISREG(metadata.st_mode)
+                    or stat.S_ISLNK(metadata.st_mode)
+                    or metadata.st_uid != os.getuid()
+                ):
+                    raise DeploymentError(
+                        "DEPLOYMENT_MAINTENANCE_STATE_INVALID"
+                    )
+                self.path.unlink()
+        except DeploymentError:
+            raise
+        except OSError:
+            raise DeploymentError("DEPLOYMENT_MAINTENANCE_STATE_INVALID") from None
+
+
+class LoopbackAdminMaintenanceClient:
+    """Secret-redacting client for the existing admin login and device lock."""
+
+    def __init__(
+        self,
+        *,
+        base_url: str = "http://127.0.0.1:8001",
+        timeout_seconds: float = 10.0,
+    ) -> None:
+        self._timeout_seconds = timeout_seconds
+        try:
+            self._transport = SafeHttpTransport(
+                base_url.rstrip("/"),
+                max_body_bytes=64 * 1024,
+            )
+        except ValueError:
+            raise DeploymentError("DEPLOYMENT_ADMIN_LOCK_FAILED") from None
+        self._base_url = base_url.rstrip("/")
+
+    def acquire_device_lock(self, password: str) -> None:
+        if not isinstance(password, str) or not password:
+            raise DeploymentError("DEPLOYMENT_ADMIN_LOCK_FAILED")
+        try:
+            body = json.dumps(
+                {"password": password}, separators=(",", ":")
+            ).encode("utf-8")
+            login = self._transport.request(
+                Request(
+                    f"{self._base_url}/api/admin/session",
+                    data=body,
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                ),
+                self._timeout_seconds,
+            )
+            if login.status != 204:
+                raise DeploymentError("DEPLOYMENT_ADMIN_LOCK_FAILED")
+            session, csrf = self._parse_admin_cookies(login.headers)
+            lock = self._transport.request(
+                Request(
+                    f"{self._base_url}/api/admin/lock/acquire",
+                    data=b"",
+                    headers={
+                        "Cookie": (
+                            f"ths_admin_session={session}; ths_csrf={csrf}"
+                        ),
+                        "X-CSRF-Token": csrf,
+                    },
+                    method="POST",
+                ),
+                self._timeout_seconds,
+            )
+            if lock.status != 200:
+                raise DeploymentError("DEPLOYMENT_ADMIN_LOCK_FAILED")
+            document = json.loads(lock.body.decode("utf-8"))
+            if document != {"locked": True}:
+                raise DeploymentError("DEPLOYMENT_ADMIN_LOCK_FAILED")
+        except DeploymentError:
+            raise
+        except Exception:
+            raise DeploymentError("DEPLOYMENT_ADMIN_LOCK_FAILED") from None
+
+    @staticmethod
+    def _parse_admin_cookies(headers: object | None) -> tuple[str, str]:
+        get_all = getattr(headers, "get_all", None)
+        values = get_all("Set-Cookie") if callable(get_all) else None
+        if not isinstance(values, list):
+            raise DeploymentError("DEPLOYMENT_ADMIN_LOCK_FAILED")
+        cookies = SimpleCookie()
+        for value in values:
+            if isinstance(value, str):
+                cookies.load(value)
+        try:
+            session = cookies["ths_admin_session"].value
+            csrf = cookies["ths_csrf"].value
+        except KeyError:
+            raise DeploymentError("DEPLOYMENT_ADMIN_LOCK_FAILED") from None
+        if not all(
+            re.fullmatch(r"[A-Za-z0-9_-]{8,256}", value)
+            for value in (session, csrf)
+        ):
+            raise DeploymentError("DEPLOYMENT_ADMIN_LOCK_FAILED")
+        return session, csrf
+
+
+_HOST_IDLE_SCRIPT = """
+-- THS_DEPLOYMENT_IDLE_CHECK
+for _, task_id in ipairs(redis.call('SMEMBERS', KEYS[2])) do
+  local payload = redis.call('GET', KEYS[1] .. task_id)
+  if payload then
+    local task = cjson.decode(payload)
+    if task.status == 'RUNNING' or (task.status == 'PARTIAL' and (not task.completed_at or task.completed_at == cjson.null)) then
+      return 'BUSY'
+    end
+  end
+end
+return 'IDLE'
+"""
+_HOST_ACQUIRE_LEASE_SCRIPT = """
+-- THS_HOST_ACQUIRE_DEPLOYMENT_LEASE
+if redis.call('GET', KEYS[1]) then return 0 end
+for _, task_id in ipairs(redis.call('SMEMBERS', KEYS[3])) do
+  local payload = redis.call('GET', KEYS[2] .. task_id)
+  if payload then
+    local task = cjson.decode(payload)
+    if task.status == 'RUNNING' or (task.status == 'PARTIAL' and (not task.completed_at or task.completed_at == cjson.null)) then
+      return -1
+    end
+  end
+end
+local lease = cjson.encode({owner_token = ARGV[2], bound_task_id = cjson.null})
+local result = redis.call('SET', KEYS[1], lease, 'NX', 'PX', ARGV[1])
+if result then return 1 end
+return 0
+"""
+_HOST_RENEW_LEASE_SCRIPT = """
+-- THS_HOST_RENEW_DEPLOYMENT_LEASE
+local payload = redis.call('GET', KEYS[1])
+if not payload then return 0 end
+local lease = cjson.decode(payload)
+if lease.owner_token ~= ARGV[2] then return 0 end
+return redis.call('PEXPIRE', KEYS[1], ARGV[1])
+"""
+_HOST_RELEASE_LEASE_SCRIPT = """
+-- THS_HOST_RELEASE_DEPLOYMENT_LEASE
+local payload = redis.call('GET', KEYS[1])
+if not payload then return 0 end
+local lease = cjson.decode(payload)
+if lease.owner_token ~= ARGV[1] then return 0 end
+return redis.call('DEL', KEYS[1])
+"""
+
+
+class HostDeploymentMaintenance:
+    """Pause the old API and preserve one Redis lease across replacement."""
+
+    _LEASE_KEY = "ths:jobs:deployment-maintenance"
+    _TASK_PREFIX = "ths:jobs:task:"
+    _TASK_INDEX = "ths:jobs:tasks"
+
+    def __init__(
+        self,
+        runner: CommandRunner,
+        compose_prefix: Callable[[], tuple[str, ...]],
+        admin_client: AdminMaintenanceClient,
+        owner_state: DeploymentOwnerState,
+        *,
+        password_reader: Callable[[], str],
+        owner_factory: Callable[[], str] = lambda: secrets.token_urlsafe(48),
+        ttl_seconds: float = 3600.0,
+        idle_timeout_seconds: float = 300.0,
+        poll_interval_seconds: float = 1.0,
+    ) -> None:
+        if not 0 < ttl_seconds <= 7200:
+            raise ValueError("invalid deployment lease TTL")
+        self._runner = runner
+        self._compose_prefix = compose_prefix
+        self._admin_client = admin_client
+        self._owner_state = owner_state
+        self._password_reader = password_reader
+        self._owner_factory = owner_factory
+        self._ttl_seconds = ttl_seconds
+        self._idle_timeout_seconds = idle_timeout_seconds
+        self._poll_interval_seconds = poll_interval_seconds
+        self._owner_token: str | None = None
+
+    @property
+    def owner_token(self) -> str:
+        if self._owner_token is None:
+            raise DeploymentError("DEPLOYMENT_MAINTENANCE_NOT_ACTIVE")
+        return self._owner_token
+
+    def prepare(self) -> None:
+        try:
+            password = self._password_reader()
+            self._admin_client.acquire_device_lock(password)
+        except DeploymentError:
+            raise
+        except Exception:
+            raise DeploymentError("DEPLOYMENT_ADMIN_LOCK_FAILED") from None
+        self._wait_for_idle()
+        existing_owner = self._owner_state.load()
+        owner = existing_owner or self._owner_factory()
+        if _SAFE_OPERATION_ID.fullmatch(owner) is None or len(owner) < 32:
+            raise DeploymentError("DEPLOYMENT_MAINTENANCE_STATE_INVALID")
+        if existing_owner is not None and self._renew_owner(owner):
+            self._owner_token = owner
+            return
+        self._owner_state.store(owner)
+        result = self._lease_eval(
+            _HOST_ACQUIRE_LEASE_SCRIPT,
+            3,
+            (self._LEASE_KEY, self._TASK_PREFIX, self._TASK_INDEX),
+            (str(int(self._ttl_seconds * 1000)),),
+            owner,
+        )
+        if result != "1":
+            self._owner_state.delete()
+            raise DeploymentError("DEPLOYMENT_MAINTENANCE_BUSY")
+        self._owner_token = owner
+
+    def renew(self) -> None:
+        if not self._renew_owner(self.owner_token):
+            raise DeploymentError("DEPLOYMENT_MAINTENANCE_LOST")
+
+    def release(self) -> None:
+        result = self._lease_eval(
+            _HOST_RELEASE_LEASE_SCRIPT,
+            1,
+            (self._LEASE_KEY,),
+            (),
+            self.owner_token,
+        )
+        if result != "1":
+            raise DeploymentError("DEPLOYMENT_MAINTENANCE_RELEASE_FAILED")
+        self._owner_state.delete()
+        self._owner_token = None
+
+    def rollback(self) -> None:
+        """Compare-owner release after reacquiring the admin lock; queue stays paused."""
+        try:
+            password = self._password_reader()
+            self._admin_client.acquire_device_lock(password)
+        except DeploymentError:
+            raise
+        except Exception:
+            raise DeploymentError("DEPLOYMENT_ADMIN_LOCK_FAILED") from None
+        self._wait_for_idle()
+        owner = self._owner_state.load()
+        if owner is None:
+            raise DeploymentError("DEPLOYMENT_MAINTENANCE_NOT_ACTIVE")
+        self._owner_token = owner
+        self.release()
+
+    def _renew_owner(self, owner: str) -> bool:
+        result = self._lease_eval(
+            _HOST_RENEW_LEASE_SCRIPT,
+            1,
+            (self._LEASE_KEY,),
+            (str(int(self._ttl_seconds * 1000)),),
+            owner,
+        )
+        return result == "1"
+
+    def _wait_for_idle(self) -> None:
+        deadline = time.monotonic() + self._idle_timeout_seconds
+        while True:
+            result = self._lease_eval(
+                _HOST_IDLE_SCRIPT,
+                2,
+                (self._TASK_PREFIX, self._TASK_INDEX),
+                (),
+                None,
+            )
+            if result == "IDLE":
+                return
+            if result != "BUSY" or time.monotonic() >= deadline:
+                raise DeploymentError("DEPLOYMENT_TASKS_ACTIVE")
+            time.sleep(max(0.0, self._poll_interval_seconds))
+
+    def _lease_eval(
+        self,
+        script: str,
+        key_count: int,
+        keys: tuple[str, ...],
+        arguments: tuple[str, ...],
+        owner_input: str | None,
+    ) -> str:
+        command = self._compose_prefix() + (
+            "exec",
+            "-T",
+            "redis",
+            "redis-cli",
+            "--raw",
+        )
+        if owner_input is not None:
+            command += ("-x",)
+        command += ("EVAL", script, str(key_count), *keys, *arguments)
+        try:
+            result = self._runner.run(
+                command,
+                30.0,
+                owner_input.encode("ascii") if owner_input is not None else None,
+            )
+        except Exception:
+            raise DeploymentError("DEPLOYMENT_MAINTENANCE_UNAVAILABLE") from None
+        if result.returncode != 0:
+            raise DeploymentError("DEPLOYMENT_MAINTENANCE_UNAVAILABLE")
+        try:
+            return result.stdout.decode("utf-8").strip()
+        except (AttributeError, UnicodeDecodeError):
+            raise DeploymentError("DEPLOYMENT_MAINTENANCE_UNAVAILABLE") from None
 
 
 class ProvisioningJournal:
@@ -585,10 +1022,17 @@ class LoopbackDataOnlyAcceptance:
         base_url: str = "http://127.0.0.1:8001",
         timeout_seconds: float = 180.0,
         poll_interval_seconds: float = 2.0,
+        lease_owner_token: str | None = None,
     ) -> None:
         self._timeout_seconds = timeout_seconds
         self._poll_interval_seconds = poll_interval_seconds
         self._base_url = base_url.rstrip("/")
+        if lease_owner_token is not None and (
+            _SAFE_OPERATION_ID.fullmatch(lease_owner_token) is None
+            or len(lease_owner_token) < 32
+        ):
+            raise DeploymentError("DATA_ONLY_ACCEPTANCE_FAILED")
+        self._lease_owner_token = lease_owner_token
         wrapped_opener = None
         if opener is not None:
             wrapped_opener = lambda request, timeout: opener(
@@ -714,14 +1158,24 @@ class LoopbackDataOnlyAcceptance:
             or not confirmed_name.strip()
         ):
             raise DeploymentError("DATA_ONLY_ACCEPTANCE_FAILED")
-        submitted = self._request_json(
-            "POST",
-            "/api/v1/jobs",
-            payload={
-                "symbol": _ACCEPTANCE_SYMBOL,
-                "include_long_capture": False,
-            },
-        )
+        if self._lease_owner_token is None:
+            submitted = self._request_json(
+                "POST",
+                "/api/v1/jobs",
+                payload={
+                    "symbol": _ACCEPTANCE_SYMBOL,
+                    "include_long_capture": False,
+                },
+            )
+        else:
+            submitted = self._request_json(
+                "POST",
+                "/internal/deployment/acceptance",
+                payload={},
+                extra_headers={
+                    "Authorization": f"Bearer {self._lease_owner_token}"
+                },
+            )
         public_id = submitted.get("public_id")
         if (
             not isinstance(public_id, str)
@@ -861,6 +1315,7 @@ class LoopbackDataOnlyAcceptance:
         path: str,
         *,
         payload: dict[str, object] | None = None,
+        extra_headers: dict[str, str] | None = None,
     ) -> dict[str, object]:
         body = (
             json.dumps(payload, separators=(",", ":")).encode("utf-8")
@@ -868,6 +1323,8 @@ class LoopbackDataOnlyAcceptance:
             else None
         )
         headers = {"Content-Type": "application/json"} if body is not None else {}
+        if extra_headers:
+            headers.update(extra_headers)
         request = Request(
             f"{self._base_url}{path}",
             data=body,
@@ -903,6 +1360,7 @@ class MacDeploymentOrchestrator:
         process_executable_resolver: ProcessExecutableResolver | None = None,
         data_only_acceptance: DataOnlyAcceptance | None = None,
         provisioning_journal: ProvisioningJournalStore | None = None,
+        deployment_maintenance: DeploymentMaintenance | None = None,
         health_timeout_seconds: float = 180.0,
         boot_timeout_seconds: float = 180.0,
         poll_interval_seconds: float = 2.0,
@@ -929,6 +1387,7 @@ class MacDeploymentOrchestrator:
         self._process_executable_resolver = (
             process_executable_resolver or DarwinProcessExecutableResolver()
         )
+        self._deployment_maintenance = deployment_maintenance
 
     @property
     def initial_missing_roles(self) -> frozenset[str]:
@@ -1023,23 +1482,44 @@ class MacDeploymentOrchestrator:
         return DeploymentResult(mode="provision", state="READY")
 
     def deploy_existing(self) -> DeploymentResult:
-        self._validate_env_file_location()
-        self._validate_host_prerequisites()
-        self._require_fixed_avds()
-        self._root_environment = self._ensure_root_environment()
-        self._validate_macos_environment()
-        self._validate_effective_compose_config()
-        self._build_local_image()
-        manifest = self._read_image_manifest()
-        self._verify_preinstall_fixed_avd_identities()
-        self._install_lifecycle_service()
-        self._start_stopped_roles()
-        self._verify_fixed_avd_identities()
-        self._verify_installed_apks(manifest["apk"]["sha256"])
-        self._validate_effective_compose_config()
-        self._compose_up()
-        self._wait_for_compose_health()
-        return DeploymentResult(mode="existing", state="READY")
+        maintenance = self._deployment_maintenance
+        maintenance_prepared = False
+        try:
+            self._validate_env_file_location()
+            self._validate_host_prerequisites()
+            self._require_fixed_avds()
+            self._root_environment = self._ensure_root_environment()
+            self._validate_macos_environment()
+            self._validate_effective_compose_config()
+            self._build_local_image()
+            manifest = self._read_image_manifest()
+            self._verify_preinstall_fixed_avd_identities()
+            if maintenance is not None:
+                maintenance.prepare()
+                maintenance_prepared = True
+            self._install_lifecycle_service()
+            self._start_stopped_roles()
+            self._verify_fixed_avd_identities()
+            self._verify_installed_apks(manifest["apk"]["sha256"])
+            self._validate_effective_compose_config()
+            if maintenance is not None:
+                maintenance.renew()
+            self._compose_up()
+            self._wait_for_compose_health()
+            if maintenance is not None:
+                maintenance.renew()
+                if not self._session_bundles_ready():
+                    raise DeploymentError("SESSION_NOT_READY")
+                self._verify_data_only_acceptance()
+                maintenance.release()
+            return DeploymentResult(mode="existing", state="READY")
+        except DeploymentError as error:
+            if maintenance_prepared and not error.instructions:
+                raise DeploymentError(
+                    error.error_code,
+                    instructions=_MAINTENANCE_RETAINED_INSTRUCTIONS,
+                ) from None
+            raise
 
     def _validate_env_file_location(self) -> None:
         try:
@@ -1866,7 +2346,12 @@ class MacDeploymentOrchestrator:
         raise DeploymentError("SESSION_STATUS_UNAVAILABLE")
 
     def _verify_data_only_acceptance(self) -> None:
-        acceptance = self._data_only_acceptance or LoopbackDataOnlyAcceptance()
+        maintenance = self._deployment_maintenance
+        acceptance = self._data_only_acceptance or LoopbackDataOnlyAcceptance(
+            lease_owner_token=(
+                maintenance.owner_token if maintenance is not None else None
+            )
+        )
         try:
             acceptance.verify()
         except DeploymentError as error:
@@ -1968,6 +2453,11 @@ def build_argument_parser() -> argparse.ArgumentParser:
         default=Path(__file__).resolve().parents[1],
     )
     parser.add_argument("--env-file", type=Path, default=Path(".env"))
+    parser.add_argument(
+        "--release-maintenance-lease",
+        action="store_true",
+        help="compare-owner release after reacquiring admin lock; queue remains paused",
+    )
     return parser
 
 
@@ -1975,17 +2465,40 @@ def main(argv: list[str] | None = None) -> int:
     args = build_argument_parser().parse_args(argv)
     project_root = args.project_root.resolve()
     filesystem = PathFileSystem()
+    runner = SubprocessCommandRunner(project_root)
     orchestrator = MacDeploymentOrchestrator(
-        SubprocessCommandRunner(project_root),
+        runner,
         None,
         filesystem,
         project_root=project_root,
         env_file=args.env_file,
     )
+    maintenance = HostDeploymentMaintenance(
+        runner,
+        orchestrator._compose_prefix,
+        LoopbackAdminMaintenanceClient(),
+        SecureDeploymentOwnerState(),
+        password_reader=lambda: getpass.getpass(
+            "Existing administrator password: "
+        ),
+    )
+    orchestrator._deployment_maintenance = maintenance
     try:
-        result = orchestrator.deploy(args.mode)
+        if args.release_maintenance_lease:
+            maintenance.rollback()
+            result = DeploymentResult(
+                mode="rollback",
+                state="MAINTENANCE_RELEASED_QUEUE_PAUSED",
+                instructions=(
+                    "Release device control and explicitly resume the queue only after verifying device safety.",
+                ),
+            )
+        else:
+            result = orchestrator.deploy(args.mode)
     except DeploymentError as error:
         print(error.error_code, file=sys.stderr)
+        for instruction in error.instructions:
+            print(instruction, file=sys.stderr)
         return 1
     print(json.dumps(asdict(result), separators=(",", ":")))
     return 0

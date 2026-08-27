@@ -1,5 +1,6 @@
 import json
-from threading import Barrier, Thread
+from threading import Barrier, RLock, Thread
+from time import monotonic
 
 import pytest
 
@@ -11,16 +12,57 @@ from level2_service.queue import RedisStreamsStore
 
 
 class FakeRedis:
-    def __init__(self) -> None:
+    def __init__(self, *, clock=None) -> None:
         self.values = {}
         self.lists = {}
         self.sets = {}
         self.hashes = {}
         self.streams = {}
+        self.clock = clock or monotonic
+        self.expiries = {}
+        self._lock = RLock()
 
-    def set(self, key, value): self.values[key] = value
-    def get(self, key): return self.values.get(key)
-    def delete(self, key): self.values.pop(key, None)
+    def _expire(self, key):
+        deadline = self.expiries.get(key)
+        if deadline is not None and self.clock() >= deadline:
+            self.values.pop(key, None)
+            self.expiries.pop(key, None)
+
+    def advance(self, seconds):
+        advance = getattr(self.clock, "advance", None)
+        if callable(advance):
+            advance(seconds)
+
+    def set(self, key, value, nx=False, px=None, keepttl=False):
+        self._expire(key)
+        if nx and key in self.values:
+            return None
+        self.values[key] = value
+        if px is not None:
+            self.expiries[key] = self.clock() + float(px) / 1000.0
+        elif not keepttl:
+            self.expiries.pop(key, None)
+        return True
+    def get(self, key):
+        self._expire(key)
+        return self.values.get(key)
+    def delete(self, key):
+        existed = self.get(key) is not None
+        self.values.pop(key, None)
+        self.expiries.pop(key, None)
+        return int(existed)
+    def pexpire(self, key, milliseconds):
+        if self.get(key) is None:
+            return 0
+        self.expiries[key] = self.clock() + float(milliseconds) / 1000.0
+        return 1
+    def pttl(self, key):
+        if self.get(key) is None:
+            return -2
+        deadline = self.expiries.get(key)
+        if deadline is None:
+            return -1
+        return max(0, int((deadline - self.clock()) * 1000))
     def rpush(self, key, value): self.lists.setdefault(key, []).append(value)
     def lpush(self, key, value): self.lists.setdefault(key, []).insert(0, value)
     def lrange(self, key, start, end):
@@ -76,6 +118,158 @@ class FakeRedis:
     def eval(self, script, key_count, *values):
         keys = values[:key_count]
         args = values[key_count:]
+        if "THS_ACQUIRE_DEPLOYMENT_LEASE" in script:
+            lease_key, prefix, index_key = keys
+            owner, ttl_ms = args
+            with self._lock:
+                if self.get(lease_key) is not None:
+                    return 0
+                for task_id in self.sets.get(index_key, set()):
+                    payload = self.get(prefix + task_id)
+                    if not payload:
+                        continue
+                    task = json.loads(payload)
+                    if task["status"] == "RUNNING" or (
+                        task["status"] == "PARTIAL"
+                        and task.get("completed_at") is None
+                    ):
+                        return -1
+                self.set(
+                    lease_key,
+                    json.dumps(
+                        {"owner_token": owner, "bound_task_id": None},
+                        separators=(",", ":"),
+                    ),
+                    nx=True,
+                    px=int(ttl_ms),
+                )
+                return 1
+        if "THS_RENEW_DEPLOYMENT_LEASE" in script:
+            (lease_key,) = keys
+            owner, ttl_ms = args
+            with self._lock:
+                payload = self.get(lease_key)
+                if not payload or json.loads(payload)["owner_token"] != owner:
+                    return 0
+                return self.pexpire(lease_key, int(ttl_ms))
+        if "THS_DEPLOYMENT_LEASE_STATUS" in script:
+            (lease_key,) = keys
+            with self._lock:
+                payload = self.get(lease_key)
+                ttl = self.pttl(lease_key)
+                return [payload, ttl] if payload and ttl > 0 else False
+        if "THS_BIND_DEPLOYMENT_ACCEPTANCE" in script:
+            lease_key, queue_key, prefix, index_key, event_stream, symbol_index = keys
+            owner, task_id, payload, symbol, cap = args
+            with self._lock:
+                lease_payload = self.get(lease_key)
+                if not lease_payload:
+                    return False
+                lease = json.loads(lease_payload)
+                if lease["owner_token"] != owner:
+                    return False
+                bound = lease.get("bound_task_id")
+                if bound:
+                    existing = self.get(prefix + bound)
+                    if not existing:
+                        return False
+                    task = json.loads(existing)
+                    return (
+                        existing
+                        if task["symbol"] == "601872"
+                        and task["include_long_capture"] is False
+                        else False
+                    )
+                if self.get(prefix + task_id):
+                    return False
+                pending = sum(
+                    json.loads(self.get(prefix + existing_id))["status"]
+                    in {"QUEUED", "RUNNING", "WAITING_ADMIN"}
+                    for existing_id in self.sets.get(index_key, set())
+                    if self.get(prefix + existing_id)
+                )
+                if pending >= int(cap):
+                    return "QUEUE_FULL"
+                self.set(prefix + task_id, payload)
+                self.sadd(index_key, task_id)
+                self.rpush(queue_key, task_id)
+                self.hset(symbol_index, symbol, task_id)
+                self.xadd(
+                    event_stream,
+                    {
+                        "event": "status",
+                        "task_id": task_id,
+                        "data": "QUEUED",
+                    },
+                )
+                lease["bound_task_id"] = task_id
+                self.set(
+                    lease_key,
+                    json.dumps(lease, separators=(",", ":")),
+                    keepttl=True,
+                )
+                return payload
+        if "THS_RELEASE_DEPLOYMENT_LEASE" in script:
+            (lease_key,) = keys
+            (owner,) = args
+            with self._lock:
+                payload = self.get(lease_key)
+                if not payload or json.loads(payload)["owner_token"] != owner:
+                    return 0
+                return self.delete(lease_key)
+        if "THS_CLAIM_WITH_DEPLOYMENT_LEASE" in script:
+            queue_key, prefix, event_stream, lease_key = keys
+            (timestamp,) = args
+            with self._lock:
+                lease_payload = self.get(lease_key)
+                if lease_payload:
+                    task_id = json.loads(lease_payload).get("bound_task_id")
+                    if not task_id:
+                        return False
+                    payload = self.get(prefix + task_id)
+                    if not payload:
+                        return False
+                    task = json.loads(payload)
+                    if (
+                        task["status"] != "QUEUED"
+                        or task["symbol"] != "601872"
+                        or task["include_long_capture"] is not False
+                    ):
+                        return False
+                    task["status"] = "RUNNING"
+                    task["updated_at"] = timestamp
+                    updated = json.dumps(task)
+                    self.set(prefix + task_id, updated)
+                    self.lrem(queue_key, 0, task_id)
+                    self.xadd(
+                        event_stream,
+                        {
+                            "event": "status",
+                            "task_id": task_id,
+                            "data": "RUNNING",
+                        },
+                    )
+                    return updated
+                while self.lists.get(queue_key):
+                    task_id = self.lists[queue_key].pop(0)
+                    payload = self.get(prefix + task_id)
+                    if payload:
+                        task = json.loads(payload)
+                        if task["status"] == "QUEUED":
+                            task["status"] = "RUNNING"
+                            task["updated_at"] = timestamp
+                            updated = json.dumps(task)
+                            self.set(prefix + task_id, updated)
+                            self.xadd(
+                                event_stream,
+                                {
+                                    "event": "status",
+                                    "task_id": task_id,
+                                    "data": "RUNNING",
+                                },
+                            )
+                            return updated
+                return False
         if "THS_ENQUEUE" in script:
             queue_key, prefix, index_key, event_stream, symbol_index_key = keys
             cap, task_id, payload, symbol = args

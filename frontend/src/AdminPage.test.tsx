@@ -70,6 +70,33 @@ describe('AdminPage', () => {
     }))
   })
 
+  it('refreshes the fund account session without exposing session material', async () => {
+    vi.mocked(fetch)
+      .mockResolvedValueOnce(new Response(null, { status: 204 }))
+      .mockResolvedValueOnce(jsonResponse({ state: 'READY', last_heartbeat: null, queue_paused: false }))
+      .mockResolvedValueOnce(jsonResponse({ locked: false }))
+      .mockResolvedValueOnce(jsonResponse({ paused: false }))
+      .mockResolvedValueOnce(jsonResponse({
+        role: 'main_fund_flow',
+        state: 'READY',
+        updated_at: '2026-08-27T10:00:00+00:00',
+        error_code: null,
+      }))
+
+    const user = userEvent.setup()
+    render(<AdminPage />)
+
+    await user.click(await screen.findByRole('button', { name: '刷新资金账号会话' }))
+
+    await waitFor(() => expect(screen.getByText('资金账号会话已刷新')).toBeInTheDocument())
+    expect(screen.getByText('资金账号会话：已就绪')).toBeInTheDocument()
+    expect(screen.queryByText(/private-cookie-marker|private-token-marker|private-user-agent-marker/i)).not.toBeInTheDocument()
+    expect(fetch).toHaveBeenLastCalledWith('/api/admin/account-sessions/main_fund_flow/refresh', expect.objectContaining({
+      method: 'POST',
+      headers: expect.objectContaining({ 'X-CSRF-Token': 'test-csrf' }),
+    }))
+  })
+
   it('does not block an existing cookie session while server validation is pending', () => {
     vi.mocked(fetch).mockReturnValue(new Promise<Response>(() => undefined))
 

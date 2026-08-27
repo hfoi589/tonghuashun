@@ -1,5 +1,5 @@
 import { FormEvent, KeyboardEvent, PointerEvent, useCallback, useEffect, useRef, useState } from 'react'
-import { ApiError, api, readCsrfToken, type MarketAdminUser, type QueueState, type RunnerHealth } from './api'
+import { ApiError, api, readCsrfToken, type AccountSessionStatus, type MarketAdminUser, type QueueState, type RunnerHealth } from './api'
 import { parseDeviceServerMessage, type DeviceInputEvent, type DeviceStatus } from './device-protocol'
 import { DeviceInputAdapter } from './device-stream'
 
@@ -153,6 +153,14 @@ function healthText(health: RunnerHealth | null) {
 
 function healthReady(health: RunnerHealth | null) { return health?.state === 'READY' || health?.state === 'ADMIN_CONTROL' }
 
+function accountSessionStateText(status: AccountSessionStatus | null): string {
+  if (!status) return '未查询'
+  if (status.state === 'READY') return '已就绪'
+  if (status.state === 'MISSING') return '未配置'
+  if (status.state === 'ERROR') return status.error_code ? `异常（${status.error_code}）` : '异常'
+  return status.state
+}
+
 export function AdminPage({ deviceStreamUrl }: { deviceStreamUrl?: string }) {
   const [password, setPassword] = useState('')
   const [currentPassword, setCurrentPassword] = useState('')
@@ -170,6 +178,8 @@ export function AdminPage({ deviceStreamUrl }: { deviceStreamUrl?: string }) {
   const [marketUsers, setMarketUsers] = useState<MarketAdminUser[] | null>(null)
   const [marketUsername, setMarketUsername] = useState('')
   const [marketTemporaryPassword, setMarketTemporaryPassword] = useState('')
+  const [fundSession, setFundSession] = useState<AccountSessionStatus | null>(null)
+  const [refreshingFundSession, setRefreshingFundSession] = useState(false)
   const invalidateAdminControl = useCallback((reason: unknown) => {
     const sessionInvalid = (reason instanceof ApiError && reason.status === 401) || (reason instanceof Error && reason.message.includes('authentication'))
     if (sessionInvalid) {
@@ -298,6 +308,25 @@ export function AdminPage({ deviceStreamUrl }: { deviceStreamUrl?: string }) {
       setMessage(updated.enabled ? '行情用户已启用' : '行情用户已停用')
     } catch (reason) { invalidateAdminControl(reason) }
   }
+  async function refreshFundSession() {
+    setMessage('')
+    setRefreshingFundSession(true)
+    try {
+      const status = await api.refreshAccountSession('main_fund_flow', readCsrfToken())
+      setFundSession(status)
+      setMessage(status.state === 'READY' ? '资金账号会话已刷新' : `资金账号会话状态：${accountSessionStateText(status)}`)
+    } catch (reason) {
+      try {
+        const response = await api.accountSessions()
+        setFundSession(response.sessions.find((item) => item.role === 'main_fund_flow') ?? null)
+      } catch {
+        // Keep the refresh error visible when the status read also fails.
+      }
+      setMessage(reason instanceof Error ? reason.message : '资金账号会话刷新失败')
+    } finally {
+      setRefreshingFundSession(false)
+    }
+  }
   useEffect(() => {
     if (!hadSessionCookie.current) return
     let active = true
@@ -335,6 +364,7 @@ export function AdminPage({ deviceStreamUrl }: { deviceStreamUrl?: string }) {
     <p className="notice"><span>密码仅用于本次请求，不会记录或展示。</span> 不要在此页面输入或粘贴同花顺账号凭据；本页面不会记录任何密码或按键内容。</p>
     <section className="admin-controls"><div><h2>人工接管</h2><p>{locked ? '当前会话正在控制设备。' : '设备未由当前会话接管。'}</p></div><div className="button-row">{locked ? <button className="secondary" onClick={() => changeLock('release')}>交还控制</button> : <button onClick={() => changeLock('acquire')}>接管设备</button>}<button className="secondary" onClick={refreshHealth}>刷新运行端状态</button></div></section>
     <section className="admin-controls"><div><h2>队列</h2><p>{queue?.paused ? '队列已暂停；已领取的任务会继续完成。' : '队列正在接收 Runner 的 FIFO 任务。'}</p></div><div className="button-row">{queue?.paused ? <button className="secondary" onClick={() => changeQueue('resume')} disabled={locked}>恢复队列</button> : <button className="secondary" onClick={() => changeQueue('pause')} disabled={!queue}>暂停队列</button>}</div></section>
+    <section className="admin-controls"><div><h2>资金账号会话</h2><p>资金流直连需要 App 已完成人工登录；刷新只保存加密会话，不会展示 Cookie 或 token。</p></div><div className="button-row"><span className="minor" aria-live="polite">资金账号会话：{accountSessionStateText(fundSession)}</span>{fundSession?.updated_at && <span className="minor">更新时间：{new Date(fundSession.updated_at).toLocaleString('zh-CN')}</span>}<button className="secondary" type="button" onClick={refreshFundSession} disabled={refreshingFundSession}>{refreshingFundSession ? '刷新中…' : '刷新资金账号会话'}</button></div></section>
     <section className="admin-controls"><div><h2>恢复等待任务</h2><p>完成设备登录、验证或权限处理后，输入任务 ID 重新排入 FIFO 队列。</p></div><form className="button-row" onSubmit={resumeWaitingJob}><label htmlFor="waiting-task">等待任务 ID</label><input id="waiting-task" value={waitingTaskId} onChange={(event) => setWaitingTaskId(event.target.value)} autoComplete="off" /><button className="secondary" type="submit" disabled={!waitingTaskId.trim()}>恢复等待任务</button></form></section>
     <section className="admin-controls"><div><h2>重试失败任务</h2><p>设备恢复后，输入失败任务 ID 重新排入 FIFO 队列；已有合格截图会保留。</p></div><form className="button-row" onSubmit={retryFailedJob}><label htmlFor="failed-task">失败任务 ID</label><input id="failed-task" value={failedTaskId} onChange={(event) => setFailedTaskId(event.target.value)} autoComplete="off" /><button className="secondary" type="submit" disabled={!failedTaskId.trim()}>重试失败任务</button></form></section>
     <section className="admin-controls"><div><h2>修改管理员密码</h2><p>修改后当前会话会退出，使用新密码重新登录。</p></div><form className="password-change-form" onSubmit={changePassword} data-1p-ignore="true" data-lpignore="true"><label htmlFor="current-admin-password">当前管理员密码</label><input id="current-admin-password" type="password" autoComplete="current-password" data-1p-ignore="true" data-lpignore="true" value={currentPassword} onChange={(event) => setCurrentPassword(event.target.value)} required /><label htmlFor="new-admin-password">新管理员密码</label><input id="new-admin-password" type="password" autoComplete="new-password" data-1p-ignore="true" data-lpignore="true" value={newPassword} onChange={(event) => setNewPassword(event.target.value)} required /><label htmlFor="confirm-admin-password">确认新管理员密码</label><input id="confirm-admin-password" type="password" autoComplete="new-password" data-1p-ignore="true" data-lpignore="true" value={newPasswordConfirmation} onChange={(event) => setNewPasswordConfirmation(event.target.value)} required /><button className="secondary" type="submit">修改管理员密码</button></form></section>
@@ -354,7 +384,7 @@ export function AdminPage({ deviceStreamUrl }: { deviceStreamUrl?: string }) {
         </>}
       </div>
     </section>
-    {message && <p className={message.includes('获得') || message.includes('交还') || message.includes('重新') ? 'success-message' : 'error'} role="status">{message}</p>}
+    {message && <p className={message.includes('获得') || message.includes('交还') || message.includes('重新') || message.includes('会话已刷新') ? 'success-message' : 'error'} role="status">{message}</p>}
     <div className="admin-device-grid">
       <DeviceViewport
         title="八项账号"

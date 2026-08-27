@@ -122,6 +122,13 @@ export interface QueueState {
   paused: boolean
 }
 
+export interface AccountSessionStatus {
+  role: 'core_metrics' | 'main_fund_flow'
+  state: string
+  updated_at: string | null
+  error_code: string | null
+}
+
 export interface MarketAdminUser {
   id: number
   username: string
@@ -201,6 +208,11 @@ export const api = {
   runner: () => request<RunnerHealth>('/api/admin/runner'),
   lock: () => request<LockState>('/api/admin/lock'),
   queue: () => request<QueueState>('/api/admin/queue'),
+  accountSessions: () => request<{ sessions: AccountSessionStatus[] }>('/api/admin/account-sessions'),
+  refreshAccountSession: (role: AccountSessionStatus['role'], csrfToken: string) => request<AccountSessionStatus>(`/api/admin/account-sessions/${role}/refresh`, {
+    method: 'POST',
+    headers: { 'X-CSRF-Token': csrfToken },
+  }),
   pauseQueue: (csrfToken: string) => request<QueueState>('/api/admin/queue/pause', {
     method: 'POST',
     headers: { 'X-CSRF-Token': csrfToken },

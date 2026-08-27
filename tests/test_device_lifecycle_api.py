@@ -1,4 +1,5 @@
 from datetime import datetime, timezone
+from threading import Event, Thread
 
 import pytest
 from argon2 import PasswordHasher
@@ -13,8 +14,13 @@ from level2_service.device_lifecycle import (
     DeviceLifecycleStatus,
 )
 from level2_service.models import TaskRecord, TaskStatus
-from level2_service.queue import InMemoryStreams, RedisStreamsStore
-from level2_service.runner import FakeDeviceBridge
+from level2_service.queue import InMemoryStreams, RedisStreamsStore, TaskStore
+from level2_service.runner import (
+    FakeDeviceBridge,
+    Level2Navigator,
+    Level2Runner,
+    RunnerControl,
+)
 from tests.test_redis_store import FakeRedis
 
 
@@ -80,7 +86,8 @@ def login_admin(client: TestClient) -> str:
 def lifecycle_app(
     lifecycle: object | None = None,
     *,
-    store: InMemoryStreams | None = None,
+    store: TaskStore | None = None,
+    runner_control: RunnerControl | None = None,
 ):
     return create_app(
         store=store,
@@ -90,6 +97,7 @@ def lifecycle_app(
             "main_fund_flow": FakeDeviceBridge(symbol="600938"),
         },
         device_lifecycle=lifecycle,
+        runner_control=runner_control,
     )
 
 
@@ -377,3 +385,152 @@ def test_admin_devices_report_unconfigured_lifecycle_without_a_client() -> None:
         }
         for device in devices
     )
+
+
+@pytest.mark.parametrize(
+    "store_factory",
+    [
+        pytest.param(InMemoryStreams, id="memory"),
+        pytest.param(lambda: RedisStreamsStore(FakeRedis()), id="redis"),
+    ],
+)
+def test_runner_claim_cannot_cross_lifecycle_maintenance_acceptance(
+    store_factory,
+    tmp_path,
+) -> None:
+    """A runner already between pause-check and claim must serialize before maintenance."""
+    store = store_factory()
+    store.enqueue(
+        TaskRecord(
+            task_id="queued",
+            symbol="000001",
+            include_long_capture=False,
+        )
+    )
+    claim_entered = Event()
+    allow_claim = Event()
+    processing_entered = Event()
+    allow_processing = Event()
+    original_next_queued = store.next_queued
+
+    def blocked_next_queued():
+        claim_entered.set()
+        assert allow_claim.wait(2)
+        return original_next_queued()
+
+    store.next_queued = blocked_next_queued
+
+    class BlockingValues:
+        def read_direct(self, _symbol):
+            processing_entered.set()
+            assert allow_processing.wait(2)
+            return {}
+
+    submit_entered = Event()
+
+    class SignalingLifecycle(FakeDeviceLifecycle):
+        def submit(self, role, action):
+            submit_entered.set()
+            return super().submit(role, action)
+
+    control = RunnerControl()
+    lifecycle = SignalingLifecycle()
+    runner = Level2Runner(
+        store,
+        Level2Navigator(FakeDeviceBridge(symbol="000001")),
+        tmp_path,
+        control,
+        parsed_value_source=BlockingValues(),
+    )
+    client = TestClient(
+        lifecycle_app(lifecycle, store=store, runner_control=control),
+        base_url="https://testserver",
+    )
+    csrf = login_admin(client)
+    runner_thread = Thread(target=runner.run_once)
+    runner_thread.start()
+    assert claim_entered.wait(1)
+    responses = {}
+
+    def request_action() -> None:
+        responses["lock"] = client.post(
+            "/api/admin/lock/acquire",
+            headers={"X-CSRF-Token": csrf},
+        )
+        responses["action"] = client.post(
+            "/api/admin/devices/core_metrics/actions",
+            headers={"X-CSRF-Token": csrf},
+            json={"action": "shutdown"},
+        )
+
+    admin_thread = Thread(target=request_action)
+    admin_thread.start()
+    submitted_before_claim = submit_entered.wait(0.5)
+    allow_claim.set()
+    assert processing_entered.wait(1)
+    admin_thread.join(timeout=2)
+    allow_processing.set()
+    runner_thread.join(timeout=2)
+
+    assert submitted_before_claim is False
+    assert not admin_thread.is_alive()
+    assert not runner_thread.is_alive()
+    assert responses["lock"].status_code == 200
+    assert responses["action"].status_code == 409
+    assert responses["action"].json() == {"detail": "DEVICE_LIFECYCLE_BUSY"}
+    assert lifecycle.calls == []
+
+
+def test_lock_release_waits_for_lifecycle_submission_to_finish() -> None:
+    """The lock owner cannot release control while an accepted broker call is open."""
+    submit_entered = Event()
+    allow_submit = Event()
+
+    class BlockingLifecycle(FakeDeviceLifecycle):
+        def submit(self, role, action):
+            submit_entered.set()
+            assert allow_submit.wait(2)
+            return super().submit(role, action)
+
+    control = RunnerControl()
+    client = TestClient(
+        lifecycle_app(BlockingLifecycle(), runner_control=control),
+        base_url="https://testserver",
+    )
+    csrf = login_admin(client)
+    assert client.post(
+        "/api/admin/lock/acquire", headers={"X-CSRF-Token": csrf}
+    ).status_code == 200
+    responses = {}
+    release_done = Event()
+
+    def submit_action() -> None:
+        responses["action"] = client.post(
+            "/api/admin/devices/core_metrics/actions",
+            headers={"X-CSRF-Token": csrf},
+            json={"action": "shutdown"},
+        )
+
+    def release_lock() -> None:
+        responses["release"] = client.post(
+            "/api/admin/lock/release",
+            headers={"X-CSRF-Token": csrf},
+        )
+        release_done.set()
+
+    action_thread = Thread(target=submit_action)
+    action_thread.start()
+    assert submit_entered.wait(1)
+    release_thread = Thread(target=release_lock)
+    release_thread.start()
+    release_finished_early = release_done.wait(0.2)
+    allow_submit.set()
+    action_thread.join(timeout=2)
+    release_thread.join(timeout=2)
+
+    assert release_finished_early is False
+    assert not action_thread.is_alive()
+    assert not release_thread.is_alive()
+    assert responses["action"].status_code == 202
+    assert responses["release"].status_code == 200
+    assert control.queue_paused is True

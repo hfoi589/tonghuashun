@@ -43,7 +43,14 @@ from .parsed_values import (
     sanitized_direct_error_code,
 )
 from .queue import InMemoryStreams, QueueFullError, TaskStore
-from .runner import ADBDeviceBridge, DeviceBridge, Level2Runner, RunnerControl, jpeg_base64
+from .runner import (
+    ADBDeviceBridge,
+    DeviceBridge,
+    Level2Runner,
+    RunnerControl,
+    RunnerMaintenanceError,
+    jpeg_base64,
+)
 from .security import AdminSessionManager, persist_password_hash
 from .symbol_cache import SymbolLookupCache
 
@@ -1058,21 +1065,14 @@ def create_app(
         if role not in device_labels:
             raise HTTPException(status_code=404, detail="device role not found")
         control = app.state.runner_control
-        if not control.authorizes_input(session.session_id):
-            raise HTTPException(
-                status_code=409,
-                detail="DEVICE_LIFECYCLE_LOCK_REQUIRED",
-            )
-        if not control.queue_paused or app.state.store.has_running_task():
-            raise HTTPException(status_code=409, detail="DEVICE_LIFECYCLE_BUSY")
         lifecycle = app.state.device_lifecycle
-        if lifecycle is None:
-            raise HTTPException(
-                status_code=503,
-                detail="DEVICE_LIFECYCLE_UNAVAILABLE",
-            )
         try:
-            operation = lifecycle.submit(role, payload.action)
+            with control.maintenance(session.session_id, app.state.store):
+                if lifecycle is None:
+                    raise DeviceLifecycleError("DEVICE_LIFECYCLE_UNAVAILABLE")
+                operation = lifecycle.submit(role, payload.action)
+        except RunnerMaintenanceError as error:
+            raise HTTPException(status_code=409, detail=error.error_code) from None
         except DeviceLifecycleError as error:
             error_code = safe_lifecycle_error_code(error.error_code)
             if error_code is None:

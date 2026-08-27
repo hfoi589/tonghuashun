@@ -11,6 +11,7 @@ from PIL import Image
 import pytest
 
 from level2_service.models import CaptureKind, CaptureStatus, MetricKind, TaskRecord, TaskStatus
+from level2_service.direct_market import Core9528Client, Core9528TemplateProtocol
 from level2_service.parsed_values import DirectReadOutcome
 from level2_service.queue import InMemoryStreams
 from level2_service.runner import (
@@ -768,6 +769,52 @@ def test_data_only_runner_preserves_interface_error_without_ocr_fallback(tmp_pat
     assert bridge.inputs == []
     assert task.long_capture.status == CaptureStatus.SKIPPED
     assert not (tmp_path / "failed-interface-data-only-task").exists()
+
+
+def test_runner_preserves_core_protocol_stage_gate_without_ui_or_ocr_fallback(
+    tmp_path: Path,
+) -> None:
+    store = InMemoryStreams()
+    store.enqueue(
+        TaskRecord(
+            task_id="unsupported-core-protocol-task",
+            symbol="601872",
+            include_long_capture=True,
+        )
+    )
+    bridge = FakeDeviceBridge(symbol="601872")
+    runner = _successful_runner(store, Level2Navigator(bridge), tmp_path)
+
+    class Provider:
+        def get(self, _role: str):
+            raise AssertionError("stage gate must not load session material")
+
+        def mark_error(self, _role: str, _error_code: str) -> None:
+            raise AssertionError("stage gate must not rewrite the error code")
+
+    runner.parsed_value_source = Core9528Client(
+        Provider(),
+        protocol=Core9528TemplateProtocol(
+            socket_factory=lambda *_args: (_ for _ in ()).throw(
+                AssertionError("stage gate must not create a socket")
+            )
+        ),
+    )
+    runner.value_reader = types.SimpleNamespace(
+        read=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("task values must never run OCR")
+        )
+    )
+
+    task = runner.run_once()
+
+    assert task is not None and task.status == TaskStatus.FAILED
+    assert task.error_code == "DIRECT_PROTOCOL_RESPONSE_UNSUPPORTED"
+    assert task.source_errors["core_metrics"] == "DIRECT_PROTOCOL_RESPONSE_UNSUPPORTED"
+    assert bridge.inputs == []
+    assert bridge.capture_attempts == 0
+    assert task.long_capture.status == CaptureStatus.PENDING
+    assert not (tmp_path / "unsupported-core-protocol-task").exists()
 
 
 def test_online_ui_failure_is_not_reported_as_device_offline(tmp_path: Path) -> None:

@@ -6,6 +6,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+import re
 import time
 from threading import RLock
 from typing import Any, Callable, Protocol
@@ -76,6 +77,16 @@ class DirectRequestError(RuntimeError):
     def __init__(self, error_code: str, message: str | None = None) -> None:
         self.error_code = error_code
         super().__init__(message or error_code)
+
+
+_FIXED_ERROR_CODE = re.compile(r"[A-Z][A-Z0-9_]{2,63}\Z")
+
+
+def sanitized_direct_error_code(error_code: object, fallback: str) -> str:
+    """Keep only an opaque fixed code at public and loggable boundaries."""
+
+    candidate = str(error_code).strip()
+    return candidate if _FIXED_ERROR_CODE.fullmatch(candidate) else fallback
 
 
 class SymbolLookupNotFoundError(LookupError):
@@ -154,11 +165,13 @@ class DualAccountParsedValueSource:
         core_source: Any,
         fund_source: Any,
         *,
+        symbol_source: Any | None = None,
         fund_market_interval_seconds: float = 15.0,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self.core_source = core_source
         self.fund_source = fund_source
+        self.symbol_source = symbol_source or core_source
         self.fund_market_interval_seconds = fund_market_interval_seconds
         self._market_clock = clock
         self._fund_market_cache: dict[str, tuple[dict[str, Any], str | None, float]] = {}
@@ -168,10 +181,10 @@ class DualAccountParsedValueSource:
         return self.core_source.read(symbol)
 
     def lookup_symbol(self, symbol: str) -> SymbolLookup:
-        return self.core_source.lookup_symbol(symbol)
+        return self.symbol_source.lookup_symbol(symbol)
 
     def search_symbols(self, query: str, limit: int = 8) -> list[SymbolLookup]:
-        return self.core_source.search_symbols(query, limit)
+        return self.symbol_source.search_symbols(query, limit)
 
     def read_direct(self, symbol: str) -> DirectReadOutcome:
         with ThreadPoolExecutor(max_workers=2, thread_name_prefix="ths-direct") as executor:
@@ -179,16 +192,22 @@ class DualAccountParsedValueSource:
             fund_future = executor.submit(self.fund_source.read_direct, symbol)
             try:
                 core_result = core_future.result()
-            except DirectRequestError:
-                raise
-            except Exception as error:
-                raise DirectRequestError("DIRECT_REQUEST_FAILED", str(error)) from error
+            except DirectRequestError as error:
+                raise DirectRequestError(
+                    sanitized_direct_error_code(
+                        error.error_code, "DIRECT_REQUEST_FAILED"
+                    )
+                ) from None
+            except Exception:
+                raise DirectRequestError("DIRECT_REQUEST_FAILED") from None
 
             fund_error: str | None = None
             try:
                 fund_result = fund_future.result()
             except DirectRequestError as error:
-                fund_error = error.error_code
+                fund_error = sanitized_direct_error_code(
+                    error.error_code, "DIRECT_FUND_FLOW_REQUEST_FAILED"
+                )
                 fund_result = {}
             except Exception:
                 fund_error = "DIRECT_FUND_FLOW_REQUEST_FAILED"
@@ -240,10 +259,14 @@ class DualAccountParsedValueSource:
             fund_future = executor.submit(self._read_cached_fund_market, symbol)
             try:
                 core = core_future.result()
-            except DirectRequestError:
-                raise
-            except Exception as error:
-                raise DirectRequestError("DIRECT_REQUEST_FAILED", str(error)) from error
+            except DirectRequestError as error:
+                raise DirectRequestError(
+                    sanitized_direct_error_code(
+                        error.error_code, "DIRECT_REQUEST_FAILED"
+                    )
+                ) from None
+            except Exception:
+                raise DirectRequestError("DIRECT_REQUEST_FAILED") from None
             try:
                 main_fund_flow, fund_error = fund_future.result()
             except Exception:
@@ -267,7 +290,9 @@ class DualAccountParsedValueSource:
             fund = self.fund_source.read_market_snapshot(symbol, detail=False)
             result = fund.main_fund_flow, fund.source_errors.get("main_fund_flow")
         except DirectRequestError as error:
-            result = {}, error.error_code
+            result = {}, sanitized_direct_error_code(
+                error.error_code, "DIRECT_FUND_FLOW_REQUEST_FAILED"
+            )
         except Exception:
             result = {}, "DIRECT_FUND_FLOW_REQUEST_FAILED"
         with self._fund_market_lock:
@@ -358,8 +383,17 @@ class FridaParsedValueSource:
                     symbol,
                     market,
                 )
-        except (UnsupportedMarketError, DirectRequestError):
+        except UnsupportedMarketError:
             raise
+        except DirectRequestError as error:
+            fallback = (
+                "DIRECT_FUND_FLOW_REQUEST_FAILED"
+                if self.request_scope == "main_fund_flow"
+                else "DIRECT_REQUEST_FAILED"
+            )
+            raise DirectRequestError(
+                sanitized_direct_error_code(error.error_code, fallback)
+            ) from None
         except Exception as error:
             bridge_offline = type(error).__name__ in {
                 "ProcessNotFoundError",
@@ -378,10 +412,17 @@ class FridaParsedValueSource:
                     if self.request_scope == "main_fund_flow"
                     else "DIRECT_REQUEST_FAILED"
                 )
-            raise DirectRequestError(error_code, str(error)) from error
+            raise DirectRequestError(error_code) from None
         error_code = _text(payload.get("error_code"))
         if error_code is not None:
-            raise DirectRequestError(error_code, _text(payload.get("error_message")))
+            fallback = (
+                "DIRECT_FUND_FLOW_REQUEST_FAILED"
+                if self.request_scope == "main_fund_flow"
+                else "DIRECT_REQUEST_FAILED"
+            )
+            raise DirectRequestError(
+                sanitized_direct_error_code(error_code, fallback)
+            ) from None
         return DirectReadOutcome(
             values=self._parse_payload(payload, symbol),
             source_errors={"core_metrics": None, "main_fund_flow": None},
@@ -401,8 +442,14 @@ class FridaParsedValueSource:
                     market,
                     detail,
                 )
-        except (UnsupportedMarketError, DirectRequestError):
+        except UnsupportedMarketError:
             raise
+        except DirectRequestError as error:
+            raise DirectRequestError(
+                sanitized_direct_error_code(
+                    error.error_code, "DIRECT_REQUEST_FAILED"
+                )
+            ) from None
         except Exception as error:
             bridge_offline = type(error).__name__ in {
                 "ProcessNotFoundError",
@@ -410,10 +457,12 @@ class FridaParsedValueSource:
                 "TransportError",
             }
             code = "DIRECT_APP_OFFLINE" if bridge_offline else "DIRECT_REQUEST_FAILED"
-            raise DirectRequestError(code, str(error)) from error
+            raise DirectRequestError(code) from None
         error_code = _text(payload.get("error_code"))
         if error_code is not None:
-            raise DirectRequestError(error_code, _text(payload.get("error_message")))
+            raise DirectRequestError(
+                sanitized_direct_error_code(error_code, "DIRECT_REQUEST_FAILED")
+            ) from None
         return self._parse_market_snapshot(payload, symbol, market)
 
     def read_market_series(
@@ -1325,51 +1374,58 @@ rpc.exports = {
       }
 
       Java.perform(function () {
-        var viewModel = null;
-        Java.choose('com.hexin.android.biz_sub_search.search.associate.AssociateViewModel', {
-          onMatch: function (candidate) {
-            if (viewModel === null) viewModel = Java.retain(candidate);
-          },
-          onComplete: function () {
-            if (viewModel === null) {
-              complete({
-                error_code: 'SYMBOL_LOOKUP_UNAVAILABLE',
-                error_message: 'App search is not active'
-              });
-              return;
-            }
-            Java.scheduleOnMainThread(function () {
-              try {
-                var StockAssociateData = Java.use(
-                  'com.hexin.android.biz_sub_search.search.StockAssociateData'
-                );
-                var SearchStockDataCell = Java.use(
-                  'com.hexin.android.biz_sub_search.search.SearchStockDataCell'
-                );
-                var wrapped = viewModel.queryStockDataList(String(requestedSymbol));
-                var data = Java.cast(wrapped.getData(), StockAssociateData);
-                var rows = data.getData();
-                var results = [];
-                for (var index = 0; index < rows.size(); index += 1) {
-                  var row = Java.cast(rows.get(index), SearchStockDataCell);
-                  results.push({
-                    stock_code: scalar(row.getStockCode()),
-                    stock_name: scalar(row.getStockName()),
-                    market_id: scalar(row.getStockMarketId()),
-                    market_label: scalar(row.getMarketLabel()),
-                    securities_code: scalar(row.getSecuritiesCode())
-                  });
-                }
-                complete({ results: results });
-              } catch (error) {
-                complete({
-                  error_code: 'SYMBOL_LOOKUP_FAILED',
-                  error_message: String(error.message || error)
-                });
-              }
+        try {
+          var searchClassName = 'com.hexin.android.biz_sub_search.search.SearchStockFromHexinDB';
+          var searchLoader = null;
+          var loaders = Java.enumerateClassLoadersSync();
+          for (var loaderIndex = 0; loaderIndex < loaders.length; loaderIndex += 1) {
+            try {
+              loaders[loaderIndex].loadClass(searchClassName);
+              searchLoader = loaders[loaderIndex];
+              break;
+            } catch (_) {}
+          }
+          if (searchLoader === null) {
+            complete({
+              error_code: 'SYMBOL_LOOKUP_UNAVAILABLE',
+              error_message: 'App local symbol database is unavailable'
+            });
+            return;
+          }
+          Java.classFactory.loader = searchLoader;
+          var SearchStockFromHexinDB = Java.use(searchClassName);
+          var SearchStockDataCell = Java.use(
+            'com.hexin.android.biz_sub_search.search.SearchStockDataCell'
+          );
+          var database = SearchStockFromHexinDB.INSTANCE.value;
+          var loadStockFromHexinDB = SearchStockFromHexinDB.loadStockFromHexinDB.overload(
+            'java.lang.String',
+            'int'
+          );
+          var data = loadStockFromHexinDB.call(database, String(requestedSymbol), 50);
+          if (data === null) {
+            complete({ results: [] });
+            return;
+          }
+          var rows = data.getData();
+          var results = [];
+          for (var index = 0; index < rows.size(); index += 1) {
+            var row = Java.cast(rows.get(index), SearchStockDataCell);
+            results.push({
+              stock_code: scalar(row.getStockCode()),
+              stock_name: scalar(row.getStockName()),
+              market_id: scalar(row.getStockMarketId()),
+              market_label: scalar(row.getMarketLabel()),
+              securities_code: scalar(row.getSecuritiesCode())
             });
           }
-        });
+          complete({ results: results });
+        } catch (error) {
+          complete({
+            error_code: 'SYMBOL_LOOKUP_FAILED',
+            error_message: String(error.message || error)
+          });
+        }
       });
     });
   }

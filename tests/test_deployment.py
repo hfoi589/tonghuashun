@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 from pathlib import Path
 from zipfile import ZipFile, ZipInfo
 
@@ -8,10 +9,17 @@ from argon2 import PasswordHasher
 from fastapi.testclient import TestClient
 
 from level2_service.main import DeploymentSettings, create_production_app
+from level2_service.app_sessions import EncryptedFileSessionProvider
 from level2_service.daily_kline import DailyKlineMarketDataSource
+from level2_service.direct_market import (
+    Core9528Client,
+    Core9528TemplateProtocol,
+    FundFlowHttpClient,
+    ShadowParsedValueSource,
+)
 from level2_service.market_accounts import RedisMarketSessionStore, SQLiteMarketAccountStore
 from level2_service.market_data import MarketDataBroker
-from level2_service.parsed_values import DualAccountParsedValueSource
+from level2_service.parsed_values import DirectRequestError, DualAccountParsedValueSource
 from level2_service.runner import DailyCheckState, OpenCVTemplateFallback, long_capture_has_net_heading
 from level2_service.symbol_cache import RedisSymbolLookupCache
 from scripts.preflight import PreflightError, validate_apk, validate_host_profile
@@ -185,6 +193,118 @@ def test_settings_require_all_four_dual_account_device_variables() -> None:
 
     with pytest.raises(ValueError, match="CORE_ADB_SERIAL.*CORE_FRIDA_SERVER_ENDPOINT.*FUND_ADB_SERIAL.*FUND_FRIDA_SERVER_ENDPOINT"):
         DeploymentSettings.from_environ(base)
+
+
+def direct_encryption_key() -> str:
+    return base64.urlsafe_b64encode(b"session-encryption-key-material!").decode("ascii")
+
+
+def dual_environment(tmp_path: Path) -> dict[str, str]:
+    return {
+        "ADMIN_PASSWORD_HASH": "$argon2id$example",
+        "ADMIN_SESSION_SECRET": "s" * 32,
+        "CAPTURE_ROOT": str(tmp_path / "captures"),
+        "CORE_ADB_SERIAL": "emulator-5556",
+        "CORE_FRIDA_SERVER_ENDPOINT": "host.docker.internal:27043",
+        "FUND_ADB_SERIAL": "emulator-5554",
+        "FUND_FRIDA_SERVER_ENDPOINT": "host.docker.internal:27042",
+        "THS_SESSION_ENCRYPTION_KEY": direct_encryption_key(),
+        "THS_SESSION_ROOT": str(tmp_path / "sessions"),
+    }
+
+
+def test_settings_validate_direct_transport_modes_and_encryption_key(tmp_path: Path) -> None:
+    invalid = dual_environment(tmp_path)
+    invalid["FUND_FLOW_TRANSPORT"] = "other"
+    with pytest.raises(ValueError, match="FUND_FLOW_TRANSPORT"):
+        DeploymentSettings.from_environ(invalid)
+
+    missing_key = dual_environment(tmp_path)
+    missing_key["FUND_FLOW_TRANSPORT"] = "direct"
+    missing_key.pop("THS_SESSION_ENCRYPTION_KEY")
+    with pytest.raises(ValueError, match="THS_SESSION_ENCRYPTION_KEY"):
+        DeploymentSettings.from_environ(missing_key)
+
+    invalid_key = dual_environment(tmp_path)
+    invalid_key["FUND_FLOW_TRANSPORT"] = "direct"
+    invalid_key["THS_SESSION_ENCRYPTION_KEY"] = "not-a-fernet-key"
+    with pytest.raises(ValueError, match="THS_SESSION_ENCRYPTION_KEY"):
+        DeploymentSettings.from_environ(invalid_key)
+
+    defaults = DeploymentSettings.from_environ(dual_environment(tmp_path))
+    assert defaults.core_metrics_transport == "frida"
+    assert defaults.fund_flow_transport == "frida"
+
+
+@pytest.mark.parametrize(
+    ("mode", "expected_type"),
+    [
+        ("direct", FundFlowHttpClient),
+        ("shadow", ShadowParsedValueSource),
+    ],
+)
+def test_production_factory_wires_the_fund_http_transport(
+    tmp_path: Path,
+    mode: str,
+    expected_type: type,
+) -> None:
+    environment = dual_environment(tmp_path)
+    environment["FUND_FLOW_TRANSPORT"] = mode
+    settings = DeploymentSettings.from_environ(environment)
+
+    app = create_production_app(
+        settings=settings,
+        redis_client_factory=lambda _url: FakeRedis(),
+        bridge_factory=FakeBridge,
+        runner_factory=FakeRunner,
+    )
+
+    source = app.state.runner.parsed_value_source
+    assert isinstance(source.fund_source, expected_type)
+    assert isinstance(app.state.account_session_provider, EncryptedFileSessionProvider)
+    assert set(app.state.account_session_refreshers) == {"core_metrics", "main_fund_flow"}
+
+
+def test_production_factory_exposes_the_core_protocol_stage_gate(tmp_path: Path) -> None:
+    environment = dual_environment(tmp_path)
+    environment["CORE_METRICS_TRANSPORT"] = "direct"
+    settings = DeploymentSettings.from_environ(environment)
+
+    app = create_production_app(
+        settings=settings,
+        redis_client_factory=lambda _url: FakeRedis(),
+        bridge_factory=FakeBridge,
+        runner_factory=FakeRunner,
+    )
+
+    source = app.state.runner.parsed_value_source
+    assert isinstance(source.core_source, Core9528Client)
+    assert isinstance(source.core_source.protocol, Core9528TemplateProtocol)
+
+
+def test_production_core_stage_gate_fails_before_session_material_or_socket_activity(
+    tmp_path: Path,
+) -> None:
+    environment = dual_environment(tmp_path)
+    environment["CORE_METRICS_TRANSPORT"] = "direct"
+    app = create_production_app(
+        settings=DeploymentSettings.from_environ(environment),
+        redis_client_factory=lambda _url: FakeRedis(),
+        bridge_factory=FakeBridge,
+        runner_factory=FakeRunner,
+    )
+    client = app.state.runner.parsed_value_source.core_source
+    client.session_provider.get = lambda _role: (_ for _ in ()).throw(
+        AssertionError("stage gate must not load encrypted material")
+    )
+    client.protocol.socket_factory = lambda *_args: (_ for _ in ()).throw(
+        AssertionError("stage gate must not create a socket")
+    )
+
+    with pytest.raises(DirectRequestError) as caught:
+        client.read_direct("601872")
+
+    assert caught.value.error_code == "DIRECT_PROTOCOL_RESPONSE_UNSUPPORTED"
 
 
 def test_production_factory_wires_two_independent_bridges_and_frida_sources(tmp_path: Path) -> None:

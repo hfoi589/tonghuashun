@@ -339,6 +339,31 @@ def test_running_start_skips_emulator_launch_and_opens_fixed_activity() -> None:
     ) in runner.calls
 
 
+def test_running_start_passes_configured_adb_path_to_host_scripts() -> None:
+    """LaunchAgents may have a restricted PATH, so scripts receive absolute adb."""
+    runner = running_device_runner("emulator-5556")
+    adb_bin = "/opt/homebrew/bin/adb"
+    manager = make_manager(runner, adb_bin=adb_bin)
+
+    operation = wait_for_terminal(
+        manager, manager.submit("core_metrics", "start_and_launch_app").operation_id
+    )
+
+    assert operation.state is module.LifecycleState.RUNNING
+    assert (
+        str(SCRIPT.parent / "configure-macos-core-display.sh"),
+        "emulator-5556",
+        adb_bin,
+    ) in runner.calls
+    assert (
+        str(SCRIPT.parent / "watch-macos-device-bridge.sh"),
+        "--once",
+        "emulator-5556",
+        "27043",
+        adb_bin,
+    ) in runner.calls
+
+
 def test_stopped_start_uses_fixed_commands_and_reaches_running() -> None:
     serial = "emulator-5556"
     runner = FakeCommandRunner(lifecycle_responses(serial, booted=False, process=False))

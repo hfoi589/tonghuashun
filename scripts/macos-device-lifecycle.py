@@ -157,6 +157,7 @@ class DeviceLifecycleManager:
         runner: CommandRunner,
         *,
         emulator_bin: str = "emulator",
+        adb_bin: str = "adb",
         configs: Mapping[str, DeviceConfig] | None = None,
         boot_timeout_seconds: float = 180.0,
         shutdown_timeout_seconds: float = 60.0,
@@ -169,8 +170,11 @@ class DeviceLifecycleManager:
             raise LifecycleRequestError("DEVICE_LIFECYCLE_UNCONFIGURED")
         if emulator_bin not in TRUSTED_EMULATOR_BINS:
             raise LifecycleRequestError("DEVICE_LIFECYCLE_UNCONFIGURED")
+        if not isinstance(adb_bin, str) or not adb_bin:
+            raise LifecycleRequestError("DEVICE_LIFECYCLE_UNCONFIGURED")
         self._runner = runner
         self._emulator_bin = emulator_bin
+        self._adb_bin = adb_bin
         if trusted_emulator_path is None:
             resolved = (
                 emulator_bin
@@ -315,7 +319,11 @@ class DeviceLifecycleManager:
         self._require_identity(config)
         if config.calibrate_display:
             self._run_required(
-                (str(SCRIPT_DIRECTORY / "configure-macos-core-display.sh"), config.serial, "adb"),
+                (
+                    str(SCRIPT_DIRECTORY / "configure-macos-core-display.sh"),
+                    config.serial,
+                    self._adb_bin,
+                ),
                 "DEVICE_LIFECYCLE_FAILED",
             )
         self._repair_bridge(config)
@@ -351,7 +359,7 @@ class DeviceLifecycleManager:
         self._run_required(
             (
                 str(SCRIPT_DIRECTORY / "watch-macos-device-bridge.sh"), "--once",
-                config.serial, str(config.frida_host_port), "adb",
+                config.serial, str(config.frida_host_port), self._adb_bin,
             ),
             "DEVICE_LIFECYCLE_FAILED",
         )
@@ -587,9 +595,13 @@ def serve(config_path: Path) -> None:
     )
     if not resolved_emulator:
         raise SystemExit("DEVICE_LIFECYCLE_UNCONFIGURED")
+    resolved_adb = shutil.which("adb", path=settings.environment.get("PATH"))
+    if not resolved_adb:
+        raise SystemExit("DEVICE_LIFECYCLE_UNCONFIGURED")
     manager = DeviceLifecycleManager(
         SubprocessCommandRunner(settings.environment),
         emulator_bin=emulator_bin,
+        adb_bin=resolved_adb,
         trusted_emulator_path=Path(resolved_emulator),
     )
     server = ThreadingHTTPServer(

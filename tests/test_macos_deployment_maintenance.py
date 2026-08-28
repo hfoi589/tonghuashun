@@ -101,6 +101,42 @@ def test_old_api_admin_client_logs_in_and_acquires_lock_without_exposing_passwor
     assert "safe-csrf" not in repr(client)
 
 
+def test_old_api_admin_client_accepts_signed_admin_session_cookie() -> None:
+    """Signed administrator sessions use a nonce.signature cookie value."""
+    module = _load_macos_deploy()
+    signed_session = "safe-session." + ("a" * 64)
+    observed: list[tuple[str, str | None]] = []
+
+    class Handler(QuietHandler):
+        def do_POST(self) -> None:
+            if self.path == "/api/admin/session":
+                self.send_response(204)
+                self.send_header(
+                    "Set-Cookie",
+                    f"ths_admin_session={signed_session}; HttpOnly; SameSite=strict",
+                )
+                self.send_header(
+                    "Set-Cookie", "ths_csrf=safe-csrf; SameSite=strict"
+                )
+                self.end_headers()
+                return
+            observed.append((self.path, self.headers.get("Cookie")))
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(b'{"locked":true}')
+
+    with serve(Handler) as server:
+        client = module.LoopbackAdminMaintenanceClient(
+            base_url=f"http://127.0.0.1:{server.server_port}"
+        )
+        client.acquire_device_lock("private-admin-password")
+
+    assert observed == [
+        ("/api/admin/lock/acquire", f"ths_admin_session={signed_session}; ths_csrf=safe-csrf")
+    ]
+
+
 def test_old_api_admin_client_rejects_redirect_and_sanitizes_secret_context() -> None:
     """Login credentials cannot follow a redirect or appear in a deployment error."""
     module = _load_macos_deploy()
@@ -263,6 +299,27 @@ def test_host_maintenance_waits_idle_and_passes_owner_only_over_stdin() -> None:
     assert "private-admin-password" not in rendered
     owner_inputs = [item for item in runner.inputs if item]
     assert owner_inputs == [OWNER.encode(), OWNER.encode(), OWNER.encode()]
+
+
+def test_host_maintenance_default_owner_factory_generates_a_valid_owner() -> None:
+    """The production default owner factory works without test injection."""
+    module = _load_macos_deploy()
+    runner = LeaseRunner()
+    state = MemoryOwnerState()
+    maintenance = module.HostDeploymentMaintenance(
+        runner,
+        compose_prefix,
+        FakeAdminMaintenance(),
+        state,
+        password_reader=lambda: "private-admin-password",
+        poll_interval_seconds=0.0,
+    )
+
+    maintenance.prepare()
+    owner = maintenance.owner_token
+    assert len(owner) >= 32
+    assert module.re.fullmatch(r"[A-Za-z0-9_-]+", owner)
+    maintenance.release()
 
 
 def test_host_release_script_cleans_only_the_bound_maintenance_task() -> None:

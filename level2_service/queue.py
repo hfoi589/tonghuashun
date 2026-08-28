@@ -736,6 +736,10 @@ class InMemoryStreams:
             task.long_capture.status = CaptureStatus.SKIPPED
             task.long_capture.path = None
             task.long_capture.captured_at = None
+            for capture in task.captures.values():
+                capture.status = CaptureStatus.SKIPPED
+                capture.path = None
+                capture.captured_at = None
         task.collected_at = now
         task.updated_at = now
         required_complete = all(task.values[kind] is not None for kind in REQUIRED_METRICS)
@@ -1932,6 +1936,10 @@ return ARGV[2]
             task.long_capture.status = CaptureStatus.SKIPPED
             task.long_capture.path = None
             task.long_capture.captured_at = None
+            for capture in task.captures.values():
+                capture.status = CaptureStatus.SKIPPED
+                capture.path = None
+                capture.captured_at = None
         task.collected_at = now
         task.updated_at = now
         required_complete = all(task.values[kind] is not None for kind in REQUIRED_METRICS)

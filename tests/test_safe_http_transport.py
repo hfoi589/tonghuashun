@@ -291,6 +291,33 @@ def test_deployment_broker_allows_an_ordinary_same_origin_response() -> None:
     assert requests[0].get_header("Authorization") == "Bearer host-secret"
 
 
+def test_deployment_broker_retries_a_transient_launchagent_restart() -> None:
+    """Reinstalling the broker can briefly refuse connections before it is ready."""
+    module = _load_macos_deploy()
+    response = FinalUrlResponse(
+        b'{"devices":[{"role":"core_metrics","state":"RUNNING"}]}',
+        "http://127.0.0.1:18765/v1/devices",
+    )
+    attempts = 0
+
+    def opener(_request: Request, **_kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise OSError("broker is restarting")
+        return response
+
+    broker = module.LoopbackLifecycleBroker(
+        "host-secret",
+        opener=opener,
+        retry_attempts=2,
+        retry_delay_seconds=0.0,
+    )
+
+    assert broker.device_states() == {"core_metrics": "RUNNING"}
+    assert attempts == 2
+
+
 def test_acceptance_client_ignores_host_proxy_environment(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -1244,8 +1244,15 @@ class RunnerControl:
     def claim_next_task(self, store: TaskStore) -> TaskRecord | None:
         """Atomically recheck pause state and claim under the maintenance gate."""
         with self._maintenance_gate:
-            if self.queue_paused or self._operation_leases:
+            if self._operation_leases:
                 return None
+            if self.queue_paused:
+                try:
+                    lease = store.deployment_lease_status()
+                except Exception:
+                    return None
+                if lease is None or lease.bound_task_id is None:
+                    return None
             self.heartbeat("BOOTING")
             return store.next_runnable()
 

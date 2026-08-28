@@ -17,6 +17,7 @@ import json
 import os
 from pathlib import Path, PurePosixPath
 import re
+import secrets
 import shlex
 import shutil
 import stat
@@ -560,10 +561,9 @@ class LoopbackAdminMaintenanceClient:
             csrf = cookies["ths_csrf"].value
         except KeyError:
             raise DeploymentError("DEPLOYMENT_ADMIN_LOCK_FAILED") from None
-        if not all(
-            re.fullmatch(r"[A-Za-z0-9_-]{8,256}", value)
-            for value in (session, csrf)
-        ):
+        if not re.fullmatch(
+            r"[A-Za-z0-9_-]{8,256}(?:\.[0-9a-f]{64})?", session
+        ) or not re.fullmatch(r"[A-Za-z0-9_-]{8,256}", csrf):
             raise DeploymentError("DEPLOYMENT_ADMIN_LOCK_FAILED")
         return session, csrf
 
@@ -1147,11 +1147,19 @@ class LoopbackLifecycleBroker:
         opener: Callable[..., object] | None = None,
         base_url: str = "http://127.0.0.1:18765",
         timeout_seconds: float = 5.0,
+        retry_attempts: int = 5,
+        retry_delay_seconds: float = 0.5,
     ) -> None:
         if not token:
             raise DeploymentError("ROOT_ENV_INVALID")
+        if not isinstance(retry_attempts, int) or retry_attempts < 1:
+            raise DeploymentError("DEVICE_LIFECYCLE_UNAVAILABLE")
+        if not isinstance(retry_delay_seconds, (int, float)) or retry_delay_seconds < 0:
+            raise DeploymentError("DEVICE_LIFECYCLE_UNAVAILABLE")
         self._token = token
         self._timeout_seconds = timeout_seconds
+        self._retry_attempts = retry_attempts
+        self._retry_delay_seconds = float(retry_delay_seconds)
         self._base_url = base_url.rstrip("/")
         wrapped_opener = None
         if opener is not None:
@@ -1237,7 +1245,22 @@ class LoopbackLifecycleBroker:
             method=method,
         )
         try:
-            response = self._transport.request(request, self._timeout_seconds)
+            response = None
+            for attempt in range(self._retry_attempts):
+                try:
+                    response = self._transport.request(
+                        request, self._timeout_seconds
+                    )
+                    break
+                except SafeHttpStatusError:
+                    raise
+                except SafeHttpError:
+                    if attempt + 1 >= self._retry_attempts:
+                        raise
+                    if self._retry_delay_seconds:
+                        time.sleep(self._retry_delay_seconds)
+            if response is None:
+                raise SafeHttpError()
             if not 200 <= response.status < 300:
                 raise DeploymentError("DEVICE_LIFECYCLE_UNAVAILABLE")
             raw = response.body

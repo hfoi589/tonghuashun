@@ -839,6 +839,27 @@ def test_redis_lease_survives_store_and_runner_replacement() -> None:
     assert new_store.get("ordinary").status == TaskStatus.QUEUED
 
 
+def test_paused_runner_still_claims_only_the_bound_maintenance_acceptance() -> None:
+    """Admin pause blocks ordinary work but must not deadlock deployment acceptance."""
+    store = memory_store()
+    store.enqueue(TaskRecord(task_id="ordinary", symbol="000001"))
+    assert store.acquire_deployment_lease(OWNER, 60.0)
+    acceptance = store.bind_deployment_acceptance(
+        OWNER,
+        TaskRecord(
+            task_id="acceptance", symbol="601872", include_long_capture=False
+        ),
+    )
+    assert acceptance is not None
+
+    control = RunnerControl()
+    control.pause_queue()
+    claimed = control.claim_next_task(store)
+
+    assert claimed is not None and claimed.task_id == "acceptance"
+    assert store.get("ordinary").status == TaskStatus.QUEUED
+
+
 def test_failed_acceptance_retains_the_lease_for_safe_rollback() -> None:
     """A terminal acceptance failure never resumes queued user work implicitly."""
     store = memory_store()

@@ -1969,7 +1969,7 @@ class MacDeploymentOrchestrator:
             return resolved
         except DeploymentError:
             raise
-        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        except (OSError, RuntimeError, TypeError, ValueError, json.JSONDecodeError):
             raise DeploymentError("ORBSTACK_DATA_DIR_UNAVAILABLE") from None
 
     def _validate_disk_space(self, *, provision_system_image: bool) -> None:

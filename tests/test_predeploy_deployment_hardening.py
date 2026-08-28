@@ -526,6 +526,42 @@ def test_orbstack_data_dir_config_is_required_and_not_taken_from_ambient_env(
     assert runner.calls == []
 
 
+def test_orbstack_data_dir_symlink_loop_runtime_error_is_sanitized(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Path.resolve symlink-loop diagnostics must never escape the fixed error boundary."""
+    module = _load_macos_deploy()
+    filesystem = DiskFileSystem(
+        {
+            ROOT.resolve(): 13 * 1024**3,
+            (Path.home() / ".android/avd").resolve(): 13 * 1024**3,
+            Path("/fake/orbstack-loop").resolve(): 23 * 1024**3,
+        }
+    )
+    filesystem.files[filesystem.orbstack_config] = (
+        json.dumps({"data_dir": "/fake/orbstack-loop"}),
+        0o600,
+    )
+    real_resolve = Path.resolve
+
+    def resolve_with_loop(self: Path, *args, **kwargs) -> Path:
+        if str(self) == "/fake/orbstack-loop":
+            raise RuntimeError("symlink loop at /private/secret/orbstack-loop")
+        return real_resolve(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "resolve", resolve_with_loop)
+    runner = existing_mac_runner(filesystem=filesystem)
+
+    with pytest.raises(module.DeploymentError) as caught:
+        make_orchestrator(runner, filesystem=filesystem)._validate_disk_space(
+            provision_system_image=False
+        )
+
+    assert caught.value.error_code == "ORBSTACK_DATA_DIR_UNAVAILABLE"
+    assert "/private/secret/orbstack-loop" not in str(caught.value)
+    assert "symlink loop" not in str(caught.value)
+
+
 @pytest.mark.parametrize("short_path", ["project", "avd"])
 def test_disk_preflight_blocks_before_build_or_provisioning_journal_mutation(
     short_path: str,

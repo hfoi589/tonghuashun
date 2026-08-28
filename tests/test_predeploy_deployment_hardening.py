@@ -1,0 +1,810 @@
+from __future__ import annotations
+
+import copy
+from importlib.util import module_from_spec, spec_from_file_location
+import json
+import os
+from pathlib import Path
+import subprocess
+
+from argon2 import PasswordHasher
+import pytest
+
+from tests.test_macos_one_click_deploy import (
+    ROOT,
+    REQUIRED_MACOS_ENV,
+    REQUIRED_ROOT_ENV,
+    VALID_COMPOSE_ENVIRONMENT,
+    FakeCommandRunner,
+    FakeFileSystem,
+    FakeProvisioningJournal,
+    _completed,
+    _load_macos_deploy,
+    existing_mac_runner,
+    make_orchestrator,
+)
+
+
+def rendered_compose_config() -> dict[str, object]:
+    return {
+        "name": "ths-level2",
+        "services": {
+            "api": {
+                "environment": {
+                    **VALID_COMPOSE_ENVIRONMENT,
+                    "THS_SESSION_ROOT": "/data/admin/ths-sessions",
+                },
+                "ports": [
+                    {
+                        "mode": "ingress",
+                        "target": 8000,
+                        "published": "8001",
+                        "protocol": "tcp",
+                    }
+                ],
+                "volumes": [
+                    {
+                        "type": "volume",
+                        "source": "capture-data",
+                        "target": "/data/captures",
+                    },
+                    {
+                        "type": "volume",
+                        "source": "template-data",
+                        "target": "/data/templates",
+                    },
+                    {
+                        "type": "volume",
+                        "source": "admin-data",
+                        "target": "/data/admin",
+                    },
+                    {
+                        "type": "volume",
+                        "source": "market-data",
+                        "target": "/data/market",
+                    },
+                ],
+            },
+            "redis": {
+                "volumes": [
+                    {
+                        "type": "volume",
+                        "source": "redis-data",
+                        "target": "/data",
+                    }
+                ]
+            },
+        },
+        "volumes": {
+            name: {"name": f"ths-level2_{name}"}
+            for name in (
+                "capture-data",
+                "template-data",
+                "admin-data",
+                "market-data",
+                "redis-data",
+            )
+        },
+    }
+
+
+class RenderedConfigRunner(FakeCommandRunner):
+    def __init__(self, document: dict[str, object]) -> None:
+        super().__init__()
+        self.document = document
+
+    def run(
+        self,
+        args: tuple[str, ...],
+        timeout: float,
+        input_data: bytes | None = None,
+    ) -> subprocess.CompletedProcess[bytes]:
+        if "config" in args and "--format" in args:
+            self.calls.append(args)
+            self.inputs.append(input_data)
+            return _completed(args, stdout=json.dumps(self.document).encode())
+        return super().run(args, timeout, input_data)
+
+
+def test_every_compose_command_binds_the_fixed_project_name() -> None:
+    """Ambient project selection must not rename volumes or target another stack."""
+    runner = existing_mac_runner(sessions_ready=True)
+
+    make_orchestrator(runner).deploy_existing()
+
+    compose_calls = [call for call in runner.calls if "compose" in call]
+    assert compose_calls
+    assert all(
+        call[call.index("--project-name") + 1] == "ths-level2"
+        for call in compose_calls
+    )
+
+
+def test_subprocess_runner_strips_every_ambient_compose_control(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Profiles, files, paths, and project names cannot come from the parent shell."""
+    module = _load_macos_deploy()
+    probe = tmp_path / "probe-environment"
+    probe.write_text("#!/bin/sh\nexec /usr/bin/env\n", encoding="utf-8")
+    probe.chmod(0o755)
+    hostile = {
+        "COMPOSE_PROJECT_NAME": "attacker",
+        "COMPOSE_FILE": "/tmp/attacker.yml",
+        "COMPOSE_PROFILES": "linux-redroid",
+        "COMPOSE_PATH_SEPARATOR": ";",
+        "COMPOSE_PARALLEL_LIMIT": "99",
+        "COMPOSE_IGNORE_ORPHANS": "1",
+    }
+    for key, value in hostile.items():
+        monkeypatch.setenv(key, value)
+
+    result = module.SubprocessCommandRunner(tmp_path).run((str(probe),), 1.0)
+
+    output = result.stdout.decode("utf-8").splitlines()
+    assert result.returncode == 0
+    for key in hostile:
+        assert not any(line.startswith(f"{key}=") for line in output)
+
+
+@pytest.mark.parametrize("env_name", ["root", "macos"])
+@pytest.mark.parametrize(
+    "control",
+    [
+        "COMPOSE_PROJECT_NAME=attacker",
+        "COMPOSE_FILE=/tmp/attacker.yml",
+        "COMPOSE_PROFILES=linux-redroid",
+        "COMPOSE_PARALLEL_LIMIT=99",
+    ],
+)
+def test_env_files_reject_compose_control_variables(
+    env_name: str, control: str
+) -> None:
+    """A reviewed env file may provide service values, never Compose control plane input."""
+    module = _load_macos_deploy()
+    filesystem = FakeFileSystem()
+    target = ROOT / (".env" if env_name == "root" else "deploy/macos.env")
+    original = REQUIRED_ROOT_ENV if env_name == "root" else REQUIRED_MACOS_ENV
+    filesystem.files[target.resolve()] = (original + control + "\n", 0o600)
+    runner = existing_mac_runner(filesystem=filesystem)
+
+    with pytest.raises(module.DeploymentError) as caught:
+        make_orchestrator(runner, filesystem=filesystem).deploy_existing()
+
+    assert caught.value.error_code == (
+        "ROOT_ENV_INVALID" if env_name == "root" else "MACOS_ENV_INVALID"
+    )
+    assert not any(call[-2:] == ("build", "api") for call in runner.calls)
+
+
+def mutate_project_name(document: dict[str, object]) -> None:
+    document["name"] = "attacker"
+
+
+def mutate_extra_service(document: dict[str, object]) -> None:
+    document["services"]["android"] = {"profiles": ["linux-redroid"]}  # type: ignore[index]
+
+
+def mutate_port(document: dict[str, object]) -> None:
+    document["services"]["api"]["ports"][0]["published"] = "9000"  # type: ignore[index]
+
+
+def mutate_admin_volume(document: dict[str, object]) -> None:
+    document["volumes"]["admin-data"]["name"] = "attacker_admin-data"  # type: ignore[index]
+
+
+def mutate_session_mount(document: dict[str, object]) -> None:
+    document["services"]["api"]["environment"]["THS_SESSION_ROOT"] = "/tmp/sessions"  # type: ignore[index]
+
+
+def mutate_redis_mount(document: dict[str, object]) -> None:
+    document["services"]["redis"]["volumes"][0]["target"] = "/tmp"  # type: ignore[index]
+
+
+def mutate_secret(document: dict[str, object]) -> None:
+    document["services"]["api"]["environment"]["THS_DEVICE_LIFECYCLE_TOKEN"] = ""  # type: ignore[index]
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        mutate_project_name,
+        mutate_extra_service,
+        mutate_port,
+        mutate_admin_volume,
+        mutate_session_mount,
+        mutate_redis_mount,
+        mutate_secret,
+    ],
+    ids=(
+        "project-name",
+        "service-set",
+        "api-port",
+        "project-volume",
+        "session-storage",
+        "redis-storage",
+        "secret",
+    ),
+)
+def test_rendered_compose_config_rejects_cross_project_or_service_drift(
+    mutate,
+) -> None:
+    """Validation must cover the effective stack before any build or replacement."""
+    module = _load_macos_deploy()
+    document = rendered_compose_config()
+    mutate(document)
+    runner = RenderedConfigRunner(document)
+    orchestrator = make_orchestrator(runner)
+    orchestrator._root_environment = {
+        "THS_DEVICE_LIFECYCLE_TOKEN": "lifecycle-secret-value",
+        "THS_SESSION_ENCRYPTION_KEY": VALID_COMPOSE_ENVIRONMENT[
+            "THS_SESSION_ENCRYPTION_KEY"
+        ],
+    }
+
+    with pytest.raises(module.DeploymentError) as caught:
+        orchestrator._validate_effective_compose_config()
+
+    assert caught.value.error_code == "COMPOSE_CONFIG_INVALID"
+
+
+def test_rendered_compose_config_accepts_only_the_fixed_macos_stack() -> None:
+    """The exact API/Redis project and persistent storage map remains deployable."""
+    runner = RenderedConfigRunner(rendered_compose_config())
+    orchestrator = make_orchestrator(runner)
+    orchestrator._root_environment = {
+        "THS_DEVICE_LIFECYCLE_TOKEN": "lifecycle-secret-value",
+        "THS_SESSION_ENCRYPTION_KEY": VALID_COMPOSE_ENVIRONMENT[
+            "THS_SESSION_ENCRYPTION_KEY"
+        ],
+    }
+
+    orchestrator._validate_effective_compose_config()
+
+
+def load_setup_admin():
+    path = ROOT / "scripts/setup-admin.py"
+    spec = spec_from_file_location("predeploy_setup_admin", path)
+    assert spec and spec.loader
+    module = module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def existing_env_text() -> str:
+    return (
+        "# operator comment\n"
+        f"ADMIN_PASSWORD_HASH='{PasswordHasher().hash('old-password')}'\n"
+        "UNRELATED_SETTING=preserve-me\n"
+        "ADMIN_SESSION_SECRET=existing-session-secret-value-that-must-survive\n"
+        "\n"
+    )
+
+
+def test_setup_admin_atomically_upgrades_only_missing_deployment_secrets(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """An existing deployment keeps its admin identity and unrelated configuration byte-for-byte."""
+    setup_admin = load_setup_admin()
+    env_file = tmp_path / ".env"
+    original = existing_env_text()
+    env_file.write_text(original, encoding="utf-8")
+    env_file.chmod(0o600)
+
+    assert setup_admin.main(["--upgrade-existing", str(env_file)]) == 0
+
+    upgraded = env_file.read_text(encoding="utf-8")
+    assert upgraded.startswith(original)
+    assert upgraded.count("ADMIN_PASSWORD_HASH=") == 1
+    assert upgraded.count("ADMIN_SESSION_SECRET=") == 1
+    assert upgraded.count("THS_SESSION_ENCRYPTION_KEY=") == 1
+    assert upgraded.count("THS_DEVICE_LIFECYCLE_TOKEN=") == 1
+    assert env_file.stat().st_mode & 0o777 == 0o600
+    output = capsys.readouterr()
+    for secret_fragment in (
+        "existing-session-secret",
+        "argon2id",
+        "THS_SESSION_ENCRYPTION_KEY=",
+        "THS_DEVICE_LIFECYCLE_TOKEN=",
+    ):
+        assert secret_fragment not in output.out + output.err
+    assert list(tmp_path.glob("..env.*")) == []
+
+
+def test_setup_admin_generates_only_the_one_missing_secret(tmp_path: Path) -> None:
+    """A partial upgrade must not rotate a newer secret that is already valid."""
+    setup_admin = load_setup_admin()
+    lifecycle_token = "existing-lifecycle-token-value-123456"
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        existing_env_text()
+        + f"THS_DEVICE_LIFECYCLE_TOKEN={lifecycle_token}\n",
+        encoding="utf-8",
+    )
+    env_file.chmod(0o600)
+
+    assert setup_admin.main(["--upgrade-existing", str(env_file)]) == 0
+
+    upgraded = env_file.read_text(encoding="utf-8")
+    assert upgraded.count(f"THS_DEVICE_LIFECYCLE_TOKEN={lifecycle_token}") == 1
+    assert upgraded.count("THS_SESSION_ENCRYPTION_KEY=") == 1
+
+
+@pytest.mark.parametrize(
+    "invalid",
+    ["duplicate", "malformed-hash", "empty-session", "wrong-mode", "symlink", "wrong-owner"],
+)
+def test_setup_admin_rejects_untrusted_existing_env(
+    invalid: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Unsafe metadata or ambiguous values must fail without replacing the original file."""
+    setup_admin = load_setup_admin()
+    env_file = tmp_path / ".env"
+    original = existing_env_text()
+    if invalid == "duplicate":
+        original += "ADMIN_SESSION_SECRET=duplicate\n"
+    elif invalid == "malformed-hash":
+        original = original.replace("'$argon2id$", "'not-an-argon-hash")
+    elif invalid == "empty-session":
+        original = original.replace(
+            "ADMIN_SESSION_SECRET=existing-session-secret-value-that-must-survive",
+            "ADMIN_SESSION_SECRET=",
+        )
+    target = env_file
+    if invalid == "symlink":
+        real = tmp_path / "real.env"
+        real.write_text(original, encoding="utf-8")
+        real.chmod(0o600)
+        env_file.symlink_to(real)
+    else:
+        env_file.write_text(original, encoding="utf-8")
+        env_file.chmod(0o644 if invalid == "wrong-mode" else 0o600)
+    if invalid == "wrong-owner":
+        monkeypatch.setattr(setup_admin.os, "getuid", lambda: os.getuid() + 1)
+
+    before = target.read_bytes()
+    assert setup_admin.main(["--upgrade-existing", str(env_file)]) == 2
+
+    assert target.read_bytes() == before
+
+
+def test_setup_admin_keeps_original_when_atomic_replace_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failed replacement may not truncate or partially upgrade the deployment env."""
+    setup_admin = load_setup_admin()
+    env_file = tmp_path / ".env"
+    original = existing_env_text()
+    env_file.write_text(original, encoding="utf-8")
+    env_file.chmod(0o600)
+    monkeypatch.setattr(
+        setup_admin.os,
+        "replace",
+        lambda *_args: (_ for _ in ()).throw(OSError("private path")),
+    )
+
+    assert setup_admin.main(["--upgrade-existing", str(env_file)]) == 2
+
+    assert env_file.read_text(encoding="utf-8") == original
+    assert list(tmp_path.glob("..env.*")) == []
+
+
+def test_orchestrator_upgrades_an_existing_pre_feature_env_without_password_prompt() -> None:
+    """Only a missing file may enter interactive administrator password setup."""
+    old_env = (
+        "ADMIN_PASSWORD_HASH='$argon2id$example'\n"
+        "ADMIN_SESSION_SECRET=session-secret-value\n"
+        "UNRELATED=preserved\n"
+    )
+    filesystem = FakeFileSystem()
+    filesystem.files[(ROOT / ".env").resolve()] = (old_env, 0o600)
+    runner = existing_mac_runner(filesystem=filesystem, sessions_ready=True)
+
+    make_orchestrator(runner, filesystem=filesystem).deploy_existing()
+
+    upgrade_calls = [
+        call
+        for call in runner.calls
+        if call[0].endswith("setup-admin.sh")
+    ]
+    assert len(upgrade_calls) == 1
+    assert "--upgrade-existing" in upgrade_calls[0]
+    assert filesystem.read_text(ROOT / ".env").startswith(old_env)
+
+
+class DiskFileSystem(FakeFileSystem):
+    def __init__(self, free_by_path: dict[Path, int]) -> None:
+        super().__init__()
+        self.free_by_path = {path.resolve(): value for path, value in free_by_path.items()}
+        self.checked: list[Path] = []
+
+    def free_bytes(self, path: Path) -> int:
+        resolved = path.resolve()
+        self.checked.append(resolved)
+        return self.free_by_path.get(resolved, 30 * 1024**3)
+
+
+JAVA17 = Path(
+    "/opt/homebrew/opt/openjdk@17/libexec/openjdk.jdk/Contents/Home/bin/java"
+)
+JAVA17_HOME = JAVA17.parent.parent
+JBR21 = Path(
+    "/Applications/Android Studio.app/Contents/jbr/Contents/Home/bin/java"
+)
+JBR21_HOME = JBR21.parent.parent
+
+
+class JavaFallbackFileSystem(FakeFileSystem):
+    def __init__(self, *available_java: Path, path_java: bool = True) -> None:
+        super().__init__()
+        if not path_java:
+            self.commands.remove("java")
+        for path in available_java:
+            self.files[path.resolve()] = ("java", 0o755)
+
+
+class JavaAwareRunner(FakeCommandRunner):
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.java_home: Path | None = None
+
+    def set_java_home(self, java_home: Path) -> None:
+        self.java_home = java_home
+
+
+def java_runner(
+    filesystem: FakeFileSystem,
+    versions: dict[str, tuple[int, bytes, bytes]],
+    *,
+    events: list[str] | None = None,
+) -> JavaAwareRunner:
+    return JavaAwareRunner(
+        filesystem=filesystem,
+        java_versions=versions,
+        events=events,
+    )
+
+
+def test_java8_path_uses_fixed_openjdk17_and_propagates_java_home() -> None:
+    """A PATH Java 8 install must select the verified fixed OpenJDK 17 toolchain."""
+    module = _load_macos_deploy()
+    filesystem = JavaFallbackFileSystem(JAVA17, JBR21)
+    runner = java_runner(
+        filesystem,
+        {
+            "java": (0, b"", b'openjdk version "1.8.0_402"\n'),
+            str(JAVA17): (0, b"", b'openjdk version "17.0.12"\n'),
+            str(JBR21): (0, b"", b'openjdk version "21.0.7"\n'),
+        },
+    )
+    orchestrator = make_orchestrator(runner, filesystem=filesystem)
+
+    orchestrator._validate_host_prerequisites(provision_system_image=False)
+
+    assert orchestrator._java_command == str(JAVA17)
+    assert orchestrator._java_home == JAVA17_HOME
+    assert runner.java_home == JAVA17_HOME
+    assert (str(JAVA17), "-version") in runner.calls
+    assert (str(JBR21), "-version") not in runner.calls
+
+
+def test_java8_path_uses_fixed_jbr21_when_openjdk17_is_missing() -> None:
+    """JBR 21 is an allowed fallback only when the preferred fixed JDK 17 is absent."""
+    module = _load_macos_deploy()
+    filesystem = JavaFallbackFileSystem(JBR21)
+    runner = java_runner(
+        filesystem,
+        {
+            "java": (0, b"", b'openjdk version "1.8.0_402"\n'),
+            str(JBR21): (0, b"", b'openjdk version "21.0.7"\n'),
+        },
+    )
+    orchestrator = make_orchestrator(runner, filesystem=filesystem)
+
+    orchestrator._validate_host_prerequisites(provision_system_image=False)
+
+    assert orchestrator._java_command == str(JBR21)
+    assert orchestrator._java_home == JBR21_HOME
+    assert runner.java_home == JBR21_HOME
+
+
+def test_java8_path_without_fixed_fallback_fails_closed() -> None:
+    """A Java 8 PATH binary cannot satisfy the host's fixed Java tooling floor."""
+    module = _load_macos_deploy()
+    filesystem = JavaFallbackFileSystem()
+    runner = java_runner(
+        filesystem,
+        {"java": (0, b"", b'openjdk version "1.8.0_402"\n')},
+    )
+
+    with pytest.raises(module.DeploymentError) as caught:
+        make_orchestrator(runner, filesystem=filesystem)._validate_host_prerequisites(
+            provision_system_image=False
+        )
+
+    assert caught.value.error_code == "JAVA_17_REQUIRED"
+
+
+def test_java_fallback_ignores_ambient_java_home_overrides(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Ambient JAVA_HOME values cannot introduce an unreviewed executable."""
+    module = _load_macos_deploy()
+    ambient_java = tmp_path / "ambient-java" / "bin" / "java"
+    filesystem = JavaFallbackFileSystem(path_java=False)
+    filesystem.files[ambient_java] = ("java", 0o755)
+    runner = java_runner(
+        filesystem,
+        {"java": (0, b"", b'openjdk version "17.0.12"\n')},
+    )
+    monkeypatch.setenv("JAVA_HOME", str(ambient_java.parent.parent))
+    monkeypatch.setenv("THS_JAVA_HOME", str(ambient_java.parent.parent))
+
+    with pytest.raises(module.DeploymentError) as caught:
+        make_orchestrator(runner, filesystem=filesystem)._validate_host_prerequisites(
+            provision_system_image=False
+        )
+
+    assert caught.value.error_code == "JAVA_17_REQUIRED"
+    assert str(ambient_java) not in " ".join(" ".join(call) for call in runner.calls)
+
+
+def test_provisioning_java_failure_happens_before_journal_or_avd_mutation() -> None:
+    """A missing fixed JDK stops provisioning before any journal/build/AVD command."""
+    module = _load_macos_deploy()
+    filesystem = JavaFallbackFileSystem(path_java=False)
+    events: list[str] = []
+    journal = FakeProvisioningJournal(events=events)
+    runner = java_runner(
+        filesystem,
+        {"java": (0, b"", b'openjdk version "1.8.0_402"\n')},
+        events=events,
+    )
+
+    with pytest.raises(module.DeploymentError) as caught:
+        make_orchestrator(
+            runner,
+            filesystem=filesystem,
+            journal=journal,
+        ).deploy("provision")
+
+    assert caught.value.error_code == "JAVA_17_REQUIRED"
+    assert not any(event.startswith("journal-") for event in events)
+    assert not any(call[-2:] == ("build", "api") for call in runner.calls)
+    assert not any(call[:3] == ("avdmanager", "create", "avd") for call in runner.calls)
+
+
+def test_subprocess_runner_accepts_only_validated_java_home(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The production runner strips ambient Java selectors and receives the validated home."""
+    module = _load_macos_deploy()
+    monkeypatch.setenv("JAVA_HOME", "/tmp/ambient-java")
+    monkeypatch.setenv("THS_JAVA_HOME", "/tmp/ambient-ths-java")
+
+    runner = module.SubprocessCommandRunner(tmp_path)
+
+    assert "JAVA_HOME" not in runner._environment
+    assert "THS_JAVA_HOME" not in runner._environment
+    runner.set_java_home(JAVA17_HOME)
+    assert runner._environment["JAVA_HOME"] == str(JAVA17_HOME)
+    assert runner._environment["PATH"].split(os.pathsep)[0] == str(JAVA17_HOME / "bin")
+
+
+def test_existing_disk_preflight_accepts_13_gib_project_avd_and_23_gib_orbstack() -> None:
+    """Existing AVD redeploys use the lower 8 GiB floor on all three filesystems."""
+    module = _load_macos_deploy()
+    filesystem = DiskFileSystem(
+        {
+            ROOT.resolve(): 13 * 1024**3,
+            (Path.home() / ".android/avd").resolve(): 13 * 1024**3,
+            Path("/fake/orbstack").resolve(): 23 * 1024**3,
+        }
+    )
+    orchestrator = make_orchestrator(
+        existing_mac_runner(filesystem=filesystem, sessions_ready=True),
+        filesystem=filesystem,
+    )
+
+    orchestrator._validate_disk_space(provision_system_image=False)
+
+    assert filesystem.checked == [
+        ROOT.resolve(),
+        (Path.home() / ".android/avd").resolve(),
+        Path("/fake/orbstack").resolve(),
+    ]
+
+
+def test_provisioning_disk_preflight_requires_30_gib_on_orbstack_before_mutation() -> None:
+    """Provisioning checks the external OrbStack filesystem before journal/build/AVD writes."""
+    module = _load_macos_deploy()
+    data_dir = Path("/fake/orbstack").resolve()
+    filesystem = DiskFileSystem(
+        {
+            ROOT.resolve(): 30 * 1024**3,
+            (Path.home() / ".android/avd").resolve(): 30 * 1024**3,
+            data_dir: 30 * 1024**3 - 1,
+        }
+    )
+    events: list[str] = []
+    journal = FakeProvisioningJournal(events=events)
+    runner = existing_mac_runner(
+        avds=("THS_API_33_ARM64",),
+        filesystem=filesystem,
+        events=events,
+    )
+
+    with pytest.raises(module.DeploymentError) as caught:
+        make_orchestrator(
+            runner,
+            filesystem=filesystem,
+            journal=journal,
+        ).deploy("provision")
+
+    assert caught.value.error_code == "INSUFFICIENT_DISK_SPACE"
+    assert filesystem.checked == [
+        ROOT.resolve(),
+        (Path.home() / ".android/avd").resolve(),
+        data_dir,
+    ]
+    assert not any(event.startswith("journal-") for event in events)
+    assert not any(call[-2:] == ("build", "api") for call in runner.calls)
+    assert not any(call[:3] == ("avdmanager", "create", "avd") for call in runner.calls)
+
+
+@pytest.mark.parametrize(
+    "config_state", ["missing", "malformed", "relative", "nonexistent", "non_object"]
+)
+def test_orbstack_data_dir_config_is_required_and_not_taken_from_ambient_env(
+    config_state: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The read-only vmconfig is the only accepted OrbStack data-dir source."""
+    module = _load_macos_deploy()
+    filesystem = DiskFileSystem(
+        {
+            ROOT.resolve(): 13 * 1024**3,
+            (Path.home() / ".android/avd").resolve(): 13 * 1024**3,
+            Path("/fake/orbstack").resolve(): 23 * 1024**3,
+        }
+    )
+    if config_state == "missing":
+        filesystem.files.pop(filesystem.orbstack_config)
+    elif config_state == "malformed":
+        filesystem.files[filesystem.orbstack_config] = ("not-json", 0o600)
+    else:
+        if config_state == "relative":
+            document = {"data_dir": "relative/orbstack"}
+        elif config_state == "nonexistent":
+            document = {"data_dir": "/fake/missing-orbstack"}
+        else:
+            document = ["not-an-object"]
+        filesystem.files[filesystem.orbstack_config] = (
+            json.dumps(document),
+            0o600,
+        )
+    monkeypatch.setenv("ORBSTACK_DATA_DIR", "/fake/orbstack")
+    runner = existing_mac_runner(filesystem=filesystem)
+
+    with pytest.raises(module.DeploymentError) as caught:
+        make_orchestrator(runner, filesystem=filesystem).deploy_existing()
+
+    assert caught.value.error_code == "ORBSTACK_DATA_DIR_UNAVAILABLE"
+    assert runner.calls == []
+
+
+def test_orbstack_data_dir_symlink_loop_runtime_error_is_sanitized(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Path.resolve symlink-loop diagnostics must never escape the fixed error boundary."""
+    module = _load_macos_deploy()
+    filesystem = DiskFileSystem(
+        {
+            ROOT.resolve(): 13 * 1024**3,
+            (Path.home() / ".android/avd").resolve(): 13 * 1024**3,
+            Path("/fake/orbstack-loop").resolve(): 23 * 1024**3,
+        }
+    )
+    filesystem.files[filesystem.orbstack_config] = (
+        json.dumps({"data_dir": "/fake/orbstack-loop"}),
+        0o600,
+    )
+    real_resolve = Path.resolve
+
+    def resolve_with_loop(self: Path, *args, **kwargs) -> Path:
+        if str(self) == "/fake/orbstack-loop":
+            raise RuntimeError("symlink loop at /private/secret/orbstack-loop")
+        return real_resolve(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "resolve", resolve_with_loop)
+    runner = existing_mac_runner(filesystem=filesystem)
+
+    with pytest.raises(module.DeploymentError) as caught:
+        make_orchestrator(runner, filesystem=filesystem)._validate_disk_space(
+            provision_system_image=False
+        )
+
+    assert caught.value.error_code == "ORBSTACK_DATA_DIR_UNAVAILABLE"
+    assert "/private/secret/orbstack-loop" not in str(caught.value)
+    assert "symlink loop" not in str(caught.value)
+
+
+@pytest.mark.parametrize("short_path", ["project", "avd"])
+def test_disk_preflight_blocks_before_build_or_provisioning_journal_mutation(
+    short_path: str,
+) -> None:
+    """Neither Docker assets nor AVD recovery state may be mutated below the documented floor."""
+    module = _load_macos_deploy()
+    avd_root = (Path.home() / ".android/avd").resolve()
+    free = {
+        ROOT.resolve(): 30 * 1024**3,
+        avd_root: 30 * 1024**3,
+    }
+    free[ROOT.resolve() if short_path == "project" else avd_root] -= 1
+    filesystem = DiskFileSystem(free)
+    events: list[str] = []
+    journal = FakeProvisioningJournal(events=events)
+    runner = existing_mac_runner(
+        avds=("THS_API_33_ARM64",),
+        filesystem=filesystem,
+        events=events,
+    )
+
+    with pytest.raises(module.DeploymentError) as caught:
+        make_orchestrator(
+            runner,
+            filesystem=filesystem,
+            journal=journal,
+        ).deploy("provision")
+
+    assert caught.value.error_code == "INSUFFICIENT_DISK_SPACE"
+    assert not any(event.startswith("journal-") for event in events)
+    assert not any(call[-2:] == ("build", "api") for call in runner.calls)
+    assert not any(call[:3] == ("avdmanager", "create", "avd") for call in runner.calls)
+
+
+def test_disk_preflight_accepts_the_exact_documented_boundary() -> None:
+    """Exactly 8 GiB on all existing-mode filesystems is sufficient."""
+    boundary = 8 * 1024**3
+    filesystem = DiskFileSystem(
+        {
+            ROOT.resolve(): boundary,
+            (Path.home() / ".android/avd").resolve(): boundary,
+        }
+    )
+    runner = existing_mac_runner(filesystem=filesystem, sessions_ready=True)
+
+    result = make_orchestrator(runner, filesystem=filesystem).deploy_existing()
+
+    assert result.state == "READY"
+    assert filesystem.checked == [
+        ROOT.resolve(),
+        (Path.home() / ".android/avd").resolve(),
+        Path("/fake/orbstack").resolve(),
+    ]
+
+
+def test_provisioning_disk_preflight_accepts_the_exact_30_gib_boundary() -> None:
+    """Provisioning retains the higher 30 GiB floor on every filesystem."""
+    boundary = 30 * 1024**3
+    filesystem = DiskFileSystem(
+        {
+            ROOT.resolve(): boundary,
+            (Path.home() / ".android/avd").resolve(): boundary,
+            Path("/fake/orbstack").resolve(): boundary,
+        }
+    )
+    orchestrator = make_orchestrator(
+        existing_mac_runner(filesystem=filesystem),
+        filesystem=filesystem,
+    )
+
+    orchestrator._validate_disk_space(provision_system_image=True)
+
+    assert filesystem.checked == [
+        ROOT.resolve(),
+        (Path.home() / ".android/avd").resolve(),
+        Path("/fake/orbstack").resolve(),
+    ]

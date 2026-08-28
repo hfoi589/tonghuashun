@@ -18,12 +18,18 @@ from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, W
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.websockets import WebSocketState
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from .app_sessions import (
     ACCOUNT_ROLES,
     AccountSessionBundle,
     SessionProvider,
+)
+from .device_lifecycle import (
+    DeviceLifecycleAction,
+    DeviceLifecycleClient,
+    DeviceLifecycleError,
+    DeviceLifecycleState,
 )
 from .models import CaptureKind, CaptureStatus, TaskRecord, TaskStatus, ValueSource, utc_now
 from .market_api import install_market_routes
@@ -37,7 +43,14 @@ from .parsed_values import (
     sanitized_direct_error_code,
 )
 from .queue import InMemoryStreams, QueueFullError, TaskStore
-from .runner import ADBDeviceBridge, DeviceBridge, Level2Runner, RunnerControl, jpeg_base64
+from .runner import (
+    ADBDeviceBridge,
+    DeviceBridge,
+    Level2Runner,
+    RunnerControl,
+    RunnerMaintenanceError,
+    jpeg_base64,
+)
 from .security import AdminSessionManager, persist_password_hash
 from .symbol_cache import SymbolLookupCache
 
@@ -223,6 +236,10 @@ class TaskResponse(BaseModel):
     long_capture: LongCaptureResponse
 
 
+class DeploymentAcceptanceRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+
 class RunnerHealthResponse(BaseModel):
     state: str
     last_heartbeat: Optional[datetime]
@@ -237,12 +254,26 @@ class QueueResponse(BaseModel):
     paused: bool
 
 
+class DeviceLifecycleActionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    action: DeviceLifecycleAction
+
+
+class AdminDeviceLifecycleResponse(BaseModel):
+    state: str
+    operation_id: Optional[str]
+    error_code: Optional[str]
+    updated_at: Optional[datetime]
+
+
 class AdminDeviceHealthResponse(BaseModel):
     role: str
     label: str
     adb: str
     app: str
     frida: str
+    lifecycle: AdminDeviceLifecycleResponse
 
 
 class AdminDevicesResponse(BaseModel):
@@ -307,6 +338,7 @@ def create_app(
         Callable[[str], AccountSessionBundle],
     ]
     | None = None,
+    device_lifecycle: DeviceLifecycleClient | None = None,
 ) -> FastAPI:
     """Build an isolated application instance for one service process."""
     if cleanup_interval_seconds <= 0:
@@ -475,6 +507,7 @@ def create_app(
     app.state.device_bridges = configured_bridges
     app.state.device_bridge = configured_bridges["core_metrics"]
     app.state.device_health_probes = dict(device_health_probes or {})
+    app.state.device_lifecycle = device_lifecycle
     app.state.capture_root = (capture_root or Path("captures")).resolve()
     app.state.frontend_root = frontend_root.resolve() if frontend_root is not None else None
     app.state.secure_admin_cookies = secure_admin_cookies
@@ -656,6 +689,43 @@ def create_app(
             raise HTTPException(status_code=429, detail="queue is full") from None
         notify_runner_if_queued(submitted)
         return task_response(submitted)
+
+    @app.post(
+        "/internal/deployment/acceptance",
+        status_code=202,
+        response_model=TaskResponse,
+    )
+    def bind_deployment_acceptance(
+        _payload: DeploymentAcceptanceRequest,
+        request: Request,
+    ) -> TaskResponse:
+        authorization = request.headers.get("Authorization")
+        if not isinstance(authorization, str) or not authorization.startswith(
+            "Bearer "
+        ):
+            raise HTTPException(
+                status_code=401,
+                detail="DEPLOYMENT_LEASE_AUTH_REQUIRED",
+            )
+        owner_token = authorization.removeprefix("Bearer ")
+        task = TaskRecord(
+            task_id=secrets.token_urlsafe(24),
+            symbol="601872",
+            include_long_capture=False,
+        )
+        try:
+            bound = app.state.store.bind_deployment_acceptance(
+                owner_token, task
+            )
+        except Exception:
+            bound = None
+        if bound is None:
+            raise HTTPException(
+                status_code=409,
+                detail="DEPLOYMENT_LEASE_INVALID",
+            )
+        notify_runner_if_queued(bound)
+        return task_response(bound)
 
     @app.get("/api/v1/jobs/{public_id}", response_model=TaskResponse)
     def get_task(public_id: str) -> TaskResponse:
@@ -866,7 +936,12 @@ def create_app(
     @app.post("/api/admin/lock/release")
     def release_lock(session=Depends(require_csrf)) -> LockResponse:
         if not app.state.runner_control.release(session.session_id):
-            raise HTTPException(status_code=409, detail="runner lock is not owned by this admin")
+            detail = (
+                "DEVICE_ACTION_IN_PROGRESS"
+                if app.state.runner_control.has_active_operation
+                else "runner lock is not owned by this admin"
+            )
+            raise HTTPException(status_code=409, detail=detail)
         return LockResponse(locked=False)
 
     @app.post("/api/admin/jobs/{public_id}/resume", response_model=TaskResponse)
@@ -905,7 +980,12 @@ def create_app(
     @app.post("/api/admin/queue/resume", response_model=QueueResponse)
     def resume_queue(_session=Depends(require_csrf)) -> QueueResponse:
         if not app.state.runner_control.resume_queue():
-            raise HTTPException(status_code=409, detail="release device control before resuming the queue")
+            detail = (
+                "DEVICE_ACTION_IN_PROGRESS"
+                if app.state.runner_control.has_active_operation
+                else "release device control before resuming the queue"
+            )
+            raise HTTPException(status_code=409, detail=detail)
         app.state.runner_wake.notify()
         return QueueResponse(paused=False)
 
@@ -913,8 +993,85 @@ def create_app(
         "core_metrics": "八项账号",
         "main_fund_flow": "资金账号",
     }
+    lifecycle_error_statuses = {
+        "DEVICE_ACTION_IN_PROGRESS": 409,
+        "DEVICE_BOOT_TIMEOUT": 504,
+        "DEVICE_AVD_NOT_FOUND": 503,
+        "DEVICE_APP_LAUNCH_FAILED": 503,
+        "DEVICE_SHUTDOWN_FAILED": 503,
+        "DEVICE_LIFECYCLE_FAILED": 503,
+        "DEVICE_LIFECYCLE_UNAVAILABLE": 503,
+    }
 
-    def role_device_health(role: str, bridge: DeviceBridge) -> AdminDeviceHealthResponse:
+    def safe_lifecycle_error_code(error_code: str | None) -> str | None:
+        if error_code is None or error_code in lifecycle_error_statuses:
+            return error_code
+        return "DEVICE_LIFECYCLE_FAILED"
+
+    def unconfigured_lifecycle() -> AdminDeviceLifecycleResponse:
+        return AdminDeviceLifecycleResponse(
+            state=DeviceLifecycleState.UNCONFIGURED.value,
+            operation_id=None,
+            error_code=None,
+            updated_at=None,
+        )
+
+    def lifecycle_health_by_role() -> dict[str, AdminDeviceLifecycleResponse]:
+        lifecycle = app.state.device_lifecycle
+        if lifecycle is None:
+            return {role: unconfigured_lifecycle() for role in device_labels}
+        try:
+            statuses = lifecycle.devices()
+        except DeviceLifecycleError as error:
+            fallback = AdminDeviceLifecycleResponse(
+                state=DeviceLifecycleState.UNKNOWN.value,
+                operation_id=None,
+                error_code=safe_lifecycle_error_code(error.error_code),
+                updated_at=None,
+            )
+        except Exception:
+            fallback = AdminDeviceLifecycleResponse(
+                state=DeviceLifecycleState.UNKNOWN.value,
+                operation_id=None,
+                error_code="DEVICE_LIFECYCLE_FAILED",
+                updated_at=None,
+            )
+        else:
+            by_role = {status.role: status for status in statuses}
+            control = app.state.runner_control
+            for status in statuses:
+                control.reconcile_operation(
+                    status.role,
+                    status.operation_id,
+                    status.state.value,
+                )
+            return {
+                role: (
+                    AdminDeviceLifecycleResponse(
+                        state=status.state.value,
+                        operation_id=status.operation_id,
+                        error_code=safe_lifecycle_error_code(status.error_code),
+                        updated_at=status.updated_at,
+                    )
+                    if (status := by_role.get(role)) is not None
+                    else AdminDeviceLifecycleResponse(
+                        state=DeviceLifecycleState.UNKNOWN.value,
+                        operation_id=None,
+                        error_code="DEVICE_LIFECYCLE_FAILED",
+                        updated_at=None,
+                    )
+                )
+                for role in device_labels
+            }
+        return {role: fallback for role in device_labels}
+
+    def role_device_health(
+        role: str,
+        bridge: DeviceBridge,
+        lifecycle_health: Mapping[str, AdminDeviceLifecycleResponse] | None = None,
+    ) -> AdminDeviceHealthResponse:
+        if lifecycle_health is None:
+            lifecycle_health = lifecycle_health_by_role()
         probe = app.state.device_health_probes.get(role)
         if probe is not None:
             try:
@@ -938,16 +1095,66 @@ def create_app(
             adb=adb_state,
             app=app_state,
             frida=frida_state,
+            lifecycle=lifecycle_health[role],
         )
 
     @app.get("/api/admin/devices", response_model=AdminDevicesResponse)
     def admin_devices(_session=Depends(require_admin)) -> AdminDevicesResponse:
+        lifecycle_health = lifecycle_health_by_role()
         devices: list[AdminDeviceHealthResponse] = []
         for role in ("core_metrics", "main_fund_flow"):
             bridge = app.state.device_bridges.get(role)
             if bridge is not None:
-                devices.append(role_device_health(role, bridge))
+                devices.append(
+                    role_device_health(role, bridge, lifecycle_health)
+                )
         return AdminDevicesResponse(devices=devices)
+
+    @app.post(
+        "/api/admin/devices/{role}/actions",
+        response_model=AdminDeviceLifecycleResponse,
+        status_code=202,
+    )
+    def admin_device_action(
+        role: str,
+        payload: DeviceLifecycleActionRequest,
+        session=Depends(require_csrf),
+    ) -> AdminDeviceLifecycleResponse:
+        if role not in device_labels:
+            raise HTTPException(status_code=404, detail="device role not found")
+        control = app.state.runner_control
+        lifecycle = app.state.device_lifecycle
+        try:
+            with control.maintenance(session.session_id, app.state.store):
+                if lifecycle is None:
+                    raise DeviceLifecycleError("DEVICE_LIFECYCLE_UNAVAILABLE")
+                operation = lifecycle.submit(role, payload.action)
+                if operation.state in {
+                    DeviceLifecycleState.STARTING,
+                    DeviceLifecycleState.STOPPING,
+                } and not control.begin_operation(role, operation.operation_id):
+                    raise DeviceLifecycleError("DEVICE_LIFECYCLE_FAILED")
+        except RunnerMaintenanceError as error:
+            raise HTTPException(status_code=409, detail=error.error_code) from None
+        except DeviceLifecycleError as error:
+            error_code = safe_lifecycle_error_code(error.error_code)
+            if error_code is None:
+                error_code = "DEVICE_LIFECYCLE_FAILED"
+            raise HTTPException(
+                status_code=lifecycle_error_statuses[error_code],
+                detail=error_code,
+            ) from None
+        except Exception:
+            raise HTTPException(
+                status_code=503,
+                detail="DEVICE_LIFECYCLE_FAILED",
+            ) from None
+        return AdminDeviceLifecycleResponse(
+            state=operation.state.value,
+            operation_id=operation.operation_id,
+            error_code=safe_lifecycle_error_code(operation.error_code),
+            updated_at=operation.updated_at,
+        )
 
     async def stream_device_role(
         websocket: WebSocket,
@@ -973,7 +1180,9 @@ def create_app(
         await websocket.send_json(control.status(session.session_id))
         if include_device_health:
             health = await to_thread(role_device_health, role, bridge)
-            await websocket.send_json({"type": "device_status", **health.model_dump()})
+            await websocket.send_json(
+                {"type": "device_status", **health.model_dump(mode="json")}
+            )
 
         def session_is_valid() -> bool:
             valid = app.state.admin_sessions.valid_session(session.session_id)
@@ -1023,7 +1232,9 @@ def create_app(
                 await websocket.send_json({"type": "frame", "encoding": "jpeg", "sequence": frame_sequence, "capturedAt": utc_now().isoformat(), "data": encoded})
                 if include_device_health and frame_sequence % 10 == 0:
                     health = await to_thread(role_device_health, role, bridge)
-                    await websocket.send_json({"type": "device_status", **health.model_dump()})
+                    await websocket.send_json(
+                        {"type": "device_status", **health.model_dump(mode="json")}
+                    )
                 await websocket.send_json(control.status(session.session_id))
 
         receiver = create_task(receive_input())

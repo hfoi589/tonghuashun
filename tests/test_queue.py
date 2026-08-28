@@ -131,6 +131,23 @@ def test_long_result_completion_stores_one_image_and_eight_values() -> None:
     assert all(capture.status == CaptureStatus.PENDING for capture in result.captures.values())
 
 
+def test_data_only_result_marks_legacy_capture_slots_skipped() -> None:
+    """A data-only task must not expose pending screenshot slots after completion."""
+    store = InMemoryStreams()
+    store.enqueue(
+        TaskRecord(task_id="data-only", symbol="601872", include_long_capture=False)
+    )
+    store.next_queued()
+
+    result = store.complete_result("data-only", FULL_VALUES, None)
+
+    assert all(capture.status == CaptureStatus.SKIPPED for capture in result.captures.values())
+    assert all(
+        capture["status"] == "SKIPPED"
+        for capture in result.as_public()["captures"]
+    )
+
+
 def test_completed_result_publishes_intraday_series_without_changing_scalar_status() -> None:
     """Keeping series outside the task result would lose it before the public API reads it."""
     store = InMemoryStreams()

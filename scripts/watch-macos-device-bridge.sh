@@ -39,32 +39,40 @@ wait_for_adb_after_root() {
 }
 
 ensure_bridge() {
-    device_ready || return 0
+    device_ready || return 1
 
     identity=$(adb_for shell id 2>/dev/null || true)
     case "$identity" in
         uid=0*) ;;
         *)
-            adb_for root >/dev/null 2>&1 || return 0
-            wait_for_adb_after_root || return 0
+            adb_for root >/dev/null 2>&1 || return 1
+            wait_for_adb_after_root || return 1
+            identity=$(adb_for shell id 2>/dev/null) || return 1
+            case "$identity" in
+                uid=0*) ;;
+                *) return 1 ;;
+            esac
             ;;
     esac
 
     if ! adb_for shell pidof ths-frida-server >/dev/null 2>&1; then
-        adb_for shell 'nohup /data/local/tmp/ths-frida-server >/data/local/tmp/ths-frida-server.log 2>&1 &' >/dev/null 2>&1 || return 0
+        adb_for shell 'nohup /data/local/tmp/ths-frida-server >/data/local/tmp/ths-frida-server.log 2>&1 &' >/dev/null 2>&1 || return 1
     fi
 
-    if adb_for shell pidof ths-frida-server >/dev/null 2>&1; then
-        adb_for forward "tcp:$host_port" "tcp:$device_port" >/dev/null 2>&1 || true
-    fi
+    adb_for shell pidof ths-frida-server >/dev/null 2>&1 || return 1
+    adb_for forward "tcp:$host_port" "tcp:$device_port" >/dev/null 2>&1 || return 1
+    return 0
 }
 
 if [ "$once" -eq 1 ]; then
-    ensure_bridge
-    exit 0
+    if ensure_bridge; then
+        exit 0
+    fi
+    printf '%s\n' 'DEVICE_LIFECYCLE_FAILED' >&2
+    exit 1
 fi
 
 while :; do
-    ensure_bridge
+    ensure_bridge || :
     sleep 2
 done

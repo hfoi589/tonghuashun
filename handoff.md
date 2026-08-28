@@ -186,7 +186,9 @@ MARKET_DIRECT_ENRICHMENT_TTL_SECONDS=15
 CORE_WARM_CONNECTION_MAX_IDLE_SECONDS=25
 ```
 
-`.env` 继续只保存管理员秘密和 `THS_SESSION_ENCRYPTION_KEY`，不得提交。
+`.env` 继续只保存管理员秘密、`THS_SESSION_ENCRYPTION_KEY` 和
+`THS_DEVICE_LIFECYCLE_TOKEN`，不得提交；后二者不得在后加载的
+`deploy/macos.env` 中出现任何赋值（包括空值）。
 
 ## 8. 2026-08-27 验收证据
 
@@ -239,3 +241,91 @@ docker --context orbstack compose \
 目录异常先检查 `/data/market/symbol-catalog.db` 和 API 日志；公开行情异常检查
 腾讯/新浪网络与 stale 缓存。只有 `DIRECT_SESSION_*` 或核心协议错误才需要管理员
 人工打开 App 续签。不要把公开源故障误诊为 App 故障，也不要操作资金设备。
+
+## 10. 管理员设备生命周期与完整镜像部署合同（待后续实现/验收）
+
+本节记录已批准的操作合同，不是本轮真实部署或全新 Mac 验收记录。Task 7–9 完成前，
+不得声称已接受真实 host、设备、镜像、首次开通或人工登录。
+
+### 生命周期安装与操作
+
+在目标 Mac 上，由
+`scripts/install-macos-device-lifecycle.sh` 安装稳定副本并加载
+`com.ths.device-lifecycle` LaunchAgent。broker 仅监听 macOS 回环地址；
+root `.env` is the sole source for Compose/API secrets；后加载的
+`deploy/macos.env` 不得赋值 `THS_DEVICE_LIFECYCLE_TOKEN` 或
+`THS_SESSION_ENCRYPTION_KEY`。installer copies the same lifecycle Token into
+the mode-0600 host config required by the broker。该 host config 私有，Token
+is never exposed through a plist, log, or browser，且绝不写入 API 响应或交接文档。
+
+管理员只可在已登录、CSRF 校验、取得当前会话设备锁、队列暂停且无运行设备任务后，
+调用固定的 `shutdown` 或 `start_and_launch_app`。前者使用 Emulator 正常关闭，后者
+只打开同花顺入口 Activity；两个角色均适用，但资金设备仍禁止账号、App、数据或 AVD
+变更和任何后续页面导航。操作员必须取得当前会话设备锁，等待运行中的设备任务结束，
+一次只操作一台设备，随后释放锁并显式恢复队列。
+
+状态只使用 `UNCONFIGURED`、`UNKNOWN`、`STOPPED`、`STARTING`、`RUNNING`、
+`STOPPING` 和 `ERROR`。固定错误码为：
+
+- `DEVICE_LIFECYCLE_UNAVAILABLE`
+- `DEVICE_LIFECYCLE_LOCK_REQUIRED`
+- `DEVICE_LIFECYCLE_BUSY`
+- `DEVICE_ACTION_IN_PROGRESS`
+- `DEVICE_AVD_NOT_FOUND`
+- `DEVICE_BOOT_TIMEOUT`
+- `DEVICE_APP_LAUNCH_FAILED`
+- `DEVICE_SHUTDOWN_FAILED`
+- `DEVICE_LIFECYCLE_FAILED`
+
+不得返回或记录 Token、AVD/serial/端口、命令、stderr、账号或会话材料。
+
+### 本地/私有完整镜像与一键部署
+
+目标镜像为本机 `ths-level2-api:local`，包含已摘要校验的 THS APK、Frida Server
+16.7.19、非秘密 manifest 和只读辅助脚本。它只用于 local/private 环境；不得
+`docker push`、`docker save` 或发布公共 Registry，也绝不包含 `.env`、Token、账号、
+会话、AVD、capture、Redis 或日志。The 204 MB APK is tracked in Git history；
+the old Docker build context and image excluded it。The approved image is
+local/private-only，完整镜像在实现后才会以固定摘要刻意纳入。
+
+标准入口为：
+
+```sh
+scripts/deploy-macos-one-click.sh --mode auto
+```
+
+脚本将只支持 Apple Silicon macOS 和显式 OrbStack context。若两个固定 AVD 已存在，
+它只重建本地镜像、校验已安装 APK 摘要、安装/更新 LaunchAgent 和重建 Compose；绝不
+创建、删除、复制、wipe、重置或重装 App。摘要不符返回
+`INSTALLED_APK_MISMATCH`，而非覆盖已登录设备。部署会通过已有管理员登录、CSRF 和
+设备锁暂停旧 Runner，等待活动任务清零，再以 owner token 获取有 TTL 的 Redis
+maintenance lease。API 替换后普通队列仍冻结，只有 lease 原子绑定的固定
+`601872` data-only acceptance task 可以被 Runner 领取；双会话 READY、两角色 bridge/App
+修复和严格验收全部成功后才 compare-owner 释放 lease。
+
+若任一固定 AVD 缺失，`auto` 进入可恢复的交互式 provisioning：只创建/安装本次缺失
+角色，保留已有 AVD；新设备必须由人完成登录、验证码、设备验证和权限确认。未完成时
+返回 `FIRST_TIME_LOGIN_REQUIRED`，下次从现有状态继续。journal 按
+`PENDING_CREATE / AVD_CREATED / APK_VERIFIED / FRIDA_READY / LOGIN_REQUIRED /
+ACCEPTANCE_PENDING` 逐步持久化；新角色会话的 `updated_at` 必须晚于记录的创建时间，
+严格 acceptance 成功前不会清除 journal。
+
+磁盘前置检查按部署模式区分：existing mode 在项目、`~/.android/avd` 和 OrbStack
+外部数据文件系统各要求至少 8 GiB 可用空间；provisioning mode 在三者各要求至少
+30 GiB。OrbStack 外部数据位置只读取 `~/.orbstack/vmconfig.json` 的绝对 `data_dir`，
+不使用环境变量覆盖；配置缺失或无效时以固定错误终止，并在镜像、journal 或 AVD
+发生任何变更前完成检查。
+
+若替换后的检查失败，maintenance lease 保留且普通任务不会自动恢复。修复固定错误后
+重跑同一部署命令；显式安全回滚命令为：
+
+```sh
+scripts/deploy-macos-one-click.sh --release-maintenance-lease
+```
+
+该回滚先重新取得管理员设备锁，只释放匹配 owner 的 lease，并保持队列暂停；随后必须
+人工交还设备控制并显式恢复队列。
+
+回滚时从 Compose 环境移除 lifecycle URL 和 Token，卸载
+`com.ths.device-lifecycle` LaunchAgent，并恢复既有人工启动方式；不删除 AVD、登录数据、
+会话包或 Docker 数据卷。公开 Market 和直连任务仍应保持可用。

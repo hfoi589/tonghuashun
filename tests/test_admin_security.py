@@ -46,6 +46,22 @@ def test_admin_session_and_csrf_protect_runner_lock_controls() -> None:
     assert client.post("/api/admin/lock/release", headers={"X-CSRF-Token": csrf}).json() == {"locked": False}
 
 
+def test_device_lifecycle_actions_preserve_admin_and_csrf_boundaries() -> None:
+    """Lifecycle availability must not be disclosed before admin authentication."""
+    client = TestClient(
+        create_app(admin_password_hash=PasswordHasher().hash("admin-secret")),
+        base_url="https://testserver",
+    )
+    path = "/api/admin/devices/core_metrics/actions"
+    payload = {"action": "shutdown"}
+
+    assert client.post(path, json=payload).status_code == 401
+    assert client.post(
+        "/api/admin/session", json={"password": "admin-secret"}
+    ).status_code == 204
+    assert client.post(path, json=payload).status_code == 403
+
+
 def test_admin_session_probe_restores_an_existing_cookie_session() -> None:
     """A page refresh must reuse the valid cookie instead of asking for the password again."""
     client = TestClient(

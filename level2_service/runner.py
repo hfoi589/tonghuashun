@@ -7,18 +7,20 @@ knows, records, or sends application credentials or private THS protocol data.
 from __future__ import annotations
 
 import base64
+from contextlib import contextmanager
 from io import BytesIO
 import json
 import os
 import re
 import subprocess
 import tempfile
+from threading import RLock
 import time
 from xml.etree import ElementTree
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Callable, Protocol
+from typing import Callable, Iterator, Protocol
 from zoneinfo import ZoneInfo
 
 from .models import CaptureKind, MetricKind, TaskRecord, TaskStatus, utc_now
@@ -1129,6 +1131,14 @@ class Level2Navigator:
         return int(self.bridge.has_text(text))
 
 
+class RunnerMaintenanceError(RuntimeError):
+    """A fixed failure raised while atomically entering device maintenance."""
+
+    def __init__(self, error_code: str) -> None:
+        super().__init__(error_code)
+        self.error_code = error_code
+
+
 @dataclass
 class RunnerControl:
     state: str = "OFFLINE"
@@ -1138,84 +1148,181 @@ class RunnerControl:
     _sequence: int = 0
     _listeners: list[Callable[[dict], None]] = field(default_factory=list)
     _socket_disconnectors: dict[str, list[Callable[[], None]]] = field(default_factory=dict)
+    _operation_leases: dict[str, str] = field(default_factory=dict)
+    _maintenance_gate: RLock = field(
+        default_factory=RLock,
+        repr=False,
+        compare=False,
+    )
 
     def heartbeat(self, state: str = "READY") -> None:
-        if state not in RUNNER_STATES:
-            raise ValueError("unknown runner state")
-        self.state = state
-        self.last_heartbeat = utc_now()
-        self._publish()
+        with self._maintenance_gate:
+            if state not in RUNNER_STATES:
+                raise ValueError("unknown runner state")
+            self.state = state
+            self.last_heartbeat = utc_now()
+            self._publish()
 
     def health(self) -> dict:
-        return {"state": self._effective_state(), "last_heartbeat": self.last_heartbeat.isoformat() if self.last_heartbeat else None, "queue_paused": self.queue_paused}
+        with self._maintenance_gate:
+            return {"state": self._effective_state(), "last_heartbeat": self.last_heartbeat.isoformat() if self.last_heartbeat else None, "queue_paused": self.queue_paused}
 
     def lock(self, session_id: str) -> bool:
-        if self._lock_owner not in (None, session_id):
-            # A lock acquired without a live device stream is stale: the
-            # browser that owned it can no longer send input, so allow the
-            # next authenticated administrator to recover the device.
-            if self._socket_disconnectors.get(self._lock_owner):
-                return False
-            self._lock_owner = None
-        self._lock_owner = session_id
-        # Device takeover must stop the worker from claiming any new task.
-        # Releasing the lock deliberately does not resume automation; the
-        # administrator must make that decision explicitly via the queue API.
-        self.queue_paused = True
-        self._publish()
-        return True
+        with self._maintenance_gate:
+            if self._lock_owner not in (None, session_id):
+                # A lock acquired without a live device stream is stale: the
+                # browser that owned it can no longer send input, so allow the
+                # next authenticated administrator to recover the device.
+                if self._socket_disconnectors.get(self._lock_owner):
+                    return False
+                self._lock_owner = None
+            self._lock_owner = session_id
+            # Device takeover must stop the worker from claiming any new task.
+            # Releasing the lock deliberately does not resume automation; the
+            # administrator must make that decision explicitly via the queue API.
+            self.queue_paused = True
+            self._publish()
+            return True
 
     def release(self, session_id: str) -> bool:
-        if self._lock_owner != session_id:
-            return False
-        self._lock_owner = None
-        self._publish()
-        return True
+        with self._maintenance_gate:
+            if self._lock_owner != session_id or self._operation_leases:
+                return False
+            self._lock_owner = None
+            self._publish()
+            return True
 
     def lock_state(self, session_id: str) -> dict[str, bool]:
-        return {"locked": self._lock_owner == session_id}
+        with self._maintenance_gate:
+            return {"locked": self._lock_owner == session_id}
 
     def authorizes_input(self, session_id: str) -> bool:
-        return self._lock_owner == session_id
+        with self._maintenance_gate:
+            return self._lock_owner == session_id
 
     def disconnect_session(self, session_id: str) -> None:
         """Invalidate a disconnected admin's lock and active device streams."""
-        if self._lock_owner == session_id:
-            self._lock_owner = None
-        for disconnect in tuple(self._socket_disconnectors.get(session_id, ())):
-            disconnect()
-        self._publish()
+        with self._maintenance_gate:
+            if self._lock_owner == session_id:
+                self._lock_owner = None
+            for disconnect in tuple(self._socket_disconnectors.get(session_id, ())):
+                disconnect()
+            self._publish()
 
     def register_socket(self, session_id: str, disconnect: Callable[[], None]) -> Callable[[], None]:
-        self._socket_disconnectors.setdefault(session_id, []).append(disconnect)
+        with self._maintenance_gate:
+            self._socket_disconnectors.setdefault(session_id, []).append(disconnect)
 
         def unregister() -> None:
-            sockets = self._socket_disconnectors.get(session_id)
-            if sockets is None:
-                return
-            if disconnect in sockets:
-                sockets.remove(disconnect)
-            if not sockets:
-                self._socket_disconnectors.pop(session_id, None)
-                if self._lock_owner == session_id:
-                    self._lock_owner = None
-                    self._publish()
+            with self._maintenance_gate:
+                sockets = self._socket_disconnectors.get(session_id)
+                if sockets is None:
+                    return
+                if disconnect in sockets:
+                    sockets.remove(disconnect)
+                if not sockets:
+                    self._socket_disconnectors.pop(session_id, None)
+                    if self._lock_owner == session_id:
+                        self._lock_owner = None
+                        self._publish()
 
         return unregister
 
     def pause_queue(self) -> None:
-        self.queue_paused = True
-        self._publish()
+        with self._maintenance_gate:
+            self.queue_paused = True
+            self._publish()
 
     def resume_queue(self) -> bool:
-        if self._lock_owner is not None:
+        with self._maintenance_gate:
+            if self._lock_owner is not None or self._operation_leases:
+                return False
+            self.queue_paused = False
+            self._publish()
+            return True
+
+    def claim_next_task(self, store: TaskStore) -> TaskRecord | None:
+        """Atomically recheck pause state and claim under the maintenance gate."""
+        with self._maintenance_gate:
+            if self._operation_leases:
+                return None
+            if self.queue_paused:
+                try:
+                    lease = store.deployment_lease_status()
+                except Exception:
+                    return None
+                if lease is None or lease.bound_task_id is None:
+                    return None
+            self.heartbeat("BOOTING")
+            return store.next_runnable()
+
+    @property
+    def has_active_operation(self) -> bool:
+        with self._maintenance_gate:
+            return bool(self._operation_leases)
+
+    def begin_operation(self, role: str, operation_id: str) -> bool:
+        """Keep runner/device ownership after an asynchronous broker submit."""
+        if (
+            role not in {"core_metrics", "main_fund_flow"}
+            or not isinstance(operation_id, str)
+            or re.fullmatch(r"[A-Za-z0-9_-]{1,256}", operation_id) is None
+        ):
             return False
-        self.queue_paused = False
-        self._publish()
-        return True
+        with self._maintenance_gate:
+            existing = self._operation_leases.get(role)
+            if existing not in {None, operation_id}:
+                return False
+            self._operation_leases[role] = operation_id
+            self.queue_paused = True
+            self._publish()
+            return True
+
+    def reconcile_operation(
+        self, role: str, operation_id: str | None, state: str
+    ) -> bool:
+        """Reconcile only an exact operation ID; stale terminal reports are ignored."""
+        if role not in {"core_metrics", "main_fund_flow"}:
+            return False
+        with self._maintenance_gate:
+            current = self._operation_leases.get(role)
+            if state in {"STARTING", "STOPPING"}:
+                if not isinstance(operation_id, str):
+                    return False
+                if current not in {None, operation_id}:
+                    return False
+                self._operation_leases[role] = operation_id
+                self.queue_paused = True
+                return True
+            if state not in {"RUNNING", "STOPPED", "ERROR"}:
+                return False
+            if current is None or operation_id != current:
+                return False
+            del self._operation_leases[role]
+            self._publish()
+            return True
+
+    @contextmanager
+    def maintenance(
+        self,
+        session_id: str,
+        store: TaskStore,
+    ) -> Iterator[None]:
+        """Hold device ownership and idle guarantees through one host action."""
+        with self._maintenance_gate:
+            if self._lock_owner != session_id:
+                raise RunnerMaintenanceError("DEVICE_LIFECYCLE_LOCK_REQUIRED")
+            if (
+                not self.queue_paused
+                or self._operation_leases
+                or store.has_running_task()
+            ):
+                raise RunnerMaintenanceError("DEVICE_LIFECYCLE_BUSY")
+            yield
 
     def status(self, session_id: str) -> dict:
-        return {"type": "runner_status", "state": self._effective_state(), "locked": self.authorizes_input(session_id), "sequence": self._sequence}
+        with self._maintenance_gate:
+            return {"type": "runner_status", "state": self._effective_state(), "locked": self.authorizes_input(session_id), "sequence": self._sequence}
 
     def subscribe(self, listener: Callable[[dict], None]) -> Callable[[], None]:
         self._listeners.append(listener)
@@ -1258,12 +1365,11 @@ class Level2Runner:
         self.long_capture_validator = long_capture_validator
 
     def run_once(self) -> TaskRecord | None:
-        if self.control.queue_paused:
+        task = self.control.claim_next_task(self.store)
+        if task is None and self.control.queue_paused:
             if self.control.state == "OFFLINE":
                 self.control.heartbeat("READY" if self.device_online() else "OFFLINE")
             return None
-        self.control.heartbeat("BOOTING")
-        task = self.store.next_queued()
         if task is None:
             self.control.heartbeat("READY")
             return None

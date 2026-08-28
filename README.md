@@ -29,17 +29,26 @@ the App, scroll, capture, stitch, or run OCR.
   Mac. It is not Dockerized. Docker reaches the host's default localhost ADB
   server through `host.docker.internal`, with no public ADB port mapping.
 
-Both profiles require a practical minimum of 4 CPU cores, 8 GiB RAM, and 30
-GiB free disk. Preflight also requires the exact external APK SHA-256:
+Both profiles require a practical minimum of 4 CPU cores and 8 GiB RAM. Linux
+deployments require 30 GiB free disk. For macOS, existing mode requires at
+least 8 GiB free on each of the project, Android AVD, and OrbStack data
+filesystems; provisioning mode requires 30 GiB on each filesystem. macOS
+preflight reads the external OrbStack storage location read-only from
+`~/.orbstack/vmconfig.json` at key `data_dir`; an absent, malformed, relative,
+or missing path fails closed. Preflight also requires the verified APK SHA-256:
 `2554490aa3f5e2df17ac0a711311f3f85ee3130008af9bb4ab12510b3d6e971e`, and at
-least one ARM ABI (`arm64-v8a` or `armeabi-v7a`). The 204 MB APK is deliberately
-not in this repository, Docker build context, or Git history.
+least one ARM ABI (`arm64-v8a` or `armeabi-v7a`). The 204 MB APK is tracked in
+Git history, but the old Docker build context and image excluded it. The
+approved image is local/private-only and deliberately adds the APK only after
+fixed digest verification; it never includes credentials, sessions, AVD data,
+or login snapshots.
 
 ## Linux amd64 / Redroid
 
 1. Create the deployment secret file. It prompts without echoing and creates a
-   mode-0600 `.env` containing only an Argon2id `ADMIN_PASSWORD_HASH` and a
-   random `ADMIN_SESSION_SECRET`:
+   mode-0600 `.env` containing an Argon2id `ADMIN_PASSWORD_HASH`, random
+   `ADMIN_SESSION_SECRET`, Fernet `THS_SESSION_ENCRYPTION_KEY`, and independent
+   `THS_DEVICE_LIFECYCLE_TOKEN`:
 
    ```sh
    ./scripts/setup-admin.sh .env
@@ -75,37 +84,89 @@ claim the VPS is supported.
 
 ## Apple Silicon macOS / native AVD
 
-1. Create the same secret file and bootstrap the two isolated native Android
-   VMs (Android SDK command-line tools must already be on `PATH`):
+### Approved complete-image and one-command contract — pending implementation
 
-   ```sh
-   ./scripts/setup-admin.sh .env
-   python3 scripts/preflight.py --apk-only --apk /absolute/path/to/ths.apk
-   ./scripts/bootstrap-macos-dual-avd.sh \
-     /absolute/path/to/ths.apk \
-     /absolute/path/to/frida-server-16.7.19-android-arm64
-   python3 scripts/preflight.py --profile macos-avd --apk /absolute/path/to/ths.apk
-   ```
+Tasks 7–9 implement and verify this contract. This documentation does not claim
+real deployment or clean-Mac acceptance before those tasks run; no host, device,
+image, login, or provisioning action is performed by documenting it.
 
-2. Make the non-secret Mac bridge settings, then start only the web/API/Redis
-   services. The host ADB server remains on its default local endpoint; do not
-   start it with `adb -a` and do not publish 5037.
+The approved `ths-level2-api:local` image is local/private-only. It will carry
+the fixed THS APK, Frida Server 16.7.19, a non-secret manifest, and read-only
+deployment helpers. Build-time digest checks cover the APK and Frida assets.
+It must not carry `.env`, tokens, account credentials, encrypted sessions, AVD
+data, captures, Redis data, or logs. It must not run `docker push`,
+`docker save`, or publish to a public registry.
 
-   ```sh
-   cp deploy/macos.env.example deploy/macos.env
-   docker --context orbstack compose --env-file .env --env-file deploy/macos.env -f deploy/compose.yml up -d --build
-   ```
+The standard future entry point is:
 
-3. The bootstrap keeps `THS_API_33_ARM64 / emulator-5554` and its login
-   untouched for `main_fund_flow`. It creates the clean
-   `THS_CORE_33_ARM64 / emulator-5556` only when absent, then pauses for manual
-   login with the big-order-enabled account. It never accepts credentials.
-   Frida server `16.7.19` is forwarded independently:
+```sh
+scripts/deploy-macos-one-click.sh --mode auto
+```
 
-   ```sh
-   adb -s emulator-5554 forward tcp:27042 tcp:27042
-   adb -s emulator-5556 forward tcp:27043 tcp:27042
-   ```
+It will use Apple Silicon macOS and the explicit OrbStack context only. It
+checks the Android/Java/OrbStack prerequisites, accepted Android image license,
+asset digests, mode-0600 `.env`, dual-role `deploy/macos.env`, and that no
+device task is running. It never installs Homebrew or OrbStack and never
+accepts a third-party license for the operator. The Compose rebuild remains:
+
+```sh
+docker --context orbstack compose --project-name ths-level2 --env-file .env --env-file deploy/macos.env -f deploy/compose.yml up -d --build
+```
+
+When both fixed existing AVDs are present, `auto` preserves them: it does not
+create, delete, copy, wipe, reset, reinstall, or alter either App's data. It
+checks the installed APK digest and returns `INSTALLED_APK_MISMATCH` instead of
+overwriting a different installation. It then installs the stable local
+lifecycle/bridge LaunchAgents and runs the fixed repair/start action for both
+roles (starting stopped AVDs and repairing already running roles), launches
+only the THS entry Activity, and rebuilds API/Redis
+without deleting data volumes. A Redis deployment-maintenance lease freezes
+ordinary claims across API replacement; only its owner-bound fixed acceptance
+task may run. READY additionally requires both encrypted sessions and strict
+data-only acceptance.
+
+When an AVD is fresh or partially missing, `auto` records which roles already
+exist and creates and installs assets only for the missing fixed role(s).
+Existing AVDs remain untouched. New AVDs require human THS login, CAPTCHA or
+device verification, and permission confirmation; the recoverable stopping
+state is `FIRST_TIME_LOGIN_REQUIRED`. It never enters credentials or turns this
+human-login gate into unattended provisioning. The journal retains each newly
+created role through `LOGIN_REQUIRED` and `ACCEPTANCE_PENDING`; that role's
+encrypted session must have been refreshed after its recorded creation time.
+
+If a post-replacement check fails, the owner-bound maintenance lease remains in
+place and ordinary queued work stays frozen. Correct the fixed error and rerun
+the same deployment command. The explicit safe rollback is:
+
+```sh
+scripts/deploy-macos-one-click.sh --release-maintenance-lease
+```
+
+Rollback reacquires the administrator device lock, releases only the matching
+lease owner, and deliberately leaves the queue paused until the operator
+releases device control and explicitly resumes it.
+
+The lifecycle broker is installed with
+`scripts/install-macos-device-lifecycle.sh` as a macOS LaunchAgent. The root
+`.env` is the sole source for Compose/API secrets; the later
+`deploy/macos.env` contains neither `THS_DEVICE_LIFECYCLE_TOKEN` nor
+`THS_SESSION_ENCRYPTION_KEY`. The installer copies the same lifecycle Token
+into the mode-0600 host config required by the broker. That host config is
+private, and the Token is never exposed through a plist, log, browser, or API
+response. Operators
+acquire the device lock, wait for running tasks to finish, perform one device
+action at a time, release the lock, and explicitly resume the queue. Relevant
+fixed errors include
+`DEVICE_LIFECYCLE_UNAVAILABLE`, `DEVICE_LIFECYCLE_LOCK_REQUIRED`,
+`DEVICE_LIFECYCLE_BUSY`, `DEVICE_ACTION_IN_PROGRESS`,
+`DEVICE_AVD_NOT_FOUND`, `DEVICE_BOOT_TIMEOUT`, `DEVICE_APP_LAUNCH_FAILED`,
+`DEVICE_SHUTDOWN_FAILED`, `DEVICE_LIFECYCLE_FAILED`,
+`INSTALLED_APK_MISMATCH`, and `FIRST_TIME_LOGIN_REQUIRED`.
+
+To roll back, remove the lifecycle URL and token from the Compose environment,
+unload the `com.ths.device-lifecycle` LaunchAgent, and return to the existing
+manual AVD workflow. Do not delete AVDs, login data, session bundles, or Docker
+data volumes; public Market and direct collection remain available.
 
 `host.docker.internal:5037` is an internal Docker Desktop bridge, not a public
 port. Dual mode uses `CORE_ADB_SERIAL`, `CORE_FRIDA_SERVER_ENDPOINT`,
@@ -129,12 +190,9 @@ CORE_WARM_CONNECTION_MAX_IDLE_SECONDS=25
 
 ## Image, volumes, and HTTP access
 
-The API image includes the built React frontend and uses multi-architecture
-base images. Publish it where needed with, for example:
-
-```sh
-docker buildx build --platform linux/amd64,linux/arm64 --target api -t example/ths-level2-api:latest --push .
-```
+The API image includes the built React frontend. The approved macOS image is
+local/private-only and must not be pushed, saved, or exported until a separate
+APK-distribution authorization and private-registry policy exists.
 
 Compose persists `capture-data`, `redis-data`, `redroid-data` (Linux only),
 `template-data`, `admin-data`, and `market-data`. The last volume contains the

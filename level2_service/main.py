@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import socket
+from math import isfinite
 from dataclasses import dataclass, field
 from datetime import timedelta
 from functools import partial
@@ -22,6 +23,7 @@ from .app_sessions import (
     capture_fund_http_session,
 )
 from .daily_kline import DailyKlineMarketDataSource, TonghuashunPublicDailyKlineProvider
+from .device_lifecycle import DeviceLifecycleClient
 from .direct_market import (
     Core9528Client,
     Core9528CurveDecoder,
@@ -77,6 +79,9 @@ class DeploymentSettings:
     core_warm_connection_max_idle_seconds: float
     core_metrics_transport: str
     fund_flow_transport: str
+    device_lifecycle_url: str | None
+    device_lifecycle_token: str | None = field(repr=False)
+    device_lifecycle_timeout_seconds: float
     ths_session_encryption_key: str | None = field(repr=False)
     ths_session_root: Path
 
@@ -155,6 +160,27 @@ class DeploymentSettings:
         session_root = Path(
             values.get("THS_SESSION_ROOT", "/data/admin/ths-sessions")
         ).expanduser().resolve()
+        lifecycle_url = values.get("THS_DEVICE_LIFECYCLE_URL", "").strip() or None
+        lifecycle_token = values.get("THS_DEVICE_LIFECYCLE_TOKEN", "").strip() or None
+        if (lifecycle_url is None) != (lifecycle_token is None):
+            raise ValueError(
+                "THS_DEVICE_LIFECYCLE_URL and THS_DEVICE_LIFECYCLE_TOKEN "
+                "must be provided together"
+            )
+        try:
+            lifecycle_timeout = float(
+                values.get("THS_DEVICE_LIFECYCLE_TIMEOUT_SECONDS", "5")
+            )
+        except ValueError as error:
+            raise ValueError(
+                "THS_DEVICE_LIFECYCLE_TIMEOUT_SECONDS must be a positive number"
+            ) from error
+        if not isfinite(lifecycle_timeout) or lifecycle_timeout <= 0:
+            raise ValueError(
+                "THS_DEVICE_LIFECYCLE_TIMEOUT_SECONDS must be a positive number"
+            )
+        if lifecycle_url is not None:
+            DeviceLifecycleClient.validate_base_url(lifecycle_url)
         cookie_secure_value = values.get("ADMIN_COOKIE_SECURE", "1").strip().lower()
         if cookie_secure_value in {"1", "true", "yes", "on"}:
             admin_cookie_secure = True
@@ -258,6 +284,9 @@ class DeploymentSettings:
             ],
             core_metrics_transport=transport_modes["CORE_METRICS_TRANSPORT"],
             fund_flow_transport=transport_modes["FUND_FLOW_TRANSPORT"],
+            device_lifecycle_url=lifecycle_url,
+            device_lifecycle_token=lifecycle_token,
+            device_lifecycle_timeout_seconds=lifecycle_timeout,
             ths_session_encryption_key=session_encryption_key or None,
             ths_session_root=session_root,
         )
@@ -507,6 +536,16 @@ def create_production_app(
         ),
         is_market_open=is_china_market_open,
     )
+    device_lifecycle = (
+        DeviceLifecycleClient(
+            config.device_lifecycle_url,
+            config.device_lifecycle_token,
+            timeout_seconds=config.device_lifecycle_timeout_seconds,
+        )
+        if config.device_lifecycle_url is not None
+        and config.device_lifecycle_token is not None
+        else None
+    )
     app = create_app(
         store=store,
         admin_password_hash=config.admin_password_hash,
@@ -547,6 +586,7 @@ def create_production_app(
         market_data_broker=market_broker,
         account_session_provider=account_session_provider,
         account_session_refreshers=account_session_refreshers,
+        device_lifecycle=device_lifecycle,
     )
     app.state.deployment_settings = config
     app.state.runner = runner

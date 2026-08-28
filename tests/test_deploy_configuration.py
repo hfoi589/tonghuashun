@@ -8,12 +8,94 @@ from pathlib import Path
 
 import pytest
 
+from level2_service.main import DeploymentSettings
+
 
 ROOT = Path(__file__).resolve().parents[1]
 CANONICAL_MACOS_COMPOSE_COMMAND = (
-    "docker --context orbstack compose --env-file .env "
+    "docker --context orbstack compose --project-name ths-level2 --env-file .env "
     "--env-file deploy/macos.env -f deploy/compose.yml up -d --build"
 )
+
+
+def lifecycle_environment(**overrides: str) -> dict[str, str]:
+    return {
+        "ADMIN_PASSWORD_HASH": "$argon2id$example",
+        "ADMIN_SESSION_SECRET": "s" * 32,
+        "ADB_SERIAL": "emulator-5556",
+        **overrides,
+    }
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"THS_DEVICE_LIFECYCLE_URL": "http://localhost:18765"},
+        {"THS_DEVICE_LIFECYCLE_TOKEN": "secret"},
+    ],
+)
+def test_lifecycle_configuration_requires_url_and_token_together(
+    overrides: dict[str, str],
+) -> None:
+    """A half-configured host control capability must not start accidentally."""
+    with pytest.raises(ValueError, match="THS_DEVICE_LIFECYCLE_URL.*TOKEN"):
+        DeploymentSettings.from_environ(lifecycle_environment(**overrides))
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"THS_DEVICE_LIFECYCLE_TIMEOUT_SECONDS": "0"},
+        {"THS_DEVICE_LIFECYCLE_TIMEOUT_SECONDS": "not-a-number"},
+        {"THS_DEVICE_LIFECYCLE_TIMEOUT_SECONDS": "nan"},
+        {"THS_DEVICE_LIFECYCLE_TIMEOUT_SECONDS": "inf"},
+        {
+            "THS_DEVICE_LIFECYCLE_URL": "https://host.docker.internal:18765",
+            "THS_DEVICE_LIFECYCLE_TOKEN": "secret",
+        },
+        {
+            "THS_DEVICE_LIFECYCLE_URL": "http://broker.example.test:18765",
+            "THS_DEVICE_LIFECYCLE_TOKEN": "secret",
+        },
+    ],
+)
+def test_lifecycle_configuration_rejects_unsafe_timeout_or_url(
+    overrides: dict[str, str],
+) -> None:
+    """Unsafe lifecycle connection settings could expose host controls externally."""
+    with pytest.raises(ValueError):
+        DeploymentSettings.from_environ(lifecycle_environment(**overrides))
+
+
+def test_missing_lifecycle_settings_leave_the_feature_disabled() -> None:
+    """Normal API startup must remain available when lifecycle controls are omitted."""
+    settings = DeploymentSettings.from_environ(lifecycle_environment())
+
+    assert settings.device_lifecycle_url is None
+    assert settings.device_lifecycle_token is None
+    assert settings.device_lifecycle_timeout_seconds == 5.0
+
+
+def test_complete_lifecycle_settings_remain_enabled() -> None:
+    """Removing configured host controls would make the admin lifecycle feature inert."""
+    settings = DeploymentSettings.from_environ(
+        lifecycle_environment(
+            THS_DEVICE_LIFECYCLE_URL="http://host.docker.internal:18765",
+            THS_DEVICE_LIFECYCLE_TOKEN="secret",
+        )
+    )
+
+    assert settings.device_lifecycle_url == "http://host.docker.internal:18765"
+    assert settings.device_lifecycle_token == "secret"
+
+
+def test_compose_injects_lifecycle_settings_without_a_token_default() -> None:
+    """A compose fallback token would turn a sample deployment into host access."""
+    compose = (ROOT / "deploy" / "compose.yml").read_text(encoding="utf-8")
+
+    assert "THS_DEVICE_LIFECYCLE_URL: ${THS_DEVICE_LIFECYCLE_URL:-}" in compose
+    assert "THS_DEVICE_LIFECYCLE_TOKEN: ${THS_DEVICE_LIFECYCLE_TOKEN:-}" in compose
+    assert "THS_DEVICE_LIFECYCLE_TIMEOUT_SECONDS: ${THS_DEVICE_LIFECYCLE_TIMEOUT_SECONDS:-5}" in compose
 
 
 @pytest.mark.skipif(shutil.which("docker") is None, reason="Docker is not installed")
@@ -101,6 +183,36 @@ def test_api_image_embeds_frontend_without_a_caddy_stage() -> None:
     assert "FROM caddy:" not in dockerfile
 
 
+def test_api_image_embeds_read_only_fixed_host_deployment_helpers() -> None:
+    """A complete private image must carry reviewed helpers without writable host state."""
+    dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+
+    for source, destination in (
+        (
+            "scripts/install-macos-device-lifecycle.sh",
+            "/opt/ths/deployment/install-macos-device-lifecycle.sh",
+        ),
+        (
+            "scripts/macos-device-lifecycle.py",
+            "/opt/ths/deployment/macos-device-lifecycle.py",
+        ),
+        (
+            "scripts/watch-macos-device-bridge.sh",
+            "/opt/ths/deployment/watch-macos-device-bridge.sh",
+        ),
+        (
+            "scripts/configure-macos-core-display.sh",
+            "/opt/ths/deployment/configure-macos-core-display.sh",
+        ),
+    ):
+        assert f"COPY --chmod=0555 {source} {destination}" in dockerfile
+    assert (
+        "COPY --chmod=0444 scripts/macos_device_identity.py "
+        "/opt/ths/deployment/macos_device_identity.py"
+    ) in dockerfile
+    assert "chmod 0555 /opt/ths/assets /opt/ths/deployment" in dockerfile
+
+
 def test_caddy_configuration_file_is_removed() -> None:
     assert not (ROOT / "deploy" / "Caddyfile").exists()
 
@@ -129,10 +241,145 @@ def test_macos_deployment_docs_use_the_binding_orbstack_command() -> None:
     assert "docker compose --env-file deploy/macos.env" not in example
 
 
+def test_macos_example_keeps_root_secrets_out_of_the_later_env_file() -> None:
+    """Later empty assignments would override valid secrets from the root env file."""
+    example = (ROOT / "deploy" / "macos.env.example").read_text(encoding="utf-8")
+    compose = (ROOT / "deploy" / "compose.yml").read_text(encoding="utf-8")
+    active_assignments = [
+        (name, value)
+        for raw_line in example.splitlines()
+        if (line := raw_line.strip()) and not line.startswith("#") and "=" in line
+        for name, value in [line.split("=", 1)]
+    ]
+    active_values = {}
+    for name, value in active_assignments:
+        active_values.setdefault(name, []).append(value)
+
+    assert active_values["THS_DEVICE_LIFECYCLE_URL"] == ["http://host.docker.internal:18765"]
+    assert active_values["THS_DEVICE_LIFECYCLE_TIMEOUT_SECONDS"] == ["5"]
+    assert "THS_DEVICE_LIFECYCLE_TOKEN" not in active_values
+    assert "THS_SESSION_ENCRYPTION_KEY" not in active_values
+    for setting in (
+        "THS_DEVICE_LIFECYCLE_URL",
+        "THS_DEVICE_LIFECYCLE_TOKEN",
+        "THS_DEVICE_LIFECYCLE_TIMEOUT_SECONDS",
+    ):
+        assert f"{setting}: ${{{setting}:-" in compose
+
+
+@pytest.mark.skipif(shutil.which("docker") is None, reason="Docker is not installed")
+def test_real_compose_config_preserves_root_secrets_with_canonical_env_order(
+    tmp_path: Path,
+) -> None:
+    """The later macOS env file must not blank the root Token or session key."""
+    root_env = tmp_path / "root.env"
+    root_env.write_text(
+        "ADMIN_PASSWORD_HASH='$argon2id$example'\n"
+        "ADMIN_SESSION_SECRET=session-secret-value\n"
+        "THS_DEVICE_LIFECYCLE_TOKEN=lifecycle-secret-value\n"
+        "THS_SESSION_ENCRYPTION_KEY=MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=\n",
+        encoding="utf-8",
+    )
+    root_env.chmod(0o600)
+    protected = {
+        "ADMIN_PASSWORD_HASH",
+        "ADMIN_SESSION_SECRET",
+        "THS_DEVICE_LIFECYCLE_URL",
+        "THS_DEVICE_LIFECYCLE_TOKEN",
+        "THS_SESSION_ENCRYPTION_KEY",
+    }
+    environment = {key: value for key, value in os.environ.items() if key not in protected}
+
+    result = subprocess.run(
+        [
+            "docker",
+            "--context",
+            "orbstack",
+            "compose",
+            "--env-file",
+            str(root_env),
+            "--env-file",
+            "deploy/macos.env.example",
+            "-f",
+            "deploy/compose.yml",
+            "config",
+            "--format",
+            "json",
+        ],
+        cwd=ROOT,
+        env=environment,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    api_environment = json.loads(result.stdout)["services"]["api"]["environment"]
+    assert api_environment["THS_DEVICE_LIFECYCLE_URL"] == "http://host.docker.internal:18765"
+    assert api_environment["THS_DEVICE_LIFECYCLE_TOKEN"] == "lifecycle-secret-value"
+    assert api_environment["THS_SESSION_ENCRYPTION_KEY"] == (
+        "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="
+    )
+
+
+def test_readme_defines_the_unimplemented_private_complete_image_contract() -> None:
+    """Operators need the image, preservation, and human-login boundary before provisioning ships."""
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    normalized_readme = " ".join(readme.split())
+
+    assert "scripts/deploy-macos-one-click.sh --mode auto" in readme
+    assert "local/private" in readme
+    assert "APK" in readme and "Frida" in readme
+    assert "existing AVD" in readme
+    assert "FIRST_TIME_LOGIN_REQUIRED" in readme
+    assert "INSTALLED_APK_MISMATCH" in readme
+    assert "204 MB APK is tracked in Git history" in normalized_readme
+    assert "old Docker build context and image excluded it" in normalized_readme
+    assert "approved image is local/private-only" in normalized_readme
+    assert "does not claim real deployment" in normalized_readme
+    assert "clean-Mac acceptance" in normalized_readme
+
+
+def test_lifecycle_token_docs_define_the_compose_and_host_broker_boundary() -> None:
+    """Calling the root environment the token's only location would leave the broker unauthenticated."""
+    readme = " ".join((ROOT / "README.md").read_text(encoding="utf-8").split())
+    handoff = " ".join((ROOT / "handoff.md").read_text(encoding="utf-8").split())
+
+    for document in (readme, handoff):
+        assert "root `.env` is the sole source for Compose/API secrets" in document
+        assert "installer copies the same lifecycle Token into the mode-0600 host config" in document
+        assert "never exposed" in document
+        for channel in ("plist", "log", "browser"):
+            assert channel in document
+        assert "deploy/macos.env" in document
+        assert "THS_DEVICE_LIFECYCLE_TOKEN" in document
+        assert "THS_SESSION_ENCRYPTION_KEY" in document
+
+
+def test_macos_disk_preflight_docs_distinguish_existing_and_provisioning_storage() -> None:
+    """Operators must know the lower existing-mode floor and external OrbStack check."""
+    documents = [
+        (ROOT / "README.md").read_text(encoding="utf-8"),
+        (ROOT / "handoff.md").read_text(encoding="utf-8"),
+        (ROOT / "docs/superpowers/specs/2026-08-27-admin-device-lifecycle-controls-design.md").read_text(encoding="utf-8"),
+        (ROOT / "docs/superpowers/plans/2026-08-27-admin-device-lifecycle-controls.md").read_text(encoding="utf-8"),
+    ]
+    normalized = [" ".join(document.split()) for document in documents]
+    for document in normalized:
+        assert "existing mode" in document.lower()
+        assert "8 GiB" in document
+        assert "provisioning" in document.lower()
+        assert "30 GiB" in document
+        assert "vmconfig.json" in document
+        assert "data_dir" in document
+
+
 def test_root_environment_example_documents_the_direct_session_key() -> None:
     example = (ROOT / ".env.example").read_text(encoding="utf-8")
 
     assert "THS_SESSION_ENCRYPTION_KEY=" in example
+    assert "THS_DEVICE_LIFECYCLE_TOKEN=" in example
 
 
 def test_api_image_installs_adb_client() -> None:

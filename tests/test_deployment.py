@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import base64
+import os
 from pathlib import Path
+import subprocess
+import sys
 from zipfile import ZipFile, ZipInfo
 
 import pytest
@@ -32,6 +35,9 @@ from level2_service.public_market import (
 from level2_service.runner import DailyCheckState, OpenCVTemplateFallback, long_capture_has_net_heading
 from level2_service.symbol_catalog import SQLiteSymbolCatalog
 from scripts.preflight import PreflightError, validate_apk, validate_host_profile
+
+
+INSTALLER = Path(__file__).parents[1] / "scripts" / "install-macos-device-lifecycle.sh"
 
 
 class FakeRedis:
@@ -80,6 +86,302 @@ class FakeRunner:
     def run_once(self) -> None:
         self.calls += 1
         self.control.heartbeat("READY")
+
+
+def test_lifecycle_installer_uses_stable_secret_and_launchagent_locations() -> None:
+    """Referencing a worktree could leave the host broker broken after cleanup."""
+    installer = INSTALLER.read_text(encoding="utf-8")
+
+    assert ".config/ths-device-lifecycle.env" in installer
+    assert "chmod 0600" in installer
+    assert "Library/LaunchAgents/com.ths.device-lifecycle.plist" in installer
+    assert ".local/lib/ths-device-lifecycle/" in installer
+    assert "macos-device-lifecycle.py" in installer
+    assert "macos_device_identity.py" in installer
+    assert "watch-macos-device-bridge.sh" in installer
+    assert "com.ths.device-bridge.27042.plist" in installer
+    assert "com.ths.device-bridge.27043.plist" in installer
+
+
+def test_lifecycle_installer_launches_only_stable_copies_without_secrets() -> None:
+    """Embedding a token or repository path in a plist would expose or destabilize the broker."""
+    installer = INSTALLER.read_text(encoding="utf-8")
+
+    assert "launchctl bootstrap gui/$UID" in installer
+    assert "launchctl kickstart -k gui/$UID/com.ths.device-lifecycle" in installer
+    plist_writers = installer.split("write_service_plist() {", 1)[1].split(
+        "write_service_plist\n", 1
+    )[0]
+    assert "THS_DEVICE_LIFECYCLE_TOKEN" not in plist_writers
+    assert "$token" not in plist_writers
+    assert "${project_root}" not in plist_writers
+    assert "printf '%s\\n' \"$token\"" not in installer
+
+
+def test_lifecycle_installer_excludes_forbidden_device_mutations() -> None:
+    """Adding destructive ADB or AVD commands would violate the protected-device boundary."""
+    installer = INSTALLER.read_text(encoding="utf-8")
+
+    forbidden = ("force-stop", "pm clear", "install -r", " uninstall", "wipe-data", "avdmanager create")
+    assert not [command for command in forbidden if command in installer]
+
+
+def test_agents_define_the_narrow_dual_role_lifecycle_authorization() -> None:
+    """Broader fund-device access would bypass the preserved account protections."""
+    agents = (Path(__file__).parents[1] / "AGENTS.md").read_text(encoding="utf-8")
+
+    for language_marker, broker_phrase in (
+        ("## 本地部署", "已认证的 lifecycle broker"),
+        ("## Local deployment", "authenticated lifecycle broker"),
+    ):
+        section = agents.split(language_marker, 1)[1]
+        assert broker_phrase in section
+        assert "start_and_launch_app" in section
+        assert "shutdown" in section
+    for forbidden in ("退出登录", "切换账号", "清数据", "重装/卸载 App", "force-stop", "自动页面导航"):
+        assert forbidden in agents
+    for forbidden in ("log it out", "switch accounts", "clear the App", "reinstall/uninstall", "force-stop", "navigate it automatically"):
+        assert forbidden in agents
+
+
+def test_handoff_documents_lifecycle_installation_queue_recovery_and_safe_rollback() -> None:
+    """A lifecycle operation without its lock and rollback procedure risks protected state."""
+    handoff = (Path(__file__).parents[1] / "handoff.md").read_text(encoding="utf-8")
+    normalized_handoff = " ".join(handoff.split())
+
+    for required in (
+        "install-macos-device-lifecycle.sh",
+        "LaunchAgent",
+        "UNCONFIGURED",
+        "DEVICE_LIFECYCLE_UNAVAILABLE",
+        "DEVICE_SHUTDOWN_FAILED",
+        "scripts/deploy-macos-one-click.sh --mode auto",
+        "取得当前会话设备锁",
+        "等待运行中的设备任务结束",
+        "一次只操作一台设备",
+        "显式恢复队列",
+        "不删除 AVD、登录数据、",
+        "会话包或 Docker 数据卷",
+    ):
+        assert required in normalized_handoff
+
+
+def write_fake_tool(path: Path, body: str) -> None:
+    path.write_text(f"#!/bin/sh\nset -eu\n{body}\n", encoding="utf-8")
+    path.chmod(0o755)
+
+
+def fake_lifecycle_environment(
+    tmp_path: Path,
+    *,
+    emulator_fails: bool = False,
+    install_fails: bool = False,
+    emulator_in_path: bool = True,
+) -> tuple[dict[str, str], Path]:
+    tools = tmp_path / "tools"
+    tools.mkdir()
+    launch_log = tmp_path / "launchctl.log"
+    write_fake_tool(tools / "uname", "printf '%s\\n' Darwin")
+    write_fake_tool(tools / "python3", 'exec "$REAL_PYTHON" "$@"')
+    write_fake_tool(tools / "adb", "exit 0")
+    if install_fails:
+        write_fake_tool(
+            tools / "install",
+            "printf '%s\\n' 'install stdout port=27043'\nprintf '%s\\n' 'install stderr path=/private/secret' >&2\nexit 25",
+        )
+    if emulator_in_path:
+        if emulator_fails:
+            emulator_body = "printf '%s\\n' 'emulator internal serial=emulator-5554' >&2\nexit 23"
+        else:
+            emulator_body = "[ \"${1:-}\" = -list-avds ] || exit 24\nprintf '%s\\n' THS_CORE_33_ARM64 THS_API_33_ARM64"
+        write_fake_tool(tools / "emulator", emulator_body)
+    write_fake_tool(tools / "launchctl", 'printf "%s\\n" "$*" >> "$FAKE_LAUNCHCTL_LOG"')
+    environment = {
+        **os.environ,
+        "HOME": str(tmp_path / "home"),
+        "PATH": f"{tools}{os.pathsep}{os.environ['PATH']}",
+        "REAL_PYTHON": sys.executable,
+        "FAKE_LAUNCHCTL_LOG": str(launch_log),
+    }
+    return environment, launch_log
+
+
+def test_lifecycle_installer_runs_in_fake_home_with_safe_stable_artifacts(tmp_path: Path) -> None:
+    """A real host install must not rely on the repository after the installer exits."""
+    environment, launch_log = fake_lifecycle_environment(tmp_path)
+    home = Path(environment["HOME"])
+    home.mkdir()
+    env_file = tmp_path / ".env"
+    env_file.write_text("UNRELATED_SETTING=preserved\n", encoding="utf-8")
+    env_file.chmod(0o644)
+
+    completed = subprocess.run(
+        [str(INSTALLER), "--project-root", str(INSTALLER.parents[1]), "--env-file", str(env_file)],
+        text=True,
+        capture_output=True,
+        env=environment,
+        check=False,
+    )
+
+    assert completed.returncode == 0
+    assert completed.stdout == "DEVICE_LIFECYCLE_INSTALL_READY\n"
+    assert completed.stderr == ""
+    assert env_file.stat().st_mode & 0o777 == 0o600
+    env_contents = env_file.read_text(encoding="utf-8")
+    assert "UNRELATED_SETTING=preserved" in env_contents
+    token = next(line.split("=", 1)[1] for line in env_contents.splitlines() if line.startswith("THS_DEVICE_LIFECYCLE_TOKEN="))
+    host_config = home / ".config" / "ths-device-lifecycle.env"
+    assert host_config.stat().st_mode & 0o777 == 0o600
+    assert f"THS_DEVICE_LIFECYCLE_TOKEN={token}" in host_config.read_text(encoding="utf-8")
+    runtime = home / ".local" / "lib" / "ths-device-lifecycle"
+    assert {path.name for path in runtime.iterdir()} == {
+        "macos-device-lifecycle.py",
+        "macos_device_identity.py",
+        "watch-macos-device-bridge.sh",
+        "configure-macos-core-display.sh",
+    }
+    assert (runtime / "macos_device_identity.py").stat().st_mode & 0o777 == 0o644
+    assert all(
+        path.stat().st_mode & 0o777 == 0o755
+        for path in runtime.iterdir()
+        if path.name != "macos_device_identity.py"
+    )
+    plists = home / "Library" / "LaunchAgents"
+    for plist in plists.glob("com.ths.device*.plist"):
+        content = plist.read_text(encoding="utf-8")
+        assert str(runtime) in content
+        assert str(INSTALLER.parents[1]) not in content
+        assert token not in content
+    assert "bootstrap" in launch_log.read_text(encoding="utf-8")
+
+
+def test_lifecycle_installer_uses_fixed_absolute_emulator_fallback_when_path_missing(
+    tmp_path: Path,
+) -> None:
+    """A PATH-missing emulator must propagate the verified fixed binary to the broker."""
+    environment, launch_log = fake_lifecycle_environment(
+        tmp_path,
+        emulator_in_path=False,
+    )
+    fallback = Path(
+        "/opt/homebrew/share/android-commandlinetools/emulator/emulator"
+    )
+    assert fallback.is_file() and os.access(fallback, os.X_OK)
+    avd_home = tmp_path / "avd"
+    avd_home.mkdir()
+    for avd_name in ("THS_CORE_33_ARM64", "THS_API_33_ARM64"):
+        (avd_home / f"{avd_name}.ini").write_text(
+            f"path=/nonexistent\npath.rel=avd/{avd_name}.avd\ntarget=android-33\n",
+            encoding="utf-8",
+        )
+    environment.pop("ANDROID_HOME", None)
+    environment.pop("ANDROID_SDK_ROOT", None)
+    environment["ANDROID_AVD_HOME"] = str(avd_home)
+    environment["ANDROID_EMULATOR_HOME"] = str(tmp_path)
+    environment["EMULATOR_BIN"] = "/tmp/untrusted-emulator"
+    home = Path(environment["HOME"])
+    home.mkdir()
+    env_file = tmp_path / ".env"
+    env_file.write_text("UNRELATED_SETTING=preserved\n", encoding="utf-8")
+
+    completed = subprocess.run(
+        [
+            str(INSTALLER),
+            "--project-root",
+            str(INSTALLER.parents[1]),
+            "--env-file",
+            str(env_file),
+        ],
+        text=True,
+        capture_output=True,
+        env=environment,
+        check=False,
+    )
+
+    assert completed.returncode == 0
+    assert completed.stdout == "DEVICE_LIFECYCLE_INSTALL_READY\n"
+    assert completed.stderr == ""
+    host_config = home / ".config" / "ths-device-lifecycle.env"
+    config = host_config.read_text(encoding="utf-8")
+    assert f"THS_DEVICE_LIFECYCLE_EMULATOR_BIN={fallback}\n" in config
+    assert "THS_DEVICE_LIFECYCLE_EMULATOR_BIN=emulator\n" not in config
+    service_plist = (
+        home / "Library/LaunchAgents/com.ths.device-lifecycle.plist"
+    ).read_text(encoding="utf-8")
+    assert str(host_config) in service_plist
+    assert "bootstrap" in launch_log.read_text(encoding="utf-8")
+
+
+def test_lifecycle_installer_fails_when_path_and_controlled_emulator_fallback_are_missing(
+    tmp_path: Path,
+) -> None:
+    """The installer remains fail-closed when no trusted emulator binary exists."""
+    environment, _launch_log = fake_lifecycle_environment(
+        tmp_path,
+        emulator_in_path=False,
+    )
+    home = Path(environment["HOME"])
+    home.mkdir()
+    env_file = tmp_path / ".env"
+    env_file.write_text("UNRELATED_SETTING=preserved\n", encoding="utf-8")
+
+    completed = subprocess.run(
+        [
+            str(INSTALLER),
+            "--project-root",
+            str(INSTALLER.parents[1]),
+            "--env-file",
+            str(env_file),
+        ],
+        text=True,
+        capture_output=True,
+        env=environment,
+        check=False,
+    )
+
+    assert completed.returncode == 1
+    assert completed.stdout == ""
+    assert completed.stderr == "DEVICE_LIFECYCLE_INSTALL_FAILED\n"
+
+
+def test_lifecycle_installer_suppresses_failing_tool_output(tmp_path: Path) -> None:
+    """Passing through emulator diagnostics could expose protected-device identifiers."""
+    environment, _launch_log = fake_lifecycle_environment(tmp_path, emulator_fails=True)
+    Path(environment["HOME"]).mkdir()
+    env_file = tmp_path / ".env"
+    env_file.write_text("UNRELATED_SETTING=preserved\n", encoding="utf-8")
+
+    completed = subprocess.run(
+        [str(INSTALLER), "--project-root", str(INSTALLER.parents[1]), "--env-file", str(env_file)],
+        text=True,
+        capture_output=True,
+        env=environment,
+        check=False,
+    )
+
+    assert completed.returncode == 1
+    assert completed.stdout == ""
+    assert completed.stderr == "DEVICE_LIFECYCLE_INSTALL_FAILED\n"
+
+
+def test_lifecycle_installer_suppresses_failing_file_utility_output(tmp_path: Path) -> None:
+    """A failed copy utility must not print local paths before the fixed error code."""
+    environment, _launch_log = fake_lifecycle_environment(tmp_path, install_fails=True)
+    Path(environment["HOME"]).mkdir()
+    env_file = tmp_path / ".env"
+    env_file.write_text("UNRELATED_SETTING=preserved\n", encoding="utf-8")
+
+    completed = subprocess.run(
+        [str(INSTALLER), "--project-root", str(INSTALLER.parents[1]), "--env-file", str(env_file)],
+        text=True,
+        capture_output=True,
+        env=environment,
+        check=False,
+    )
+
+    assert completed.returncode == 1
+    assert completed.stdout == ""
+    assert completed.stderr == "DEVICE_LIFECYCLE_INSTALL_FAILED\n"
 
 
 class StaticCatalogSource:

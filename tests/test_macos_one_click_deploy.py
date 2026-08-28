@@ -27,6 +27,7 @@ FRIDA_BINARY_SHA256 = "4eebf1fbc66ff54aba9a9124c2ef8b32b566616388c60e2caa65148a5
 PROVISIONER = ROOT / "scripts" / "container-provision-device.sh"
 MACOS_DEPLOY = ROOT / "scripts" / "macos_deploy.py"
 ONE_CLICK_WRAPPER = ROOT / "scripts" / "deploy-macos-one-click.sh"
+SETUP_ADMIN_WRAPPER = ROOT / "scripts" / "setup-admin.sh"
 PROVISION_WRAPPER = ROOT / "scripts" / "provision-macos-from-image.sh"
 _MACOS_DEPLOY_MODULE = None
 
@@ -3091,6 +3092,44 @@ def test_one_click_wrapper_help_works_with_explicit_system_python_without_argon2
     assert completed.returncode == 0, completed.stderr
     assert "usage:" in completed.stdout
     assert "PYTHON_DEPENDENCY_MISSING" not in completed.stderr
+
+
+def test_setup_admin_wrapper_is_executable_and_runs_with_project_venv(
+    tmp_path: Path,
+) -> None:
+    """The orchestrator's absolute setup wrapper must execute with the dependency-complete venv."""
+    assert SETUP_ADMIN_WRAPPER.stat().st_mode & 0o777 == 0o755
+
+    from argon2 import PasswordHasher
+
+    env_file = tmp_path / "operator.env"
+    env_file.write_text(
+        f"ADMIN_PASSWORD_HASH='{PasswordHasher().hash('temporary-password')}'\n"
+        "ADMIN_SESSION_SECRET=" + "s" * 40 + "\n",
+        encoding="utf-8",
+    )
+    env_file.chmod(0o600)
+    project_python = ROOT / ".venv/bin/python"
+    if not project_python.is_file():
+        project_python = Path(sys.executable)
+
+    completed = subprocess.run(
+        [str(SETUP_ADMIN_WRAPPER), "--upgrade-existing", str(env_file)],
+        cwd=ROOT,
+        env=os.environ | {"PYTHON_BIN": str(project_python)},
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stderr == ""
+    assert "secret values were not printed" in completed.stdout
+    assert env_file.stat().st_mode & 0o777 == 0o600
+    contents = env_file.read_text(encoding="utf-8")
+    assert "THS_SESSION_ENCRYPTION_KEY=" in contents
+    assert "THS_DEVICE_LIFECYCLE_TOKEN=" in contents
+    assert "temporary-password" not in contents
 
 
 def test_cli_and_wrapper_expose_no_device_or_asset_override_surface() -> None:

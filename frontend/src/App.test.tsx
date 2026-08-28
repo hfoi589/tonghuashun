@@ -1074,4 +1074,37 @@ describe('job SSE subscription', () => {
     expect(FakeEventSource.instances).toHaveLength(1)
     expect(FakeEventSource.instances[0].closed).toBe(false)
   })
+
+  it('does not scroll the document when an active job status refreshes', async () => {
+    window.localStorage.clear()
+    vi.stubGlobal('EventSource', FakeEventSource)
+    vi.stubGlobal('fetch', vi.fn()
+      .mockResolvedValueOnce(jsonResponse(symbolLookup('600938', '中国海油')))
+      .mockResolvedValueOnce(jsonResponse(task, 202))
+      .mockResolvedValueOnce(jsonResponse({ ...task, status: 'RUNNING' })))
+    const user = userEvent.setup()
+    const scrollIntoView = vi.fn()
+    const originalScrollIntoView = HTMLElement.prototype.scrollIntoView
+    Object.defineProperty(HTMLElement.prototype, 'scrollIntoView', {
+      configurable: true,
+      value: scrollIntoView,
+    })
+
+    try {
+      render(<App />)
+      await user.type(screen.getByLabelText('股票代码或名称'), '600938')
+      await screen.findByText('中国海油（600938）')
+      await user.click(screen.getByRole('button', { name: '提交采集任务' }))
+      await waitFor(() => expect(scrollIntoView).toHaveBeenCalledTimes(1))
+
+      FakeEventSource.instances[0].emitStatus()
+      await waitFor(() => expect(screen.getByText('正在采集')).toBeInTheDocument())
+      expect(scrollIntoView).toHaveBeenCalledTimes(1)
+    } finally {
+      Object.defineProperty(HTMLElement.prototype, 'scrollIntoView', {
+        configurable: true,
+        value: originalScrollIntoView,
+      })
+    }
+  })
 })

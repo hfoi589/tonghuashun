@@ -367,7 +367,7 @@ function StockTabs({ tabs, activePublicId, onSelect, onRequestDelete }: {
     if (typeof activeElement?.scrollIntoView === 'function') {
       activeElement.scrollIntoView({ behavior: 'smooth', block: 'nearest', inline: 'center' })
     }
-  }, [activePublicId, tabs])
+  }, [activePublicId])
 
   function moveFocus(event: KeyboardEvent<HTMLButtonElement>, currentIndex: number) {
     let nextIndex: number | null = null

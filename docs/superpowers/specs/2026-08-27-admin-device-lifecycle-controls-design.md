@@ -488,6 +488,13 @@ scripts/deploy-macos-one-click.sh --mode auto
 - `deploy/macos.env` 的双角色配置完整；
 - 不存在正在使用设备的任务。
 
+磁盘前置检查按模式执行：已有 AVD `existing`（existing mode）模式要求项目文件系统、Android
+`~/.android/avd` 文件系统以及 OrbStack 外部数据文件系统各至少有 8 GiB 可用空间；
+`provision`（provisioning mode）模式在这三个文件系统上各要求至少 30 GiB。OrbStack 数据文件系统只读解析
+自 `~/.orbstack/vmconfig.json` 的绝对 `data_dir`，缺失、格式错误、相对路径或路径不存在
+时返回固定错误，不接受环境变量覆盖。所有三项检查必须在镜像构建、journal 写入或
+AVD 创建之前完成。
+
 缺少 OrbStack、Java、Android 工具或未接受许可时，脚本以固定错误码退出并打印人工
 安装/许可命令；不自动安装 Homebrew、OrbStack，不自动接受许可。
 

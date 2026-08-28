@@ -29,8 +29,13 @@ the App, scroll, capture, stitch, or run OCR.
   Mac. It is not Dockerized. Docker reaches the host's default localhost ADB
   server through `host.docker.internal`, with no public ADB port mapping.
 
-Both profiles require a practical minimum of 4 CPU cores, 8 GiB RAM, and 30
-GiB free disk. Preflight also requires the verified APK SHA-256:
+Both profiles require a practical minimum of 4 CPU cores and 8 GiB RAM. Linux
+deployments require 30 GiB free disk. For macOS, existing mode requires at
+least 8 GiB free on each of the project, Android AVD, and OrbStack data
+filesystems; provisioning mode requires 30 GiB on each filesystem. macOS
+preflight reads the external OrbStack storage location read-only from
+`~/.orbstack/vmconfig.json` at key `data_dir`; an absent, malformed, relative,
+or missing path fails closed. Preflight also requires the verified APK SHA-256:
 `2554490aa3f5e2df17ac0a711311f3f85ee3130008af9bb4ab12510b3d6e971e`, and at
 least one ARM ABI (`arm64-v8a` or `armeabi-v7a`). The 204 MB APK is tracked in
 Git history, but the old Docker build context and image excluded it. The

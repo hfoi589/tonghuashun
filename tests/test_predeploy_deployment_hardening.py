@@ -424,6 +424,108 @@ class DiskFileSystem(FakeFileSystem):
         return self.free_by_path.get(resolved, 30 * 1024**3)
 
 
+def test_existing_disk_preflight_accepts_13_gib_project_avd_and_23_gib_orbstack() -> None:
+    """Existing AVD redeploys use the lower 8 GiB floor on all three filesystems."""
+    module = _load_macos_deploy()
+    filesystem = DiskFileSystem(
+        {
+            ROOT.resolve(): 13 * 1024**3,
+            (Path.home() / ".android/avd").resolve(): 13 * 1024**3,
+            Path("/fake/orbstack").resolve(): 23 * 1024**3,
+        }
+    )
+    orchestrator = make_orchestrator(
+        existing_mac_runner(filesystem=filesystem, sessions_ready=True),
+        filesystem=filesystem,
+    )
+
+    orchestrator._validate_disk_space(provision_system_image=False)
+
+    assert filesystem.checked == [
+        ROOT.resolve(),
+        (Path.home() / ".android/avd").resolve(),
+        Path("/fake/orbstack").resolve(),
+    ]
+
+
+def test_provisioning_disk_preflight_requires_30_gib_on_orbstack_before_mutation() -> None:
+    """Provisioning checks the external OrbStack filesystem before journal/build/AVD writes."""
+    module = _load_macos_deploy()
+    data_dir = Path("/fake/orbstack").resolve()
+    filesystem = DiskFileSystem(
+        {
+            ROOT.resolve(): 30 * 1024**3,
+            (Path.home() / ".android/avd").resolve(): 30 * 1024**3,
+            data_dir: 30 * 1024**3 - 1,
+        }
+    )
+    events: list[str] = []
+    journal = FakeProvisioningJournal(events=events)
+    runner = existing_mac_runner(
+        avds=("THS_API_33_ARM64",),
+        filesystem=filesystem,
+        events=events,
+    )
+
+    with pytest.raises(module.DeploymentError) as caught:
+        make_orchestrator(
+            runner,
+            filesystem=filesystem,
+            journal=journal,
+        ).deploy("provision")
+
+    assert caught.value.error_code == "INSUFFICIENT_DISK_SPACE"
+    assert filesystem.checked == [
+        ROOT.resolve(),
+        (Path.home() / ".android/avd").resolve(),
+        data_dir,
+    ]
+    assert not any(event.startswith("journal-") for event in events)
+    assert not any(call[-2:] == ("build", "api") for call in runner.calls)
+    assert not any(call[:3] == ("avdmanager", "create", "avd") for call in runner.calls)
+
+
+@pytest.mark.parametrize(
+    "config_state", ["missing", "malformed", "relative", "nonexistent", "non_object"]
+)
+def test_orbstack_data_dir_config_is_required_and_not_taken_from_ambient_env(
+    config_state: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The read-only vmconfig is the only accepted OrbStack data-dir source."""
+    module = _load_macos_deploy()
+    filesystem = DiskFileSystem(
+        {
+            ROOT.resolve(): 13 * 1024**3,
+            (Path.home() / ".android/avd").resolve(): 13 * 1024**3,
+            Path("/fake/orbstack").resolve(): 23 * 1024**3,
+        }
+    )
+    if config_state == "missing":
+        filesystem.files.pop(filesystem.orbstack_config)
+    elif config_state == "malformed":
+        filesystem.files[filesystem.orbstack_config] = ("not-json", 0o600)
+    else:
+        if config_state == "relative":
+            document = {"data_dir": "relative/orbstack"}
+        elif config_state == "nonexistent":
+            document = {"data_dir": "/fake/missing-orbstack"}
+        else:
+            document = ["not-an-object"]
+        filesystem.files[filesystem.orbstack_config] = (
+            json.dumps(document),
+            0o600,
+        )
+    monkeypatch.setenv("ORBSTACK_DATA_DIR", "/fake/orbstack")
+    runner = existing_mac_runner(filesystem=filesystem)
+
+    with pytest.raises(module.DeploymentError) as caught:
+        make_orchestrator(runner, filesystem=filesystem).deploy_existing()
+
+    assert caught.value.error_code == "ORBSTACK_DATA_DIR_UNAVAILABLE"
+    assert runner.calls == []
+
+
 @pytest.mark.parametrize("short_path", ["project", "avd"])
 def test_disk_preflight_blocks_before_build_or_provisioning_journal_mutation(
     short_path: str,
@@ -459,8 +561,8 @@ def test_disk_preflight_blocks_before_build_or_provisioning_journal_mutation(
 
 
 def test_disk_preflight_accepts_the_exact_documented_boundary() -> None:
-    """Exactly 30 GiB on both relevant filesystems is sufficient."""
-    boundary = 30 * 1024**3
+    """Exactly 8 GiB on all existing-mode filesystems is sufficient."""
+    boundary = 8 * 1024**3
     filesystem = DiskFileSystem(
         {
             ROOT.resolve(): boundary,
@@ -475,4 +577,29 @@ def test_disk_preflight_accepts_the_exact_documented_boundary() -> None:
     assert filesystem.checked == [
         ROOT.resolve(),
         (Path.home() / ".android/avd").resolve(),
+        Path("/fake/orbstack").resolve(),
+    ]
+
+
+def test_provisioning_disk_preflight_accepts_the_exact_30_gib_boundary() -> None:
+    """Provisioning retains the higher 30 GiB floor on every filesystem."""
+    boundary = 30 * 1024**3
+    filesystem = DiskFileSystem(
+        {
+            ROOT.resolve(): boundary,
+            (Path.home() / ".android/avd").resolve(): boundary,
+            Path("/fake/orbstack").resolve(): boundary,
+        }
+    )
+    orchestrator = make_orchestrator(
+        existing_mac_runner(filesystem=filesystem),
+        filesystem=filesystem,
+    )
+
+    orchestrator._validate_disk_space(provision_system_image=True)
+
+    assert filesystem.checked == [
+        ROOT.resolve(),
+        (Path.home() / ".android/avd").resolve(),
+        Path("/fake/orbstack").resolve(),
     ]

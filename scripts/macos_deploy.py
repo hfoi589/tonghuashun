@@ -51,7 +51,10 @@ FRIDA_BINARY_SHA256 = "4eebf1fbc66ff54aba9a9124c2ef8b32b566616388c60e2caa65148a5
 ANDROID_SYSTEM_IMAGE = "system-images;android-33;google_apis;arm64-v8a"
 IMAGE_NAME = "ths-level2-api:local"
 COMPOSE_PROJECT_NAME = "ths-level2"
-MINIMUM_FREE_BYTES = 30 * 1024**3
+EXISTING_MINIMUM_FREE_BYTES = 8 * 1024**3
+PROVISIONING_MINIMUM_FREE_BYTES = 30 * 1024**3
+# Backward-compatible alias for callers that imported the old provisioning floor.
+MINIMUM_FREE_BYTES = PROVISIONING_MINIMUM_FREE_BYTES
 PACKAGE_NAME = "com.hexin.plat.android"
 FIXED_ROLES = {
     "core_metrics": ("THS_CORE_33_ARM64", "emulator-5556"),
@@ -1914,7 +1917,7 @@ class MacDeploymentOrchestrator:
         self, *, provision_system_image: bool = False
     ) -> None:
         self._validate_command_presence()
-        self._validate_disk_space()
+        self._validate_disk_space(provision_system_image=provision_system_image)
         system = self._run(("uname", "-s"), 10.0, "UNSUPPORTED_HOST")
         architecture = self._run(("uname", "-m"), 10.0, "UNSUPPORTED_HOST")
         if self._stdout_text(system).strip() != "Darwin" or self._stdout_text(
@@ -1946,15 +1949,45 @@ class MacDeploymentOrchestrator:
                 raise DeploymentError("ANDROID_33_ARM64_UNAVAILABLE")
             self._install_android_system_image()
 
-    def _validate_disk_space(self) -> None:
+    def _resolve_orbstack_data_dir(self) -> Path:
+        config_path = Path.home() / ".orbstack/vmconfig.json"
+        try:
+            if not self._filesystem.exists(config_path):
+                raise DeploymentError("ORBSTACK_DATA_DIR_UNAVAILABLE")
+            document = json.loads(self._filesystem.read_text(config_path))
+            if not isinstance(document, dict):
+                raise DeploymentError("ORBSTACK_DATA_DIR_UNAVAILABLE")
+            data_dir_value = document.get("data_dir")
+            if not isinstance(data_dir_value, str) or not data_dir_value:
+                raise DeploymentError("ORBSTACK_DATA_DIR_UNAVAILABLE")
+            data_dir = Path(data_dir_value)
+            if not data_dir.is_absolute():
+                raise DeploymentError("ORBSTACK_DATA_DIR_UNAVAILABLE")
+            resolved = data_dir.resolve()
+            if not self._filesystem.exists(resolved):
+                raise DeploymentError("ORBSTACK_DATA_DIR_UNAVAILABLE")
+            return resolved
+        except DeploymentError:
+            raise
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            raise DeploymentError("ORBSTACK_DATA_DIR_UNAVAILABLE") from None
+
+    def _validate_disk_space(self, *, provision_system_image: bool) -> None:
+        minimum_free_bytes = (
+            PROVISIONING_MINIMUM_FREE_BYTES
+            if provision_system_image
+            else EXISTING_MINIMUM_FREE_BYTES
+        )
+        data_dir = self._resolve_orbstack_data_dir()
         try:
             free_values = (
                 self._filesystem.free_bytes(self._project_root),
                 self._filesystem.free_bytes(Path.home() / ".android/avd"),
+                self._filesystem.free_bytes(data_dir),
             )
         except Exception:
             raise DeploymentError("INSUFFICIENT_DISK_SPACE") from None
-        if any(value < MINIMUM_FREE_BYTES for value in free_values):
+        if any(value < minimum_free_bytes for value in free_values):
             raise DeploymentError("INSUFFICIENT_DISK_SPACE")
 
     def _install_android_system_image(self) -> None:

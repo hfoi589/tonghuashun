@@ -357,6 +357,24 @@ def test_lifecycle_token_docs_define_the_compose_and_host_broker_boundary() -> N
         assert "THS_SESSION_ENCRYPTION_KEY" in document
 
 
+def test_macos_disk_preflight_docs_distinguish_existing_and_provisioning_storage() -> None:
+    """Operators must know the lower existing-mode floor and external OrbStack check."""
+    documents = [
+        (ROOT / "README.md").read_text(encoding="utf-8"),
+        (ROOT / "handoff.md").read_text(encoding="utf-8"),
+        (ROOT / "docs/superpowers/specs/2026-08-27-admin-device-lifecycle-controls-design.md").read_text(encoding="utf-8"),
+        (ROOT / "docs/superpowers/plans/2026-08-27-admin-device-lifecycle-controls.md").read_text(encoding="utf-8"),
+    ]
+    normalized = [" ".join(document.split()) for document in documents]
+    for document in normalized:
+        assert "existing mode" in document.lower()
+        assert "8 GiB" in document
+        assert "provisioning" in document.lower()
+        assert "30 GiB" in document
+        assert "vmconfig.json" in document
+        assert "data_dir" in document
+
+
 def test_root_environment_example_documents_the_direct_session_key() -> None:
     example = (ROOT / ".env.example").read_text(encoding="utf-8")
 

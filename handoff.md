@@ -310,6 +310,12 @@ maintenance lease。API 替换后普通队列仍冻结，只有 lease 原子绑�
 ACCEPTANCE_PENDING` 逐步持久化；新角色会话的 `updated_at` 必须晚于记录的创建时间，
 严格 acceptance 成功前不会清除 journal。
 
+磁盘前置检查按部署模式区分：existing mode 在项目、`~/.android/avd` 和 OrbStack
+外部数据文件系统各要求至少 8 GiB 可用空间；provisioning mode 在三者各要求至少
+30 GiB。OrbStack 外部数据位置只读取 `~/.orbstack/vmconfig.json` 的绝对 `data_dir`，
+不使用环境变量覆盖；配置缺失或无效时以固定错误终止，并在镜像、journal 或 AVD
+发生任何变更前完成检查。
+
 若替换后的检查失败，maintenance lease 保留且普通任务不会自动恢复。修复固定错误后
 重跑同一部署命令；显式安全回滚命令为：
 

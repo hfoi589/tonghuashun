@@ -27,6 +27,8 @@
 - The APK-bearing image is local/private only; scripts never push, save, export, or publish it.
 - Redis, market, admin, session, capture, emulator, and AVD data must be preserved through deployment and acceptance.
 - Docker deployment continues to use OrbStack, `.env`, `deploy/macos.env`, port 8001, and no Caddy.
+- Existing mode requires 8 GiB free on the project, Android AVD, and resolved OrbStack data filesystems; provisioning mode requires 30 GiB on each.
+- Resolve OrbStack external storage read-only from `~/.orbstack/vmconfig.json` key `data_dir`; reject missing, malformed, relative, or nonexistent paths and ignore ambient overrides.
 
 ## File Map
 
@@ -1058,7 +1060,7 @@ class DeploymentError(RuntimeError):
 
 `MacDeploymentOrchestrator.deploy_existing()` must:
 
-1. validate Apple Silicon and required commands;
+1. validate Apple Silicon, required commands, and mode-specific disk floors (existing 8 GiB; provisioning 30 GiB) on the project, Android AVD, and OrbStack `vmconfig.json:data_dir` filesystems;
 2. validate both fixed AVD names from `emulator -list-avds`;
 3. create `.env` only when absent and validate its mode/required keys;
 4. build `ths-level2-api:local` with OrbStack Compose;

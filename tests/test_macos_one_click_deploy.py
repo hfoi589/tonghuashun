@@ -586,9 +586,16 @@ def _completed(
 
 class FakeFileSystem:
     def __init__(self, *, env_exists: bool = True) -> None:
+        self.orbstack_config = (Path.home() / ".orbstack/vmconfig.json").resolve()
+        self.orbstack_data_dir = Path("/fake/orbstack").resolve()
         self.files: dict[Path, tuple[str, int]] = {
             (ROOT / "deploy/macos.env").resolve(): (REQUIRED_MACOS_ENV, 0o600),
             (ROOT / ".dockerignore").resolve(): (".env\n", 0o644),
+            self.orbstack_config: (
+                json.dumps({"data_dir": str(self.orbstack_data_dir)}),
+                0o600,
+            ),
+            self.orbstack_data_dir: ("", 0o755),
         }
         if env_exists:
             self.files[(ROOT / ".env").resolve()] = (REQUIRED_ROOT_ENV, 0o600)

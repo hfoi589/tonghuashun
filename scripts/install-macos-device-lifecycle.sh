@@ -38,7 +38,16 @@ done
 [ "$(uname -s)" = Darwin ] || fail
 python3_bin=$(command -v python3 2>/dev/null) || fail
 adb_bin=$(command -v adb 2>/dev/null) || fail
-emulator_bin=$(command -v emulator 2>/dev/null) || fail
+emulator_bin=$(command -v emulator 2>/dev/null || true)
+emulator_config=emulator
+if [ -z "$emulator_bin" ] && [ -x /opt/homebrew/share/android-commandlinetools/emulator/emulator ]; then
+    emulator_bin=/opt/homebrew/share/android-commandlinetools/emulator/emulator
+    emulator_config=$emulator_bin
+fi
+case "$emulator_bin" in
+    /*/emulator) ;;
+    *) fail ;;
+esac
 command -v launchctl >/dev/null 2>&1 || fail
 
 service_source=$project_root/scripts/macos-device-lifecycle.py
@@ -105,7 +114,7 @@ fi
     printf '%s\n' "THS_DEVICE_LIFECYCLE_TOKEN=$token"
     printf '%s\n' 'THS_DEVICE_LIFECYCLE_BIND_HOST=127.0.0.1'
     printf '%s\n' 'THS_DEVICE_LIFECYCLE_PORT=18765'
-    printf '%s\n' 'THS_DEVICE_LIFECYCLE_EMULATOR_BIN=emulator'
+    printf '%s\n' "THS_DEVICE_LIFECYCLE_EMULATOR_BIN=$emulator_config"
     printf '%s\n' "PATH=$PATH"
     printf '%s\n' 'CORE_AVD_NAME=THS_CORE_33_ARM64'
     printf '%s\n' 'CORE_ADB_SERIAL=emulator-5556'

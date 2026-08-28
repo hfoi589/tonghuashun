@@ -172,7 +172,11 @@ def write_fake_tool(path: Path, body: str) -> None:
 
 
 def fake_lifecycle_environment(
-    tmp_path: Path, *, emulator_fails: bool = False, install_fails: bool = False
+    tmp_path: Path,
+    *,
+    emulator_fails: bool = False,
+    install_fails: bool = False,
+    emulator_in_path: bool = True,
 ) -> tuple[dict[str, str], Path]:
     tools = tmp_path / "tools"
     tools.mkdir()
@@ -185,11 +189,12 @@ def fake_lifecycle_environment(
             tools / "install",
             "printf '%s\\n' 'install stdout port=27043'\nprintf '%s\\n' 'install stderr path=/private/secret' >&2\nexit 25",
         )
-    if emulator_fails:
-        emulator_body = "printf '%s\\n' 'emulator internal serial=emulator-5554' >&2\nexit 23"
-    else:
-        emulator_body = "[ \"${1:-}\" = -list-avds ] || exit 24\nprintf '%s\\n' THS_CORE_33_ARM64 THS_API_33_ARM64"
-    write_fake_tool(tools / "emulator", emulator_body)
+    if emulator_in_path:
+        if emulator_fails:
+            emulator_body = "printf '%s\\n' 'emulator internal serial=emulator-5554' >&2\nexit 23"
+        else:
+            emulator_body = "[ \"${1:-}\" = -list-avds ] || exit 24\nprintf '%s\\n' THS_CORE_33_ARM64 THS_API_33_ARM64"
+        write_fake_tool(tools / "emulator", emulator_body)
     write_fake_tool(tools / "launchctl", 'printf "%s\\n" "$*" >> "$FAKE_LAUNCHCTL_LOG"')
     environment = {
         **os.environ,
@@ -248,6 +253,95 @@ def test_lifecycle_installer_runs_in_fake_home_with_safe_stable_artifacts(tmp_pa
         assert str(INSTALLER.parents[1]) not in content
         assert token not in content
     assert "bootstrap" in launch_log.read_text(encoding="utf-8")
+
+
+def test_lifecycle_installer_uses_fixed_absolute_emulator_fallback_when_path_missing(
+    tmp_path: Path,
+) -> None:
+    """A PATH-missing emulator must propagate the verified fixed binary to the broker."""
+    environment, launch_log = fake_lifecycle_environment(
+        tmp_path,
+        emulator_in_path=False,
+    )
+    fallback = Path(
+        "/opt/homebrew/share/android-commandlinetools/emulator/emulator"
+    )
+    assert fallback.is_file() and os.access(fallback, os.X_OK)
+    avd_home = tmp_path / "avd"
+    avd_home.mkdir()
+    for avd_name in ("THS_CORE_33_ARM64", "THS_API_33_ARM64"):
+        (avd_home / f"{avd_name}.ini").write_text(
+            f"path=/nonexistent\npath.rel=avd/{avd_name}.avd\ntarget=android-33\n",
+            encoding="utf-8",
+        )
+    environment.pop("ANDROID_HOME", None)
+    environment.pop("ANDROID_SDK_ROOT", None)
+    environment["ANDROID_AVD_HOME"] = str(avd_home)
+    environment["ANDROID_EMULATOR_HOME"] = str(tmp_path)
+    environment["EMULATOR_BIN"] = "/tmp/untrusted-emulator"
+    home = Path(environment["HOME"])
+    home.mkdir()
+    env_file = tmp_path / ".env"
+    env_file.write_text("UNRELATED_SETTING=preserved\n", encoding="utf-8")
+
+    completed = subprocess.run(
+        [
+            str(INSTALLER),
+            "--project-root",
+            str(INSTALLER.parents[1]),
+            "--env-file",
+            str(env_file),
+        ],
+        text=True,
+        capture_output=True,
+        env=environment,
+        check=False,
+    )
+
+    assert completed.returncode == 0
+    assert completed.stdout == "DEVICE_LIFECYCLE_INSTALL_READY\n"
+    assert completed.stderr == ""
+    host_config = home / ".config" / "ths-device-lifecycle.env"
+    config = host_config.read_text(encoding="utf-8")
+    assert f"THS_DEVICE_LIFECYCLE_EMULATOR_BIN={fallback}\n" in config
+    assert "THS_DEVICE_LIFECYCLE_EMULATOR_BIN=emulator\n" not in config
+    service_plist = (
+        home / "Library/LaunchAgents/com.ths.device-lifecycle.plist"
+    ).read_text(encoding="utf-8")
+    assert str(host_config) in service_plist
+    assert "bootstrap" in launch_log.read_text(encoding="utf-8")
+
+
+def test_lifecycle_installer_fails_when_path_and_controlled_emulator_fallback_are_missing(
+    tmp_path: Path,
+) -> None:
+    """The installer remains fail-closed when no trusted emulator binary exists."""
+    environment, _launch_log = fake_lifecycle_environment(
+        tmp_path,
+        emulator_in_path=False,
+    )
+    home = Path(environment["HOME"])
+    home.mkdir()
+    env_file = tmp_path / ".env"
+    env_file.write_text("UNRELATED_SETTING=preserved\n", encoding="utf-8")
+
+    completed = subprocess.run(
+        [
+            str(INSTALLER),
+            "--project-root",
+            str(INSTALLER.parents[1]),
+            "--env-file",
+            str(env_file),
+        ],
+        text=True,
+        capture_output=True,
+        env=environment,
+        check=False,
+    )
+
+    assert completed.returncode == 1
+    assert completed.stdout == ""
+    assert completed.stderr == "DEVICE_LIFECYCLE_INSTALL_FAILED\n"
 
 
 def test_lifecycle_installer_suppresses_failing_tool_output(tmp_path: Path) -> None:

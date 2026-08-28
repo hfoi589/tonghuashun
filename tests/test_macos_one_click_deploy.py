@@ -735,7 +735,11 @@ class FakeCommandRunner:
                 returncode=self.sdkmanager_install_returncode,
                 stderr=self.sdkmanager_install_stderr,
             )
-        if args == ("emulator", "-list-avds"):
+        if (
+            len(args) == 2
+            and args[1] == "-list-avds"
+            and (args[0] == "emulator" or args[0].endswith("/emulator"))
+        ):
             return _completed(args, stdout=("\n".join(self.avds) + "\n").encode())
         if args[:3] == ("avdmanager", "create", "avd"):
             avd_name = args[args.index("--name") + 1]
@@ -1609,6 +1613,68 @@ def test_existing_mode_returns_a_fixed_error_for_missing_prerequisite() -> None:
 
     assert caught.value.error_code == "MISSING_PREREQUISITE"
     assert runner.calls == []
+
+
+def test_emulator_path_missing_uses_fixed_fallback_and_auto_preflight_proceeds() -> None:
+    """A PATH miss must not mask the executable used by the native bootstrap."""
+    module = _load_macos_deploy()
+    fallback = Path(
+        "/opt/homebrew/share/android-commandlinetools/emulator/emulator"
+    )
+    filesystem = FakeFileSystem()
+    filesystem.commands.remove("emulator")
+    filesystem.files[fallback] = ("binary", 0o755)
+    runner = existing_mac_runner(filesystem=filesystem)
+    orchestrator = make_orchestrator(runner, filesystem=filesystem)
+
+    orchestrator._validate_command_presence()
+
+    assert orchestrator._trusted_emulator_path == fallback
+    assert orchestrator._missing_fixed_roles() == frozenset()
+    assert any(
+        call[0] == str(fallback) and call[1:] == ("-list-avds",)
+        for call in runner.calls
+    )
+    try:
+        result = orchestrator.deploy("auto")
+    except module.DeploymentError as error:
+        assert error.error_code != "MISSING_PREREQUISITE"
+    else:
+        assert result.mode == "existing"
+
+
+def test_emulator_path_missing_and_fallback_missing_still_fails_closed() -> None:
+    """Only the controlled fallback is accepted; an absent binary remains a fixed error."""
+    module = _load_macos_deploy()
+    filesystem = FakeFileSystem()
+    filesystem.commands.remove("emulator")
+    runner = existing_mac_runner(filesystem=filesystem)
+
+    with pytest.raises(module.DeploymentError) as caught:
+        make_orchestrator(runner, filesystem=filesystem)._validate_command_presence()
+
+    assert caught.value.error_code == "MISSING_PREREQUISITE"
+
+
+def test_emulator_path_missing_rejects_ambient_android_home_override(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Ambient SDK roots cannot expand the fixed host command surface."""
+    module = _load_macos_deploy()
+    android_home = tmp_path / "android-home"
+    fallback = android_home / "emulator" / "emulator"
+    filesystem = FakeFileSystem()
+    filesystem.commands.remove("emulator")
+    filesystem.files[fallback.resolve()] = ("binary", 0o755)
+    monkeypatch.setenv("ANDROID_HOME", str(android_home))
+    runner = existing_mac_runner(filesystem=filesystem)
+    orchestrator = make_orchestrator(runner, filesystem=filesystem)
+
+    with pytest.raises(module.DeploymentError) as caught:
+        orchestrator._validate_command_presence()
+
+    assert caught.value.error_code == "MISSING_PREREQUISITE"
 
 
 def test_existing_mode_sanitizes_prerequisite_lookup_failures() -> None:

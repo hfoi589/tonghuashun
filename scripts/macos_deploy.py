@@ -61,6 +61,9 @@ FIXED_EMULATOR_PORTS = {
     "core_metrics": 5556,
     "main_fund_flow": 5554,
 }
+EMULATOR_FALLBACK_PATH = Path(
+    "/opt/homebrew/share/android-commandlinetools/emulator/emulator"
+)
 REQUIRED_COMMANDS = (
     "adb",
     "avdmanager",
@@ -1594,6 +1597,7 @@ class MacDeploymentOrchestrator:
         self._poll_interval_seconds = poll_interval_seconds
         self._root_environment: dict[str, str] = {}
         self._trusted_emulator_path: Path | None = None
+        self._emulator_command = "emulator"
         self._data_only_acceptance = data_only_acceptance
         self._provisioning_journal = provisioning_journal or ProvisioningJournal()
         self._initial_missing_roles: frozenset[str] | None = None
@@ -1864,23 +1868,47 @@ class MacDeploymentOrchestrator:
 
     def _validate_command_presence(self) -> None:
         try:
-            resolved_commands = {
-                command: self._filesystem.which(command)
-                for command in REQUIRED_COMMANDS
-            }
+            resolved_commands = {}
+            for command in REQUIRED_COMMANDS:
+                resolved_commands[command] = self._filesystem.which(command)
         except Exception:
             raise DeploymentError("MISSING_PREREQUISITE") from None
-        if any(path is None for path in resolved_commands.values()):
-            raise DeploymentError("MISSING_PREREQUISITE")
+        for command, path in resolved_commands.items():
+            if command != "emulator" and path is None:
+                raise DeploymentError("MISSING_PREREQUISITE")
         emulator_path = resolved_commands["emulator"]
-        assert emulator_path is not None
-        candidate = Path(emulator_path)
-        if not candidate.is_absolute() or candidate.name != "emulator":
-            raise DeploymentError("MISSING_PREREQUISITE")
-        try:
-            self._trusted_emulator_path = candidate.resolve()
-        except OSError:
-            raise DeploymentError("MISSING_PREREQUISITE") from None
+        if emulator_path:
+            candidate = Path(emulator_path)
+            if not candidate.is_absolute() or candidate.name != "emulator":
+                raise DeploymentError("MISSING_PREREQUISITE")
+            try:
+                self._trusted_emulator_path = candidate.resolve()
+            except OSError:
+                raise DeploymentError("MISSING_PREREQUISITE") from None
+            self._emulator_command = "emulator"
+            return
+        for candidate in self._emulator_fallback_candidates():
+            try:
+                if (
+                    not candidate.is_absolute()
+                    or candidate.name != "emulator"
+                    or not self._filesystem.exists(candidate)
+                    or not (self._filesystem.mode(candidate) & 0o111)
+                ):
+                    continue
+                resolved = candidate.resolve()
+                if not resolved.is_absolute() or resolved.name != "emulator":
+                    continue
+            except (OSError, ValueError, TypeError):
+                continue
+            self._trusted_emulator_path = resolved
+            self._emulator_command = str(resolved)
+            return
+        raise DeploymentError("MISSING_PREREQUISITE")
+
+    @staticmethod
+    def _emulator_fallback_candidates() -> tuple[Path, ...]:
+        return (EMULATOR_FALLBACK_PATH,)
 
     def _validate_host_prerequisites(
         self, *, provision_system_image: bool = False
@@ -1969,8 +1997,9 @@ class MacDeploymentOrchestrator:
         return not self._missing_fixed_roles()
 
     def _missing_fixed_roles(self) -> frozenset[str]:
+        emulator_command = self._emulator_command
         result = self._run(
-            ("emulator", "-list-avds"), 30.0, "FIXED_AVD_NOT_FOUND"
+            (emulator_command, "-list-avds"), 30.0, "FIXED_AVD_NOT_FOUND"
         )
         avds = {
             line.strip()

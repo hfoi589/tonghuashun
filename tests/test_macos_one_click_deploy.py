@@ -2970,6 +2970,129 @@ def test_provision_wrapper_resolves_the_project_root_and_forces_provision_mode(
     ]
 
 
+def _write_fake_python(path: Path, *, import_ok: bool, result: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    probe = "exit 0" if import_ok else "printf '%s\\n' 'private traceback token=secret' >&2; exit 1"
+    path.write_text(
+        "#!/bin/sh\n"
+        "set -eu\n"
+        "if [ \"${1:-}\" = \"-c\" ]; then\n"
+        f"    {probe}\n"
+        "fi\n"
+        f"printf '%s\\n' \"${{PYTHON_BIN:-unset}}\" > \"{result}\"\n",
+        encoding="utf-8",
+    )
+    path.chmod(0o755)
+
+
+def _write_wrapper_project(tmp_path: Path) -> tuple[Path, Path, Path]:
+    project = tmp_path / "project"
+    scripts = project / "scripts"
+    scripts.mkdir(parents=True)
+    wrapper = scripts / "deploy-macos-one-click.sh"
+    wrapper.write_text(ONE_CLICK_WRAPPER.read_text(encoding="utf-8"), encoding="utf-8")
+    wrapper.chmod(0o755)
+    (scripts / "macos_deploy.py").write_text(
+        "import os\n"
+        "from pathlib import Path\n"
+        "Path(os.environ['WRAPPER_RESULT']).write_text(os.environ.get('PYTHON_BIN', 'unset'))\n",
+        encoding="utf-8",
+    )
+    venv_result = tmp_path / "venv-result"
+    _write_fake_python(project / ".venv/bin/python", import_ok=True, result=venv_result)
+    return project, wrapper, venv_result
+
+
+def test_one_click_wrapper_auto_selects_project_venv_and_exports_python_bin(
+    tmp_path: Path,
+) -> None:
+    """Stable-root invocation must use its dependency-complete project interpreter."""
+    _project, wrapper, result = _write_wrapper_project(tmp_path)
+    environment = {key: value for key, value in os.environ.items() if key != "PYTHON_BIN"}
+    environment["WRAPPER_RESULT"] = str(result)
+
+    completed = subprocess.run(
+        [str(wrapper), "--mode", "existing"],
+        text=True,
+        capture_output=True,
+        env=environment,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert result.read_text(encoding="utf-8").strip() == str(wrapper.parent.parent / ".venv/bin/python")
+
+
+def test_one_click_wrapper_honors_explicit_python_bin_over_project_venv(
+    tmp_path: Path,
+) -> None:
+    """An explicit interpreter remains authoritative for feature-worktree callers."""
+    _project, wrapper, _venv_result = _write_wrapper_project(tmp_path)
+    explicit_result = tmp_path / "explicit-result"
+    explicit = tmp_path / "explicit-python"
+    _write_fake_python(explicit, import_ok=True, result=explicit_result)
+    environment = os.environ | {
+        "PYTHON_BIN": str(explicit),
+        "WRAPPER_RESULT": str(explicit_result),
+    }
+
+    completed = subprocess.run(
+        [str(wrapper), "--mode", "existing"],
+        text=True,
+        capture_output=True,
+        env=environment,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert explicit_result.read_text(encoding="utf-8").strip() == str(explicit)
+
+
+def test_one_click_wrapper_reports_fixed_error_when_argon2_dependency_is_missing(
+    tmp_path: Path,
+) -> None:
+    """A selected interpreter without argon2 fails safely before macos_deploy runs."""
+    _project, wrapper, _venv_result = _write_wrapper_project(tmp_path)
+    failing_result = tmp_path / "failing-result"
+    failing = tmp_path / "python-without-argon2"
+    _write_fake_python(failing, import_ok=False, result=failing_result)
+    environment = os.environ | {
+        "PYTHON_BIN": str(failing),
+        "WRAPPER_RESULT": str(failing_result),
+    }
+
+    completed = subprocess.run(
+        [str(wrapper), "--mode", "existing"],
+        text=True,
+        capture_output=True,
+        env=environment,
+        check=False,
+    )
+
+    assert completed.returncode == 1
+    assert completed.stdout == ""
+    assert completed.stderr == "PYTHON_DEPENDENCY_MISSING\n"
+    assert not failing_result.exists()
+    assert "private traceback" not in completed.stderr
+
+
+def test_one_click_wrapper_help_works_with_explicit_system_python_without_argon2() -> None:
+    """Help is a dependency-free path and remains usable on the system interpreter."""
+    system_python = shutil.which("python3")
+    assert system_python is not None
+    completed = subprocess.run(
+        [str(ONE_CLICK_WRAPPER), "--help"],
+        text=True,
+        capture_output=True,
+        env=os.environ | {"PYTHON_BIN": system_python},
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert "usage:" in completed.stdout
+    assert "PYTHON_DEPENDENCY_MISSING" not in completed.stderr
+
+
 def test_cli_and_wrapper_expose_no_device_or_asset_override_surface() -> None:
     """User-supplied serials, ports, URLs, or images would bypass reviewed constants."""
     module = _load_macos_deploy()
@@ -2982,9 +3105,7 @@ def test_cli_and_wrapper_expose_no_device_or_asset_override_surface() -> None:
     assert parsed.mode == "existing"
     with pytest.raises(SystemExit):
         parser.parse_args(["--serial", "emulator-9999"])
-    assert wrapper == (
-        "#!/bin/sh\n"
-        "set -eu\n"
-        'script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)\n'
-        'exec "${PYTHON_BIN:-python3}" "$script_dir/macos_deploy.py" "$@"\n'
-    )
+    assert 'project_root=$(CDPATH= cd -- "$script_dir/.." && pwd)' in wrapper
+    assert 'export PYTHON_BIN' in wrapper
+    assert 'PYTHON_DEPENDENCY_MISSING' in wrapper
+    assert 'exec "$PYTHON_BIN" "$script_dir/macos_deploy.py" "$@"' in wrapper

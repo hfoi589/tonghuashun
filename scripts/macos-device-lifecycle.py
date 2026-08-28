@@ -340,6 +340,11 @@ class DeviceLifecycleManager:
             raise LifecycleFailure("DEVICE_LIFECYCLE_FAILED")
         self._require_identity(config)
         self._run(("adb", "-s", config.serial, "emu", "kill"))
+        # ``launchctl submit`` keeps the fixed emulator label alive and can
+        # immediately respawn QEMU after the emulator console accepts ``kill``.
+        # Remove only this service-owned transient label so the normal shutdown
+        # can settle at STOPPED instead of being reported as a timeout.
+        self._run(("launchctl", "remove", f"com.ths.avd.{config.emulator_port}"))
         deadline = time.monotonic() + self._shutdown_timeout_seconds
         while time.monotonic() < deadline:
             if self._detect_state(config) is LifecycleState.STOPPED:

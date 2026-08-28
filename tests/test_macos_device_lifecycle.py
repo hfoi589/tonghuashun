@@ -319,6 +319,25 @@ def test_shutdown_uses_emulator_kill_and_never_force_stops_app() -> None:
         assert forbidden not in rendered
 
 
+def test_shutdown_removes_transient_launchctl_job_to_prevent_respawn() -> None:
+    """A submitted emulator job must not relaunch the VM after a normal kill."""
+    runner = running_device_runner("emulator-5554")
+    state = ("adb", "-s", "emulator-5554", "get-state")
+    ps = ("ps", "-axo", "pid=,command=")
+    runner.sequences[state] = [result(state, 0, b"device\n"), result(state, 1)]
+    runner.sequences[ps] = [result(ps, 0, b"")]
+    manager = make_manager(runner)
+
+    operation = manager.submit("main_fund_flow", "shutdown")
+    assert wait_for_terminal(manager, operation.operation_id).state is module.LifecycleState.STOPPED
+
+    kill_call = ("adb", "-s", "emulator-5554", "emu", "kill")
+    remove_call = ("launchctl", "remove", "com.ths.avd.5554")
+    assert kill_call in runner.calls
+    assert remove_call in runner.calls
+    assert runner.calls.index(kill_call) < runner.calls.index(remove_call)
+
+
 def test_shutdown_of_stopped_device_does_not_send_adb_kill() -> None:
     runner = FakeCommandRunner(lifecycle_responses("emulator-5554", booted=False, process=False))
     manager = make_manager(runner)

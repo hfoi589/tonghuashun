@@ -1399,6 +1399,74 @@ def test_core_template_protocol_preserves_a_request_batch_timeout() -> None:
     assert caught.value.error_code == "DIRECT_PROTOCOL_RESPONSE_TIMEOUT"
 
 
+def test_core_template_protocol_shares_one_deadline_across_request_batches(
+    monkeypatch,
+) -> None:
+    class Clock:
+        value = 0.0
+
+        def __call__(self) -> float:
+            return self.value
+
+    clock = Clock()
+    monkeypatch.setattr("level2_service.direct_market.time.monotonic", clock)
+
+    class Socket:
+        def __init__(self) -> None:
+            self.buffer = b""
+            self.timeout = 0.0
+            self.sent: list[bytes] = []
+            self.closed = False
+
+        def sendall(self, payload: bytes) -> None:
+            self.sent.append(payload)
+            if len(self.sent) % 2 == 0:
+                self.buffer += framed_9528(b"control")
+
+        def settimeout(self, timeout: float) -> None:
+            self.timeout = timeout
+
+        def recv(self, size: int) -> bytes:
+            if self.buffer:
+                value, self.buffer = self.buffer[:size], self.buffer[size:]
+                return value
+            clock.value += self.timeout
+            raise TimeoutError("synthetic idle timeout")
+
+        def close(self) -> None:
+            self.closed = True
+
+    values = {kind: None for kind in MetricKind}
+    prepared = CoreRequestMaterial(
+        host="127.0.0.1",
+        port=9528,
+        auth_packet=b"auth",
+        request_packets=tuple(f"packet-{index}".encode() for index in range(10)),
+        macdfs_params=(10, 20, 5),
+        timeout_seconds=1.0,
+        session_fingerprint=b"fingerprint",
+    )
+    socket = Socket()
+    protocol = Core9528TemplateProtocol(
+        socket_factory=lambda _address, _timeout: socket,
+        response_decoder=lambda _frames, _symbol, _market: DirectReadOutcome(
+            values=values,
+            source_errors={"core_metrics": None, "main_fund_flow": None},
+        ),
+    )
+
+    with pytest.raises(DirectRequestError) as caught:
+        protocol.read_authenticated(
+            WarmCoreConnection(socket, b"fingerprint", 0.0),
+            prepared,
+            "601872",
+            "17",
+        )
+
+    assert caught.value.error_code == "DIRECT_PROTOCOL_RESPONSE_TIMEOUT"
+    assert clock.value == pytest.approx(1.0)
+
+
 def test_core_template_protocol_rejects_a_partial_next_frame() -> None:
     complete = framed_9528(b"complete")
     partial = framed_9528(b"partial")[:15]

@@ -1574,6 +1574,7 @@ class Core9528TemplateProtocol:
         connection: object,
         timeout_seconds: float,
         *,
+        deadline: float | None = None,
         stop_after_curves: int | None = None,
         inter_frame_timeout_seconds: float | None = None,
     ) -> list[bytes]:
@@ -1584,7 +1585,8 @@ class Core9528TemplateProtocol:
             and inter_frame_timeout_seconds <= 0
         ):
             raise ValueError("inter_frame_timeout_seconds must be positive")
-        deadline = time.monotonic() + timeout_seconds
+        if deadline is None:
+            deadline = time.monotonic() + timeout_seconds
         frames: list[bytes] = []
         curve_frames = 0
         for _ in range(self.max_response_frames):
@@ -1646,6 +1648,7 @@ class Core9528TemplateProtocol:
             raise DirectRequestError("DIRECT_PROTOCOL_HANDSHAKE_FAILED")
         try:
             frames: list[bytes] = []
+            deadline = time.monotonic() + prepared.timeout_seconds
             # Captured request templates are emitted as adjacent pairs by the
             # App (a request descriptor followed by its 6001 payload).  Keep
             # each pair together and stop after its first curve response before
@@ -1665,6 +1668,7 @@ class Core9528TemplateProtocol:
                     self._read_frames(
                         warm.connection,
                         prepared.timeout_seconds,
+                        deadline=deadline,
                         stop_after_curves=1,
                     )
                 )

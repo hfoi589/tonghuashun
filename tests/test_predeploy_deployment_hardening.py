@@ -424,6 +424,175 @@ class DiskFileSystem(FakeFileSystem):
         return self.free_by_path.get(resolved, 30 * 1024**3)
 
 
+JAVA17 = Path(
+    "/opt/homebrew/opt/openjdk@17/libexec/openjdk.jdk/Contents/Home/bin/java"
+)
+JAVA17_HOME = JAVA17.parent.parent
+JBR21 = Path(
+    "/Applications/Android Studio.app/Contents/jbr/Contents/Home/bin/java"
+)
+JBR21_HOME = JBR21.parent.parent
+
+
+class JavaFallbackFileSystem(FakeFileSystem):
+    def __init__(self, *available_java: Path, path_java: bool = True) -> None:
+        super().__init__()
+        if not path_java:
+            self.commands.remove("java")
+        for path in available_java:
+            self.files[path.resolve()] = ("java", 0o755)
+
+
+class JavaAwareRunner(FakeCommandRunner):
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.java_home: Path | None = None
+
+    def set_java_home(self, java_home: Path) -> None:
+        self.java_home = java_home
+
+
+def java_runner(
+    filesystem: FakeFileSystem,
+    versions: dict[str, tuple[int, bytes, bytes]],
+    *,
+    events: list[str] | None = None,
+) -> JavaAwareRunner:
+    return JavaAwareRunner(
+        filesystem=filesystem,
+        java_versions=versions,
+        events=events,
+    )
+
+
+def test_java8_path_uses_fixed_openjdk17_and_propagates_java_home() -> None:
+    """A PATH Java 8 install must select the verified fixed OpenJDK 17 toolchain."""
+    module = _load_macos_deploy()
+    filesystem = JavaFallbackFileSystem(JAVA17, JBR21)
+    runner = java_runner(
+        filesystem,
+        {
+            "java": (0, b"", b'openjdk version "1.8.0_402"\n'),
+            str(JAVA17): (0, b"", b'openjdk version "17.0.12"\n'),
+            str(JBR21): (0, b"", b'openjdk version "21.0.7"\n'),
+        },
+    )
+    orchestrator = make_orchestrator(runner, filesystem=filesystem)
+
+    orchestrator._validate_host_prerequisites(provision_system_image=False)
+
+    assert orchestrator._java_command == str(JAVA17)
+    assert orchestrator._java_home == JAVA17_HOME
+    assert runner.java_home == JAVA17_HOME
+    assert (str(JAVA17), "-version") in runner.calls
+    assert (str(JBR21), "-version") not in runner.calls
+
+
+def test_java8_path_uses_fixed_jbr21_when_openjdk17_is_missing() -> None:
+    """JBR 21 is an allowed fallback only when the preferred fixed JDK 17 is absent."""
+    module = _load_macos_deploy()
+    filesystem = JavaFallbackFileSystem(JBR21)
+    runner = java_runner(
+        filesystem,
+        {
+            "java": (0, b"", b'openjdk version "1.8.0_402"\n'),
+            str(JBR21): (0, b"", b'openjdk version "21.0.7"\n'),
+        },
+    )
+    orchestrator = make_orchestrator(runner, filesystem=filesystem)
+
+    orchestrator._validate_host_prerequisites(provision_system_image=False)
+
+    assert orchestrator._java_command == str(JBR21)
+    assert orchestrator._java_home == JBR21_HOME
+    assert runner.java_home == JBR21_HOME
+
+
+def test_java8_path_without_fixed_fallback_fails_closed() -> None:
+    """A Java 8 PATH binary cannot satisfy the host's fixed Java tooling floor."""
+    module = _load_macos_deploy()
+    filesystem = JavaFallbackFileSystem()
+    runner = java_runner(
+        filesystem,
+        {"java": (0, b"", b'openjdk version "1.8.0_402"\n')},
+    )
+
+    with pytest.raises(module.DeploymentError) as caught:
+        make_orchestrator(runner, filesystem=filesystem)._validate_host_prerequisites(
+            provision_system_image=False
+        )
+
+    assert caught.value.error_code == "JAVA_17_REQUIRED"
+
+
+def test_java_fallback_ignores_ambient_java_home_overrides(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Ambient JAVA_HOME values cannot introduce an unreviewed executable."""
+    module = _load_macos_deploy()
+    ambient_java = tmp_path / "ambient-java" / "bin" / "java"
+    filesystem = JavaFallbackFileSystem(path_java=False)
+    filesystem.files[ambient_java] = ("java", 0o755)
+    runner = java_runner(
+        filesystem,
+        {"java": (0, b"", b'openjdk version "17.0.12"\n')},
+    )
+    monkeypatch.setenv("JAVA_HOME", str(ambient_java.parent.parent))
+    monkeypatch.setenv("THS_JAVA_HOME", str(ambient_java.parent.parent))
+
+    with pytest.raises(module.DeploymentError) as caught:
+        make_orchestrator(runner, filesystem=filesystem)._validate_host_prerequisites(
+            provision_system_image=False
+        )
+
+    assert caught.value.error_code == "JAVA_17_REQUIRED"
+    assert str(ambient_java) not in " ".join(" ".join(call) for call in runner.calls)
+
+
+def test_provisioning_java_failure_happens_before_journal_or_avd_mutation() -> None:
+    """A missing fixed JDK stops provisioning before any journal/build/AVD command."""
+    module = _load_macos_deploy()
+    filesystem = JavaFallbackFileSystem(path_java=False)
+    events: list[str] = []
+    journal = FakeProvisioningJournal(events=events)
+    runner = java_runner(
+        filesystem,
+        {"java": (0, b"", b'openjdk version "1.8.0_402"\n')},
+        events=events,
+    )
+
+    with pytest.raises(module.DeploymentError) as caught:
+        make_orchestrator(
+            runner,
+            filesystem=filesystem,
+            journal=journal,
+        ).deploy("provision")
+
+    assert caught.value.error_code == "JAVA_17_REQUIRED"
+    assert not any(event.startswith("journal-") for event in events)
+    assert not any(call[-2:] == ("build", "api") for call in runner.calls)
+    assert not any(call[:3] == ("avdmanager", "create", "avd") for call in runner.calls)
+
+
+def test_subprocess_runner_accepts_only_validated_java_home(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The production runner strips ambient Java selectors and receives the validated home."""
+    module = _load_macos_deploy()
+    monkeypatch.setenv("JAVA_HOME", "/tmp/ambient-java")
+    monkeypatch.setenv("THS_JAVA_HOME", "/tmp/ambient-ths-java")
+
+    runner = module.SubprocessCommandRunner(tmp_path)
+
+    assert "JAVA_HOME" not in runner._environment
+    assert "THS_JAVA_HOME" not in runner._environment
+    runner.set_java_home(JAVA17_HOME)
+    assert runner._environment["JAVA_HOME"] == str(JAVA17_HOME)
+    assert runner._environment["PATH"].split(os.pathsep)[0] == str(JAVA17_HOME / "bin")
+
+
 def test_existing_disk_preflight_accepts_13_gib_project_avd_and_23_gib_orbstack() -> None:
     """Existing AVD redeploys use the lower 8 GiB floor on all three filesystems."""
     module = _load_macos_deploy()

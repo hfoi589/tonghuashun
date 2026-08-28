@@ -656,6 +656,7 @@ class FakeCommandRunner:
         process_snapshots: list[str] | None = None,
         avd_identity_sequences: dict[str, list[str | None]] | None = None,
         healthy: bool = True,
+        java_versions: dict[str, tuple[int, bytes, bytes]] | None = None,
         compose_environment: dict[str, str] | None = None,
         system_image_installed: bool = True,
         sdkmanager_install_returncode: int = 0,
@@ -689,6 +690,7 @@ class FakeCommandRunner:
             for serial, values in (avd_identity_sequences or {}).items()
         }
         self.healthy = healthy
+        self.java_versions = dict(java_versions or {})
         self.compose_environment = (
             dict(VALID_COMPOSE_ENVIRONMENT)
             if compose_environment is None
@@ -723,8 +725,16 @@ class FakeCommandRunner:
             return _completed(args, stdout=b"arm64\n")
         if args[:4] == ("docker", "--context", "orbstack", "info"):
             return _completed(args, stdout=b"orbstack\n")
-        if args == ("java", "-version"):
-            return _completed(args, stderr=b'openjdk version "17.0.12"\n')
+        if (
+            len(args) == 2
+            and args[1] == "-version"
+            and (args[0] == "java" or args[0].endswith("/java"))
+        ):
+            returncode, stdout, stderr = self.java_versions.get(
+                args[0],
+                (0, b"", b'openjdk version "17.0.12"\n'),
+            )
+            return _completed(args, returncode, stdout, stderr)
         if args == ("sdkmanager", "--list_installed"):
             return _completed(
                 args,
@@ -1071,6 +1081,7 @@ def existing_mac_runner(
     process_snapshots: list[str] | None = None,
     avd_identity_sequences: dict[str, list[str | None]] | None = None,
     healthy: bool = True,
+    java_versions: dict[str, tuple[int, bytes, bytes]] | None = None,
     compose_environment: dict[str, str] | None = None,
     system_image_installed: bool = True,
     sdkmanager_install_returncode: int = 0,
@@ -1090,6 +1101,7 @@ def existing_mac_runner(
         process_snapshots=process_snapshots,
         avd_identity_sequences=avd_identity_sequences,
         healthy=healthy,
+        java_versions=java_versions,
         compose_environment=compose_environment,
         system_image_installed=system_image_installed,
         sdkmanager_install_returncode=sdkmanager_install_returncode,

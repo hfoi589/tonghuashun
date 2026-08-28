@@ -67,6 +67,13 @@ FIXED_EMULATOR_PORTS = {
 EMULATOR_FALLBACK_PATH = Path(
     "/opt/homebrew/share/android-commandlinetools/emulator/emulator"
 )
+JAVA17_PATH = Path(
+    "/opt/homebrew/opt/openjdk@17/libexec/openjdk.jdk/Contents/Home/bin/java"
+)
+JAVA21_PATH = Path(
+    "/Applications/Android Studio.app/Contents/jbr/Contents/Home/bin/java"
+)
+JAVA_FALLBACK_PATHS = (JAVA17_PATH, JAVA21_PATH)
 REQUIRED_COMMANDS = (
     "adb",
     "avdmanager",
@@ -91,6 +98,8 @@ REQUIRED_MACOS_ENV = {
 ROOT_ONLY_COMPOSE_KEYS = frozenset(REQUIRED_ROOT_ENV_KEYS)
 SANITIZED_AMBIENT_KEYS = ROOT_ONLY_COMPOSE_KEYS | {
     "THS_DEVICE_LIFECYCLE_URL",
+    "JAVA_HOME",
+    "THS_JAVA_HOME",
 }
 _SAFE_APK_PATH = re.compile(r"/data/app/[A-Za-z0-9._~+=/-]+/base\.apk")
 _SAFE_OPERATION_ID = re.compile(r"[A-Za-z0-9_-]{1,256}")
@@ -304,6 +313,19 @@ class SubprocessCommandRunner:
                 self._environment.pop(key, None)
         for key in SANITIZED_AMBIENT_KEYS:
             self._environment.pop(key, None)
+
+    def set_java_home(self, java_home: Path) -> None:
+        """Install the preflight-validated JDK for all subsequent host tools."""
+        if not java_home.is_absolute():
+            raise ValueError("java home must be absolute")
+        self._environment["JAVA_HOME"] = str(java_home)
+        java_bin = str(java_home / "bin")
+        path_entries = [
+            entry
+            for entry in self._environment.get("PATH", "").split(os.pathsep)
+            if entry and entry != java_bin
+        ]
+        self._environment["PATH"] = os.pathsep.join([java_bin, *path_entries])
 
     def run(
         self,
@@ -1601,6 +1623,8 @@ class MacDeploymentOrchestrator:
         self._root_environment: dict[str, str] = {}
         self._trusted_emulator_path: Path | None = None
         self._emulator_command = "emulator"
+        self._java_command = "java"
+        self._java_home: Path | None = None
         self._data_only_acceptance = data_only_acceptance
         self._provisioning_journal = provisioning_journal or ProvisioningJournal()
         self._initial_missing_roles: frozenset[str] | None = None
@@ -1877,7 +1901,7 @@ class MacDeploymentOrchestrator:
         except Exception:
             raise DeploymentError("MISSING_PREREQUISITE") from None
         for command, path in resolved_commands.items():
-            if command != "emulator" and path is None:
+            if command not in {"emulator", "java"} and path is None:
                 raise DeploymentError("MISSING_PREREQUISITE")
         emulator_path = resolved_commands["emulator"]
         if emulator_path:
@@ -1931,10 +1955,7 @@ class MacDeploymentOrchestrator:
         )
         if "orbstack" not in self._stdout_text(context).lower():
             raise DeploymentError("ORBSTACK_UNAVAILABLE")
-        java = self._run(("java", "-version"), 10.0, "JAVA_17_REQUIRED")
-        java_version = self._stdout_text(java) + self._stderr_text(java)
-        if not re.search(r'version\s+"17(?:[."]|$)', java_version):
-            raise DeploymentError("JAVA_17_REQUIRED")
+        self._resolve_java_tool()
         sdk = self._run(
             ("sdkmanager", "--list_installed"),
             60.0,
@@ -1948,6 +1969,75 @@ class MacDeploymentOrchestrator:
             if not provision_system_image:
                 raise DeploymentError("ANDROID_33_ARM64_UNAVAILABLE")
             self._install_android_system_image()
+
+    def _resolve_java_tool(self) -> None:
+        """Select only a validated PATH JDK or one of the fixed macOS JDKs."""
+        try:
+            path_value = self._filesystem.which("java")
+        except Exception:
+            path_value = None
+        if path_value:
+            candidate = Path(path_value)
+            if candidate.is_absolute() and candidate.name == "java":
+                if self._java_version_supported(
+                    self._probe_java_version("java"), allow_java21=False
+                ):
+                    try:
+                        java_home = candidate.resolve().parent.parent
+                    except (OSError, RuntimeError, ValueError):
+                        java_home = None
+                    if java_home is not None:
+                        self._set_java_tool("java", java_home)
+                        return
+        for candidate in JAVA_FALLBACK_PATHS:
+            try:
+                if (
+                    not candidate.is_absolute()
+                    or candidate.name != "java"
+                    or not self._filesystem.exists(candidate)
+                    or not (self._filesystem.mode(candidate) & 0o111)
+                ):
+                    continue
+                resolved = candidate
+                if not resolved.is_absolute() or resolved.name != "java":
+                    continue
+            except (OSError, RuntimeError, TypeError, ValueError):
+                continue
+            if self._java_version_supported(
+                self._probe_java_version(str(resolved)), allow_java21=True
+            ):
+                self._set_java_tool(str(resolved), resolved.parent.parent)
+                return
+        raise DeploymentError("JAVA_17_REQUIRED")
+
+    def _probe_java_version(self, command: str) -> str:
+        try:
+            result = self._runner.run((command, "-version"), 10.0)
+        except Exception:
+            return ""
+        if result.returncode != 0:
+            return ""
+        return self._stdout_text(result) + self._stderr_text(result)
+
+    @staticmethod
+    def _java_version_supported(output: str, *, allow_java21: bool) -> bool:
+        majors = "17|21" if allow_java21 else "17"
+        return re.search(
+            rf'version\s+"(?:{majors})(?:[.\"]|$)', output
+        ) is not None
+
+    def _set_java_tool(self, command: str, java_home: Path) -> None:
+        try:
+            resolved_home = Path(java_home)
+            if not resolved_home.is_absolute():
+                raise ValueError
+            self._java_command = command
+            self._java_home = resolved_home
+            configure = getattr(self._runner, "set_java_home", None)
+            if callable(configure):
+                configure(resolved_home)
+        except Exception:
+            raise DeploymentError("JAVA_17_REQUIRED") from None
 
     def _resolve_orbstack_data_dir(self) -> Path:
         config_path = Path.home() / ".orbstack/vmconfig.json"

@@ -46,6 +46,7 @@ RUN set -eu; \
 
 FROM python:3.12-slim-bookworm AS api
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PIP_NO_CACHE_DIR=1
+COPY --from=ghcr.io/astral-sh/uv:0.8.14 /uv /uvx /bin/
 WORKDIR /app
 LABEL org.opencontainers.image.ths.apk.sha256="2554490aa3f5e2df17ac0a711311f3f85ee3130008af9bb4ab12510b3d6e971e" \
       org.opencontainers.image.ths.frida-server.version="16.7.19" \
@@ -55,8 +56,10 @@ RUN apt-get update \
     && apt-get install --no-install-recommends -y android-sdk-platform-tools adb ca-certificates tesseract-ocr tesseract-ocr-chi-sim \
     && rm -rf /var/lib/apt/lists/*
 COPY pyproject.toml ./
+COPY uv.lock ./
 COPY level2_service/ ./level2_service/
-RUN pip install --no-cache-dir .
+RUN uv sync --frozen --no-dev
+ENV PATH="/app/.venv/bin:${PATH}"
 COPY --from=frontend-build /src/frontend/dist /app/frontend
 COPY --from=mobile-assets --chmod=0444 /opt/ths/assets/manifest.json /opt/ths/assets/manifest.json
 COPY --from=mobile-assets --chmod=0444 /opt/ths/assets/ths.apk /opt/ths/assets/ths.apk

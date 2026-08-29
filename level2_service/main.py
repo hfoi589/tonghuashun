@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import socket
+import time
 from math import isfinite
 from dataclasses import dataclass, field
 from datetime import timedelta
@@ -50,6 +51,10 @@ from .symbol_catalog import SinaSymbolCatalogSource, SQLiteSymbolCatalog
 @dataclass(frozen=True)
 class DeploymentSettings:
     redis_url: str
+    redis_connect_timeout_seconds: float
+    redis_socket_timeout_seconds: float
+    redis_startup_retry_attempts: int
+    redis_startup_retry_delay_seconds: float
     capture_root: Path
     admin_password_hash: str
     admin_password_file: Path | None
@@ -196,6 +201,8 @@ class DeploymentSettings:
         ).expanduser().resolve()
         positive_values: dict[str, float] = {}
         for name, default in (
+            ("REDIS_CONNECT_TIMEOUT_SECONDS", "5"),
+            ("REDIS_SOCKET_TIMEOUT_SECONDS", "5"),
             ("SYMBOL_CATALOG_MAX_AGE_SECONDS", "604800"),
             ("PUBLIC_MARKET_TIMEOUT_SECONDS", "8"),
             ("MARKET_DIRECT_ENRICHMENT_TTL_SECONDS", "5"),
@@ -205,9 +212,33 @@ class DeploymentSettings:
                 parsed = float(values.get(name, default))
             except ValueError as error:
                 raise ValueError(f"{name} must be a positive number") from error
-            if parsed <= 0:
+            if not isfinite(parsed) or parsed <= 0:
                 raise ValueError(f"{name} must be a positive number")
             positive_values[name] = parsed
+        try:
+            redis_startup_retry_attempts = int(
+                values.get("REDIS_STARTUP_RETRY_ATTEMPTS", "10")
+            )
+        except ValueError as error:
+            raise ValueError(
+                "REDIS_STARTUP_RETRY_ATTEMPTS must be a positive integer"
+            ) from error
+        if redis_startup_retry_attempts <= 0:
+            raise ValueError(
+                "REDIS_STARTUP_RETRY_ATTEMPTS must be a positive integer"
+            )
+        try:
+            redis_startup_retry_delay = float(
+                values.get("REDIS_STARTUP_RETRY_DELAY_SECONDS", "1")
+            )
+        except ValueError as error:
+            raise ValueError(
+                "REDIS_STARTUP_RETRY_DELAY_SECONDS must be a non-negative number"
+            ) from error
+        if not isfinite(redis_startup_retry_delay) or redis_startup_retry_delay < 0:
+            raise ValueError(
+                "REDIS_STARTUP_RETRY_DELAY_SECONDS must be a non-negative number"
+            )
         try:
             catalog_refresh_hour = int(
                 values.get("SYMBOL_CATALOG_REFRESH_HOUR", "16")
@@ -240,6 +271,14 @@ class DeploymentSettings:
             raise ValueError("MARKET_DIRECT_ENRICHMENT must be a boolean value")
         return cls(
             redis_url=values.get("REDIS_URL", "redis://redis:6379/0"),
+            redis_connect_timeout_seconds=positive_values[
+                "REDIS_CONNECT_TIMEOUT_SECONDS"
+            ],
+            redis_socket_timeout_seconds=positive_values[
+                "REDIS_SOCKET_TIMEOUT_SECONDS"
+            ],
+            redis_startup_retry_attempts=redis_startup_retry_attempts,
+            redis_startup_retry_delay_seconds=redis_startup_retry_delay,
             capture_root=capture_root,
             admin_password_hash=password_hash,
             admin_password_file=password_file,
@@ -292,10 +331,43 @@ class DeploymentSettings:
         )
 
 
-def _redis_client_from_url(url: str) -> object:
+def _redis_client_from_url(
+    url: str,
+    *,
+    socket_connect_timeout: float = 5.0,
+    socket_timeout: float = 5.0,
+) -> object:
     from redis import Redis
 
-    return Redis.from_url(url)
+    return Redis.from_url(
+        url,
+        socket_connect_timeout=socket_connect_timeout,
+        socket_timeout=socket_timeout,
+        health_check_interval=30,
+        retry_on_timeout=True,
+    )
+
+
+def _wait_for_redis_ready(
+    redis_client: object,
+    *,
+    attempts: int,
+    delay_seconds: float,
+) -> None:
+    """Block startup until Redis accepts commands, with a bounded retry loop."""
+    ping = getattr(redis_client, "ping", None)
+    if not callable(ping):
+        return
+    last_error: Exception | None = None
+    for attempt in range(attempts):
+        try:
+            ping()
+            return
+        except Exception as error:
+            last_error = error
+            if attempt + 1 < attempts and delay_seconds:
+                time.sleep(delay_seconds)
+    raise RuntimeError("Redis did not become ready during startup") from last_error
 
 
 def _device_health_probe(
@@ -335,7 +407,7 @@ def _device_health_probe(
 def create_production_app(
     *,
     settings: DeploymentSettings | None = None,
-    redis_client_factory: Callable[[str], object] = _redis_client_from_url,
+    redis_client_factory: Callable[..., object] = _redis_client_from_url,
     bridge_factory: Callable[..., ADBDeviceBridge] = ADBDeviceBridge,
     runner_factory: Callable[..., Level2Runner] = Level2Runner,
     symbol_catalog_source: object | None = None,
@@ -346,7 +418,19 @@ def create_production_app(
     """Create the only app mode that enables the real Android worker."""
     config = settings or DeploymentSettings.from_environ()
     config.capture_root.mkdir(parents=True, exist_ok=True)
-    redis_client = redis_client_factory(config.redis_url)
+    if redis_client_factory is _redis_client_from_url:
+        redis_client = redis_client_factory(
+            config.redis_url,
+            socket_connect_timeout=config.redis_connect_timeout_seconds,
+            socket_timeout=config.redis_socket_timeout_seconds,
+        )
+    else:
+        redis_client = redis_client_factory(config.redis_url)
+    _wait_for_redis_ready(
+        redis_client,
+        attempts=config.redis_startup_retry_attempts,
+        delay_seconds=config.redis_startup_retry_delay_seconds,
+    )
     store = RedisStreamsStore(redis_client, capture_root=config.capture_root)
     symbol_catalog = symbol_catalog_factory(
         config.symbol_catalog_path,

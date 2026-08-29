@@ -12,6 +12,10 @@ services:
         required: false
     environment:
       REDIS_URL: redis://redis:6379/0
+      REDIS_CONNECT_TIMEOUT_SECONDS: ${REDIS_CONNECT_TIMEOUT_SECONDS:-5}
+      REDIS_SOCKET_TIMEOUT_SECONDS: ${REDIS_SOCKET_TIMEOUT_SECONDS:-5}
+      REDIS_STARTUP_RETRY_ATTEMPTS: ${REDIS_STARTUP_RETRY_ATTEMPTS:-10}
+      REDIS_STARTUP_RETRY_DELAY_SECONDS: ${REDIS_STARTUP_RETRY_DELAY_SECONDS:-1}
       CAPTURE_ROOT: /data/captures
       ADB_PATH: adb
       ADB_SERIAL: ${ADB_SERIAL:-redroid:5555}
@@ -33,7 +37,7 @@ services:
       SYMBOL_CATALOG_REFRESH_MINUTE: ${SYMBOL_CATALOG_REFRESH_MINUTE:-20}
       PUBLIC_MARKET_TIMEOUT_SECONDS: ${PUBLIC_MARKET_TIMEOUT_SECONDS:-8}
       MARKET_DIRECT_ENRICHMENT: ${MARKET_DIRECT_ENRICHMENT:-1}
-      MARKET_DIRECT_ENRICHMENT_TTL_SECONDS: ${MARKET_DIRECT_ENRICHMENT_TTL_SECONDS:-15}
+      MARKET_DIRECT_ENRICHMENT_TTL_SECONDS: ${MARKET_DIRECT_ENRICHMENT_TTL_SECONDS:-5}
       CORE_WARM_CONNECTION_MAX_IDLE_SECONDS: ${CORE_WARM_CONNECTION_MAX_IDLE_SECONDS:-25}
       RUNNER_POLL_INTERVAL_SECONDS: ${RUNNER_POLL_INTERVAL_SECONDS:-1}
       FRONTEND_ROOT: /app/frontend
@@ -48,9 +52,9 @@ services:
       THS_SESSION_ROOT: /data/admin/ths-sessions
     depends_on:
       redis:
-        condition: service_started
+        condition: service_healthy
     ports:
-      - "${APP_PORT:-8000}:8000"
+      - "${APP_PORT:-8001}:8000"
     volumes:
       - capture-data:/data/captures
       - template-data:/data/templates
@@ -65,7 +69,7 @@ services:
       retries: 3
 
   redis:
-    image: redis:7.4-alpine
+    image: redis:7.4.7-alpine
     restart: unless-stopped
     command: ["redis-server", "--appendonly", "yes"]
     expose:

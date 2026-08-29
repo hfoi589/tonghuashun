@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from level2_service.main import DeploymentSettings
+from level2_service.main import DeploymentSettings, _redis_client_from_url
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -265,6 +265,66 @@ def test_macos_example_keeps_root_secrets_out_of_the_later_env_file() -> None:
         "THS_DEVICE_LIFECYCLE_TIMEOUT_SECONDS",
     ):
         assert f"{setting}: ${{{setting}:-" in compose
+
+
+def test_redis_client_uses_bounded_connect_and_read_timeouts(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A dead Redis socket must not pin the API process indefinitely."""
+    calls: list[tuple[str, dict[str, object]]] = []
+
+    class RedisFactory:
+        @staticmethod
+        def from_url(url: str, **kwargs: object) -> object:
+            calls.append((url, kwargs))
+            return object()
+
+    monkeypatch.setattr("redis.Redis", RedisFactory)
+
+    _redis_client_from_url("redis://redis:6379/0")
+
+    assert calls == [
+        (
+            "redis://redis:6379/0",
+            {
+                "socket_connect_timeout": 5.0,
+                "socket_timeout": 5.0,
+                "health_check_interval": 30,
+                "retry_on_timeout": True,
+            },
+        )
+    ]
+
+
+def test_redis_client_accepts_deployment_timeout_overrides(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[dict[str, object]] = []
+
+    class RedisFactory:
+        @staticmethod
+        def from_url(_url: str, **kwargs: object) -> object:
+            calls.append(kwargs)
+            return object()
+
+    monkeypatch.setattr("redis.Redis", RedisFactory)
+    _redis_client_from_url(
+        "redis://redis:6379/0",
+        socket_connect_timeout=2.5,
+        socket_timeout=3.5,
+    )
+
+    assert calls[0]["socket_connect_timeout"] == 2.5
+    assert calls[0]["socket_timeout"] == 3.5
+
+
+def test_compose_uses_unified_enrichment_ttl_default() -> None:
+    compose = (ROOT / "deploy" / "compose.yml").read_text(encoding="utf-8")
+
+    assert "MARKET_DIRECT_ENRICHMENT_TTL_SECONDS: ${MARKET_DIRECT_ENRICHMENT_TTL_SECONDS:-5}" in compose
+
+
+def test_dockerfile_installs_from_frozen_lockfile() -> None:
+    dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+
+    assert "COPY uv.lock ./" in dockerfile
+    assert "uv sync --frozen" in dockerfile
 
 
 @pytest.mark.skipif(shutil.which("docker") is None, reason="Docker is not installed")

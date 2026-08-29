@@ -262,6 +262,18 @@ def test_rendered_compose_config_accepts_only_the_fixed_macos_stack() -> None:
     orchestrator._validate_effective_compose_config()
 
 
+def test_compose_waits_for_redis_health_before_starting_api() -> None:
+    compose = (ROOT / "deploy" / "compose.yml").read_text(encoding="utf-8")
+
+    assert "condition: service_healthy" in compose
+
+
+def test_generated_graph_artifacts_are_ignored() -> None:
+    ignore = (ROOT / ".gitignore").read_text(encoding="utf-8")
+
+    assert "graphify-out/" in ignore
+
+
 def load_setup_admin():
     path = ROOT / "scripts/setup-admin.py"
     spec = spec_from_file_location("predeploy_setup_admin", path)

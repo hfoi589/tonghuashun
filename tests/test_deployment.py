@@ -457,6 +457,41 @@ def test_settings_parse_frontend_root_and_admin_cookie_secure(tmp_path: Path) ->
     assert secure_defaults.market_direct_enrichment is True
     assert secure_defaults.market_direct_enrichment_ttl_seconds == 5
     assert secure_defaults.core_warm_connection_max_idle_seconds == 25
+    assert secure_defaults.redis_connect_timeout_seconds == 5
+    assert secure_defaults.redis_socket_timeout_seconds == 5
+    assert secure_defaults.redis_startup_retry_attempts == 10
+    assert secure_defaults.redis_startup_retry_delay_seconds == 1
+
+
+def test_production_startup_retries_until_redis_is_ready(tmp_path: Path) -> None:
+    attempts: list[int] = []
+
+    class ReadinessRedis(FakeRedis):
+        def ping(self) -> bool:
+            attempts.append(1)
+            if len(attempts) < 3:
+                raise OSError("redis is still starting")
+            return True
+
+    settings = DeploymentSettings.from_environ(
+        {
+            "ADMIN_PASSWORD_HASH": "$argon2id$example",
+            "ADMIN_SESSION_SECRET": "s" * 32,
+            "CAPTURE_ROOT": str(tmp_path),
+            "ADB_SERIAL": "emulator-5554",
+            "REDIS_STARTUP_RETRY_ATTEMPTS": "3",
+            "REDIS_STARTUP_RETRY_DELAY_SECONDS": "0",
+        }
+    )
+
+    create_production_app(
+        settings=settings,
+        redis_client_factory=lambda _url: ReadinessRedis(),
+        bridge_factory=FakeBridge,
+        runner_factory=FakeRunner,
+    )
+
+    assert len(attempts) == 3
 
 
 def test_production_factory_wires_the_configured_frida_runtime_source(tmp_path: Path) -> None:

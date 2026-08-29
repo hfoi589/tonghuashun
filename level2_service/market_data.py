@@ -145,13 +145,17 @@ class MarketDataBroker:
         detail_interval_seconds: float = 2.0,
         watchlist_interval_seconds: float = 2.0,
         closed_interval_seconds: float | None = None,
+        max_concurrent_refreshes: int = 8,
         clock: Callable[[], float] = time.monotonic,
         is_market_open: Callable[[], bool] = lambda: True,
     ) -> None:
+        if not isinstance(max_concurrent_refreshes, int) or max_concurrent_refreshes <= 0:
+            raise ValueError("max_concurrent_refreshes must be positive")
         self.source = source
         self.detail_interval_seconds = detail_interval_seconds
         self.watchlist_interval_seconds = watchlist_interval_seconds
         self.closed_interval_seconds = closed_interval_seconds
+        self.max_concurrent_refreshes = max_concurrent_refreshes
         self.clock = clock
         self.is_market_open = is_market_open
         self._subscriptions: dict[str, tuple[set[str], set[str]]] = {}
@@ -164,7 +168,10 @@ class MarketDataBroker:
         self._sequence: dict[str, int] = {}
         self._last_polled: dict[str, float] = {}
         self._refresh_locks: dict[str, asyncio.Lock] = {}
+        self._cache_detail: dict[str, bool] = {}
         self._closed_refresh_requests: set[str] = set()
+        self._failure_counts: dict[str, int] = {}
+        self._retry_after: dict[str, float] = {}
 
     def subscribe(
         self,
@@ -194,6 +201,22 @@ class MarketDataBroker:
         self._subscriptions.pop(client_id, None)
         self._queues.pop(client_id, None)
         self._pending_events.pop(client_id, None)
+        referenced = {
+            symbol
+            for watchlist, detail in self._subscriptions.values()
+            for symbol in (watchlist | detail)
+        }
+        for symbol in tuple(self._cache):
+            if symbol not in referenced:
+                self._cache.pop(symbol, None)
+                self._cache_detail.pop(symbol, None)
+                self._sequence.pop(symbol, None)
+                self._last_polled.pop(symbol, None)
+                lock = self._refresh_locks.get(symbol)
+                if lock is None or not lock.locked():
+                    self._refresh_locks.pop(symbol, None)
+                self._failure_counts.pop(symbol, None)
+                self._retry_after.pop(symbol, None)
 
     def has_subscriber(self, client_id: str) -> bool:
         return client_id in self._subscriptions
@@ -229,6 +252,11 @@ class MarketDataBroker:
         self._sequence[snapshot.symbol] = max(
             snapshot.sequence,
             self._sequence.get(snapshot.symbol, 0),
+        )
+        self._cache_detail[snapshot.symbol] = bool(
+            snapshot.timeshare
+            or snapshot.intraday_series
+            or snapshot.main_fund_flow
         )
 
     def _wanted(self, client_id: str, symbol: str) -> bool:
@@ -275,7 +303,12 @@ class MarketDataBroker:
             if max_age_seconds > 0:
                 cached = self._cache.get(symbol)
                 last = self._last_polled.get(symbol)
-                if cached is not None and last is not None and self.clock() - last < max_age_seconds:
+                if (
+                    cached is not None
+                    and last is not None
+                    and self.clock() - last < max_age_seconds
+                    and (not detail or self._cache_detail.get(symbol, False))
+                ):
                     return cached
             snapshot = await asyncio.to_thread(
                 self.source.read_market_snapshot,
@@ -286,7 +319,10 @@ class MarketDataBroker:
             current = replace(snapshot, sequence=sequence)
             self._sequence[symbol] = sequence
             self._cache[symbol] = current
+            self._cache_detail[symbol] = self._cache_detail.get(symbol, False) or detail
             self._last_polled[symbol] = self.clock()
+            self._failure_counts.pop(symbol, None)
+            self._retry_after.pop(symbol, None)
             self._publish(symbol, {"type": "snapshot", "data": current.as_public()})
             return current
 
@@ -298,20 +334,21 @@ class MarketDataBroker:
             watchlist_symbols.update(watchlist)
             detail_symbols.update(detail)
         market_open = self.is_market_open()
-        if not market_open:
-            self._closed_refresh_requests.intersection_update(
-                watchlist_symbols | detail_symbols
-            )
-            requested = set(self._closed_refresh_requests)
-            self._closed_refresh_requests.difference_update(requested)
-            for symbol in sorted(
-                requested,
-                key=lambda value: (value not in detail_symbols, value),
-            ):
+        semaphore = asyncio.Semaphore(self.max_concurrent_refreshes)
+
+        async def refresh_one(symbol: str, detail: bool) -> None:
+            async with semaphore:
                 try:
-                    await self.refresh(symbol, detail=symbol in detail_symbols)
+                    await self.refresh(symbol, detail=detail)
                 except Exception as error:
                     self._last_polled[symbol] = now
+                    failures = self._failure_counts.get(symbol, 0) + 1
+                    self._failure_counts[symbol] = failures
+                    self._retry_after[symbol] = now + min(
+                        30.0,
+                        max(self.detail_interval_seconds, self.watchlist_interval_seconds)
+                        * (2 ** min(failures - 1, 4)),
+                    )
                     error_code = fixed_market_error_code(error)
                     self._publish(
                         symbol,
@@ -322,28 +359,36 @@ class MarketDataBroker:
                             "error_code": error_code,
                         },
                     )
+
+        if not market_open:
+            self._closed_refresh_requests.intersection_update(
+                watchlist_symbols | detail_symbols
+            )
+            requested = set(self._closed_refresh_requests)
+            self._closed_refresh_requests.difference_update(requested)
+            tasks = [
+                refresh_one(symbol, symbol in detail_symbols)
+                for symbol in sorted(
+                requested,
+                key=lambda value: (value not in detail_symbols, value),
+                )
+            ]
+            if tasks:
+                await asyncio.gather(*tasks)
             return
         self._closed_refresh_requests.clear()
+        tasks: list[asyncio.Future | asyncio.Task] = []
         for symbol in sorted(watchlist_symbols | detail_symbols, key=lambda value: (value not in detail_symbols, value)):
             detail = symbol in detail_symbols
             interval = self.detail_interval_seconds if detail else self.watchlist_interval_seconds
             last = self._last_polled.get(symbol)
             if last is not None and now - last < interval:
                 continue
-            try:
-                await self.refresh(symbol, detail=detail)
-            except Exception as error:
-                self._last_polled[symbol] = now
-                error_code = fixed_market_error_code(error)
-                self._publish(
-                    symbol,
-                    {
-                        "type": "source_status",
-                        "symbol": symbol,
-                        "status": "OFFLINE",
-                        "error_code": error_code,
-                    },
-                )
+            if self._retry_after.get(symbol, 0.0) > now:
+                continue
+            tasks.append(asyncio.create_task(refresh_one(symbol, detail)))
+        if tasks:
+            await asyncio.gather(*tasks)
 
     async def series(
         self,

@@ -660,10 +660,10 @@ def create_production_app(
             if direct_core_source is not None
             else None
         ),
-        managed_resources=(
-            (direct_core_source,)
-            if direct_core_source is not None
-            else ()
+        managed_resources=tuple(
+            resource
+            for resource in (direct_core_source, parsed_value_source)
+            if resource is not None and callable(getattr(resource, "close", None))
         ),
         market_account_store=market_accounts,
         market_session_store=market_sessions,

@@ -144,9 +144,10 @@ export const marketApi = {
     { method: 'DELETE', headers: { 'X-CSRF-Token': readMarketCsrfToken() } },
   ),
   lookupSymbol: (symbol: string) => request<SymbolLookup>(`/api/v1/symbols/${encodeURIComponent(symbol)}`),
-  snapshot: (symbol: string) => request<MarketSnapshot>(`/api/v1/market/symbols/${encodeURIComponent(symbol)}/snapshot`),
-  series: (symbol: string, period: string) => request<MarketSeriesPage>(
+  snapshot: (symbol: string, signal?: AbortSignal) => request<MarketSnapshot>(`/api/v1/market/symbols/${encodeURIComponent(symbol)}/snapshot`, { signal }),
+  series: (symbol: string, period: string, signal?: AbortSignal) => request<MarketSeriesPage>(
     `/api/v1/market/symbols/${encodeURIComponent(symbol)}/series?period=${encodeURIComponent(period)}&limit=240`,
+    { signal },
   ),
 }
 

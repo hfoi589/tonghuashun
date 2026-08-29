@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta, timezone
+import json
 import sqlite3
 
 import pytest
@@ -6,6 +7,7 @@ import pytest
 from level2_service.market_accounts import (
     DuplicateUserError,
     InMemoryMarketSessionStore,
+    RedisMarketSessionStore,
     SQLiteMarketAccountStore,
 )
 from level2_service.parsed_values import SymbolLookup
@@ -261,4 +263,28 @@ def test_market_sessions_expire_and_can_be_revoked_per_user() -> None:
     assert sessions.get(first.session_id).user_id == 7
     sessions.revoke_user(7)
     assert sessions.get(first.session_id) is None
-    assert sessions.get(second.session_id) is None
+
+
+def test_redis_expired_session_is_removed_without_recursive_revoke() -> None:
+    class Client:
+        def __init__(self):
+            self.values = {}
+            self.sets = {}
+        def setex(self, key, _seconds, value): self.values[key] = value
+        def get(self, key): return self.values.get(key)
+        def delete(self, key): self.values.pop(key, None)
+        def sadd(self, key, value): self.sets.setdefault(key, set()).add(value)
+        def srem(self, key, value): self.sets.setdefault(key, set()).discard(value)
+        def smembers(self, key): return self.sets.get(key, set())
+
+    client = Client()
+    store = RedisMarketSessionStore(client, ttl=timedelta(seconds=1))
+    session = store.create(7)
+    client.values[store._key(session.session_id)] = json.dumps({
+        "user_id": 7,
+        "csrf_token": session.csrf_token,
+        "expires_at": "2020-01-01T00:00:00+00:00",
+    })
+
+    assert store.get(session.session_id) is None
+    assert session.session_id not in client.sets[store._user_key(7)]

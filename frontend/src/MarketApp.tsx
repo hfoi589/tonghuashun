@@ -539,31 +539,35 @@ export function MarketApp() {
   useEffect(() => {
     if (!selected || auth !== 'authenticated' || user?.must_change_password || connection === 'live') return
     let active = true
-    void marketApi.snapshot(selected).then((snapshot) => {
+    const controller = new AbortController()
+    void marketApi.snapshot(selected, controller.signal).then((snapshot) => {
       if (active) setSnapshots((current) => ({ ...current, [snapshot.symbol]: snapshot }))
-    }).catch((reason) => { if (active) setMessage(reason instanceof Error ? reason.message : '行情读取失败') })
-    return () => { active = false }
+    }).catch((reason) => { if (active && !controller.signal.aborted) setMessage(reason instanceof Error ? reason.message : '行情读取失败') })
+    return () => { active = false; controller.abort() }
   }, [auth, connection, selected, user?.must_change_password])
 
   useEffect(() => {
-    if (!selected || auth !== 'authenticated' || user?.must_change_password || requestedDailySeries.current.has(selected)) return
+    if (period !== 'day' || !selected || auth !== 'authenticated' || user?.must_change_password || requestedDailySeries.current.has(selected)) return
     requestedDailySeries.current.add(selected)
     const requestedSymbol = selected
+    const controller = new AbortController()
     setDailyLoading((current) => ({ ...current, [requestedSymbol]: true }))
     setDailyErrors((current) => {
       const next = { ...current }
       delete next[requestedSymbol]
       return next
     })
-    void marketApi.series(requestedSymbol, 'day').then((value) => {
+    void marketApi.series(requestedSymbol, 'day', controller.signal).then((value) => {
       setDailySeries((current) => ({ ...current, [requestedSymbol]: value }))
     }).catch((reason) => {
+      if (controller.signal.aborted) return
       requestedDailySeries.current.delete(requestedSymbol)
       setDailyErrors((current) => ({ ...current, [requestedSymbol]: reason instanceof Error ? reason.message : '日 K 读取失败' }))
     }).finally(() => {
       setDailyLoading((current) => ({ ...current, [requestedSymbol]: false }))
     })
-  }, [auth, dailyRetryVersion, selected, user?.must_change_password])
+    return () => controller.abort()
+  }, [auth, dailyRetryVersion, period, selected, user?.must_change_password])
 
   function retryDailySeries(symbol: string) {
     requestedDailySeries.current.delete(symbol)
@@ -586,8 +590,9 @@ export function MarketApp() {
       return
     }
     let active = true
-    void marketApi.series(selected, period).then((value) => { if (active) setLegacySeries(value) }).catch((reason) => { if (active) setMessage(reason instanceof Error ? reason.message : 'K 线读取失败') })
-    return () => { active = false }
+    const controller = new AbortController()
+    void marketApi.series(selected, period, controller.signal).then((value) => { if (active) setLegacySeries(value) }).catch((reason) => { if (active && !controller.signal.aborted) setMessage(reason instanceof Error ? reason.message : 'K 线读取失败') })
+    return () => { active = false; controller.abort() }
   }, [period, selected, selectedKlineAvailable])
 
   useEffect(() => {

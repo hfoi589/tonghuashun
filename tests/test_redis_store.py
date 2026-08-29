@@ -231,6 +231,27 @@ class FakeRedis:
     def eval(self, script, key_count, *values):
         keys = values[:key_count]
         args = values[key_count:]
+        if "THS_PERSIST_EVENT" in script:
+            task_key, event_stream = keys
+            payload, task_id, status, retention = args
+            previous = self.values.get(task_key)
+            self.set(task_key, payload)
+            try:
+                event_id = self.xadd(
+                    event_stream,
+                    {"event": "status", "task_id": task_id, "data": status},
+                )
+            except Exception:
+                if previous is None:
+                    self.values.pop(task_key, None)
+                else:
+                    self.values[task_key] = previous
+                raise
+            entries = self.streams.get(event_stream, [])
+            excess = len(entries) - int(retention)
+            if excess > 0:
+                self.xdel(event_stream, *(entry_id for entry_id, _ in entries[:excess]))
+            return event_id
         if "THS_ACQUIRE_DEPLOYMENT_LEASE" in script:
             lease_key, prefix, index_key = keys
             owner, owner_digest, ttl_ms = args
@@ -923,6 +944,65 @@ def test_redis_store_persists_state_and_claims_fifo_jobs_once() -> None:
     assert second.task_id == "second"
     assert store.get("first").status == TaskStatus.PARTIAL
     assert [event["data"] for event in store.events_after("first")] == ["QUEUED", "RUNNING", "PARTIAL"]
+
+
+def test_redis_events_accept_stream_cursor_and_limit_reads() -> None:
+    redis = FakeRedis()
+    store = RedisStreamsStore(redis, event_retention=20)
+    task = TaskRecord(task_id="cursor", symbol="600938")
+    store.enqueue(task)
+    store.next_queued()
+    store.transition(task.task_id, TaskStatus.WAITING_ADMIN)
+
+    events = store.events_after(task.task_id, "1", limit=1)
+
+    assert [event["data"] for event in events] == ["RUNNING"]
+
+
+def test_redis_events_after_cursor_returns_next_global_cursor() -> None:
+    redis = FakeRedis()
+    store = RedisStreamsStore(redis, event_retention=20)
+    first = TaskRecord(task_id="cursor-first", symbol="600938")
+    second = TaskRecord(task_id="cursor-second", symbol="000001")
+    store.enqueue(first)
+    store.enqueue(second)
+
+    events, cursor = store.events_after_cursor(first.task_id)
+
+    assert [event["data"] for event in events] == ["QUEUED"]
+    assert cursor == "2"
+    events, next_cursor = store.events_after_cursor(first.task_id, cursor)
+    assert events == []
+    assert next_cursor == cursor
+
+
+def test_redis_event_retention_bounds_stream_size() -> None:
+    redis = FakeRedis()
+    store = RedisStreamsStore(redis, event_retention=2)
+    for index in range(3):
+        task = TaskRecord(task_id=f"retention-{index}", symbol=f"6009{index:02d}")
+        store.enqueue(task)
+
+    assert len(redis.streams["ths:jobs:events"]) <= 2
+
+
+def test_redis_transition_persists_state_and_event_together() -> None:
+    class FailingEmitRedis(FakeRedis):
+        def xadd(self, key, fields):
+            if key == "ths:jobs:events" and fields.get("data") == "WAITING_ADMIN":
+                raise RuntimeError("event write failed")
+            return super().xadd(key, fields)
+
+    redis = FailingEmitRedis()
+    store = RedisStreamsStore(redis)
+    task = TaskRecord(task_id="atomic", symbol="600938")
+    store.enqueue(task)
+    store.next_queued()
+
+    with pytest.raises(RuntimeError, match="event write failed"):
+        store.transition(task.task_id, TaskStatus.WAITING_ADMIN)
+
+    assert store.get(task.task_id).status == TaskStatus.RUNNING
 
 
 def test_redis_restart_recovery_atomically_requeues_running_work_before_later_jobs() -> None:

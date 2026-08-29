@@ -472,11 +472,12 @@ describe('MarketApp', () => {
     expect(screen.getAllByRole('button', { name: /^(分时|日K|五日|周K|月K)$/ }).map((button) => button.textContent)).toEqual([
       '分时', '日K', '五日', '周K', '月K',
     ])
+    expect(fetchMock.mock.calls.filter(([url]) => String(url).includes('/series?period=day')).length).toBe(0)
+    await userEvent.click(await screen.findByRole('button', { name: '日K' }))
     await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(
       '/api/v1/market/symbols/601872/series?period=day&limit=240',
       expect.anything(),
     ))
-    await userEvent.click(screen.getByRole('button', { name: '日K' }))
     expect(await screen.findByRole('img', { name: '招商轮船前复权日K图' })).toBeInTheDocument()
     expect(screen.queryByRole('img', { name: 'MACD当日分时图' })).not.toBeInTheDocument()
     expect(screen.getByText('前复权')).toBeInTheDocument()
@@ -589,6 +590,7 @@ describe('MarketApp', () => {
 
   it('keeps a slow previous daily response from replacing the selected stock', async () => {
     let resolveFirstSeries: (response: Response) => void = () => undefined
+    let firstSeriesSignal: AbortSignal | null | undefined
     const firstSeries = new Promise<Response>((resolve) => { resolveFirstSeries = resolve })
     const seriesBody = (symbol: string) => ({
       symbol,
@@ -610,7 +612,7 @@ describe('MarketApp', () => {
       capabilities: { kline: { available: false }, daily_kline: { available: true, adjustment: 'qfq' } },
       source_errors: { core_metrics: null, main_fund_flow: null },
     })
-    const fetchMock = vi.fn((input: RequestInfo | URL): Promise<Response> => {
+    const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
       const url = String(input)
       if (url === '/api/v1/session') return Promise.resolve(jsonResponse({
         id: 7, username: 'wilson', enabled: true, must_change_password: false, created_at: '2026-08-23T00:00:00+00:00',
@@ -623,7 +625,10 @@ describe('MarketApp', () => {
       }] }))
       if (url.includes('/601872/snapshot')) return Promise.resolve(jsonResponse(snapshotBody('601872', '招商轮船')))
       if (url.includes('/600026/snapshot')) return Promise.resolve(jsonResponse(snapshotBody('600026', '中远海能')))
-      if (url.includes('/601872/series')) return firstSeries
+      if (url.includes('/601872/series')) {
+        firstSeriesSignal = init?.signal
+        return firstSeries
+      }
       if (url.includes('/600026/series')) return Promise.resolve(jsonResponse(seriesBody('600026')))
       return Promise.reject(new Error(`unexpected request: ${url}`))
     })
@@ -632,10 +637,13 @@ describe('MarketApp', () => {
 
     render(<MarketApp />)
 
+    await userEvent.click(await screen.findByRole('button', { name: '日K' }))
     await waitFor(() => expect(fetchMock.mock.calls.some(([url]) => String(url).includes('/601872/series'))).toBe(true))
     await userEvent.click(await screen.findByRole('button', { name: /中远海能/ }))
     await userEvent.click(screen.getByRole('button', { name: '日K' }))
+    await waitFor(() => expect(fetchMock.mock.calls.some(([url]) => String(url).includes('/600026/series'))).toBe(true))
     expect(await screen.findByRole('img', { name: '中远海能前复权日K图' })).toHaveTextContent('600026')
+    expect(firstSeriesSignal?.aborted).toBe(true)
 
     resolveFirstSeries(jsonResponse(seriesBody('601872')))
     await waitFor(() => expect(screen.getByRole('img', { name: '中远海能前复权日K图' })).toHaveTextContent('600026'))
@@ -678,8 +686,9 @@ describe('MarketApp', () => {
     render(<MarketApp />)
 
     await screen.findByRole('button', { name: /招商轮船/ })
-    await waitFor(() => expect(seriesCalls).toBe(1))
+    expect(seriesCalls).toBe(0)
     await userEvent.click(screen.getByRole('button', { name: '日K' }))
+    await waitFor(() => expect(seriesCalls).toBe(1))
     expect(await screen.findByText('日 K 加载失败')).toBeInTheDocument()
 
     await userEvent.click(screen.getByRole('button', { name: '重新加载日 K' }))

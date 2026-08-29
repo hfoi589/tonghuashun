@@ -167,15 +167,23 @@ class DualAccountParsedValueSource:
         *,
         symbol_source: Any | None = None,
         fund_market_interval_seconds: float = 15.0,
+        max_fund_market_cache_entries: int = 512,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
+        if not isinstance(max_fund_market_cache_entries, int) or max_fund_market_cache_entries <= 0:
+            raise ValueError("max_fund_market_cache_entries must be positive")
         self.core_source = core_source
         self.fund_source = fund_source
         self.symbol_source = symbol_source or core_source
         self.fund_market_interval_seconds = fund_market_interval_seconds
+        self.max_fund_market_cache_entries = max_fund_market_cache_entries
         self._market_clock = clock
         self._fund_market_cache: dict[str, tuple[dict[str, Any], str | None, float]] = {}
         self._fund_market_lock = RLock()
+        self._executor = ThreadPoolExecutor(
+            max_workers=4,
+            thread_name_prefix="ths-direct",
+        )
 
     def read(self, symbol: str) -> dict[MetricKind, str | None]:
         return self.core_source.read(symbol)
@@ -187,31 +195,32 @@ class DualAccountParsedValueSource:
         return self.symbol_source.search_symbols(query, limit)
 
     def read_direct(self, symbol: str) -> DirectReadOutcome:
-        with ThreadPoolExecutor(max_workers=2, thread_name_prefix="ths-direct") as executor:
-            core_future = executor.submit(self.core_source.read_direct, symbol)
-            fund_future = executor.submit(self.fund_source.read_direct, symbol)
-            try:
-                core_result = core_future.result()
-            except DirectRequestError as error:
-                raise DirectRequestError(
-                    sanitized_direct_error_code(
-                        error.error_code, "DIRECT_REQUEST_FAILED"
-                    )
-                ) from None
-            except Exception:
-                raise DirectRequestError("DIRECT_REQUEST_FAILED") from None
-
-            fund_error: str | None = None
-            try:
-                fund_result = fund_future.result()
-            except DirectRequestError as error:
-                fund_error = sanitized_direct_error_code(
-                    error.error_code, "DIRECT_FUND_FLOW_REQUEST_FAILED"
+        core_future = self._executor.submit(self.core_source.read_direct, symbol)
+        fund_future = self._executor.submit(self.fund_source.read_direct, symbol)
+        try:
+            core_result = core_future.result()
+        except DirectRequestError as error:
+            fund_future.cancel()
+            raise DirectRequestError(
+                sanitized_direct_error_code(
+                    error.error_code, "DIRECT_REQUEST_FAILED"
                 )
-                fund_result = {}
-            except Exception:
-                fund_error = "DIRECT_FUND_FLOW_REQUEST_FAILED"
-                fund_result = {}
+            ) from None
+        except Exception:
+            fund_future.cancel()
+            raise DirectRequestError("DIRECT_REQUEST_FAILED") from None
+
+        fund_error: str | None = None
+        try:
+            fund_result = fund_future.result()
+        except DirectRequestError as error:
+            fund_error = sanitized_direct_error_code(
+                error.error_code, "DIRECT_FUND_FLOW_REQUEST_FAILED"
+            )
+            fund_result = {}
+        except Exception:
+            fund_error = "DIRECT_FUND_FLOW_REQUEST_FAILED"
+            fund_result = {}
 
         if isinstance(core_result, DirectReadOutcome):
             core_values = core_result.values
@@ -250,27 +259,28 @@ class DualAccountParsedValueSource:
                     "main_fund_flow": None,
                 },
             )
-        with ThreadPoolExecutor(max_workers=2, thread_name_prefix="ths-market") as executor:
-            core_future = executor.submit(
-                self.core_source.read_market_snapshot,
-                symbol,
-                detail=detail,
-            )
-            fund_future = executor.submit(self._read_cached_fund_market, symbol)
-            try:
-                core = core_future.result()
-            except DirectRequestError as error:
-                raise DirectRequestError(
-                    sanitized_direct_error_code(
-                        error.error_code, "DIRECT_REQUEST_FAILED"
-                    )
-                ) from None
-            except Exception:
-                raise DirectRequestError("DIRECT_REQUEST_FAILED") from None
-            try:
-                main_fund_flow, fund_error = fund_future.result()
-            except Exception:
-                fund_error, main_fund_flow = "DIRECT_FUND_FLOW_REQUEST_FAILED", {}
+        core_future = self._executor.submit(
+            self.core_source.read_market_snapshot,
+            symbol,
+            detail=detail,
+        )
+        fund_future = self._executor.submit(self._read_cached_fund_market, symbol)
+        try:
+            core = core_future.result()
+        except DirectRequestError as error:
+            fund_future.cancel()
+            raise DirectRequestError(
+                sanitized_direct_error_code(
+                    error.error_code, "DIRECT_REQUEST_FAILED"
+                )
+            ) from None
+        except Exception:
+            fund_future.cancel()
+            raise DirectRequestError("DIRECT_REQUEST_FAILED") from None
+        try:
+            main_fund_flow, fund_error = fund_future.result()
+        except Exception:
+            fund_error, main_fund_flow = "DIRECT_FUND_FLOW_REQUEST_FAILED", {}
         return replace(
             core,
             main_fund_flow=main_fund_flow,
@@ -297,6 +307,8 @@ class DualAccountParsedValueSource:
             result = {}, "DIRECT_FUND_FLOW_REQUEST_FAILED"
         with self._fund_market_lock:
             self._fund_market_cache[symbol] = (result[0], result[1], now)
+            while len(self._fund_market_cache) > self.max_fund_market_cache_entries:
+                self._fund_market_cache.pop(next(iter(self._fund_market_cache)))
         return result
 
     def read_market_series(
@@ -307,6 +319,9 @@ class DualAccountParsedValueSource:
         limit: int,
     ) -> MarketSeriesPage:
         return self.core_source.read_market_series(symbol, period, cursor, limit)
+
+    def close(self) -> None:
+        self._executor.shutdown(wait=False, cancel_futures=True)
 
 
 class FridaParsedValueSource:

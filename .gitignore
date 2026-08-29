@@ -14,6 +14,8 @@ deploy/macos.env
 data/
 artifacts/
 .superpowers/
+.superpowers/sdd/
+graphify-out/
 .DS_Store
 .venv/
 __pycache__/

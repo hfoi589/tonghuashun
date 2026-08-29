@@ -628,6 +628,27 @@ def test_dual_account_source_queries_both_apps_in_parallel_and_merges_by_whiteli
     assert source.lookup_symbol("600938").name == "中国海油"
 
 
+def test_dual_account_core_failure_does_not_wait_for_slow_fund_future() -> None:
+    def fail_core(_symbol: str):
+        raise DirectRequestError("DIRECT_APP_OFFLINE")
+
+    def slow_fund(_symbol: str):
+        time.sleep(0.5)
+        return {}
+
+    source = DualAccountParsedValueSource(
+        types.SimpleNamespace(read_direct=fail_core),
+        types.SimpleNamespace(read_direct=slow_fund),
+    )
+    started = time.monotonic()
+
+    with pytest.raises(DirectRequestError, match="DIRECT_APP_OFFLINE"):
+        source.read_direct("600938")
+
+    assert time.monotonic() - started < 0.25
+    source.close()
+
+
 def test_dual_account_source_keeps_core_values_when_the_fund_interface_fails() -> None:
     core = types.SimpleNamespace(
         read_direct=lambda _symbol: {

@@ -557,13 +557,17 @@ class DirectEnrichedMarketDataSource:
         direct_source: object | None,
         *,
         ttl_seconds: float = 5.0,
+        max_cache_entries: int = 512,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         if ttl_seconds <= 0:
             raise ValueError("ttl_seconds must be positive")
+        if not isinstance(max_cache_entries, int) or max_cache_entries <= 0:
+            raise ValueError("max_cache_entries must be positive")
         self.base_source = base_source
         self.direct_source = direct_source
         self.ttl_seconds = ttl_seconds
+        self.max_cache_entries = max_cache_entries
         self.clock = clock
         self._lock = RLock()
         self._cache: dict[str, _EnrichmentEntry] = {}
@@ -610,6 +614,8 @@ class DirectEnrichedMarketDataSource:
                 )
         with self._lock:
             self._cache[symbol] = entry
+            while len(self._cache) > self.max_cache_entries:
+                self._cache.pop(next(iter(self._cache)))
         return entry
 
     @staticmethod

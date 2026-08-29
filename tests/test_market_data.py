@@ -1,6 +1,7 @@
 import asyncio
 from dataclasses import replace
 from datetime import datetime, timezone
+import time
 
 import pytest
 
@@ -138,6 +139,87 @@ def test_broker_coalesces_multiple_subscribers_and_prioritizes_detail_refresh() 
     asyncio.run(broker.poll_due())
     assert len(source.snapshot_calls) == 1
     now[0] += 0.1
+    asyncio.run(broker.poll_due())
+    assert len(source.snapshot_calls) == 2
+
+
+def test_detail_refresh_does_not_reuse_a_low_detail_snapshot() -> None:
+    class DetailAwareSource(FakeMarketSource):
+        def read_market_snapshot(self, symbol: str, *, detail: bool) -> MarketSnapshot:
+            return replace(
+                super().read_market_snapshot(symbol, detail=detail),
+                timeshare=(
+                    (TimesharePoint(time="09:30", price="19.42"),)
+                    if detail
+                    else ()
+                ),
+            )
+
+    source = DetailAwareSource()
+    broker = MarketDataBroker(source, clock=lambda: 100.0, is_market_open=lambda: True)
+    broker.subscribe("client", watchlist_symbols={"601872"}, detail_symbols=set())
+    asyncio.run(broker.refresh("601872", detail=False))
+    detail = asyncio.run(broker.refresh("601872", detail=True, max_age_seconds=10))
+
+    assert detail.timeshare
+    assert source.snapshot_calls == [("601872", False), ("601872", True)]
+
+
+def test_poll_due_refreshes_symbols_with_bounded_concurrency() -> None:
+    class SlowSource(FakeMarketSource):
+        def read_market_snapshot(self, symbol: str, *, detail: bool) -> MarketSnapshot:
+            time.sleep(0.05)
+            return super().read_market_snapshot(symbol, detail=detail)
+
+    source = SlowSource()
+    broker = MarketDataBroker(
+        source,
+        max_concurrent_refreshes=2,
+        clock=lambda: 100.0,
+        is_market_open=lambda: True,
+    )
+    broker.subscribe(
+        "client",
+        watchlist_symbols={"600000", "600001", "600002", "600003"},
+        detail_symbols=set(),
+    )
+    started = time.monotonic()
+    asyncio.run(broker.poll_due())
+
+    assert time.monotonic() - started < 0.18
+    assert len(source.snapshot_calls) == 4
+
+
+def test_unsubscribe_evicts_unreferenced_snapshot_state() -> None:
+    source = FakeMarketSource()
+    broker = MarketDataBroker(source, is_market_open=lambda: True)
+    broker.subscribe("client", watchlist_symbols={"601872"}, detail_symbols=set())
+    asyncio.run(broker.refresh("601872", detail=False))
+
+    broker.unsubscribe("client")
+
+    assert broker.cached_snapshot("601872") is None
+
+
+def test_poll_due_backs_off_after_repeated_source_failures() -> None:
+    class FailingSource(FakeMarketSource):
+        def read_market_snapshot(self, symbol: str, *, detail: bool) -> MarketSnapshot:
+            self.snapshot_calls.append((symbol, detail))
+            raise RuntimeError("MARKET_QUOTE_UNAVAILABLE")
+
+    source = FailingSource()
+    now = [100.0]
+    broker = MarketDataBroker(source, clock=lambda: now[0], is_market_open=lambda: True)
+    broker.subscribe("client", watchlist_symbols={"601872"}, detail_symbols=set())
+
+    asyncio.run(broker.poll_due())
+    now[0] += 1.0
+    asyncio.run(broker.poll_due())
+    assert len(source.snapshot_calls) == 1
+    now[0] += 1.0
+    asyncio.run(broker.poll_due())
+    assert len(source.snapshot_calls) == 2
+    now[0] += 2.0
     asyncio.run(broker.poll_due())
     assert len(source.snapshot_calls) == 2
 

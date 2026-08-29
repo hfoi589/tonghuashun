@@ -11,6 +11,7 @@ from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from threading import RLock
 from typing import Callable
 
 from argon2 import PasswordHasher
@@ -46,6 +47,8 @@ class AdminSessionManager:
         self._persist_password_hash = persist_password_hash
         self._sessions: dict[str, AdminSession] = {}
         self._login_failures: dict[str, deque[datetime]] = {}
+        self._lock = RLock()
+        self._max_sessions = 2048
         self.login_failure_limit = 5
         self.login_failure_window = timedelta(minutes=1)
 
@@ -66,7 +69,12 @@ class AdminSessionManager:
             csrf_token=secrets.token_urlsafe(32),
             expires_at=_now() + self.session_ttl,
         )
-        self._sessions[session.session_id] = session
+        with self._lock:
+            self._prune_locked()
+            self._sessions[session.session_id] = session
+            if len(self._sessions) > self._max_sessions:
+                oldest = min(self._sessions.values(), key=lambda item: item.expires_at)
+                self._sessions.pop(oldest.session_id, None)
         return session
 
     def change_password(self, current_password: str, new_password: str) -> bool:
@@ -82,42 +90,51 @@ class AdminSessionManager:
         if self._persist_password_hash is not None:
             self._persist_password_hash(replacement)
         self.password_hash = replacement
-        self._sessions.clear()
-        self._login_failures.clear()
+        with self._lock:
+            self._sessions.clear()
+            self._login_failures.clear()
         return True
 
     def login_allowed(self, identifier: str) -> bool:
         now = _now()
-        failures = self._login_failures.get(identifier)
-        if failures is None:
-            return True
-        cutoff = now - self.login_failure_window
-        while failures and failures[0] <= cutoff:
-            failures.popleft()
-        if not failures:
-            self._login_failures.pop(identifier, None)
-            return True
-        return len(failures) < self.login_failure_limit
+        with self._lock:
+            self._prune_locked(now)
+            failures = self._login_failures.get(identifier)
+            if failures is None:
+                return True
+            now = _now()
+            cutoff = now - self.login_failure_window
+            while failures and failures[0] <= cutoff:
+                failures.popleft()
+            if not failures:
+                self._login_failures.pop(identifier, None)
+                return True
+            return len(failures) < self.login_failure_limit
 
     def record_login_failure(self, identifier: str) -> None:
         self.login_allowed(identifier)
-        self._login_failures.setdefault(identifier, deque()).append(_now())
+        with self._lock:
+            self._login_failures.setdefault(identifier, deque()).append(_now())
 
     def record_login_success(self, identifier: str) -> None:
-        self._login_failures.pop(identifier, None)
+        with self._lock:
+            self._login_failures.pop(identifier, None)
 
     def valid_session(self, session_id: str | None) -> AdminSession | None:
         if not session_id:
             return None
-        session = self._sessions.get(session_id)
-        if session is None or not self._valid_session_id(session_id) or session.expires_at <= _now():
-            self._sessions.pop(session_id, None)
-            return None
-        return session
+        with self._lock:
+            self._prune_locked()
+            session = self._sessions.get(session_id)
+            if session is None or not self._valid_session_id(session_id) or session.expires_at <= _now():
+                self._sessions.pop(session_id, None)
+                return None
+            return session
 
     def revoke(self, session_id: str | None) -> None:
         if session_id:
-            self._sessions.pop(session_id, None)
+            with self._lock:
+                self._sessions.pop(session_id, None)
 
     def _new_session_id(self) -> str:
         nonce = secrets.token_urlsafe(32)
@@ -125,6 +142,25 @@ class AdminSessionManager:
             return nonce
         signature = hmac.new(self._session_secret, nonce.encode("ascii"), hashlib.sha256).hexdigest()
         return f"{nonce}.{signature}"
+
+    def _prune_locked(self, now: datetime | None = None) -> None:
+        current = now or _now()
+        expired = [
+            session_id
+            for session_id, session in self._sessions.items()
+            if session.expires_at <= current
+        ]
+        for session_id in expired:
+            self._sessions.pop(session_id, None)
+        cutoff = current - self.login_failure_window
+        stale_identifiers = []
+        for identifier, failures in self._login_failures.items():
+            while failures and failures[0] <= cutoff:
+                failures.popleft()
+            if not failures:
+                stale_identifiers.append(identifier)
+        for identifier in stale_identifiers:
+            self._login_failures.pop(identifier, None)
 
     def _valid_session_id(self, session_id: str) -> bool:
         if self._session_secret is None:

@@ -996,16 +996,20 @@ class FundFlowHttpClient:
         requester: HttpRequester = _urllib_request,
         timeout_seconds: float = 10.0,
         minimum_interval_seconds: float = 15.0,
+        max_cache_entries: int = 512,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         if timeout_seconds <= 0:
             raise ValueError("timeout_seconds must be positive")
         if minimum_interval_seconds < 0:
             raise ValueError("minimum_interval_seconds must not be negative")
+        if not isinstance(max_cache_entries, int) or max_cache_entries <= 0:
+            raise ValueError("max_cache_entries must be positive")
         self.session_provider = session_provider
         self.requester = requester
         self.timeout_seconds = timeout_seconds
         self.minimum_interval_seconds = minimum_interval_seconds
+        self.max_cache_entries = max_cache_entries
         self.clock = clock
         self._cache: dict[str, tuple[DirectReadOutcome, float]] = {}
         self._lock = RLock()
@@ -1164,6 +1168,8 @@ class FundFlowHttpClient:
                 return cached[0]
             outcome = self._read_uncached(symbol, market)
             self._cache[symbol] = (outcome, now)
+            while len(self._cache) > self.max_cache_entries:
+                self._cache.pop(next(iter(self._cache)))
             return outcome
 
     def read(self, symbol: str) -> dict[MetricKind, str | None]:

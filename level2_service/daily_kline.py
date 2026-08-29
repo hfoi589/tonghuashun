@@ -368,13 +368,17 @@ class DailyKlineMarketDataSource:
         is_market_open: Callable[[], bool] = lambda: False,
         open_cache_seconds: float = 60.0,
         closed_cache_seconds: float = 15 * 60.0,
+        max_cache_entries: int = 512,
     ) -> None:
+        if not isinstance(max_cache_entries, int) or max_cache_entries <= 0:
+            raise ValueError("max_cache_entries must be positive")
         self.base_source = base_source
         self.public_provider = public_provider
         self.clock = clock
         self.is_market_open = is_market_open
         self.open_cache_seconds = open_cache_seconds
         self.closed_cache_seconds = closed_cache_seconds
+        self.max_cache_entries = max_cache_entries
         self._cache: dict[tuple[str, str], _DailyCacheEntry] = {}
         self._locks: dict[tuple[str, str], threading.Lock] = {}
         self._state_lock = threading.RLock()
@@ -517,6 +521,8 @@ class DailyKlineMarketDataSource:
             if entry is not None:
                 with self._state_lock:
                     self._cache[key] = entry
+                    while len(self._cache) > self.max_cache_entries:
+                        self._cache.pop(next(iter(self._cache)))
                 return self._page(
                     symbol,
                     period,

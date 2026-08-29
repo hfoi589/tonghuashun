@@ -275,10 +275,11 @@ class SQLiteMarketAccountStore:
 
     def reset_password(self, user_id: int, temporary_password: str) -> MarketUser:
         password = self._password(temporary_password)
+        password_hash = self._hasher.hash(password)
         with self._lock, self._connection:
             cursor = self._connection.execute(
                 "UPDATE market_users SET password_hash=?,must_change_password=1 WHERE id=?",
-                (self._hasher.hash(password), user_id),
+                (password_hash, user_id),
             )
             if cursor.rowcount != 1:
                 raise LookupError("market user not found")
@@ -297,33 +298,45 @@ class SQLiteMarketAccountStore:
     def list_watchlists(self, user_id: int) -> list[WatchlistGroup]:
         self.get_user(user_id)
         with self._lock:
-            groups = self._connection.execute(
-                "SELECT id,name,sort_order,is_primary FROM watchlist_groups WHERE user_id=? ORDER BY sort_order,id",
+            rows = self._connection.execute(
+                """SELECT g.id,g.name,g.sort_order,g.is_primary,
+                          i.symbol,i.name AS item_name,i.market,i.sort_order AS item_order
+                   FROM watchlist_groups g
+                   LEFT JOIN watchlist_items i ON i.group_id=g.id
+                   WHERE g.user_id=?
+                   ORDER BY g.sort_order,g.id,i.sort_order,i.symbol""",
                 (user_id,),
             ).fetchall()
-            result: list[WatchlistGroup] = []
-            for group in groups:
-                rows = self._connection.execute(
-                    "SELECT symbol,name,market FROM watchlist_items WHERE group_id=? ORDER BY sort_order,symbol",
-                    (group["id"],),
-                ).fetchall()
-                result.append(
-                    WatchlistGroup(
-                        id=int(group["id"]),
-                        name=str(group["name"]),
-                        sort_order=int(group["sort_order"]),
-                        is_primary=bool(group["is_primary"]),
-                        items=tuple(
-                            WatchlistItem(
-                                symbol=str(row["symbol"]),
-                                name=str(row["name"]),
-                                market=str(row["market"]),
-                            )
-                            for row in rows
-                        ),
+        groups: dict[int, dict[str, object]] = {}
+        for row in rows:
+            group_id = int(row["id"])
+            group = groups.setdefault(
+                group_id,
+                {
+                    "name": str(row["name"]),
+                    "sort_order": int(row["sort_order"]),
+                    "is_primary": bool(row["is_primary"]),
+                    "items": [],
+                },
+            )
+            if row["symbol"] is not None:
+                group["items"].append(
+                    WatchlistItem(
+                        symbol=str(row["symbol"]),
+                        name=str(row["item_name"]),
+                        market=str(row["market"]),
                     )
                 )
-        return result
+        return [
+            WatchlistGroup(
+                id=group_id,
+                name=str(value["name"]),
+                sort_order=int(value["sort_order"]),
+                is_primary=bool(value["is_primary"]),
+                items=tuple(value["items"]),
+            )
+            for group_id, value in groups.items()
+        ]
 
     def _owned_group(self, user_id: int, group_id: int) -> sqlite3.Row:
         row = self._connection.execute(
@@ -632,18 +645,22 @@ class RedisMarketSessionStore:
             expires_at=_utc_now() + self.ttl,
         )
         seconds = max(1, round(self.ttl.total_seconds()))
-        self.client.setex(
-            self._key(session.session_id),
-            seconds,
-            json.dumps(
-                {
-                    "user_id": user_id,
-                    "csrf_token": session.csrf_token,
-                    "expires_at": session.expires_at.isoformat(),
-                }
-            ),
+        payload = json.dumps(
+            {
+                "user_id": user_id,
+                "csrf_token": session.csrf_token,
+                "expires_at": session.expires_at.isoformat(),
+            }
         )
-        self.client.sadd(self._user_key(user_id), session.session_id)
+        pipeline_factory = getattr(self.client, "pipeline", None)
+        if callable(pipeline_factory):
+            with pipeline_factory(transaction=True) as pipeline:
+                pipeline.setex(self._key(session.session_id), seconds, payload)
+                pipeline.sadd(self._user_key(user_id), session.session_id)
+                pipeline.execute()
+        else:
+            self.client.setex(self._key(session.session_id), seconds, payload)
+            self.client.sadd(self._user_key(user_id), session.session_id)
         return session
 
     @staticmethod
@@ -668,16 +685,37 @@ class RedisMarketSessionStore:
             self.client.delete(self._key(session_id))
             return None
         if session.expires_at <= _utc_now():
-            self.revoke(session_id)
+            # Expiry is handled inline instead of calling revoke(), which would
+            # re-enter get() and recurse forever for an already-expired payload.
+            self._delete_session(session.session_id, session.user_id)
             return None
         return session
 
     def revoke(self, session_id: str | None) -> None:
-        session = self.get(session_id) if session_id else None
-        if session_id:
-            self.client.delete(self._key(session_id))
-        if session is not None:
-            self.client.srem(self._user_key(session.user_id), session.session_id)
+        if not session_id:
+            return
+        raw = self.client.get(self._key(session_id))
+        user_id = None
+        if raw is not None:
+            try:
+                user_id = int(json.loads(self._text(raw))["user_id"])
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                pass
+        self._delete_session(session_id, user_id)
+
+    def _delete_session(self, session_id: str, user_id: int | None) -> None:
+        """Delete payload and reverse-index membership as one logical operation."""
+        pipeline_factory = getattr(self.client, "pipeline", None)
+        if callable(pipeline_factory):
+            with pipeline_factory(transaction=True) as pipeline:
+                pipeline.delete(self._key(session_id))
+                if user_id is not None:
+                    pipeline.srem(self._user_key(user_id), session_id)
+                pipeline.execute()
+            return
+        self.client.delete(self._key(session_id))
+        if user_id is not None:
+            self.client.srem(self._user_key(user_id), session_id)
 
     def revoke_user(self, user_id: int) -> None:
         key = self._user_key(user_id)

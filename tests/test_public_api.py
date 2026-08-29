@@ -127,6 +127,19 @@ def test_public_submission_accepts_a_six_digit_a_share_symbol() -> None:
     assert body["captures"][0]["expires_at"] is None
 
 
+def test_task_events_response_disables_proxy_buffering_and_uses_safe_cache_headers() -> None:
+    store = InMemoryStreams()
+    client = TestClient(create_app(store=store))
+    response = client.get("/api/v1/jobs/missing/events")
+    assert response.status_code == 404
+
+    queued = client.post("/api/v1/jobs", json={"symbol": "600938"}).json()
+    response = client.get(f"/api/v1/jobs/{queued['public_id']}/events", params={"once": "true"})
+    assert response.status_code == 200
+    assert response.headers["cache-control"] == "no-cache"
+    assert response.headers["x-accel-buffering"] == "no"
+
+
 def test_public_submission_can_skip_the_long_capture() -> None:
     """A data-only request must remain distinguishable after it enters the queue."""
     store = InMemoryStreams()

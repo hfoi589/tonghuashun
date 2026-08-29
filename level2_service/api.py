@@ -363,10 +363,10 @@ def create_app(
                     prewarm()
                 except Exception:
                     pass
-        app.state.store.recover_running()
+        await to_thread(app.state.store.recover_running)
         deduplicate = getattr(app.state.store, "deduplicate_by_symbol", None)
         app.state.task_migration = (
-            deduplicate()
+            await to_thread(deduplicate)
             if callable(deduplicate)
             else {"total": 0, "kept": 0, "deleted": 0, "aliases": 0}
         )
@@ -380,7 +380,10 @@ def create_app(
 
         async def retention_loop() -> None:
             while not stop.is_set():
-                app.state.store.cleanup(utc_now())
+                try:
+                    await to_thread(app.state.store.cleanup, utc_now())
+                except Exception:
+                    logger.exception("task retention cleanup failed")
                 try:
                     await wait_for(stop.wait(), timeout=cleanup_interval_seconds)
                 except TimeoutError:
@@ -788,15 +791,36 @@ def create_app(
 
     @app.get("/api/v1/jobs/{public_id}/events")
     async def task_events(public_id: str, request: Request, after: int = 0, once: bool = False):
-        task = app.state.store.get(public_id)
+        task = await to_thread(app.state.store.get, public_id)
         if task is None:
             raise HTTPException(status_code=404, detail="task not found")
         canonical_id = task.task_id
 
         async def event_stream() -> AsyncIterator[str]:
+            cursor_reader = getattr(app.state.store, "events_after_cursor", None)
+            if callable(cursor_reader):
+                cursor: str | None = None
+                while not await request.is_disconnected():
+                    events, cursor = await to_thread(
+                        cursor_reader,
+                        canonical_id,
+                        cursor,
+                    )
+                    for event in events:
+                        payload = json.dumps(
+                            {"public_id": canonical_id, "status": event["data"]}
+                        )
+                        yield f"id: {event['id']}\nevent: {event['event']}\ndata: {payload}\n\n"
+                    if once:
+                        return
+                    if not events:
+                        yield ": keepalive\n\n"
+                    await sleep(1)
+                return
+
             event_index = after
             while not await request.is_disconnected():
-                events = app.state.store.events_after(canonical_id, event_index)
+                events = await to_thread(app.state.store.events_after, canonical_id, event_index)
                 for event in events:
                     payload = json.dumps({"public_id": canonical_id, "status": event["data"]})
                     yield f"event: {event['event']}\ndata: {payload}\n\n"
@@ -807,7 +831,11 @@ def create_app(
                     yield ": keepalive\n\n"
                 await sleep(1)
 
-        return StreamingResponse(event_stream(), media_type="text/event-stream")
+        return StreamingResponse(
+            event_stream(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
 
     @app.post("/api/admin/session", status_code=204)
     def admin_login(payload: LoginRequest, request: Request, response: Response) -> None:

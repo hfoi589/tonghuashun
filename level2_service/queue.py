@@ -129,6 +129,7 @@ class TaskStore(Protocol):
     def find_by_symbol(self, symbol: str) -> TaskRecord | None: ...
     def deduplicate_by_symbol(self) -> dict[str, int]: ...
     def queue_position(self, task_id: str) -> int | None: ...
+    def active_count(self) -> int: ...
     def next_queued(self) -> TaskRecord | None: ...
     def next_runnable(self) -> TaskRecord | None: ...
     def recover_running(self) -> list[TaskRecord]: ...
@@ -875,6 +876,15 @@ class RedisStreamsStore:
     """Redis-backed TaskStore using a stream for events and Lua for FIFO claims."""
 
     _REQUIRED_CLIENT_METHODS = ("delete", "eval", "get", "hdel", "hget", "hgetall", "hset", "lrange", "lrem", "rpush", "sadd", "set", "smembers", "srem", "xadd", "xdel", "xrange")
+    _PERSIST_EVENT_SCRIPT = """
+-- THS_PERSIST_EVENT
+redis.call('SET', KEYS[1], ARGV[1])
+local id = redis.call('XADD', KEYS[2], '*', 'event', 'status', 'task_id', ARGV[2], 'data', ARGV[3])
+if tonumber(ARGV[4]) and tonumber(ARGV[4]) > 0 then
+  redis.call('XTRIM', KEYS[2], 'MAXLEN', '~', tonumber(ARGV[4]))
+end
+return id
+"""
     _ENQUEUE_SCRIPT = """
 -- THS_ENQUEUE
 local pending = 0
@@ -1429,13 +1439,14 @@ redis.call('XADD', KEYS[3], '*', 'event', 'status', 'task_id', ARGV[1], 'data', 
 return ARGV[2]
 """
 
-    def __init__(self, client: object, stream: str = "ths:jobs", pending_cap: int = 200, capture_root: Path | None = None) -> None:
+    def __init__(self, client: object, stream: str = "ths:jobs", pending_cap: int = 200, capture_root: Path | None = None, event_retention: int = 1000) -> None:
         missing = [name for name in self._REQUIRED_CLIENT_METHODS if not callable(getattr(client, name, None))]
         if missing:
             raise TypeError(f"RedisStreamsStore requires redis client methods: {', '.join(missing)}")
         self.client = client
         self.stream = stream
         self.pending_cap = pending_cap
+        self.event_retention = max(1, int(event_retention))
         self.capture_root = capture_root.resolve() if capture_root else None
         self._queue_key = f"{stream}:pending"
         self._index_key = f"{stream}:tasks"
@@ -1444,6 +1455,7 @@ return ARGV[2]
         self._symbol_index_key = f"{stream}:symbols"
         self._alias_key = f"{stream}:aliases"
         self._deployment_lease_key = f"{stream}:deployment-maintenance"
+        self._active_count_key = f"{stream}:active-count"
 
     def set_capture_root(self, capture_root: Path) -> None:
         self.capture_root = capture_root.resolve()
@@ -1468,6 +1480,7 @@ return ARGV[2]
         )
         if not accepted:
             raise QueueFullError("global pending queue cap reached")
+        self._trim_events()
 
     def submit_or_refresh(self, task: TaskRecord) -> TaskRecord:
         if _has_maintenance_metadata(task):
@@ -1494,6 +1507,7 @@ return ARGV[2]
             raise QueueFullError("global pending queue cap reached")
         if not payload:
             raise RuntimeError("task submission failed")
+        self._trim_events()
         return self._deserialize(payload)
 
     def get(self, task_id: str) -> TaskRecord | None:
@@ -1639,6 +1653,13 @@ return ARGV[2]
                 return position
         return None
 
+    def active_count(self) -> int:
+        raw = self.client.get(self._active_count_key)
+        try:
+            return max(0, int(self._text(raw))) if raw is not None else self._sync_active_count()
+        except (TypeError, ValueError):
+            return self._sync_active_count()
+
     def next_queued(self) -> TaskRecord | None:
         return self.next_runnable()
 
@@ -1652,6 +1673,7 @@ return ARGV[2]
             self._deployment_lease_key,
             utc_now().isoformat(),
         )
+        self._trim_events()
         return self._deserialize(payload) if payload else None
 
     def recover_running(self) -> list[TaskRecord]:
@@ -1664,6 +1686,7 @@ return ARGV[2]
             self._event_stream,
             utc_now().isoformat(),
         )
+        self._trim_events()
         return [self._deserialize(payload) for payload in (payloads or [])]
 
     def has_running_task(self) -> bool:
@@ -1813,6 +1836,7 @@ return ARGV[2]
         if marker == "MAINTENANCE":
             raise InvalidTransitionError("maintenance task cannot be requeued")
         if payload:
+            self._trim_events()
             return self._deserialize(payload)
         task = self._required(task_id)
         if task.status == TaskStatus.QUEUED:
@@ -1834,6 +1858,7 @@ return ARGV[2]
         if marker == "MAINTENANCE":
             raise InvalidTransitionError("maintenance task cannot be retried")
         if payload:
+            self._trim_events()
             return self._deserialize(payload)
         task = self._required(task_id)
         if task.status == TaskStatus.QUEUED:
@@ -1869,6 +1894,7 @@ return ARGV[2]
         if marker == "MAINTENANCE":
             raise InvalidTransitionError("maintenance task cannot be refreshed")
         if payload:
+            self._trim_events()
             return self._deserialize(payload)
         current = self._required(task_id)
         if current.status in _ACTIVE_STATUSES:
@@ -1886,8 +1912,7 @@ return ARGV[2]
         task.updated_at = utc_now()
         if status in {TaskStatus.COMPLETED, TaskStatus.FAILED}:
             task.completed_at = task.updated_at
-        self._save(task)
-        self._emit(task)
+        self._persist_with_event(task)
         return task
 
     def complete_capture(self, task_id: str, kind: CaptureKind, path: str) -> TaskRecord:
@@ -1903,8 +1928,7 @@ return ARGV[2]
         task.status = TaskStatus.COMPLETED if ready == len(CaptureKind) else TaskStatus.PARTIAL
         if task.status == TaskStatus.COMPLETED:
             task.completed_at = task.updated_at
-        self._save(task)
-        self._emit(task)
+        self._persist_with_event(task)
         return task
 
     def complete_result(self, task_id: str, values: dict[MetricKind, str | None], path: str | None, *, ocr_metrics: set[MetricKind] | None = None, source_errors: dict[str, str | None] | None = None, intraday_series: dict[MetricKind, dict[str, object]] | None = None) -> TaskRecord:
@@ -1955,18 +1979,62 @@ return ARGV[2]
             else fund_error if required_complete else "VALUE_RECOGNITION_FAILED"
         )
         task.completed_at = task.updated_at
-        self._save(task)
-        self._emit(task)
+        self._persist_with_event(task)
         return task
 
-    def events_after(self, task_id: str, event_index: int = 0) -> list[dict[str, str]]:
+    def events_after(self, task_id: str, event_index: int | str = 0, *, limit: int | None = None) -> list[dict[str, str]]:
         task_id = self.resolve_task_id(task_id)
         events: list[dict[str, str]] = []
-        for _, fields in self.client.xrange(self._event_stream, "-", "+"):
+        cursor_mode = isinstance(event_index, str)
+        cursor = str(event_index) if cursor_mode else None
+        start = "-" if not cursor_mode else f"({cursor}"
+        for entry_id, fields in self.client.xrange(self._event_stream, start, "+"):
             normalized = {self._text(key): self._text(value) for key, value in fields.items()}
+            normalized_id = self._text(entry_id)
+            if cursor_mode and self._stream_id_leq(normalized_id, cursor):
+                continue
             if normalized.get("task_id") == task_id:
                 events.append({"event": normalized["event"], "data": normalized["data"]})
-        return events[event_index:]
+                if limit is not None and len(events) >= max(0, int(limit)):
+                    break
+        if cursor_mode:
+            return events
+        return events[int(event_index):] if limit is None else events[int(event_index): int(event_index) + max(0, int(limit))]
+
+    def events_after_cursor(
+        self,
+        task_id: str,
+        cursor: str | None = None,
+        *,
+        limit: int = 100,
+    ) -> tuple[list[dict[str, str]], str | None]:
+        """Read the bounded event stream incrementally using Redis stream IDs."""
+        task_id = self.resolve_task_id(task_id)
+        safe_limit = max(1, min(int(limit), 500))
+        start = "-" if cursor is None else f"({cursor}"
+        events: list[dict[str, str]] = []
+        next_cursor = cursor
+        for entry_id, fields in self.client.xrange(self._event_stream, start, "+"):
+            normalized_id = self._text(entry_id)
+            next_cursor = normalized_id
+            if cursor is not None and self._stream_id_leq(normalized_id, cursor):
+                continue
+            normalized = {
+                self._text(key): self._text(value)
+                for key, value in fields.items()
+            }
+            if normalized.get("task_id") != task_id:
+                continue
+            events.append(
+                {
+                    "id": normalized_id,
+                    "event": normalized["event"],
+                    "data": normalized["data"],
+                }
+            )
+            if len(events) >= safe_limit:
+                break
+        return events, next_cursor
 
     def cleanup(self, now: datetime) -> list[TaskRecord]:
         removed: list[TaskRecord] = []
@@ -2028,6 +2096,58 @@ return ARGV[2]
 
     def _emit(self, task: TaskRecord) -> None:
         self.client.xadd(self._event_stream, {"event": "status", "task_id": task.task_id, "data": task.status.value})
+        self._trim_events()
+
+    def _persist_with_event(self, task: TaskRecord) -> None:
+        self.client.eval(
+            self._PERSIST_EVENT_SCRIPT,
+            2,
+            self._key(task.task_id),
+            self._event_stream,
+            self._serialize(task),
+            task.task_id,
+            task.status.value,
+            self.event_retention,
+        )
+
+    @staticmethod
+    def _stream_id_leq(left: str, right: str) -> bool:
+        def parts(value: str) -> tuple[int, int]:
+            raw = value.split("-", 1)
+            return int(raw[0]), int(raw[1]) if len(raw) == 2 else 0
+        try:
+            return parts(left) <= parts(right)
+        except ValueError:
+            return left <= right
+
+    def _trim_events(self) -> None:
+        """Keep the event stream bounded without scanning Redis in production."""
+        xtrim = getattr(self.client, "xtrim", None)
+        if callable(xtrim):
+            try:
+                xtrim(self._event_stream, maxlen=self.event_retention, approximate=True)
+                return
+            except (TypeError, AttributeError):
+                pass
+        entries = list(self.client.xrange(self._event_stream, "-", "+"))
+        excess = len(entries) - self.event_retention
+        if excess > 0:
+            self.client.xdel(self._event_stream, *(entry_id for entry_id, _ in entries[:excess]))
+
+    def _sync_active_count(self) -> int:
+        count = 0
+        for raw_task_id in self.client.smembers(self._index_key):
+            payload = self.client.get(self._key(self._text(raw_task_id)))
+            if not payload:
+                continue
+            try:
+                task = self._deserialize(payload)
+            except (KeyError, TypeError, ValueError):
+                continue
+            if task.status in _ACTIVE_STATUSES:
+                count += 1
+        self.client.set(self._active_count_key, str(count))
+        return count
 
     def _unlink_capture(self, capture: CaptureRecord | LongCaptureRecord) -> None:
         if capture.path is None or self.capture_root is None:

@@ -598,12 +598,12 @@ def install_market_routes(
                             "detail": next(iter(detail), None),
                         }
                     )
-                    broker.subscribe(
+                    detail_refresh = broker.subscribe(
                         client_id,
                         watchlist_symbols=watchlist,
                         detail_symbols=detail,
                     )
-                    for detail_symbol in detail:
+                    for detail_symbol in detail_refresh:
                         await broker.refresh(detail_symbol, detail=True, max_age_seconds=1.5)
                 elif event is not None and event in done:
                     await websocket.send_json(event.result())

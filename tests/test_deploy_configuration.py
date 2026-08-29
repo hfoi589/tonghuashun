@@ -172,7 +172,7 @@ def test_compose_publishes_only_the_fastapi_frontend_and_api() -> None:
     assert api["environment"]["SYMBOL_CATALOG_REFRESH_MINUTE"] == "20"
     assert api["environment"]["PUBLIC_MARKET_TIMEOUT_SECONDS"] == "8"
     assert api["environment"]["MARKET_DIRECT_ENRICHMENT"] == "1"
-    assert api["environment"]["MARKET_DIRECT_ENRICHMENT_TTL_SECONDS"] == "15"
+    assert api["environment"]["MARKET_DIRECT_ENRICHMENT_TTL_SECONDS"] == "5"
     assert api["environment"]["CORE_WARM_CONNECTION_MAX_IDLE_SECONDS"] == "25"
 
 

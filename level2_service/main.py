@@ -198,7 +198,7 @@ class DeploymentSettings:
         for name, default in (
             ("SYMBOL_CATALOG_MAX_AGE_SECONDS", "604800"),
             ("PUBLIC_MARKET_TIMEOUT_SECONDS", "8"),
-            ("MARKET_DIRECT_ENRICHMENT_TTL_SECONDS", "15"),
+            ("MARKET_DIRECT_ENRICHMENT_TTL_SECONDS", "5"),
             ("CORE_WARM_CONNECTION_MAX_IDLE_SECONDS", "25"),
         ):
             try:

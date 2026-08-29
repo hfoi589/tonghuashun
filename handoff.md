@@ -135,6 +135,10 @@ Redis 仍是持久 FIFO 权威，`RUNNER_POLL_INTERVAL_SECONDS` 只作为外部 
   三列累计量；统一换算为分钟增量和股。
 - 腾讯失败时使用新浪 `hq.sinajs.cn` 基础报价；没有分时时明确标记能力缺失。
 - 股票价格通常两位，沪深基金三位。
+- 工作日 09:10–11:30、13:00–15:00 的报价刷新窗口内，选中和未选中股票均按
+  2 秒调度；09:10–09:30 若公开接口没有分时点，只保留实际返回的报价。
+- 休市期间不做后台定时轮询；进入自选页面读取整份自选一次，切换详情只读取被点击股票。
+- 未选中股票仅使用轻量公开报价；大单、散户、MACDFS、资金流和 L2 分时只为当前详情股票读取。
 
 ### K 线
 
@@ -147,7 +151,7 @@ Redis 仍是持久 FIFO 权威，`RUNNER_POLL_INTERVAL_SECONDS` 只作为外部 
 ### 可选 L2 增强
 
 只有 `CORE_METRICS_TRANSPORT=direct`、`FUND_FLOW_TRANSPORT=direct` 且
-`MARKET_DIRECT_ENRICHMENT=1` 时启用。每股票 15 秒缓存，只合并：
+`MARKET_DIRECT_ENRICHMENT=1` 时启用。每股票 5 秒缓存，只合并：
 
 - 大单净量/金额；
 - 散户数量；
@@ -182,7 +186,7 @@ SYMBOL_CATALOG_REFRESH_HOUR=16
 SYMBOL_CATALOG_REFRESH_MINUTE=20
 PUBLIC_MARKET_TIMEOUT_SECONDS=8
 MARKET_DIRECT_ENRICHMENT=1
-MARKET_DIRECT_ENRICHMENT_TTL_SECONDS=15
+MARKET_DIRECT_ENRICHMENT_TTL_SECONDS=5
 CORE_WARM_CONNECTION_MAX_IDLE_SECONDS=25
 ```
 

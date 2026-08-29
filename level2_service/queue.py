@@ -879,30 +879,34 @@ class RedisStreamsStore:
     _PERSIST_EVENT_SCRIPT = """
 -- THS_PERSIST_EVENT
 redis.call('SET', KEYS[1], ARGV[1])
-local id = redis.call('XADD', KEYS[2], '*', 'event', 'status', 'task_id', ARGV[2], 'data', ARGV[3])
+local ok, id = pcall(redis.call, 'XADD', KEYS[2], '*', 'event', 'status', 'task_id', ARGV[2], 'data', ARGV[3])
+if not ok then
+  if ARGV[6] == '' then
+    redis.call('DEL', KEYS[1])
+  else
+    redis.call('SET', KEYS[1], ARGV[6])
+  end
+  return redis.error_reply('EVENT_WRITE_FAILED')
+end
 if tonumber(ARGV[4]) and tonumber(ARGV[4]) > 0 then
   redis.call('XTRIM', KEYS[2], 'MAXLEN', '~', tonumber(ARGV[4]))
+end
+local delta = tonumber(ARGV[5]) or 0
+if delta ~= 0 then
+  redis.call('INCRBY', KEYS[3], delta)
 end
 return id
 """
     _ENQUEUE_SCRIPT = """
 -- THS_ENQUEUE
-local pending = 0
-for _, task_id in ipairs(redis.call('SMEMBERS', KEYS[3])) do
-  local payload = redis.call('GET', KEYS[2] .. task_id)
-  if payload then
-    local task = cjson.decode(payload)
-    if task.status == 'QUEUED' or task.status == 'RUNNING' or task.status == 'WAITING_ADMIN' then
-      pending = pending + 1
-    end
-  end
-end
+local pending = tonumber(redis.call('GET', KEYS[6]) or '0')
 if pending >= tonumber(ARGV[1]) then return false end
 redis.call('SET', KEYS[2] .. ARGV[2], ARGV[3])
 redis.call('SADD', KEYS[3], ARGV[2])
 redis.call('RPUSH', KEYS[1], ARGV[2])
 redis.call('XADD', KEYS[4], '*', 'event', 'status', 'task_id', ARGV[2], 'data', 'QUEUED')
 redis.call('HSET', KEYS[5], ARGV[4], ARGV[2])
+redis.call('INCRBY', KEYS[6], 1)
 return true
 """
     _SUBMIT_OR_REFRESH_SCRIPT = """
@@ -927,16 +931,7 @@ if existing_id then
       if existing.status == 'QUEUED' or existing.status == 'RUNNING' or existing.status == 'WAITING_ADMIN' then
         return existing_payload
       end
-      local pending = 0
-      for _, task_id in ipairs(redis.call('SMEMBERS', KEYS[3])) do
-        local payload = redis.call('GET', KEYS[2] .. task_id)
-        if payload then
-          local queued = cjson.decode(payload)
-          if queued.status == 'QUEUED' or queued.status == 'RUNNING' or queued.status == 'WAITING_ADMIN' then
-            pending = pending + 1
-          end
-        end
-      end
+      local pending = tonumber(redis.call('GET', KEYS[7]) or '0')
       if pending >= tonumber(ARGV[1]) then return 'QUEUE_FULL' end
       local refreshed = cjson.decode(ARGV[5])
       refreshed.task_id = existing_id
@@ -946,28 +941,21 @@ if existing_id then
       redis.call('SET', KEYS[2] .. existing_id, updated)
       redis.call('RPUSH', KEYS[1], existing_id)
       redis.call('XADD', KEYS[4], '*', 'event', 'status', 'task_id', existing_id, 'data', 'QUEUED')
+      redis.call('INCRBY', KEYS[7], 1)
       return updated
     end
   else
     redis.call('HDEL', KEYS[5], ARGV[2])
   end
 end
-local pending = 0
-for _, task_id in ipairs(redis.call('SMEMBERS', KEYS[3])) do
-  local payload = redis.call('GET', KEYS[2] .. task_id)
-  if payload then
-    local task = cjson.decode(payload)
-    if task.status == 'QUEUED' or task.status == 'RUNNING' or task.status == 'WAITING_ADMIN' then
-      pending = pending + 1
-    end
-  end
-end
+local pending = tonumber(redis.call('GET', KEYS[7]) or '0')
 if pending >= tonumber(ARGV[1]) then return 'QUEUE_FULL' end
 redis.call('SET', KEYS[2] .. ARGV[3], ARGV[4])
 redis.call('SADD', KEYS[3], ARGV[3])
 redis.call('RPUSH', KEYS[1], ARGV[3])
 redis.call('HSET', KEYS[5], ARGV[2], ARGV[3])
 redis.call('XADD', KEYS[4], '*', 'event', 'status', 'task_id', ARGV[3], 'data', 'QUEUED')
+redis.call('INCRBY', KEYS[7], 1)
 return ARGV[4]
 """
     _CLAIM_SCRIPT = """
@@ -1400,6 +1388,7 @@ local updated = cjson.encode(task)
 redis.call('SET', KEYS[2] .. ARGV[1], updated)
 redis.call('RPUSH', KEYS[1], ARGV[1])
 redis.call('XADD', KEYS[3], '*', 'event', 'status', 'task_id', ARGV[1], 'data', 'QUEUED')
+redis.call('INCRBY', KEYS[5], 1)
 return updated
 """
     _REFRESH_TASK_SCRIPT = """
@@ -1421,21 +1410,13 @@ end
 if current.status ~= 'COMPLETED' and current.status ~= 'PARTIAL' and current.status ~= 'FAILED' and current.status ~= 'EXPIRED' then
   return false
 end
-local pending = 0
-for _, task_id in ipairs(redis.call('SMEMBERS', KEYS[4])) do
-  local existing = redis.call('GET', KEYS[2] .. task_id)
-  if existing then
-    local task = cjson.decode(existing)
-    if task.status == 'QUEUED' or task.status == 'RUNNING' or task.status == 'WAITING_ADMIN' then
-      pending = pending + 1
-    end
-  end
-end
+local pending = tonumber(redis.call('GET', KEYS[6]) or '0')
 if pending >= tonumber(ARGV[3]) then return 'QUEUE_FULL' end
 redis.call('SET', key, ARGV[2])
 redis.call('RPUSH', KEYS[1], ARGV[1])
 redis.call('SADD', KEYS[4], ARGV[1])
 redis.call('XADD', KEYS[3], '*', 'event', 'status', 'task_id', ARGV[1], 'data', 'QUEUED')
+redis.call('INCRBY', KEYS[6], 1)
 return ARGV[2]
 """
 
@@ -1456,6 +1437,7 @@ return ARGV[2]
         self._alias_key = f"{stream}:aliases"
         self._deployment_lease_key = f"{stream}:deployment-maintenance"
         self._active_count_key = f"{stream}:active-count"
+        self._active_count_init_lock = RLock()
 
     def set_capture_root(self, capture_root: Path) -> None:
         self.capture_root = capture_root.resolve()
@@ -1465,14 +1447,16 @@ return ARGV[2]
             raise InvalidTransitionError(
                 "maintenance task requires the maintenance binding path"
             )
+        self._ensure_active_count()
         accepted = self.client.eval(
             self._ENQUEUE_SCRIPT,
-            5,
+            6,
             self._queue_key,
             self._prefix,
             self._index_key,
             self._event_stream,
             self._symbol_index_key,
+            self._active_count_key,
             self.pending_cap,
             task.task_id,
             self._serialize(task),
@@ -1487,15 +1471,17 @@ return ARGV[2]
             raise InvalidTransitionError(
                 "maintenance task requires the maintenance binding path"
             )
+        self._ensure_active_count()
         payload = self.client.eval(
             self._SUBMIT_OR_REFRESH_SCRIPT,
-            6,
+            7,
             self._queue_key,
             self._prefix,
             self._index_key,
             self._event_stream,
             self._symbol_index_key,
             self._deployment_lease_key,
+            self._active_count_key,
             self.pending_cap,
             task.symbol,
             task.task_id,
@@ -1659,6 +1645,10 @@ return ARGV[2]
             return max(0, int(self._text(raw))) if raw is not None else self._sync_active_count()
         except (TypeError, ValueError):
             return self._sync_active_count()
+
+    def reconcile_active_count(self) -> int:
+        """Rebuild the admission counter once after a deployment or migration."""
+        return self._sync_active_count()
 
     def next_queued(self) -> TaskRecord | None:
         return self.next_runnable()
@@ -1844,13 +1834,15 @@ return ARGV[2]
         raise InvalidTransitionError(f"{task.status.value} cannot be requeued")
 
     def retry_failed(self, task_id: str) -> TaskRecord:
+        self._ensure_active_count()
         payload = self.client.eval(
             self._RETRY_FAILED_SCRIPT,
-            4,
+            5,
             self._queue_key,
             self._prefix,
             self._event_stream,
             self._deployment_lease_key,
+            self._active_count_key,
             task_id,
             utc_now().isoformat(),
         )
@@ -1876,14 +1868,16 @@ return ARGV[2]
             raise InvalidTransitionError(f"{task.status.value} cannot be refreshed")
         candidate = deepcopy(task)
         _reset_task_for_refresh(candidate, include_long_capture)
+        self._ensure_active_count()
         payload = self.client.eval(
             self._REFRESH_TASK_SCRIPT,
-            5,
+            6,
             self._queue_key,
             self._prefix,
             self._event_stream,
             self._index_key,
             self._deployment_lease_key,
+            self._active_count_key,
             task_id,
             self._serialize(candidate),
             self.pending_cap,
@@ -1903,6 +1897,8 @@ return ARGV[2]
 
     def transition(self, task_id: str, status: TaskStatus, *, error_code: str | None = None, source_errors: dict[str, str | None] | None = None) -> TaskRecord:
         task = self._required(task_id)
+        previous_status = task.status
+        previous_payload = self._serialize(task)
         if status not in _ALLOWED_TRANSITIONS[task.status]:
             raise InvalidTransitionError(f"{task.status.value} cannot transition to {status.value}")
         task.status = status
@@ -1912,11 +1908,17 @@ return ARGV[2]
         task.updated_at = utc_now()
         if status in {TaskStatus.COMPLETED, TaskStatus.FAILED}:
             task.completed_at = task.updated_at
-        self._persist_with_event(task)
+        self._persist_with_event(
+            task,
+            delta=int(status in _ACTIVE_STATUSES) - int(previous_status in _ACTIVE_STATUSES),
+            previous_payload=previous_payload,
+        )
         return task
 
     def complete_capture(self, task_id: str, kind: CaptureKind, path: str) -> TaskRecord:
         task = self._required(task_id)
+        previous_status = task.status
+        previous_payload = self._serialize(task)
         if task.status not in {TaskStatus.RUNNING, TaskStatus.PARTIAL}:
             raise InvalidTransitionError(f"{task.status.value} cannot accept a capture")
         capture = task.captures[kind]
@@ -1928,11 +1930,17 @@ return ARGV[2]
         task.status = TaskStatus.COMPLETED if ready == len(CaptureKind) else TaskStatus.PARTIAL
         if task.status == TaskStatus.COMPLETED:
             task.completed_at = task.updated_at
-        self._persist_with_event(task)
+        self._persist_with_event(
+            task,
+            delta=int(task.status in _ACTIVE_STATUSES) - int(previous_status in _ACTIVE_STATUSES),
+            previous_payload=previous_payload,
+        )
         return task
 
     def complete_result(self, task_id: str, values: dict[MetricKind, str | None], path: str | None, *, ocr_metrics: set[MetricKind] | None = None, source_errors: dict[str, str | None] | None = None, intraday_series: dict[MetricKind, dict[str, object]] | None = None) -> TaskRecord:
         task = self._required(task_id)
+        previous_status = task.status
+        previous_payload = self._serialize(task)
         if task.status not in {TaskStatus.RUNNING, TaskStatus.PARTIAL}:
             raise InvalidTransitionError(f"{task.status.value} cannot accept a result")
         task.values = {kind: values.get(kind) for kind in MetricKind}
@@ -1979,7 +1987,11 @@ return ARGV[2]
             else fund_error if required_complete else "VALUE_RECOGNITION_FAILED"
         )
         task.completed_at = task.updated_at
-        self._persist_with_event(task)
+        self._persist_with_event(
+            task,
+            delta=int(task.status in _ACTIVE_STATUSES) - int(previous_status in _ACTIVE_STATUSES),
+            previous_payload=previous_payload,
+        )
         return task
 
     def events_after(self, task_id: str, event_index: int | str = 0, *, limit: int | None = None) -> list[dict[str, str]]:
@@ -2098,16 +2110,25 @@ return ARGV[2]
         self.client.xadd(self._event_stream, {"event": "status", "task_id": task.task_id, "data": task.status.value})
         self._trim_events()
 
-    def _persist_with_event(self, task: TaskRecord) -> None:
+    def _persist_with_event(
+        self,
+        task: TaskRecord,
+        *,
+        delta: int = 0,
+        previous_payload: str = "",
+    ) -> None:
         self.client.eval(
             self._PERSIST_EVENT_SCRIPT,
-            2,
+            3,
             self._key(task.task_id),
             self._event_stream,
+            self._active_count_key,
             self._serialize(task),
             task.task_id,
             task.status.value,
             self.event_retention,
+            delta,
+            previous_payload,
         )
 
     @staticmethod
@@ -2148,6 +2169,11 @@ return ARGV[2]
                 count += 1
         self.client.set(self._active_count_key, str(count))
         return count
+
+    def _ensure_active_count(self) -> None:
+        with self._active_count_init_lock:
+            if self.client.get(self._active_count_key) is None:
+                self._sync_active_count()
 
     def _unlink_capture(self, capture: CaptureRecord | LongCaptureRecord) -> None:
         if capture.path is None or self.capture_root is None:

@@ -364,6 +364,13 @@ def create_app(
                 except Exception:
                     pass
         await to_thread(app.state.store.recover_running)
+        reconcile_active_count = getattr(
+            app.state.store,
+            "reconcile_active_count",
+            None,
+        )
+        if callable(reconcile_active_count):
+            await to_thread(reconcile_active_count)
         deduplicate = getattr(app.state.store, "deduplicate_by_symbol", None)
         app.state.task_migration = (
             await to_thread(deduplicate)
@@ -799,7 +806,13 @@ def create_app(
         async def event_stream() -> AsyncIterator[str]:
             cursor_reader = getattr(app.state.store, "events_after_cursor", None)
             if callable(cursor_reader):
-                cursor: str | None = request.headers.get("last-event-id") or None
+                raw_cursor = request.headers.get("last-event-id")
+                cursor: str | None = (
+                    raw_cursor
+                    if raw_cursor is not None
+                    and re.fullmatch(r"[0-9]+(?:-[0-9]+)?", raw_cursor)
+                    else None
+                )
                 while not await request.is_disconnected():
                     events, cursor = await to_thread(
                         cursor_reader,

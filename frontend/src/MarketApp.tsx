@@ -551,6 +551,7 @@ export function MarketApp() {
     requestedDailySeries.current.add(selected)
     const requestedSymbol = selected
     const controller = new AbortController()
+    let completed = false
     setDailyLoading((current) => ({ ...current, [requestedSymbol]: true }))
     setDailyErrors((current) => {
       const next = { ...current }
@@ -558,15 +559,20 @@ export function MarketApp() {
       return next
     })
     void marketApi.series(requestedSymbol, 'day', controller.signal).then((value) => {
+      completed = true
       setDailySeries((current) => ({ ...current, [requestedSymbol]: value }))
     }).catch((reason) => {
       if (controller.signal.aborted) return
+      completed = true
       requestedDailySeries.current.delete(requestedSymbol)
       setDailyErrors((current) => ({ ...current, [requestedSymbol]: reason instanceof Error ? reason.message : '日 K 读取失败' }))
     }).finally(() => {
       setDailyLoading((current) => ({ ...current, [requestedSymbol]: false }))
     })
-    return () => controller.abort()
+    return () => {
+      controller.abort()
+      if (!completed) requestedDailySeries.current.delete(requestedSymbol)
+    }
   }, [auth, dailyRetryVersion, period, selected, user?.must_change_password])
 
   function retryDailySeries(symbol: string) {

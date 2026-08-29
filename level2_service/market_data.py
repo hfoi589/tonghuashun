@@ -319,7 +319,7 @@ class MarketDataBroker:
             current = replace(snapshot, sequence=sequence)
             self._sequence[symbol] = sequence
             self._cache[symbol] = current
-            self._cache_detail[symbol] = self._cache_detail.get(symbol, False) or detail
+            self._cache_detail[symbol] = detail
             self._last_polled[symbol] = self.clock()
             self._failure_counts.pop(symbol, None)
             self._retry_after.pop(symbol, None)

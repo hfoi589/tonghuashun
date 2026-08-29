@@ -560,7 +560,10 @@ def create_production_app(
             fund_source = frida_fund_source
         else:
             assert account_session_provider is not None
-            direct_fund_source = FundFlowHttpClient(account_session_provider)
+            direct_fund_source = FundFlowHttpClient(
+                account_session_provider,
+                minimum_interval_seconds=config.market_direct_enrichment_ttl_seconds,
+            )
             fund_source = (
                 direct_fund_source
                 if config.fund_flow_transport == "direct"
@@ -574,6 +577,7 @@ def create_production_app(
             core_source,
             fund_source,
             symbol_source=symbol_catalog,
+            fund_market_interval_seconds=config.market_direct_enrichment_ttl_seconds,
         )
     else:
         parsed_value_source = (

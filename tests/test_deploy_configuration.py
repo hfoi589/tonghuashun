@@ -383,7 +383,7 @@ def test_real_compose_config_preserves_root_secrets_with_canonical_env_order(
     )
 
 
-def test_readme_defines_the_unimplemented_private_complete_image_contract() -> None:
+def test_readme_defines_the_implemented_private_complete_image_contract() -> None:
     """Operators need the image, preservation, and human-login boundary before provisioning ships."""
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     normalized_readme = " ".join(readme.split())
@@ -397,7 +397,7 @@ def test_readme_defines_the_unimplemented_private_complete_image_contract() -> N
     assert "204 MB APK is tracked in Git history" in normalized_readme
     assert "old Docker build context and image excluded it" in normalized_readme
     assert "approved image is local/private-only" in normalized_readme
-    assert "does not claim real deployment" in normalized_readme
+    assert "implementation is present in the current tree" in normalized_readme
     assert "clean-Mac acceptance" in normalized_readme
 
 

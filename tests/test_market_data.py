@@ -165,6 +165,33 @@ def test_detail_refresh_does_not_reuse_a_low_detail_snapshot() -> None:
     assert source.snapshot_calls == [("601872", False), ("601872", True)]
 
 
+def test_low_detail_refresh_cannot_overwrite_detail_cache_capability() -> None:
+    class DetailAwareSource(FakeMarketSource):
+        def read_market_snapshot(self, symbol: str, *, detail: bool) -> MarketSnapshot:
+            return replace(
+                super().read_market_snapshot(symbol, detail=detail),
+                timeshare=(
+                    (TimesharePoint(time="09:30", price="19.42"),)
+                    if detail
+                    else ()
+                ),
+            )
+
+    source = DetailAwareSource()
+    broker = MarketDataBroker(source, clock=lambda: 100.0, is_market_open=lambda: True)
+    broker.subscribe("client", watchlist_symbols={"601872"}, detail_symbols={"601872"})
+    asyncio.run(broker.refresh("601872", detail=True))
+    asyncio.run(broker.refresh("601872", detail=False))
+    detail = asyncio.run(broker.refresh("601872", detail=True, max_age_seconds=10))
+
+    assert detail.timeshare
+    assert source.snapshot_calls == [
+        ("601872", True),
+        ("601872", False),
+        ("601872", True),
+    ]
+
+
 def test_poll_due_refreshes_symbols_with_bounded_concurrency() -> None:
     class SlowSource(FakeMarketSource):
         def read_market_snapshot(self, symbol: str, *, detail: bool) -> MarketSnapshot:

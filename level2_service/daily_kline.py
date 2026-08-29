@@ -401,6 +401,9 @@ class DailyKlineMarketDataSource:
 
     def _lock_for(self, key: tuple[str, str]) -> threading.Lock:
         with self._state_lock:
+            for stale_key, stale_lock in tuple(self._locks.items()):
+                if stale_key not in self._cache and not stale_lock.locked():
+                    self._locks.pop(stale_key, None)
             return self._locks.setdefault(key, threading.Lock())
 
     def _fresh(self, entry: _DailyCacheEntry, now: float) -> bool:
@@ -522,7 +525,11 @@ class DailyKlineMarketDataSource:
                 with self._state_lock:
                     self._cache[key] = entry
                     while len(self._cache) > self.max_cache_entries:
-                        self._cache.pop(next(iter(self._cache)))
+                        evicted = next(iter(self._cache))
+                        self._cache.pop(evicted, None)
+                        lock = self._locks.get(evicted)
+                        if lock is None or not lock.locked():
+                            self._locks.pop(evicted, None)
                 return self._page(
                     symbol,
                     period,

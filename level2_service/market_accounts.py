@@ -199,12 +199,13 @@ class SQLiteMarketAccountStore:
     def create_user(self, username: str, temporary_password: str) -> MarketUser:
         normalized = self._username(username)
         password = self._password(temporary_password)
+        password_hash = self._hasher.hash(password)
         created_at = _utc_now().isoformat()
         try:
             with self._lock, self._connection:
                 cursor = self._connection.execute(
                     "INSERT INTO market_users(username,password_hash,created_at) VALUES(?,?,?)",
-                    (normalized, self._hasher.hash(password), created_at),
+                    (normalized, password_hash, created_at),
                 )
                 user_id = int(cursor.lastrowid)
                 self._connection.execute(
@@ -253,6 +254,7 @@ class SQLiteMarketAccountStore:
 
     def change_password(self, user_id: int, current_password: str, new_password: str) -> MarketUser:
         password = self._password(new_password)
+        password_hash = self._hasher.hash(password)
         with self._lock:
             row = self._connection.execute(
                 "SELECT password_hash FROM market_users WHERE id=? AND enabled=1",
@@ -269,7 +271,7 @@ class SQLiteMarketAccountStore:
             with self._connection:
                 self._connection.execute(
                     "UPDATE market_users SET password_hash=?,must_change_password=0 WHERE id=?",
-                    (self._hasher.hash(password), user_id),
+                    (password_hash, user_id),
                 )
         return self.get_user(user_id)
 
@@ -622,6 +624,14 @@ class InMemoryMarketSessionStore:
 class RedisMarketSessionStore:
     """Redis-backed sessions with a reverse index for administrator revocation."""
 
+    _REVOKE_USER_SCRIPT = """
+local session_ids = redis.call('SMEMBERS', KEYS[1])
+for _, session_id in ipairs(session_ids) do
+  redis.call('DEL', ARGV[1] .. session_id)
+end
+return redis.call('DEL', KEYS[1])
+"""
+
     def __init__(self, client: object, *, ttl: timedelta = timedelta(days=7)) -> None:
         for method in ("delete", "get", "sadd", "setex", "smembers", "srem"):
             if not callable(getattr(client, method, None)):
@@ -719,6 +729,19 @@ class RedisMarketSessionStore:
 
     def revoke_user(self, user_id: int) -> None:
         key = self._user_key(user_id)
-        for raw in self.client.smembers(key):
-            self.client.delete(self._key(self._text(raw)))
+        evaluator = getattr(self.client, "eval", None)
+        if callable(evaluator):
+            evaluator(self._REVOKE_USER_SCRIPT, 1, key, "ths:market:sessions:")
+            return
+        session_ids = [self._text(raw) for raw in self.client.smembers(key)]
+        pipeline_factory = getattr(self.client, "pipeline", None)
+        if callable(pipeline_factory):
+            with pipeline_factory(transaction=True) as pipeline:
+                for session_id in session_ids:
+                    pipeline.delete(self._key(session_id))
+                pipeline.delete(key)
+                pipeline.execute()
+            return
+        for session_id in session_ids:
+            self.client.delete(self._key(session_id))
         self.client.delete(key)

@@ -7,6 +7,7 @@ import './styles.css'
 const LEGACY_HISTORY_STORAGE_KEY = 'ths_level2_job_history'
 const STOCK_TABS_STORAGE_KEY = 'ths_level2_stock_tabs_v2'
 const ACTIVE_TAB_STORAGE_KEY = 'ths_level2_active_stock_tab'
+const MAX_STOCK_TABS = 50
 const terminalStatuses = new Set<JobStatus>(['COMPLETED', 'PARTIAL', 'FAILED', 'EXPIRED'])
 
 interface StoredStockTab {
@@ -72,7 +73,7 @@ function readStoredTabs(): StoredStockTab[] {
       ) return []
       seenSymbols.add(candidate.symbol)
       return [{ public_id: candidate.public_id, symbol: candidate.symbol, name: candidate.name }]
-    })
+    }).slice(0, MAX_STOCK_TABS)
   } catch {
     return []
   }
@@ -507,7 +508,7 @@ export default function App({ initialTask }: { initialTask?: Job }) {
         ...(linkedId ? [linkedId] : []),
         ...storedTabs.map((tab) => tab.public_id),
         ...readHistoryIds(),
-      ])]
+      ])].slice(0, MAX_STOCK_TABS)
       if (ids.length === 0) {
         setRestoring(false)
         return
@@ -692,7 +693,7 @@ export default function App({ initialTask }: { initialTask?: Job }) {
         name: tabName(updated, preferredName || existing?.name),
         task: updated,
       }
-      const next = [nextTab, ...current.filter((tab) => tab.public_id !== updated.public_id && tab.symbol !== updated.symbol)]
+      const next = [nextTab, ...current.filter((tab) => tab.public_id !== updated.public_id && tab.symbol !== updated.symbol)].slice(0, MAX_STOCK_TABS)
       persistStockTabs(next)
       return next
     })

@@ -838,7 +838,7 @@ describe('Level2 web UI', () => {
     expect(within(picker).queryByRole('button', { name: /测试股票1/ })).not.toBeInTheDocument()
   })
 
-  it('restores more than fifty persistent stock tabs without truncating them', async () => {
+  it('bounds persistent stock tabs to the client-side event-stream limit', async () => {
     const storedTabs = Array.from({ length: 51 }, (_, index) => ({
       public_id: `persistent-${index}`,
       symbol: String(600000 + index),
@@ -859,8 +859,8 @@ describe('Level2 web UI', () => {
 
     render(<App />)
 
-    await screen.findByRole('button', { name: '全部股票 51' })
-    expect(JSON.parse(window.localStorage.getItem('ths_level2_stock_tabs_v2')!)).toHaveLength(51)
+    await screen.findByRole('button', { name: '全部股票 50' })
+    expect(JSON.parse(window.localStorage.getItem('ths_level2_stock_tabs_v2')!)).toHaveLength(50)
   })
 
   it('asks for confirmation and can cancel browser-only tab deletion', async () => {

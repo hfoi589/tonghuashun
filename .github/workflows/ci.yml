@@ -21,7 +21,7 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - run: uv sync --frozen --dev
-      - run: uv run pytest -q
+      - run: uv run python -m pytest -q
 
   frontend:
     name: Frontend
@@ -50,4 +50,3 @@ jobs:
           ADMIN_PASSWORD_HASH: "$argon2id$placeholder"
           ADMIN_SESSION_SECRET: "ci-session-secret-ci-session-secret"
         run: docker compose --env-file deploy/macos.env.example -f deploy/compose.yml config --quiet
-

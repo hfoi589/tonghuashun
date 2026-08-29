@@ -1,6 +1,6 @@
 import json
 import re
-from threading import Barrier, RLock, Thread
+from threading import RLock, Thread
 from time import monotonic
 
 import pytest
@@ -44,6 +44,11 @@ class FakeRedis:
         elif not keepttl:
             self.expiries.pop(key, None)
         return True
+    def incrby(self, key, amount):
+        current = int(self.values.get(key, "0"))
+        current += int(amount)
+        self.values[key] = str(current)
+        return current
     def get(self, key):
         self._expire(key)
         return self.values.get(key)
@@ -232,8 +237,8 @@ class FakeRedis:
         keys = values[:key_count]
         args = values[key_count:]
         if "THS_PERSIST_EVENT" in script:
-            task_key, event_stream = keys
-            payload, task_id, status, retention = args
+            task_key, event_stream, active_count_key = keys
+            payload, task_id, status, retention, delta, _previous_payload = args
             previous = self.values.get(task_key)
             self.set(task_key, payload)
             try:
@@ -251,6 +256,8 @@ class FakeRedis:
             excess = len(entries) - int(retention)
             if excess > 0:
                 self.xdel(event_stream, *(entry_id for entry_id, _ in entries[:excess]))
+            if int(delta):
+                self.incrby(active_count_key, int(delta))
             return event_id
         if "THS_ACQUIRE_DEPLOYMENT_LEASE" in script:
             lease_key, prefix, index_key = keys
@@ -620,13 +627,9 @@ class FakeRedis:
                             return updated
                 return False
         if "THS_ENQUEUE" in script:
-            queue_key, prefix, index_key, event_stream, symbol_index_key = keys
+            queue_key, prefix, index_key, event_stream, symbol_index_key, active_count_key = keys
             cap, task_id, payload, symbol = args
-            pending = 0
-            for existing_id in self.sets.get(index_key, set()):
-                raw = self.values.get(prefix + existing_id)
-                if raw and json.loads(raw)["status"] in {"QUEUED", "RUNNING", "WAITING_ADMIN"}:
-                    pending += 1
+            pending = int(self.values.get(active_count_key, "0"))
             if pending >= int(cap):
                 return False
             self.values[prefix + task_id] = payload
@@ -634,6 +637,7 @@ class FakeRedis:
             self.rpush(queue_key, task_id)
             self.xadd(event_stream, {"event": "status", "task_id": task_id, "data": "QUEUED"})
             self.hset(symbol_index_key, symbol, task_id)
+            self.incrby(active_count_key, 1)
             return True
         if "THS_SUBMIT_OR_REFRESH" in script:
             (
@@ -643,6 +647,7 @@ class FakeRedis:
                 event_stream,
                 symbol_index_key,
                 lease_key,
+                active_count_key,
             ) = keys
             cap, symbol, new_task_id, new_payload, refresh_payload = args
             lease_payload = self.get(lease_key)
@@ -665,12 +670,7 @@ class FakeRedis:
                             "WAITING_ADMIN",
                         }:
                             return payload
-                        pending = sum(
-                            json.loads(self.values[prefix + task_id])["status"]
-                            in {"QUEUED", "RUNNING", "WAITING_ADMIN"}
-                            for task_id in self.sets.get(index_key, set())
-                            if prefix + task_id in self.values
-                        )
+                        pending = int(self.values.get(active_count_key, "0"))
                         if pending >= int(cap):
                             return "QUEUE_FULL"
                         refreshed = json.loads(refresh_payload)
@@ -688,14 +688,11 @@ class FakeRedis:
                                 "data": "QUEUED",
                             },
                         )
+                        self.incrby(active_count_key, 1)
                         return updated
                 else:
                     self.hdel(symbol_index_key, symbol)
-            pending = sum(
-                json.loads(self.values[prefix + task_id])["status"] in {"QUEUED", "RUNNING", "WAITING_ADMIN"}
-                for task_id in self.sets.get(index_key, set())
-                if prefix + task_id in self.values
-            )
+            pending = int(self.values.get(active_count_key, "0"))
             if pending >= int(cap):
                 return "QUEUE_FULL"
             self.values[prefix + new_task_id] = new_payload
@@ -703,6 +700,7 @@ class FakeRedis:
             self.rpush(queue_key, new_task_id)
             self.hset(symbol_index_key, symbol, new_task_id)
             self.xadd(event_stream, {"event": "status", "task_id": new_task_id, "data": "QUEUED"})
+            self.incrby(active_count_key, 1)
             return new_payload
         if "THS_RECOVER_RUNNING" in script:
             queue_key, prefix, index_key, event_stream = keys
@@ -731,7 +729,7 @@ class FakeRedis:
                 self.lpush(queue_key, task_id)
             return updated_payloads
         if "THS_REFRESH_TASK" in script:
-            queue_key, prefix, event_stream, index_key, lease_key = keys
+            queue_key, prefix, event_stream, index_key, lease_key, active_count_key = keys
             task_id, updated_payload, cap = args
             key = prefix + task_id
             payload = self.values.get(key)
@@ -748,20 +746,17 @@ class FakeRedis:
                 return payload
             if current["status"] not in {"COMPLETED", "PARTIAL", "FAILED", "EXPIRED"}:
                 return False
-            pending = sum(
-                json.loads(self.values[prefix + existing_id])["status"] in {"QUEUED", "RUNNING", "WAITING_ADMIN"}
-                for existing_id in self.sets.get(index_key, set())
-                if prefix + existing_id in self.values
-            )
+            pending = int(self.values.get(active_count_key, "0"))
             if pending >= int(cap):
                 return "QUEUE_FULL"
             self.values[key] = updated_payload
             self.sadd(index_key, task_id)
             self.rpush(queue_key, task_id)
             self.xadd(event_stream, {"event": "status", "task_id": task_id, "data": "QUEUED"})
+            self.incrby(active_count_key, 1)
             return updated_payload
         if "THS_RETRY_FAILED" in script:
-            queue_key, prefix, event_stream, lease_key = keys
+            queue_key, prefix, event_stream, lease_key, active_count_key = keys
             task_id, timestamp = args
             key = prefix + task_id
             payload = self.values.get(key)
@@ -786,6 +781,7 @@ class FakeRedis:
             self.values[key] = updated
             self.rpush(queue_key, task_id)
             self.xadd(event_stream, {"event": "status", "task_id": task_id, "data": "QUEUED"})
+            self.incrby(active_count_key, 1)
             return updated
         if "THS_REQUEUE_WAITING" in script:
             queue_key, prefix, event_stream, lease_key = keys
@@ -899,12 +895,10 @@ def test_redis_pending_cap_is_atomic_across_concurrent_submissions() -> None:
     class InterleavingRedis(FakeRedis):
         def __init__(self) -> None:
             super().__init__()
-            self.barrier = Barrier(2)
 
-        def smembers(self, key):
-            result = super().smembers(key)
-            self.barrier.wait()
-            return result
+        def eval(self, script, key_count, *values):
+            with self._lock:
+                return super().eval(script, key_count, *values)
 
     redis = InterleavingRedis()
     store = RedisStreamsStore(redis, pending_cap=1)

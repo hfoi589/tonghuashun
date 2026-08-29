@@ -84,11 +84,11 @@ claim the VPS is supported.
 
 ## Apple Silicon macOS / native AVD
 
-### Approved complete-image and one-command contract — pending implementation
+### Approved complete-image and one-command contract
 
-Tasks 7–9 implement and verify this contract. This documentation does not claim
-real deployment or clean-Mac acceptance before those tasks run; no host, device,
-image, login, or provisioning action is performed by documenting it.
+The implementation is present in the current tree. This documentation still does not
+claim clean-Mac acceptance; host, device, image, login, and provisioning checks remain
+operator-run acceptance steps.
 
 The approved `ths-level2-api:local` image is local/private-only. It will carry
 the fixed THS APK, Frida Server 16.7.19, a non-secret manifest, and read-only
@@ -97,7 +97,7 @@ It must not carry `.env`, tokens, account credentials, encrypted sessions, AVD
 data, captures, Redis data, or logs. It must not run `docker push`,
 `docker save`, or publish to a public registry.
 
-The standard future entry point is:
+The standard entry point is:
 
 ```sh
 scripts/deploy-macos-one-click.sh --mode auto

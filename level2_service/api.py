@@ -799,7 +799,7 @@ def create_app(
         async def event_stream() -> AsyncIterator[str]:
             cursor_reader = getattr(app.state.store, "events_after_cursor", None)
             if callable(cursor_reader):
-                cursor: str | None = None
+                cursor: str | None = request.headers.get("last-event-id") or None
                 while not await request.is_disconnected():
                     events, cursor = await to_thread(
                         cursor_reader,

@@ -364,6 +364,12 @@ def create_app(
                 except Exception:
                     pass
         await to_thread(app.state.store.recover_running)
+        deduplicate = getattr(app.state.store, "deduplicate_by_symbol", None)
+        app.state.task_migration = (
+            await to_thread(deduplicate)
+            if callable(deduplicate)
+            else {"total": 0, "kept": 0, "deleted": 0, "aliases": 0}
+        )
         reconcile_active_count = getattr(
             app.state.store,
             "reconcile_active_count",
@@ -371,12 +377,6 @@ def create_app(
         )
         if callable(reconcile_active_count):
             await to_thread(reconcile_active_count)
-        deduplicate = getattr(app.state.store, "deduplicate_by_symbol", None)
-        app.state.task_migration = (
-            await to_thread(deduplicate)
-            if callable(deduplicate)
-            else {"total": 0, "kept": 0, "deleted": 0, "aliases": 0}
-        )
         logger.info(
             "task migration total=%s kept=%s deleted=%s aliases=%s",
             app.state.task_migration["total"],

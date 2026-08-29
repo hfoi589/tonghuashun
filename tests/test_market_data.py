@@ -49,9 +49,57 @@ class FakeMarketSource:
 
 
 def test_china_market_schedule_uses_asia_shanghai_sessions() -> None:
+    assert is_china_market_open(datetime(2026, 8, 24, 1, 10, tzinfo=timezone.utc)) is True
+    assert is_china_market_open(datetime(2026, 8, 24, 1, 9, tzinfo=timezone.utc)) is False
     assert is_china_market_open(datetime(2026, 8, 24, 1, 31, tzinfo=timezone.utc)) is True
     assert is_china_market_open(datetime(2026, 8, 24, 4, 0, tzinfo=timezone.utc)) is False
     assert is_china_market_open(datetime(2026, 8, 23, 1, 31, tzinfo=timezone.utc)) is False
+
+
+def test_watchlist_only_symbols_refresh_every_two_seconds_during_quote_session() -> None:
+    source = FakeMarketSource()
+    now = [100.0]
+    broker = MarketDataBroker(source, clock=lambda: now[0], is_market_open=lambda: True)
+    broker.subscribe("watchlist", watchlist_symbols={"601872"}, detail_symbols=set())
+
+    asyncio.run(broker.poll_due())
+    now[0] += 1.9
+    asyncio.run(broker.poll_due())
+    assert source.snapshot_calls == [("601872", False)]
+
+    now[0] += 0.1
+    asyncio.run(broker.poll_due())
+    assert source.snapshot_calls == [("601872", False), ("601872", False)]
+
+
+def test_closed_subscriptions_read_once_and_detail_switch_only_reads_clicked_symbol() -> None:
+    source = FakeMarketSource()
+    now = [100.0]
+    broker = MarketDataBroker(source, clock=lambda: now[0], is_market_open=lambda: False)
+
+    initial_detail = broker.subscribe(
+        "client",
+        watchlist_symbols={"601872", "300750"},
+        detail_symbols={"601872"},
+    )
+    assert initial_detail == {"601872"}
+    asyncio.run(broker.refresh("601872", detail=True))
+    asyncio.run(broker.poll_due())
+    assert source.snapshot_calls == [("601872", True), ("300750", False)]
+
+    now[0] += 3600
+    asyncio.run(broker.poll_due())
+    assert source.snapshot_calls == [("601872", True), ("300750", False)]
+
+    changed_detail = broker.subscribe(
+        "client",
+        watchlist_symbols={"601872", "300750"},
+        detail_symbols={"300750"},
+    )
+    assert changed_detail == {"300750"}
+    asyncio.run(broker.refresh("300750", detail=True))
+    asyncio.run(broker.poll_due())
+    assert source.snapshot_calls == [("601872", True), ("300750", False), ("300750", True)]
 
 
 def test_market_snapshot_exposes_public_source_and_price_precision() -> None:

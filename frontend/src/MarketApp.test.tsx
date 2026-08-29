@@ -158,6 +158,7 @@ describe('MarketApp', () => {
     })
     class FakeWebSocket {
       static instances: FakeWebSocket[] = []
+      readyState = 1
       onopen: ((event: Event) => void) | null = null
       onmessage: ((event: MessageEvent) => void) | null = null
       onclose: ((event: CloseEvent) => void) | null = null
@@ -186,6 +187,65 @@ describe('MarketApp', () => {
       type: 'subscribe', watchlist: ['601872'], detail: '601872',
     }))
     expect(fetchMock.mock.calls.filter(([url]) => String(url).includes('/snapshot')).length).toBeGreaterThan(1)
+  })
+
+  it('keeps one market stream while changing the selected stock', async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url === '/api/v1/session') return jsonResponse({
+        id: 7, username: 'wilson', enabled: true, must_change_password: false,
+        created_at: '2026-08-23T00:00:00+00:00',
+      })
+      if (url === '/api/v1/watchlists') return jsonResponse({ groups: [{
+        id: 1, name: '自选', sort_order: 0, is_primary: true,
+        items: [
+          { symbol: '601872', name: '招商轮船', market: '17' },
+          { symbol: '600026', name: '中远海能', market: '17' },
+        ],
+      }] })
+      if (url.includes('/snapshot')) return jsonResponse({
+        symbol: url.includes('600026') ? '600026' : '601872',
+        name: url.includes('600026') ? '中远海能' : '招商轮船',
+        market: '17', sequence: 1, source_time: '10:00',
+        collected_at: '2026-08-23T02:00:00+00:00', source: 'TENCENT_PUBLIC',
+        price_precision: 2, stale: false, age_seconds: 0.2,
+        quote: { price: '18.62', change_percent: '1.31%' },
+        timeshare: [{ time: '10:00', price: '18.62', average_price: '18.40', volume: '1000' }],
+        intraday_series: {}, order_book: [], trades: [], main_fund_flow: {},
+        capabilities: { timeshare: { available: true }, kline: { available: true }, l2: { available: false } },
+        source_errors: { core_metrics: null, main_fund_flow: null },
+      })
+      if (url.includes('/series?period=day')) return jsonResponse({
+        symbol: '601872', period: 'day', bars: [], indicators: {}, next_cursor: null,
+        source_error: 'KLINE_SOURCES_UNAVAILABLE', adjustment: 'qfq', source: null,
+        cached: false, stale: false, source_errors: {},
+      })
+      throw new Error(`unexpected request: ${url}`)
+    })
+    class FakeWebSocket {
+      static instances: FakeWebSocket[] = []
+      readyState = 1
+      onopen: ((event: Event) => void) | null = null
+      onmessage: ((event: MessageEvent) => void) | null = null
+      onclose: ((event: CloseEvent) => void) | null = null
+      onerror: ((event: Event) => void) | null = null
+      send = vi.fn()
+      close = vi.fn()
+      constructor(public url: string) { FakeWebSocket.instances.push(this) }
+    }
+    vi.stubGlobal('fetch', fetchMock)
+    vi.stubGlobal('WebSocket', FakeWebSocket as unknown as typeof WebSocket)
+
+    render(<MarketApp />)
+    await waitFor(() => expect(FakeWebSocket.instances).toHaveLength(1))
+    FakeWebSocket.instances[0].onopen?.(new Event('open'))
+
+    await userEvent.click(await screen.findByRole('button', { name: /中远海能/ }))
+
+    await waitFor(() => expect(FakeWebSocket.instances).toHaveLength(1))
+    expect(FakeWebSocket.instances[0].send).toHaveBeenLastCalledWith(JSON.stringify({
+      type: 'subscribe', watchlist: ['601872', '600026'], detail: '600026',
+    }))
   })
 
   it('loads grouped watchlists and opens a realtime stock detail', async () => {

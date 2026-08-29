@@ -190,6 +190,6 @@ def test_admin_market_health_reports_broker_cadence_and_cache(tmp_path) -> None:
         "subscribed_symbols": 0,
         "cached_symbols": 0,
         "detail_interval_seconds": 2.0,
-        "watchlist_interval_seconds": 15.0,
-        "closed_interval_seconds": 60.0,
+        "watchlist_interval_seconds": 2.0,
+        "closed_interval_seconds": None,
     }

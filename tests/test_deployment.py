@@ -455,7 +455,7 @@ def test_settings_parse_frontend_root_and_admin_cookie_secure(tmp_path: Path) ->
     assert secure_defaults.symbol_catalog_refresh_minute == 20
     assert secure_defaults.public_market_timeout_seconds == 8
     assert secure_defaults.market_direct_enrichment is True
-    assert secure_defaults.market_direct_enrichment_ttl_seconds == 15
+    assert secure_defaults.market_direct_enrichment_ttl_seconds == 5
     assert secure_defaults.core_warm_connection_max_idle_seconds == 25
 
 

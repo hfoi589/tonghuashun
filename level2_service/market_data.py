@@ -27,13 +27,13 @@ def fixed_market_error_code(
 
 
 def is_china_market_open(now: datetime | None = None) -> bool:
-    """Return whether A-share continuous trading is scheduled at this instant."""
+    """Return whether the A-share quote refresh window is active at this instant."""
     current = now or datetime.now(timezone.utc)
     local = current.astimezone(ZoneInfo("Asia/Shanghai"))
     if local.weekday() >= 5:
         return False
     minute = local.hour * 60 + local.minute
-    return 9 * 60 + 30 <= minute <= 11 * 60 + 30 or 13 * 60 <= minute <= 15 * 60
+    return 9 * 60 + 10 <= minute <= 11 * 60 + 30 or 13 * 60 <= minute <= 15 * 60
 
 
 @dataclass(frozen=True)
@@ -143,8 +143,8 @@ class MarketDataBroker:
         source: MarketDataSource,
         *,
         detail_interval_seconds: float = 2.0,
-        watchlist_interval_seconds: float = 15.0,
-        closed_interval_seconds: float = 60.0,
+        watchlist_interval_seconds: float = 2.0,
+        closed_interval_seconds: float | None = None,
         clock: Callable[[], float] = time.monotonic,
         is_market_open: Callable[[], bool] = lambda: True,
     ) -> None:
@@ -164,6 +164,7 @@ class MarketDataBroker:
         self._sequence: dict[str, int] = {}
         self._last_polled: dict[str, float] = {}
         self._refresh_locks: dict[str, asyncio.Lock] = {}
+        self._closed_refresh_requests: set[str] = set()
 
     def subscribe(
         self,
@@ -171,14 +172,23 @@ class MarketDataBroker:
         *,
         watchlist_symbols: set[str],
         detail_symbols: set[str],
-    ) -> None:
-        self._subscriptions[client_id] = (set(watchlist_symbols), set(detail_symbols))
+    ) -> set[str]:
+        next_watchlist = set(watchlist_symbols)
+        next_detail = set(detail_symbols)
+        previous = self._subscriptions.get(client_id)
+        previous_watchlist, previous_detail = previous or (set(), set())
+        self._subscriptions[client_id] = (next_watchlist, next_detail)
         self._queues.setdefault(client_id, asyncio.Queue())
         pending = self._pending_events.setdefault(client_id, {})
-        wanted = set(watchlist_symbols) | set(detail_symbols)
+        wanted = next_watchlist | next_detail
         for key in tuple(pending):
             if key[0] not in wanted:
                 pending.pop(key, None)
+        detail_refresh = next_detail if previous is None else next_detail - previous_detail
+        new_watchlist = next_watchlist if previous is None else next_watchlist - previous_watchlist
+        if not self.is_market_open():
+            self._closed_refresh_requests.update((new_watchlist - next_detail))
+        return detail_refresh
 
     def unsubscribe(self, client_id: str) -> None:
         self._subscriptions.pop(client_id, None)
@@ -200,7 +210,11 @@ class MarketDataBroker:
             "cached_symbols": len(self._cache),
             "detail_interval_seconds": float(self.detail_interval_seconds),
             "watchlist_interval_seconds": float(self.watchlist_interval_seconds),
-            "closed_interval_seconds": float(self.closed_interval_seconds),
+            "closed_interval_seconds": (
+                None
+                if self.closed_interval_seconds is None
+                else float(self.closed_interval_seconds)
+            ),
         }
         daily_stats = getattr(self.source, "daily_kline_stats", None)
         if callable(daily_stats):
@@ -283,11 +297,36 @@ class MarketDataBroker:
         for watchlist, detail in self._subscriptions.values():
             watchlist_symbols.update(watchlist)
             detail_symbols.update(detail)
+        market_open = self.is_market_open()
+        if not market_open:
+            self._closed_refresh_requests.intersection_update(
+                watchlist_symbols | detail_symbols
+            )
+            requested = set(self._closed_refresh_requests)
+            self._closed_refresh_requests.difference_update(requested)
+            for symbol in sorted(
+                requested,
+                key=lambda value: (value not in detail_symbols, value),
+            ):
+                try:
+                    await self.refresh(symbol, detail=symbol in detail_symbols)
+                except Exception as error:
+                    self._last_polled[symbol] = now
+                    error_code = fixed_market_error_code(error)
+                    self._publish(
+                        symbol,
+                        {
+                            "type": "source_status",
+                            "symbol": symbol,
+                            "status": "OFFLINE",
+                            "error_code": error_code,
+                        },
+                    )
+            return
+        self._closed_refresh_requests.clear()
         for symbol in sorted(watchlist_symbols | detail_symbols, key=lambda value: (value not in detail_symbols, value)):
             detail = symbol in detail_symbols
-            interval = (
-                self.detail_interval_seconds if detail else self.watchlist_interval_seconds
-            ) if self.is_market_open() else self.closed_interval_seconds
+            interval = self.detail_interval_seconds if detail else self.watchlist_interval_seconds
             last = self._last_polled.get(symbol)
             if last is not None and now - last < interval:
                 continue

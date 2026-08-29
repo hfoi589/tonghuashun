@@ -495,7 +495,9 @@ export function MarketApp() {
   const [removingSymbol, setRemovingSymbol] = useState<string | null>(null)
   const [connection, setConnection] = useState<'live' | 'reconnecting' | 'unavailable'>('unavailable')
   const socket = useRef<WebSocket | null>(null)
+  const selectedRef = useRef<string | null>(selected)
   const requestedDailySeries = useRef(new Set<string>())
+  selectedRef.current = selected
 
   const allItems = useMemo(() => {
     const found = new Map<string, { symbol: string, name: string, market: string }>()
@@ -535,13 +537,13 @@ export function MarketApp() {
   }, [])
 
   useEffect(() => {
-    if (!selected || auth !== 'authenticated' || user?.must_change_password) return
+    if (!selected || auth !== 'authenticated' || user?.must_change_password || connection === 'live') return
     let active = true
     void marketApi.snapshot(selected).then((snapshot) => {
       if (active) setSnapshots((current) => ({ ...current, [snapshot.symbol]: snapshot }))
     }).catch((reason) => { if (active) setMessage(reason instanceof Error ? reason.message : '行情读取失败') })
     return () => { active = false }
-  }, [auth, selected, user?.must_change_password])
+  }, [auth, connection, selected, user?.must_change_password])
 
   useEffect(() => {
     if (!selected || auth !== 'authenticated' || user?.must_change_password || requestedDailySeries.current.has(selected)) return
@@ -600,8 +602,9 @@ export function MarketApp() {
     let reconnectAttempt = 0
     const reconnectDelays = [1000, 2000, 4000, 8000, 15000]
     const refreshSelectedSnapshot = () => {
-      if (!selected) return
-      void marketApi.snapshot(selected).then((snapshot) => {
+      const currentSelected = selectedRef.current
+      if (!currentSelected) return
+      void marketApi.snapshot(currentSelected).then((snapshot) => {
         if (active) setSnapshots((current) => ({ ...current, [snapshot.symbol]: snapshot }))
       }).catch(() => undefined)
     }
@@ -630,7 +633,7 @@ export function MarketApp() {
         if (!active || client === null) return
         reconnectAttempt = 0
         setConnection('live')
-        client.send(JSON.stringify({ type: 'subscribe', watchlist: allItems.map((item) => item.symbol), detail: selected }))
+        client.send(JSON.stringify({ type: 'subscribe', watchlist: allItems.map((item) => item.symbol), detail: selectedRef.current }))
       }
       client.onmessage = (event) => {
         try {
@@ -656,6 +659,13 @@ export function MarketApp() {
       }
       socket.current = null
     }
+  }, [allItems, auth, user?.must_change_password])
+
+  useEffect(() => {
+    if (auth !== 'authenticated' || user?.must_change_password || typeof WebSocket === 'undefined') return
+    const client = socket.current
+    if (client === null || client.readyState !== 1) return
+    client.send(JSON.stringify({ type: 'subscribe', watchlist: allItems.map((item) => item.symbol), detail: selected }))
   }, [allItems, auth, selected, user?.must_change_password])
 
   async function addSymbol(event: FormEvent) {

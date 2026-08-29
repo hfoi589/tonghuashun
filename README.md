@@ -184,7 +184,7 @@ SYMBOL_CATALOG_REFRESH_HOUR=16
 SYMBOL_CATALOG_REFRESH_MINUTE=20
 PUBLIC_MARKET_TIMEOUT_SECONDS=8
 MARKET_DIRECT_ENRICHMENT=1
-MARKET_DIRECT_ENRICHMENT_TTL_SECONDS=15
+MARKET_DIRECT_ENRICHMENT_TTL_SECONDS=5
 CORE_WARM_CONNECTION_MAX_IDLE_SECONDS=25
 ```
 
@@ -270,9 +270,11 @@ prefix is rejected. Missing direct fields make the task `PARTIAL` and never
 trigger UI, screenshot, public-quote, or OCR fallback.
 
 The market PWA shares one server-side subscription broker across users. During
-weekday A-share sessions it refreshes the selected detail symbol every 2
-seconds and watchlist-only symbols every 15 seconds; outside the configured
-09:30–11:30 and 13:00–15:00 Asia/Shanghai windows it uses a 60-second cadence.
+weekday quote sessions from 09:10–11:30 and 13:00–15:00 Asia/Shanghai it
+refreshes both selected detail symbols and watchlist-only symbols every 2
+seconds. Outside those windows it reads each watchlist once when the page is
+opened, and reads only the clicked detail symbol when selection changes; it
+does not run a background closed-market poll.
 Selected/watchlist snapshots use Tencent public quote and minute endpoints;
 Sina public quote is the basic fallback. Five-day, week, and month series use
 Tencent qfq data. Daily K-line prefers the 10jqka public yearly line endpoint,
@@ -280,9 +282,11 @@ falls back to Tencent qfq, and then to validated stale cache—never App. It
 returns 240 visible bars after indicator warm-up and computes
 MA(5/13/21/60/120/250), BOLL(20,2), MACD(12,26,9), and volume server-side.
 Stocks display two price decimals and exchange-traded funds three.
+Watchlist-only snapshots use the lightweight quote path and do not invoke the
+optional L2 enrichment; L2 is read only for the selected detail symbol.
 
 When both task transports are explicitly `direct`, the market detail snapshot
-may merge a 15-second cached L2 enhancement containing large-order, retail,
+may merge a 5-second cached L2 enhancement containing large-order, retail,
 MACDFS, and fund-flow fields. This enhancement cannot overwrite public name,
 price, OHLC, turnover, volume, amount, or public intraday points, and its
 failure cannot make the public snapshot unavailable. Per-client WebSocket

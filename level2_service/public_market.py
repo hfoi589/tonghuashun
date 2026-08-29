@@ -556,7 +556,7 @@ class DirectEnrichedMarketDataSource:
         base_source: object,
         direct_source: object | None,
         *,
-        ttl_seconds: float = 15.0,
+        ttl_seconds: float = 5.0,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         if ttl_seconds <= 0:

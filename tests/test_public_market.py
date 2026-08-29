@@ -489,15 +489,19 @@ def test_direct_enrichment_merges_only_l2_owned_fields_and_is_cached() -> None:
                 },
             )
 
+    now = [100.0]
     source = DirectEnrichedMarketDataSource(
         Base(),
         Direct(),
-        ttl_seconds=15,
-        clock=lambda: 100,
+        clock=lambda: now[0],
     )
 
     first = source.read_market_snapshot("601872", detail=True)
     second = source.read_market_snapshot("601872", detail=True)
+    now[0] += 4.9
+    third = source.read_market_snapshot("601872", detail=True)
+    now[0] += 0.1
+    fourth = source.read_market_snapshot("601872", detail=True)
 
     assert first.name == "公开名称"
     assert first.quote["price"] == "18.62"
@@ -507,7 +511,44 @@ def test_direct_enrichment_merges_only_l2_owned_fields_and_is_cached() -> None:
     assert first.main_fund_flow["today"]["main_net_inflow"] == "1.23"
     assert first.capabilities["l2"]["available"] is True
     assert second.quote == first.quote
-    assert direct_calls == ["601872"]
+    assert third.quote == first.quote
+    assert fourth.quote == first.quote
+    assert direct_calls == ["601872", "601872"]
+
+
+def test_direct_enrichment_skips_l2_for_watchlist_snapshots() -> None:
+    from level2_service.public_market import DirectEnrichedMarketDataSource
+
+    snapshot = MarketSnapshot(
+        symbol="601872",
+        name="招商轮船",
+        market="17",
+        sequence=0,
+        source_time="15:00",
+        collected_at=datetime.now(timezone.utc),
+        quote={"price": "18.62"},
+        source="TENCENT_PUBLIC",
+    )
+    direct_calls: list[str] = []
+
+    class Base:
+        @staticmethod
+        def read_market_snapshot(_symbol: str, *, detail: bool):
+            assert detail is False
+            return snapshot
+
+    class Direct:
+        @staticmethod
+        def read_direct(symbol: str):
+            direct_calls.append(symbol)
+            raise AssertionError("watchlist snapshots must not read L2")
+
+    result = DirectEnrichedMarketDataSource(Base(), Direct()).read_market_snapshot(
+        "601872", detail=False
+    )
+
+    assert result.quote == {"price": "18.62"}
+    assert direct_calls == []
 
 
 def test_direct_enrichment_failure_keeps_the_public_snapshot_available() -> None:

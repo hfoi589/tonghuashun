@@ -655,6 +655,39 @@ def test_data_only_runner_reads_parsed_values_without_capturing_or_running_ocr(t
     assert not (tmp_path / "data-only-task").exists()
 
 
+def test_data_only_runner_does_not_probe_app_ui_before_direct_read(tmp_path: Path) -> None:
+    """Pure interface tasks must not require the Android UI or ADB device."""
+    class UnpassedDailyCheck:
+        def passed_today(self) -> bool:
+            return False
+
+        def mark_passed(self) -> None:
+            raise AssertionError("data-only direct tasks must not mark an App check")
+
+    class OfflineNavigator:
+        def admin_blocking_texts(self) -> frozenset[str]:
+            raise AssertionError("data-only direct tasks must not inspect App UI")
+
+        def device_online(self) -> bool:
+            return False
+
+    store = InMemoryStreams()
+    store.enqueue(TaskRecord(task_id="direct-without-device", symbol="601872", include_long_capture=False))
+    runner = Level2Runner(
+        store,
+        OfflineNavigator(),  # type: ignore[arg-type]
+        tmp_path,
+        RunnerControl(),
+        daily_check_state=UnpassedDailyCheck(),  # type: ignore[arg-type]
+        parsed_value_source=types.SimpleNamespace(read_direct=lambda _symbol: dict(PARSED_VALUES)),
+    )
+
+    task = runner.run_once()
+
+    assert task is not None and task.status == TaskStatus.COMPLETED
+    assert task.error_code is None
+
+
 def test_data_only_runner_never_uses_ocr_for_missing_interface_values(tmp_path: Path) -> None:
     """A partial interface response must stay partial without opening the App UI."""
     store = InMemoryStreams()

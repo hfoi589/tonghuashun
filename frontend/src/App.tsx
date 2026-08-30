@@ -33,15 +33,13 @@ const statusText: Record<JobStatus, string> = {
   QUEUED: '已进入队列',
   RUNNING: '正在采集',
   WAITING_ADMIN: '等待管理员处理',
-  COMPLETED: '数据和长截图已就绪',
-  PARTIAL: '长截图已生成，部分数据未读取',
+  COMPLETED: '数据已就绪',
+  PARTIAL: '部分数据未读取',
   FAILED: '采集未完成',
   EXPIRED: '结果已过期',
 }
 
 function taskStatusText(task: Job): string {
-  if (!task.include_long_capture && task.status === 'COMPLETED') return '数据已就绪'
-  if (!task.include_long_capture && task.status === 'PARTIAL') return '部分数据未读取'
   return statusText[task.status]
 }
 
@@ -262,10 +260,7 @@ export function JobResult({ task, isLatest = false, onRetry, retrying = false }:
   onRetry?: () => void,
   retrying?: boolean,
 }) {
-  const [captureOpen, setCaptureOpen] = useState(false)
   const finished = task.status === 'COMPLETED' || task.status === 'PARTIAL'
-  const captureReady = task.long_capture.status === 'READY' && Boolean(task.long_capture.url)
-  const captureId = `long-capture-${task.public_id}`
   const stockDisplayName = task.values.stock_name ? `${task.values.stock_name}（${task.symbol}）` : null
 
   return <article className={`job-result${isLatest ? ' latest-job' : ''}`} aria-live="polite">
@@ -315,35 +310,6 @@ export function JobResult({ task, isLatest = false, onRetry, retrying = false }:
       series={task.values.intraday_series}
     />}
 
-    {captureReady ? <section className="capture-drawer">
-      <button
-        type="button"
-        className="capture-toggle"
-        aria-label={captureOpen ? '收起长截图' : '展开长截图'}
-        aria-expanded={captureOpen}
-        aria-controls={captureId}
-        onClick={() => setCaptureOpen((open) => !open)}
-      >
-        <span>
-          <strong>整页长截图</strong>
-          <small>{task.long_capture.expires_at ? `可用至 ${new Date(task.long_capture.expires_at).toLocaleString('zh-CN')}` : '可在有效期内查看'}</small>
-        </span>
-        <span className="capture-toggle-label">{captureOpen ? '收起长截图' : '展开长截图'}</span>
-      </button>
-      {captureOpen && <div className="capture-drawer-body" id={captureId}>
-        <div className="capture-actions">
-          <a href={task.long_capture.url!} target="_blank" rel="noreferrer">打开长截图</a>
-          <a href={task.long_capture.url!} download>下载长截图</a>
-        </div>
-        <img src={task.long_capture.url!} alt={`${task.symbol} Level2 整页长截图`} loading="lazy" />
-      </div>}
-    </section> : task.long_capture.status === 'EXPIRED'
-      ? <p className="minor long-capture-expired">长截图已过期，指标数据仍保留</p>
-      : task.status !== 'EXPIRED' && (
-        task.long_capture.status === 'SKIPPED' || !task.include_long_capture
-          ? <p className="minor long-capture-skipped">未请求长截图</p>
-          : <p className="minor long-capture-pending">整页长截图尚未生成。</p>
-      )}
   </article>
 }
 
@@ -464,7 +430,6 @@ export default function App({ initialTask }: { initialTask?: Job }) {
   const [suggestionsOpen, setSuggestionsOpen] = useState(false)
   const [activeSuggestionIndex, setActiveSuggestionIndex] = useState(-1)
   const [composingSymbol, setComposingSymbol] = useState(false)
-  const [includeLongCapture, setIncludeLongCapture] = useState(false)
   const [tabs, setTabs] = useState<StockTab[]>(initialTask ? [{
     public_id: initialTask.public_id,
     symbol: initialTask.symbol,
@@ -745,7 +710,7 @@ export default function App({ initialTask }: { initialTask?: Job }) {
     setSubmitting(true)
     setError('')
     try {
-      const nextTask = await api.submitJob(normalized, includeLongCapture)
+      const nextTask = await api.submitJob(normalized, false)
       removedTabIds.current.delete(nextTask.public_id)
       placeTabAtTop(nextTask, symbolLookup.result.name)
       setSymbol('')
@@ -927,15 +892,6 @@ export default function App({ initialTask }: { initialTask?: Job }) {
             </div>}
           </div>
           <button type="submit" disabled={submitting || !verifiedSymbol}>{submitting ? '正在提交…' : '提交采集任务'}</button>
-          <label className="capture-option">
-            <input
-              type="checkbox"
-              aria-label="生成整页长截图"
-              checked={includeLongCapture}
-              onChange={(event) => setIncludeLongCapture(event.target.checked)}
-            />
-            <span><strong>生成整页长截图</strong></span>
-          </label>
         </div>
         <div
           id="symbol-lookup-status"
@@ -968,7 +924,7 @@ export default function App({ initialTask }: { initialTask?: Job }) {
         <div>
           <p className="eyebrow">当前浏览器</p>
           <h2 id="history-title">股票页签</h2>
-          <p>股票和指标结果会永久保存在当前浏览器；长截图链接保留 24 小时。</p>
+          <p>股票和指标结果会永久保存在当前浏览器。</p>
         </div>
         {!initialTask && tabs.length > 0 && <button type="button" className="secondary clear-history" onClick={clearHistory}>清空本机记录</button>}
       </div>

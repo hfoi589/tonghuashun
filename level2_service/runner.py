@@ -1379,7 +1379,6 @@ class Level2Runner:
         try:
             frames: tuple[bytes, ...] | None = None
             long_capture: bytes | None = None
-            self._run_daily_admin_check()
             direct_reader = getattr(self.parsed_value_source, "read_direct", None)
             if not callable(direct_reader):
                 raise DirectRequestError(

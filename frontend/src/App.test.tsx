@@ -93,7 +93,7 @@ describe('Level2 web UI', () => {
     await user.type(screen.getByLabelText('股票代码或名称'), '600938')
     await screen.findByText('中国海油（600938）')
     expect(screen.getByRole('heading', { name: '同花顺数据采集' })).toBeInTheDocument()
-    expect(screen.getByRole('checkbox', { name: '生成整页长截图' })).not.toBeChecked()
+    expect(screen.queryByRole('checkbox', { name: '生成整页长截图' })).not.toBeInTheDocument()
     await user.click(screen.getByRole('button', { name: '提交采集任务' }))
 
     await waitFor(() => expect(screen.getByText('已进入队列')).toBeInTheDocument())
@@ -107,11 +107,8 @@ describe('Level2 web UI', () => {
     expect(window.location.href).toBe(currentUrl)
   })
 
-  it('submits a long-capture task when the switch is turned on', async () => {
-    const dataOnlyTask: Job = {
-      ...task,
-      include_long_capture: true,
-    }
+  it('hides the long-capture option and always submits a data-only task', async () => {
+    const dataOnlyTask: Job = { ...task, include_long_capture: false }
     vi.mocked(fetch)
       .mockResolvedValueOnce(jsonResponse(symbolLookup('601872', '招商轮船')))
       .mockResolvedValueOnce(jsonResponse(dataOnlyTask, 202))
@@ -120,13 +117,13 @@ describe('Level2 web UI', () => {
     render(<App />)
     await user.type(screen.getByLabelText('股票代码或名称'), '601872')
     await screen.findByText('招商轮船（601872）')
-    await user.click(screen.getByRole('checkbox', { name: '生成整页长截图' }))
+    expect(screen.queryByRole('checkbox', { name: '生成整页长截图' })).not.toBeInTheDocument()
     await user.click(screen.getByRole('button', { name: '提交采集任务' }))
 
     await waitFor(() => expect(screen.getByText('已进入队列')).toBeInTheDocument())
     expect(fetch).toHaveBeenCalledWith('/api/v1/jobs', expect.objectContaining({
       method: 'POST',
-      body: JSON.stringify({ symbol: '601872', include_long_capture: true }),
+      body: JSON.stringify({ symbol: '601872', include_long_capture: false }),
     }))
   })
 
@@ -576,8 +573,7 @@ describe('Level2 web UI', () => {
     expect(within(screen.getByText('大单金额').closest('article')!).queryByText('OCR识别')).not.toBeInTheDocument()
   })
 
-  it('keeps the long capture collapsed until the user opens its drawer', async () => {
-    const user = userEvent.setup()
+  it('hides long-capture controls even when a historical task has a capture', () => {
     render(<App initialTask={{
       ...task,
       status: 'PARTIAL',
@@ -597,7 +593,8 @@ describe('Level2 web UI', () => {
       long_capture: { status: 'READY', url: '/api/v1/jobs/public-job-1/capture', expires_at: '2026-08-22T08:00:00+00:00' },
     }} />)
 
-    expect(screen.getByText('长截图已生成，部分数据未读取')).toBeInTheDocument()
+    expect(screen.queryByText('长截图已生成，部分数据未读取')).not.toBeInTheDocument()
+    expect(screen.getByText('部分数据未读取')).toBeInTheDocument()
     expect(screen.getByText('-0.02')).toBeInTheDocument()
     expect(screen.getByText('+21.23')).toBeInTheDocument()
     expect(screen.getByText('招商轮船（600938）')).toBeInTheDocument()
@@ -612,16 +609,11 @@ describe('Level2 web UI', () => {
     expect(screen.getByText(/采集时间/)).toBeInTheDocument()
     expect(screen.getByText('大单净量')).toBeInTheDocument()
     expect(screen.queryByRole('img', { name: '600938 Level2 整页长截图' })).not.toBeInTheDocument()
-
-    await user.click(screen.getByRole('button', { name: '展开长截图' }))
-
-    expect(screen.getByRole('img', { name: '600938 Level2 整页长截图' })).toHaveAttribute('src', '/api/v1/jobs/public-job-1/capture')
-    expect(screen.getByRole('link', { name: '打开长截图' })).toHaveAttribute('href', '/api/v1/jobs/public-job-1/capture')
-    expect(screen.getByRole('button', { name: '收起长截图' })).toHaveAttribute('aria-expanded', 'true')
+    expect(screen.queryByRole('button', { name: '展开长截图' })).not.toBeInTheDocument()
     expect(screen.queryByText('截图已就绪')).not.toBeInTheDocument()
   })
 
-  it('shows that a completed data-only task did not request a long capture', () => {
+  it('does not show long-capture status for a completed data-only task', () => {
     render(<App initialTask={{
       ...task,
       include_long_capture: false,
@@ -642,7 +634,7 @@ describe('Level2 web UI', () => {
     }} />)
 
     expect(screen.getByText('数据已就绪')).toBeInTheDocument()
-    expect(screen.getByText('未请求长截图')).toBeInTheDocument()
+    expect(screen.queryByText('未请求长截图')).not.toBeInTheDocument()
     expect(screen.queryByText('整页长截图尚未生成。')).not.toBeInTheDocument()
     expect(screen.queryByRole('button', { name: '展开长截图' })).not.toBeInTheDocument()
   })
@@ -661,7 +653,7 @@ describe('Level2 web UI', () => {
 
     expect(screen.getByText('中国海油（600938）')).toBeInTheDocument()
     expect(screen.getByText('25.48')).toBeInTheDocument()
-    expect(screen.getByText('长截图已过期，指标数据仍保留')).toBeInTheDocument()
+    expect(screen.queryByText('长截图已过期，指标数据仍保留')).not.toBeInTheDocument()
   })
 
   it('keeps earlier stocks as tabs when a new job is submitted', async () => {

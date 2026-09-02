@@ -161,6 +161,7 @@ class DeviceLifecycleManager:
         configs: Mapping[str, DeviceConfig] | None = None,
         boot_timeout_seconds: float = 180.0,
         shutdown_timeout_seconds: float = 60.0,
+        app_start_timeout_seconds: float = 10.0,
         command_timeout_seconds: float = 10.0,
         poll_interval_seconds: float = 1.0,
         trusted_emulator_path: Path | None = None,
@@ -198,6 +199,9 @@ class DeviceLifecycleManager:
         self._configs = dict(FIXED_CONFIGS)
         self._boot_timeout_seconds = boot_timeout_seconds
         self._shutdown_timeout_seconds = shutdown_timeout_seconds
+        if app_start_timeout_seconds <= 0:
+            raise ValueError("app_start_timeout_seconds must be positive")
+        self._app_start_timeout_seconds = app_start_timeout_seconds
         self._command_timeout_seconds = command_timeout_seconds
         self._poll_interval_seconds = poll_interval_seconds
         self._operations: dict[str, DeviceOperation] = {}
@@ -213,20 +217,36 @@ class DeviceLifecycleManager:
                 busy = self._role_busy[role]
                 saved_state = self._states[role]
                 latest = self._latest_operations.get(role)
-            preserve_error = (
-                not busy
-                and saved_state is LifecycleState.ERROR
-                and latest is not None
-                and latest.error_code is not None
-            )
-            state = (
-                saved_state
-                if busy or preserve_error
-                else self._detect_state(config)
-            )
-            if not busy and not preserve_error:
-                with self._lock:
-                    self._states[role] = state
+            if busy:
+                state = saved_state
+            else:
+                detected_state = self._detect_state(config)
+                recovered = (
+                    detected_state is LifecycleState.RUNNING
+                    and saved_state is LifecycleState.ERROR
+                    and latest is not None
+                    and latest.error_code == "DEVICE_APP_LAUNCH_FAILED"
+                    and self._app_is_running(config)
+                )
+                if recovered:
+                    state = detected_state
+                    with self._lock:
+                        current_latest = self._latest_operations.get(role)
+                        if current_latest is latest and current_latest is not None:
+                            current_latest.state = LifecycleState.RUNNING
+                            current_latest.error_code = None
+                            current_latest.updated_at = self._now()
+                        self._states[role] = state
+                elif (
+                    saved_state is LifecycleState.ERROR
+                    and latest is not None
+                    and latest.error_code is not None
+                ):
+                    state = saved_state
+                else:
+                    state = detected_state
+                    with self._lock:
+                        self._states[role] = state
             result.append(
                 {
                     "role": role,
@@ -328,9 +348,12 @@ class DeviceLifecycleManager:
             )
         self._repair_bridge(config)
         self._launch_app(config)
-        if not self._app_is_running(config):
-            raise LifecycleFailure("DEVICE_APP_LAUNCH_FAILED")
-        return LifecycleState.RUNNING
+        deadline = time.monotonic() + self._app_start_timeout_seconds
+        while time.monotonic() < deadline:
+            if self._app_is_running(config):
+                return LifecycleState.RUNNING
+            time.sleep(self._poll_interval_seconds)
+        raise LifecycleFailure("DEVICE_APP_LAUNCH_FAILED")
 
     def _shutdown(self, config: DeviceConfig) -> LifecycleState:
         state = self._detect_state(config)

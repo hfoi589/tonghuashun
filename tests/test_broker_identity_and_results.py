@@ -156,39 +156,30 @@ def test_valid_absent_serial_and_exact_starting_process_reports_starting() -> No
     assert resolver.calls == [123]
 
 
-def test_terminal_error_remains_visible_until_a_later_successful_action() -> None:
-    """Normal state detection must not erase the latest asynchronous failure alert."""
+def test_terminal_error_is_cleared_when_health_probe_sees_running_app() -> None:
+    """A recovered device must not keep showing a stale launch error forever."""
     responses = lifecycle_responses(CORE_SERIAL, app_running=False)
     add_attached_identity(responses)
     runner = FakeCommandRunner(responses)
-    manager = identity_manager(runner)
+    manager = identity_manager(runner, app_start_timeout_seconds=0.01)
     failed = wait_for_terminal(
         manager,
         manager.submit("core_metrics", "start_and_launch_app").operation_id,
     )
     assert failed.state is module.LifecycleState.ERROR
 
-    first = {item["role"]: item for item in manager.devices()}["core_metrics"]
-    second = {item["role"]: item for item in manager.devices()}["core_metrics"]
-
-    assert first == second
-    assert first["state"] == "ERROR"
-    assert first["operation_id"] == failed.operation_id
-    assert first["error_code"] == "DEVICE_APP_LAUNCH_FAILED"
-    assert isinstance(first["updated_at"], str)
+    still_failed = {item["role"]: item for item in manager.devices()}["core_metrics"]
+    assert still_failed["state"] == "ERROR"
+    assert still_failed["error_code"] == "DEVICE_APP_LAUNCH_FAILED"
 
     pidof = ("adb", "-s", CORE_SERIAL, "shell", "pidof", "com.hexin.plat.android")
     runner.responses[pidof] = result(pidof, stdout=b"234\n")
-    succeeded = wait_for_terminal(
-        manager,
-        manager.submit("core_metrics", "start_and_launch_app").operation_id,
-    )
     latest = {item["role"]: item for item in manager.devices()}["core_metrics"]
 
-    assert succeeded.state is module.LifecycleState.RUNNING
     assert latest["state"] == "RUNNING"
-    assert latest["operation_id"] == succeeded.operation_id
+    assert latest["operation_id"] == failed.operation_id
     assert latest["error_code"] is None
+    assert manager.operation(failed.operation_id).state is module.LifecycleState.RUNNING
 
 
 def test_broker_and_deployer_share_the_same_identity_verifier() -> None:

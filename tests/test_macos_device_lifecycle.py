@@ -358,6 +358,18 @@ def test_running_start_skips_emulator_launch_and_opens_fixed_activity() -> None:
     ) in runner.calls
 
 
+def test_start_waits_for_app_process_after_launch() -> None:
+    runner = running_device_runner("emulator-5556")
+    pidof = ("adb", "-s", "emulator-5556", "shell", "pidof", "com.hexin.plat.android")
+    runner.sequences[pidof] = [result(pidof, code=1), result(pidof, stdout=b"234\n")]
+    manager = make_manager(runner)
+
+    operation = wait_for_terminal(manager, manager.submit("core_metrics", "start_and_launch_app").operation_id)
+
+    assert operation.state is module.LifecycleState.RUNNING
+    assert runner.calls.count(pidof) >= 2
+
+
 def test_running_start_passes_configured_adb_path_to_host_scripts() -> None:
     """LaunchAgents may have a restricted PATH, so scripts receive absolute adb."""
     runner = running_device_runner("emulator-5556")

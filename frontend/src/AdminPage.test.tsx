@@ -23,6 +23,7 @@ function mockAuthenticatedDashboard(options: {
   coreApp?: string
   fundState?: string
   fundApp?: string
+  fundExpiresAt?: string
 } = {}) {
   const {
     locked = true,
@@ -30,6 +31,7 @@ function mockAuthenticatedDashboard(options: {
     coreApp = 'ONLINE',
     fundState = 'STOPPED',
     fundApp = 'OFFLINE',
+    fundExpiresAt,
   } = options
   vi.mocked(fetch).mockImplementation(async (input) => {
     const url = String(input)
@@ -48,8 +50,8 @@ function mockAuthenticatedDashboard(options: {
       },
     ] })
     if (url === '/api/admin/account-sessions') return jsonResponse({ sessions: [
-      { role: 'core_metrics', state: 'READY', updated_at: null, error_code: null },
-      { role: 'main_fund_flow', state: 'READY', updated_at: null, error_code: null },
+      { role: 'core_metrics', state: 'READY', updated_at: null, error_code: null, expires_at: null },
+      { role: 'main_fund_flow', state: 'READY', updated_at: fundExpiresAt ? '2026-08-26T08:00:00Z' : null, error_code: null, expires_at: fundExpiresAt ?? null },
     ] })
     throw new Error(`unexpected request: ${url}`)
   })
@@ -61,6 +63,7 @@ describe('AdminPage', () => {
       const url = String(input)
       if (url === '/api/admin/devices') return jsonResponse({ devices: [] })
       if (url === '/api/admin/account-sessions') return jsonResponse({ sessions: [] })
+      if (url === '/api/admin/premium') return jsonResponse({ as_of: null, valid_count: 0, errors: {}, rows: [] })
       throw new Error(`unexpected request: ${url}`)
     }))
     Object.defineProperty(document, 'cookie', { writable: true, value: 'ths_csrf=test-csrf' })
@@ -92,8 +95,8 @@ describe('AdminPage', () => {
         ],
       })
       if (url === '/api/admin/account-sessions') return jsonResponse({ sessions: [
-        { role: 'core_metrics', state: 'READY', updated_at: '2026-08-27T10:00:00+00:00', error_code: null },
-        { role: 'main_fund_flow', state: 'MISSING', updated_at: null, error_code: null },
+        { role: 'core_metrics', state: 'READY', updated_at: '2026-08-27T10:00:00+00:00', error_code: null, expires_at: null },
+        { role: 'main_fund_flow', state: 'MISSING', updated_at: null, error_code: null, expires_at: null },
       ] })
       throw new Error(`unexpected request: ${url}`)
     })
@@ -114,6 +117,55 @@ describe('AdminPage', () => {
     expect(within(fundPanel).getByText('账号会话：未配置')).toBeInTheDocument()
     expect(within(fundPanel).getByRole('button', { name: '刷新资金账号会话' })).toBeInTheDocument()
     expect(screen.queryByRole('heading', { name: '资金账号会话' })).not.toBeInTheDocument()
+  })
+
+  it('shows the calculated expiry date on the fund account panel', async () => {
+    mockAuthenticatedDashboard({ fundExpiresAt: '2026-09-04' })
+
+    render(<AdminPage />)
+
+    const fundPanel = (await screen.findByRole('heading', { name: '资金账号' })).closest('section')!
+    expect(await within(fundPanel).findByText('账户到期日：2026-09-04')).toBeInTheDocument()
+  })
+
+  it('loads and saves monitoring, MACD, push channels, and replay rules', async () => {
+    const requests: Array<{ url: string, init?: RequestInit }> = []
+    vi.mocked(fetch).mockImplementation(async (input, init) => {
+      const url = String(input)
+      requests.push({ url, init })
+      if (url === '/api/admin/session') return new Response(null, { status: 204 })
+      if (url === '/api/admin/runner') return jsonResponse({ state: 'READY', last_heartbeat: null, queue_paused: false })
+      if (url === '/api/admin/lock') return jsonResponse({ locked: false })
+      if (url === '/api/admin/queue') return jsonResponse({ paused: false })
+      if (url === '/api/admin/devices') return jsonResponse({ devices: [] })
+      if (url === '/api/admin/account-sessions') return jsonResponse({ sessions: [] })
+      if (url === '/api/admin/premium') return jsonResponse({ as_of: null, valid_count: 0, errors: {}, rows: [] })
+      if (url === '/api/admin/monitoring') return jsonResponse([{ symbol: '601872', latest_trade_date: '20260831', latest_time: '09:31', last_sync_at: '2026-08-31T09:31:00+08:00', last_error: null }])
+      if (url === '/api/admin/research/macd') return jsonResponse({ short: 10, long: 20, signal: 5, marker_threshold: 0.001 })
+      if (url === '/api/admin/push/config') return jsonResponse({
+        enabled: true, premium_push_enabled: true,
+        bark_groups: [{ id: 'phone', name: '手机', base_url: 'https://api.day.app', device_key: '', device_key_configured: true }],
+        sc3_bot: { enabled: true, base_url: 'https://bot.example', token: '', token_configured: true, chat_id: '7', parse_mode: 'markdown', silent: false },
+        wecom: { enabled: true, api_base_url: 'https://qyapi.weixin.qq.com', news_base_url: '', corp_id: 'corp', corp_secret: '', corp_secret_configured: true, agent_id: 1, to_user: '@all', to_party: '', to_tag: '' },
+        rules: [{ id: 'buy', enabled: true, side: 'buy', title: '买入', joiner: 'and', conditions: [] }],
+      })
+      if (url === '/api/admin/research/macd' && init?.method === 'PUT') return jsonResponse(JSON.parse(String(init.body)))
+      if (url === '/api/admin/push/config' && init?.method === 'PUT') return jsonResponse(JSON.parse(String(init.body)))
+      throw new Error(`unexpected request: ${url}`)
+    })
+
+    render(<AdminPage autoLoad />)
+    await userEvent.click(await screen.findByRole('button', { name: '监控与推送' }))
+
+    expect(await screen.findByRole('heading', { name: '监控采集' })).toBeInTheDocument()
+    expect(screen.getByRole('heading', { name: 'MACD 参数' })).toBeInTheDocument()
+    expect(screen.getByRole('heading', { name: 'Bark 多组推送' })).toBeInTheDocument()
+    expect(screen.getByRole('heading', { name: 'Server酱³' })).toBeInTheDocument()
+    expect(screen.getByRole('heading', { name: '企业微信' })).toBeInTheDocument()
+    expect(screen.getByRole('heading', { name: '推送规则' })).toBeInTheDocument()
+    fireEvent.change(screen.getByLabelText('MACD 短期'), { target: { value: '8' } })
+    await userEvent.click(screen.getByRole('button', { name: '保存 MACD 参数' }))
+    await waitFor(() => expect(requests.some((request) => request.url === '/api/admin/research/macd' && request.init?.method === 'PUT')).toBe(true))
   })
 
   it('uses an alertdialog with trapped focus and restores the shutdown trigger on cancel or Escape', async () => {
@@ -394,7 +446,8 @@ describe('AdminPage', () => {
 
     const user = userEvent.setup()
     render(<AdminPage />)
-    await user.click(await screen.findByRole('button', { name: '加载行情用户' }))
+    await user.click(await screen.findByRole('button', { name: '用户与安全' }))
+    expect(await screen.findByText('还没有行情用户。')).toBeInTheDocument()
     await user.type(screen.getByLabelText('新用户名'), 'trader')
     await user.type(screen.getByLabelText('临时密码'), 'temporary-pass')
     await user.click(screen.getByRole('button', { name: '创建行情用户' }))
@@ -405,6 +458,51 @@ describe('AdminPage', () => {
       method: 'POST',
       headers: expect.objectContaining({ 'X-CSRF-Token': 'test-csrf' }),
     }))
+  })
+
+  it('loads the global market monitoring list when its tab is opened', async () => {
+    const requests: string[] = []
+    vi.mocked(fetch).mockImplementation(async (input) => {
+      const url = String(input)
+      requests.push(url)
+      if (url === '/api/admin/session') return new Response(null, { status: 204 })
+      if (url === '/api/admin/runner') return jsonResponse({ state: 'READY', last_heartbeat: null, queue_paused: false })
+      if (url === '/api/admin/lock') return jsonResponse({ locked: false })
+      if (url === '/api/admin/queue') return jsonResponse({ paused: false })
+      if (url === '/api/admin/devices') return jsonResponse({ devices: [] })
+      if (url === '/api/admin/account-sessions') return jsonResponse({ sessions: [] })
+      if (url === '/api/admin/market-monitoring-list') return jsonResponse([{
+        symbol: '601872', stock_name: '招商轮船', monitoring_date: '2026-09-20', monitoring_users: ['alice', 'bob'],
+      }])
+      throw new Error(`unexpected request: ${url}`)
+    })
+
+    render(<AdminPage />)
+    await userEvent.click(await screen.findByRole('button', { name: '市场监控列表' }))
+
+    expect(await screen.findByText('2026-09-20')).toBeInTheDocument()
+    expect(screen.getByText('alice；bob')).toBeInTheDocument()
+    expect(requests).toContain('/api/admin/market-monitoring-list')
+  })
+
+  it('shows a retryable error when the market user list fails to load automatically', async () => {
+    vi.mocked(fetch).mockImplementation(async (input) => {
+      const url = String(input)
+      if (url === '/api/admin/session') return new Response(null, { status: 204 })
+      if (url === '/api/admin/runner') return jsonResponse({ state: 'READY', last_heartbeat: null, queue_paused: false })
+      if (url === '/api/admin/lock') return jsonResponse({ locked: false })
+      if (url === '/api/admin/queue') return jsonResponse({ paused: false })
+      if (url === '/api/admin/devices') return jsonResponse({ devices: [] })
+      if (url === '/api/admin/account-sessions') return jsonResponse({ sessions: [] })
+      if (url === '/api/admin/users') return jsonResponse({ detail: '暂时无法加载' }, 503)
+      throw new Error(`unexpected request: ${url}`)
+    })
+
+    render(<AdminPage />)
+    await userEvent.click(await screen.findByRole('button', { name: '用户与安全' }))
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('暂时无法加载')
+    expect(screen.getByRole('button', { name: '重新加载行情用户' })).toBeInTheDocument()
   })
 
   it('refreshes the fund account session without exposing session material', async () => {
@@ -611,6 +709,7 @@ describe('AdminPage', () => {
     renderLoggedOutAdmin()
     await user.type(await screen.findByLabelText('管理员密码'), 'never-display-this')
     await user.click(screen.getByRole('button', { name: '登录管理台' }))
+    await user.click(await screen.findByRole('button', { name: '运行概览' }))
     await user.type(screen.getByLabelText('等待任务 ID'), 'waiting-job')
     await user.click(screen.getByRole('button', { name: '恢复等待任务' }))
 
@@ -635,6 +734,7 @@ describe('AdminPage', () => {
     renderLoggedOutAdmin()
     await user.type(await screen.findByLabelText('管理员密码'), 'never-display-this')
     await user.click(screen.getByRole('button', { name: '登录管理台' }))
+    await user.click(await screen.findByRole('button', { name: '运行概览' }))
     await user.type(screen.getByLabelText('失败任务 ID'), 'failed-job')
     await user.click(screen.getByRole('button', { name: '重试失败任务' }))
 
@@ -867,6 +967,7 @@ describe('AdminPage', () => {
       .mockResolvedValueOnce(jsonResponse({ paused: false }))
       .mockResolvedValueOnce(jsonResponse({ devices: [] }))
       .mockResolvedValueOnce(jsonResponse({ sessions: [] }))
+      .mockResolvedValueOnce(jsonResponse([]))
       .mockResolvedValueOnce(new Response(null, { status: 204 }))
 
     const user = userEvent.setup()
@@ -874,6 +975,7 @@ describe('AdminPage', () => {
     expect(document.querySelector('main[data-1p-ignore="true"]')).toBeInTheDocument()
     await user.type(await screen.findByLabelText('管理员密码'), 'never-display-this')
     await user.click(screen.getByRole('button', { name: '登录管理台' }))
+    await user.click(await screen.findByRole('button', { name: '用户与安全' }))
     await user.type(screen.getByLabelText('当前管理员密码'), 'never-display-this')
     await user.type(screen.getByLabelText('新管理员密码'), 'new-admin-secret-123')
     await user.type(screen.getByLabelText('确认新管理员密码'), 'new-admin-secret-123')

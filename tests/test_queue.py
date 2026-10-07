@@ -501,6 +501,29 @@ def test_refresh_reuses_a_terminal_task_id_and_clears_stale_result_before_queuei
     assert store.next_queued().task_id == "refresh"
 
 
+def test_market_snapshot_is_terminal_and_round_trips_through_public_response() -> None:
+    store = InMemoryStreams()
+    store.enqueue(TaskRecord(task_id="snapshot", symbol="601872"))
+    store.transition("snapshot", TaskStatus.RUNNING)
+
+    task = store.complete_market_snapshot(
+        "snapshot",
+        {
+            "symbol": "601872",
+            "source": "MARKET_DATABASE",
+            "stored_trade_dates": {
+                "core_metrics": "20260909",
+                "main_fund_flow": "20260914",
+            },
+        },
+    )
+
+    assert task.status == TaskStatus.MARKET_SNAPSHOT
+    assert task.market_snapshot["source"] == "MARKET_DATABASE"
+    assert task.as_public()["market_snapshot"]["stored_trade_dates"]["main_fund_flow"] == "20260914"
+    assert task.as_public()["captures"][0]["status"] == "SKIPPED"
+
+
 def test_find_by_symbol_returns_the_most_recent_task_for_history_reuse() -> None:
     store = InMemoryStreams()
     older = TaskRecord(task_id="older", symbol="600938")

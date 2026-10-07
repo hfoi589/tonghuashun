@@ -57,6 +57,9 @@ _NODE_KINDS = {
     "lof_hq_fund": {"20", "36"},
 }
 _MARKET_LABELS = {"17": "沪A", "33": "深A", "151": "北交", "20": "沪基", "36": "深基"}
+_CANONICAL_SYMBOL_NAMES = {
+    "688027": "国盾量子",
+}
 
 
 def _exchange_for_market(market: str) -> str:
@@ -72,6 +75,10 @@ def _exchange_for_market(market: str) -> str:
 def _text(value: object) -> str | None:
     text = str(value).strip() if value is not None else ""
     return text or None
+
+
+def _canonical_symbol_name(symbol: str, name: str) -> str:
+    return _CANONICAL_SYMBOL_NAMES.get(symbol, name)
 
 
 class SinaSymbolCatalogSource:
@@ -134,12 +141,18 @@ class SinaSymbolCatalogSource:
             if not isinstance(payload, list):
                 raise SymbolCatalogError("SYMBOL_CATALOG_SOURCE_INVALID")
             if not payload:
+                if node == "lof_hq_fund" and seen_records > 0:
+                    break
                 raise SymbolCatalogError("SYMBOL_CATALOG_SOURCE_INCOMPLETE")
             seen_records += len(payload)
             for row in payload:
                 parsed = self._parse_row(row, node)
                 if parsed is not None:
                     results.append(parsed)
+            if len(payload) < self.page_size:
+                if expected_count - seen_records > 1 and node != "lof_hq_fund":
+                    raise SymbolCatalogError("SYMBOL_CATALOG_SOURCE_INCOMPLETE")
+                break
             page += 1
         return results
 
@@ -286,7 +299,7 @@ class SQLiteSymbolCatalog:
                 expected_market = market_code_for_symbol(value.symbol)
             except UnsupportedMarketError as error:
                 raise SymbolCatalogError("SYMBOL_CATALOG_SOURCE_INVALID") from error
-            name = value.name.strip()
+            name = _canonical_symbol_name(value.symbol, value.name.strip())
             identity = (value.symbol, value.market)
             if not name or value.market != expected_market:
                 raise SymbolCatalogError("SYMBOL_CATALOG_SOURCE_INVALID")
@@ -395,11 +408,37 @@ class SQLiteSymbolCatalog:
         expected_market = market_code_for_symbol(symbol)
         with self._lock, self._connect() as connection:
             active = self._require_active(connection)
-            row = connection.execute(
-                """SELECT symbol,name,market,market_label FROM catalog_securities
-                   WHERE version_id=? AND symbol=? AND market=?""",
-                (active["version_id"], symbol, expected_market),
-            ).fetchone()
+            row = self._lookup_row(connection, active, symbol, expected_market)
+        return self._symbol_lookup_from_row(row, symbol)
+
+    def lookup_existing(self, symbol: str) -> SymbolLookup:
+        """Read an exact active-version identity without enforcing catalog age."""
+        expected_market = market_code_for_symbol(symbol)
+        with self._lock, self._connect() as connection:
+            active = self._active_row(connection)
+            if active is None:
+                raise SymbolCatalogError("SYMBOL_CATALOG_UNAVAILABLE")
+            row = self._lookup_row(connection, active, symbol, expected_market)
+        return self._symbol_lookup_from_row(row, symbol)
+
+    @staticmethod
+    def _lookup_row(
+        connection: sqlite3.Connection,
+        active: sqlite3.Row,
+        symbol: str,
+        expected_market: str,
+    ) -> sqlite3.Row | None:
+        return connection.execute(
+            """SELECT symbol,name,market,market_label FROM catalog_securities
+               WHERE version_id=? AND symbol=? AND market=?""",
+            (active["version_id"], symbol, expected_market),
+        ).fetchone()
+
+    @staticmethod
+    def _symbol_lookup_from_row(
+        row: sqlite3.Row | None,
+        symbol: str,
+    ) -> SymbolLookup:
         if row is None:
             raise SymbolLookupNotFoundError(symbol)
         return SymbolLookup(

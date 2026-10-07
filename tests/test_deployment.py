@@ -32,6 +32,7 @@ from level2_service.public_market import (
     DirectEnrichedMarketDataSource,
     PublicMarketDataSource,
 )
+from level2_service.preopen_market import PreopenMarketDataSource
 from level2_service.runner import DailyCheckState, OpenCVTemplateFallback, long_capture_has_net_heading
 from level2_service.symbol_catalog import SQLiteSymbolCatalog
 from scripts.preflight import PreflightError, validate_apk, validate_host_profile
@@ -453,10 +454,12 @@ def test_settings_parse_frontend_root_and_admin_cookie_secure(tmp_path: Path) ->
     assert secure_defaults.symbol_catalog_max_age_seconds == 604800
     assert secure_defaults.symbol_catalog_refresh_hour == 16
     assert secure_defaults.symbol_catalog_refresh_minute == 20
+    assert secure_defaults.trading_calendar_path.name == "trading-calendar.json"
     assert secure_defaults.public_market_timeout_seconds == 8
     assert secure_defaults.market_direct_enrichment is True
     assert secure_defaults.market_direct_enrichment_ttl_seconds == 5
     assert secure_defaults.core_warm_connection_max_idle_seconds == 25
+    assert secure_defaults.market_preopen_transport == "off"
     assert secure_defaults.redis_connect_timeout_seconds == 5
     assert secure_defaults.redis_socket_timeout_seconds == 5
     assert secure_defaults.redis_startup_retry_attempts == 10
@@ -640,6 +643,11 @@ def test_settings_validate_direct_transport_modes_and_encryption_key(tmp_path: P
     assert defaults.core_metrics_transport == "frida"
     assert defaults.fund_flow_transport == "frida"
 
+    invalid_preopen = dual_environment(tmp_path)
+    invalid_preopen["MARKET_PREOPEN_TRANSPORT"] = "invalid"
+    with pytest.raises(ValueError, match="MARKET_PREOPEN_TRANSPORT"):
+        DeploymentSettings.from_environ(invalid_preopen)
+
 
 @pytest.mark.parametrize(
     ("mode", "expected_type"),
@@ -750,6 +758,22 @@ def test_production_market_enables_l2_only_when_both_transports_are_direct(
 
     assert isinstance(market_source, DirectEnrichedMarketDataSource)
     assert market_source.direct_source is app.state.runner.parsed_value_source
+
+
+def test_production_direct_preopen_mode_wraps_public_market_source(tmp_path: Path) -> None:
+    environment = dual_environment(tmp_path)
+    environment["CORE_METRICS_TRANSPORT"] = "direct"
+    environment["FUND_FLOW_TRANSPORT"] = "direct"
+    environment["MARKET_PREOPEN_TRANSPORT"] = "direct"
+    app = create_production_app(
+        settings=DeploymentSettings.from_environ(environment),
+        redis_client_factory=lambda _url: FakeRedis(),
+        bridge_factory=FakeBridge,
+        runner_factory=FakeRunner,
+    )
+
+    assert isinstance(app.state.market_data_broker.source, PreopenMarketDataSource)
+    assert app.state.market_data_broker.source.enforce_preopen is True
 
 
 def test_production_factory_wires_two_independent_bridges_and_frida_sources(tmp_path: Path) -> None:

@@ -15,6 +15,31 @@ explicit long captures. OCR is limited to structural validation of an optional
 long screenshot and never fills task metrics. Data-only tasks do not navigate
 the App, scroll, capture, stitch, or run OCR.
 
+## Market monitoring and replay
+
+The `/market` application includes an optional monitoring/replay workspace.
+Market users can enable or pause collection for symbols in their grouped
+watchlists, trigger a current-day backfill, inspect replayable minute history,
+select administrator-managed rules, and calculate OPM-compatible B/S replay
+performance. History is stored separately in `RESEARCH_DATABASE_PATH` (default
+`/data/market/research.db`) and is populated from the existing
+`MarketDataBroker` snapshot contract; it never replaces task metrics or public
+quote ownership.
+
+On trading days, `MARKET_PREOPEN_TRANSPORT=direct` switches Market quotes to
+the verified core 9528 session during 09:10–09:30. The current implementation
+uses verified `43/7001` price and change fields; 1004 virtual-matching quotes
+remain disabled until a real-session capture validates the response for each
+market category. At 09:30 the existing Tencent/Sina public quote chain resumes.
+Auction failures keep only a same-day Redis last-valid value and never fall
+back to a public quote during the auction window.
+
+The administrator console exposes monitoring status, dynamic MACD settings,
+server-side Bark/Server酱³/企业微信 configuration, rule JSON, and QDII/LOF
+premium refresh/push controls. Browser responses mask secrets. OPM-compatible
+legacy routes are FastAPI adapters and do not start the old OPM server or use
+its cookie-based collector.
+
 ## Supported profiles only
 
 - `linux-redroid`: Linux **amd64** host, Docker with privileged containers and
@@ -179,12 +204,14 @@ settings:
 
 ```dotenv
 SYMBOL_CATALOG_PATH=/data/market/symbol-catalog.db
+TRADING_CALENDAR_PATH=/data/market/trading-calendar.json
 SYMBOL_CATALOG_MAX_AGE_SECONDS=604800
 SYMBOL_CATALOG_REFRESH_HOUR=16
 SYMBOL_CATALOG_REFRESH_MINUTE=20
 PUBLIC_MARKET_TIMEOUT_SECONDS=8
 MARKET_DIRECT_ENRICHMENT=1
 MARKET_DIRECT_ENRICHMENT_TTL_SECONDS=5
+MARKET_PREOPEN_TRANSPORT=off
 CORE_WARM_CONNECTION_MAX_IDLE_SECONDS=25
 ```
 
@@ -216,6 +243,9 @@ The multi-user market PWA is `http://HOST:8001/market`. Administrators create
 ordinary users and temporary passwords in the “行情用户” section; each user
 must change that password on first login and receives an isolated grouped
 watchlist (50 unique symbols maximum).
+The fund-account expiry date uses the versioned statutory workday calendar in
+`level2_service/china_workdays.json`; update its coverage and holiday/adjusted
+workday dates when the State Council publishes each year's schedule.
 For this HTTP deployment, `ADMIN_COOKIE_SECURE=0` allows the administrator
 session to survive page refreshes.
 

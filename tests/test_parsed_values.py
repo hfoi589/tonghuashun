@@ -101,7 +101,7 @@ def test_frida_source_selects_the_requested_stock_and_formats_all_runtime_values
         MetricKind.TURNOVER_RATE: "2.40%",
         MetricKind.RETAIL_COUNT: "21.23",
         MetricKind.LARGE_ORDER_NET: "-0.02",
-        MetricKind.LARGE_ORDER_AMOUNT: "-2802.6万",
+        MetricKind.LARGE_ORDER_AMOUNT: "-2802.56万元",
         MetricKind.MACDFS: "+0.012",
     }
 
@@ -245,7 +245,7 @@ def test_direct_read_passes_the_derived_market_to_the_app_and_formats_fresh_valu
     ]
     assert values[MetricKind.STOCK_NAME] == "招商轮船"
     assert values[MetricKind.RETAIL_COUNT] == "21.23"
-    assert values[MetricKind.LARGE_ORDER_AMOUNT] == "-2802.6万"
+    assert values[MetricKind.LARGE_ORDER_AMOUNT] == "-2802.56万元"
 
 
 def test_direct_read_preserves_the_three_app_intraday_series_with_their_time_axis() -> None:
@@ -289,10 +289,10 @@ def test_direct_read_preserves_the_three_app_intraday_series_with_their_time_axi
             ],
         },
         MetricKind.LARGE_ORDER_AMOUNT: {
-            "unit": "万",
+            "unit": "万元",
             "points": [
-                {"time": "09:30", "value": "-3397.0"},
-                {"time": "09:31", "value": "-2802.6"},
+                {"time": "09:30", "value": "-3397.01"},
+                {"time": "09:31", "value": "-2802.56"},
             ],
         },
         MetricKind.RETAIL_COUNT: {
@@ -524,7 +524,7 @@ def test_dual_account_market_snapshot_refreshes_fund_flow_on_a_slower_cadence() 
     first = source.read_market_snapshot("601872", detail=True)
     second = source.read_market_snapshot("601872", detail=True)
 
-    assert first.main_fund_flow["today"]["main_net_inflow"] == "12000.00"
+    assert first.main_fund_flow["today"]["main_net_inflow"] == "12000"
     assert second.main_fund_flow == first.main_fund_flow
     assert fund_calls == 1
 
@@ -649,6 +649,50 @@ def test_dual_account_core_failure_does_not_wait_for_slow_fund_future() -> None:
     source.close()
 
 
+def test_dual_account_best_effort_keeps_fund_values_when_core_times_out() -> None:
+    def fail_core(_symbol: str):
+        raise DirectRequestError("DIRECT_PROTOCOL_RESPONSE_TIMEOUT")
+
+    source = DualAccountParsedValueSource(
+        types.SimpleNamespace(read_direct=fail_core),
+        types.SimpleNamespace(read_direct=lambda _symbol: {
+            MetricKind.MAIN_FLOW_TODAY_NET: "1.25",
+        }),
+    )
+
+    outcome = source.read_direct_best_effort("600938")
+
+    assert outcome.values[MetricKind.STOCK_NAME] is None
+    assert outcome.values[MetricKind.MAIN_FLOW_TODAY_NET] == "1.25"
+    assert outcome.source_errors == {
+        "core_metrics": "DIRECT_PROTOCOL_RESPONSE_TIMEOUT",
+        "main_fund_flow": None,
+    }
+    source.close()
+
+
+def test_dual_account_best_effort_reports_both_source_failures() -> None:
+    def fail_core(_symbol: str):
+        raise DirectRequestError("CORE_TIMEOUT")
+
+    def fail_fund(_symbol: str):
+        raise DirectRequestError("FUND_TIMEOUT")
+
+    source = DualAccountParsedValueSource(
+        types.SimpleNamespace(read_direct=fail_core),
+        types.SimpleNamespace(read_direct=fail_fund),
+    )
+
+    outcome = source.read_direct_best_effort("600938")
+
+    assert all(value is None for value in outcome.values.values())
+    assert outcome.source_errors == {
+        "core_metrics": "CORE_TIMEOUT",
+        "main_fund_flow": "FUND_TIMEOUT",
+    }
+    source.close()
+
+
 def test_dual_account_source_keeps_core_values_when_the_fund_interface_fails() -> None:
     core = types.SimpleNamespace(
         read_direct=lambda _symbol: {
@@ -755,10 +799,10 @@ def test_direct_payload_formats_fund_flow_units_and_leaves_missing_fields_empty(
     )
 
     assert values[MetricKind.MAIN_FLOW_TODAY_UNIT] == "万元"
-    assert values[MetricKind.MAIN_FLOW_TODAY_NET] == "-123.46"
+    assert values[MetricKind.MAIN_FLOW_TODAY_NET] == "-123.456"
     assert values[MetricKind.MAIN_FLOW_TODAY_VISIBLE] is None
-    assert values[MetricKind.MAIN_FLOW_TODAY_HIDDEN] == "0.00"
-    assert values[MetricKind.MAIN_FLOW_TODAY_RETAIL] == "123.46"
+    assert values[MetricKind.MAIN_FLOW_TODAY_HIDDEN] == "0"
+    assert values[MetricKind.MAIN_FLOW_TODAY_RETAIL] == "123.456"
     assert values[MetricKind.MAIN_FLOW_THREE_DAY_UNIT] == "亿元"
     assert values[MetricKind.MAIN_FLOW_THREE_DAY_NET] is None
 

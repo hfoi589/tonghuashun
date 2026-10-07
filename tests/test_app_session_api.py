@@ -62,12 +62,14 @@ def test_admin_session_status_requires_authentication_and_hides_credentials(
                 "state": "MISSING",
                 "updated_at": None,
                 "error_code": None,
+                "expires_at": None,
             },
             {
                 "role": "main_fund_flow",
                 "state": "READY",
                 "updated_at": "2026-08-26T08:00:00Z",
                 "error_code": None,
+                "expires_at": "2026-09-04",
             },
         ]
     }
@@ -115,6 +117,7 @@ def test_admin_refreshes_a_session_without_submitting_login_credentials(
         "state": "READY",
         "updated_at": "2026-08-26T09:00:00Z",
         "error_code": None,
+        "expires_at": "2026-09-04",
     }
     assert calls == ["main_fund_flow"]
     assert sessions.get("main_fund_flow") is not None

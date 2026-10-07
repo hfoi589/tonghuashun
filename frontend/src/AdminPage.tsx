@@ -1,10 +1,12 @@
 import { FormEvent, KeyboardEvent, PointerEvent, useCallback, useEffect, useRef, useState } from 'react'
-import { ApiError, api, readCsrfToken, type AccountSessionStatus, type AdminDeviceHealth, type DeviceLifecycleAction, type DeviceRole, type MarketAdminUser, type QueueState, type RunnerHealth } from './api'
+import { ApiError, api, readCsrfToken, type AccountSessionStatus, type AdminDeviceHealth, type AdminMacdSettings, type AdminMarketMonitoringItem, type AdminMonitoringStatus, type AdminPushConfig, type DeviceLifecycleAction, type DeviceRole, type MarketAdminUser, type QueueState, type RunnerHealth } from './api'
 import { parseDeviceServerMessage, type DeviceInputEvent, type DeviceStatus } from './device-protocol'
 import { DeviceInputAdapter } from './device-stream'
+import { beijingDateBoundaryToUtc, formatRequestLogTimestamp } from './request-log-time'
 
 type DeviceConnection = 'UNCONFIGURED' | 'CONNECTING' | 'ONLINE' | 'OFFLINE'
 type AdminAuthentication = 'AUTHENTICATED' | 'ANONYMOUS'
+type AdminTab = 'overview' | 'market' | 'market_list' | 'devices' | 'users' | 'logs'
 
 interface DeviceLifecycleDialogState {
   role: DeviceRole
@@ -12,6 +14,8 @@ interface DeviceLifecycleDialogState {
   title: string
   trigger: HTMLButtonElement | null
 }
+
+const actionNames: Record<string,string> = { symbol_search:'股票搜索', symbol_lookup:'股票确认', job_submit:'提交任务', job_retry:'重试任务', market_tab:'行情查询-标签', market_retry:'行情查询-重试', market_query:'行情查询', fund_flow_history:'资金流历史', watchlist_group:'自选分组操作', watchlist_symbol:'自选股操作' }
 
 function defaultDeviceStreamUrl(): string | undefined {
   const configured = import.meta.env.VITE_RUNNER_WS_URL as string | undefined
@@ -212,6 +216,7 @@ export function DeviceViewport({
         <h3>账号会话</h3>
         <p className="minor" aria-live="polite">账号会话：{accountSessionStateText(sessionStatus)}</p>
         {sessionStatus?.updated_at && <p className="minor">更新时间：{new Date(sessionStatus.updated_at).toLocaleString('zh-CN')}</p>}
+        {role === 'main_fund_flow' && sessionStatus?.updated_at && <p className="minor">账户到期日：{sessionStatus.expires_at ?? '暂不可用'}</p>}
       </div>
       <button className="secondary" type="button" onClick={() => onRefreshSession?.(role)} disabled={sessionRefreshPending}>
         {sessionRefreshPending ? '刷新中…' : `刷新${title}会话`}
@@ -334,7 +339,117 @@ function isAdminAuthenticationFailure(reason: unknown): boolean {
     || (reason instanceof Error && reason.message.includes('authentication'))
 }
 
-export function AdminPage({ deviceStreamUrl }: { deviceStreamUrl?: string }) {
+function MonitoringPushAdmin({ onError, autoLoad = false }: { onError: (reason: unknown) => void, autoLoad?: boolean }) {
+  const [loaded, setLoaded] = useState(false)
+  const [busy, setBusy] = useState(false)
+  const [status, setStatus] = useState('')
+  const [monitoring, setMonitoring] = useState<AdminMonitoringStatus[]>([])
+  const [macd, setMacd] = useState<AdminMacdSettings>()
+  const [push, setPush] = useState<AdminPushConfig>()
+  const [barkGroups, setBarkGroups] = useState('[]')
+  const [rules, setRules] = useState('[]')
+  const [premium, setPremium] = useState<import('./market-api').PremiumSnapshot>()
+
+  async function load(silent = false) {
+    setBusy(true)
+    setStatus('')
+    try {
+      const [nextMonitoring, nextMacd, nextPush] = await Promise.all([
+        api.monitoringStatus(), api.macdSettings(), api.pushConfig(),
+      ])
+      const nextPremium = await api.premium()
+      const normalizedPush: AdminPushConfig = {
+        enabled: Boolean(nextPush?.enabled),
+        premium_push_enabled: nextPush?.premium_push_enabled !== false,
+        bark_groups: Array.isArray(nextPush?.bark_groups) ? nextPush.bark_groups : [],
+        sc3_bot: {
+          enabled: Boolean(nextPush?.sc3_bot?.enabled),
+          base_url: nextPush?.sc3_bot?.base_url ?? 'https://bot-go.apijia.cn',
+          token: nextPush?.sc3_bot?.token ?? '',
+          token_configured: nextPush?.sc3_bot?.token_configured,
+          chat_id: nextPush?.sc3_bot?.chat_id ?? '',
+          parse_mode: nextPush?.sc3_bot?.parse_mode ?? 'markdown',
+          silent: Boolean(nextPush?.sc3_bot?.silent),
+        },
+        wecom: {
+          enabled: Boolean(nextPush?.wecom?.enabled),
+          api_base_url: nextPush?.wecom?.api_base_url ?? 'https://qyapi.weixin.qq.com',
+          news_base_url: nextPush?.wecom?.news_base_url ?? '',
+          corp_id: nextPush?.wecom?.corp_id ?? '',
+          corp_secret: nextPush?.wecom?.corp_secret ?? '',
+          corp_secret_configured: nextPush?.wecom?.corp_secret_configured,
+          agent_id: Number(nextPush?.wecom?.agent_id ?? 0),
+          to_user: nextPush?.wecom?.to_user ?? '@all',
+          to_party: nextPush?.wecom?.to_party ?? '',
+          to_tag: nextPush?.wecom?.to_tag ?? '',
+        },
+        rules: Array.isArray(nextPush?.rules) ? nextPush.rules : [],
+      }
+      setMonitoring(Array.isArray(nextMonitoring) ? nextMonitoring : [])
+      setMacd(nextMacd ?? { short: 10, long: 20, signal: 5, marker_threshold: 0.00001 })
+      setPush(normalizedPush)
+      setPremium(nextPremium)
+      setBarkGroups(JSON.stringify(normalizedPush.bark_groups, null, 2))
+      setRules(JSON.stringify(normalizedPush.rules, null, 2))
+      setLoaded(true)
+    } catch (reason) {
+      if (!silent) onError(reason)
+      else setStatus('监控与推送配置暂不可用，可稍后刷新')
+    }
+    finally { setBusy(false) }
+  }
+
+  useEffect(() => {
+    if (autoLoad) void load(true)
+  }, [autoLoad])
+
+  async function saveMacd(event: FormEvent) {
+    event.preventDefault()
+    if (!macd) return
+    setBusy(true)
+    try { setMacd(await api.saveMacdSettings(macd, readCsrfToken())); setStatus('MACD 参数已保存') }
+    catch (reason) { onError(reason) }
+    finally { setBusy(false) }
+  }
+
+  async function savePush(event: FormEvent) {
+    event.preventDefault()
+    if (!push) return
+    setBusy(true)
+    try {
+      const next = await api.savePushConfig({
+        ...push,
+        bark_groups: JSON.parse(barkGroups),
+        rules: JSON.parse(rules),
+      }, readCsrfToken())
+      setPush(next)
+      setBarkGroups(JSON.stringify(next.bark_groups, null, 2))
+      setRules(JSON.stringify(next.rules, null, 2))
+      setStatus('推送渠道与规则已保存')
+    } catch (reason) { onError(reason) }
+    finally { setBusy(false) }
+  }
+
+  if (!loaded) return <section className="admin-controls admin-monitoring-loader"><div><h2>行情监控与推送</h2><p>正在自动加载监控采集、MACD、推送渠道和全局规则配置。</p></div><button type="button" className="secondary" onClick={() => void load()} disabled={busy}>{busy ? '加载中…' : '重新加载配置'}</button></section>
+  if (!macd || !push) return null
+  return <section className="admin-operations-suite">
+    <header><div><p className="eyebrow">MARKET OPERATIONS</p><h2>监控、复盘与推送</h2></div><button type="button" className="secondary" onClick={() => void load()} disabled={busy}>刷新配置</button></header>
+    {status && <p className="success-message" role="status">{status}</p>}
+    <section className="admin-ops-card"><div className="admin-ops-heading"><h3>监控采集</h3><button type="button" className="secondary" disabled={busy} onClick={async () => { setBusy(true); try { await api.refreshMonitoring(readCsrfToken()); await load(); setStatus('监控数据已刷新') } catch (reason) { onError(reason) } finally { setBusy(false) } }}>立即刷新全部</button></div><div className="admin-monitoring-table">{monitoring.length ? monitoring.map((item) => <div key={item.symbol}><strong>{item.symbol}</strong><span>{item.latest_trade_date ?? '未采集'} {item.latest_time ?? ''}</span><small className={item.last_error ? 'error' : ''}>{item.last_error ?? item.last_sync_at ?? '等待首次采集'}</small></div>) : <p className="minor">当前没有启用监控的用户自选。</p>}</div></section>
+    <form className="admin-ops-card" onSubmit={saveMacd}><div className="admin-ops-heading"><h3>MACD 参数</h3><button type="submit" className="secondary" disabled={busy}>保存 MACD 参数</button></div><div className="admin-ops-grid four"><label>MACD 短期<input type="number" min="1" max="199" value={macd.short} onChange={(event) => setMacd({ ...macd, short: Number(event.target.value) })} /></label><label>MACD 长期<input type="number" min="2" max="200" value={macd.long} onChange={(event) => setMacd({ ...macd, long: Number(event.target.value) })} /></label><label>MACD 信号<input type="number" min="1" max="100" value={macd.signal} onChange={(event) => setMacd({ ...macd, signal: Number(event.target.value) })} /></label><label>标记阈值<input type="number" min="0" max="1" step="0.0001" value={macd.marker_threshold} onChange={(event) => setMacd({ ...macd, marker_threshold: Number(event.target.value) })} /></label></div></form>
+    <form className="admin-ops-card admin-push-form" onSubmit={savePush}><div className="admin-ops-heading"><h3>推送配置</h3><div className="button-row"><button type="button" className="secondary" disabled={busy} onClick={async () => { try { await api.testPush(readCsrfToken()); setStatus('测试推送已发送') } catch (reason) { onError(reason) } }}>测试推送</button><button type="submit" className="secondary" disabled={busy}>保存推送配置</button></div></div><div className="admin-switch-row"><label><input type="checkbox" checked={push.enabled} onChange={(event) => setPush({ ...push, enabled: event.target.checked })} />启用 Bark 总开关</label><label><input type="checkbox" checked={push.premium_push_enabled} onChange={(event) => setPush({ ...push, premium_push_enabled: event.target.checked })} />启用溢价推送</label></div>
+      <div className="admin-channel-grid">
+        <section><h3>Bark 多组推送</h3><label>Bark 组 JSON<textarea value={barkGroups} onChange={(event) => setBarkGroups(event.target.value)} rows={10} /></label></section>
+        <section><h3>Server酱³</h3><label><input type="checkbox" checked={push.sc3_bot.enabled} onChange={(event) => setPush({ ...push, sc3_bot: { ...push.sc3_bot, enabled: event.target.checked } })} />启用</label><label>API 地址<input value={push.sc3_bot.base_url} onChange={(event) => setPush({ ...push, sc3_bot: { ...push.sc3_bot, base_url: event.target.value } })} /></label><label>Token<input type="password" placeholder={push.sc3_bot.token_configured ? '已配置，留空保持不变' : ''} value={push.sc3_bot.token} onChange={(event) => setPush({ ...push, sc3_bot: { ...push.sc3_bot, token: event.target.value } })} /></label><label>Chat ID<input value={push.sc3_bot.chat_id} onChange={(event) => setPush({ ...push, sc3_bot: { ...push.sc3_bot, chat_id: event.target.value } })} /></label></section>
+        <section><h3>企业微信</h3><label><input type="checkbox" checked={push.wecom.enabled} onChange={(event) => setPush({ ...push, wecom: { ...push.wecom, enabled: event.target.checked } })} />启用</label><label>API 地址<input value={push.wecom.api_base_url} onChange={(event) => setPush({ ...push, wecom: { ...push.wecom, api_base_url: event.target.value } })} /></label><label>Corp ID<input value={push.wecom.corp_id} onChange={(event) => setPush({ ...push, wecom: { ...push.wecom, corp_id: event.target.value } })} /></label><label>Corp Secret<input type="password" placeholder={push.wecom.corp_secret_configured ? '已配置，留空保持不变' : ''} value={push.wecom.corp_secret} onChange={(event) => setPush({ ...push, wecom: { ...push.wecom, corp_secret: event.target.value } })} /></label><label>Agent ID<input type="number" value={push.wecom.agent_id} onChange={(event) => setPush({ ...push, wecom: { ...push.wecom, agent_id: Number(event.target.value) } })} /></label><label>接收用户<input value={push.wecom.to_user} onChange={(event) => setPush({ ...push, wecom: { ...push.wecom, to_user: event.target.value } })} /></label></section>
+      </div>
+      <section className="admin-rules-editor"><h3>推送规则</h3><p className="minor">规则由管理员全局维护，同时用于实时提醒和 market 页复盘。</p><label>规则 JSON<textarea value={rules} onChange={(event) => setRules(event.target.value)} rows={14} /></label></section>
+    </form>
+    <section className="admin-ops-card"><div className="admin-ops-heading"><div><h3>QDII/LOF 溢价快照</h3><p className="minor">{premium?.as_of ? `最近刷新：${premium.as_of}，有效 ${premium.valid_count} 条` : '尚未刷新'}</p></div><div className="button-row"><button type="button" className="secondary" disabled={busy} onClick={async () => { setBusy(true); try { setPremium(await api.refreshPremium(readCsrfToken())); setStatus('溢价快照已刷新') } catch (reason) { onError(reason) } finally { setBusy(false) } }}>刷新溢价</button><button type="button" className="secondary" disabled={busy || !premium?.valid_count} onClick={async () => { try { await api.pushPremium(readCsrfToken()); setStatus('溢价推送已发送') } catch (reason) { onError(reason) } }}>立即推送溢价</button></div></div></section>
+  </section>
+}
+
+export function AdminPage({ deviceStreamUrl, autoLoad = false }: { deviceStreamUrl?: string, autoLoad?: boolean }) {
   const [password, setPassword] = useState('')
   const [currentPassword, setCurrentPassword] = useState('')
   const [newPassword, setNewPassword] = useState('')
@@ -342,6 +457,7 @@ export function AdminPage({ deviceStreamUrl }: { deviceStreamUrl?: string }) {
   const hadSessionCookie = useRef(Boolean(readCsrfToken()))
   const [authentication, setAuthentication] = useState<AdminAuthentication>(hadSessionCookie.current ? 'AUTHENTICATED' : 'ANONYMOUS')
   const authenticated = authentication === 'AUTHENTICATED'
+  const [activeTab, setActiveTab] = useState<AdminTab>('devices')
   const [sessionValidated, setSessionValidated] = useState(false)
   const [health, setHealth] = useState<RunnerHealth | null>(null)
   const [queue, setQueue] = useState<QueueState | null>(null)
@@ -349,7 +465,23 @@ export function AdminPage({ deviceStreamUrl }: { deviceStreamUrl?: string }) {
   const [waitingTaskId, setWaitingTaskId] = useState('')
   const [failedTaskId, setFailedTaskId] = useState('')
   const [message, setMessage] = useState('')
+  const [logs, setLogs] = useState<import('./api').RequestLog[]>([])
+  const [logFilter, setLogFilter] = useState('')
+  const [logAction, setLogAction] = useState('')
+  const [logStatus, setLogStatus] = useState('')
+  const [logPage, setLogPage] = useState(0)
+  const [logFrom, setLogFrom] = useState('')
+  const [logTo, setLogTo] = useState('')
+  const [logSymbol, setLogSymbol] = useState('')
+  const [logStockName, setLogStockName] = useState('')
+  const [logUserName, setLogUserName] = useState('')
+  const [logIp, setLogIp] = useState('')
   const [marketUsers, setMarketUsers] = useState<MarketAdminUser[] | null>(null)
+  const [marketUsersLoading, setMarketUsersLoading] = useState(false)
+  const [marketUsersError, setMarketUsersError] = useState('')
+  const [adminMonitoringList, setAdminMonitoringList] = useState<AdminMarketMonitoringItem[]>([])
+  const [adminMonitoringLoading, setAdminMonitoringLoading] = useState(false)
+  const [adminMonitoringError, setAdminMonitoringError] = useState('')
   const [marketUsername, setMarketUsername] = useState('')
   const [marketTemporaryPassword, setMarketTemporaryPassword] = useState('')
   const [devices, setDevices] = useState<Partial<Record<DeviceRole, AdminDeviceHealth>>>({})
@@ -376,6 +508,7 @@ export function AdminPage({ deviceStreamUrl }: { deviceStreamUrl?: string }) {
     setActionErrors({})
     setLifecycleDialog(null)
     setMarketUsers(null)
+    setActiveTab('devices')
   }, [])
   const invalidateAdminControl = useCallback((reason: unknown) => {
     if (isAdminAuthenticationFailure(reason)) {
@@ -513,9 +646,32 @@ export function AdminPage({ deviceStreamUrl }: { deviceStreamUrl?: string }) {
   }
   async function loadMarketUsers() {
     setMessage('')
+    setMarketUsersLoading(true)
+    setMarketUsersError('')
     try { setMarketUsers(await api.marketUsers()) }
-    catch (reason) { invalidateAdminControl(reason) }
+    catch (reason) {
+      if (isAdminAuthenticationFailure(reason)) invalidateAdminControl(reason)
+      else setMarketUsersError(reason instanceof Error ? reason.message : '行情用户加载失败')
+    } finally { setMarketUsersLoading(false) }
   }
+  async function loadAdminMonitoringList() {
+    setAdminMonitoringLoading(true)
+    setAdminMonitoringError('')
+    try { setAdminMonitoringList(await api.marketMonitoringList()) }
+    catch (reason) {
+      if (isAdminAuthenticationFailure(reason)) invalidateAdminControl(reason)
+      else setAdminMonitoringError(reason instanceof Error ? reason.message : '市场监控列表加载失败')
+    } finally { setAdminMonitoringLoading(false) }
+  }
+  useEffect(() => {
+    if (authenticated && activeTab === 'users' && marketUsers === null && !marketUsersLoading) {
+      void loadMarketUsers()
+    }
+  }, [activeTab, authenticated])
+  useEffect(() => {
+    if (!authenticated || activeTab !== 'market_list') return
+    void loadAdminMonitoringList()
+  }, [activeTab, authenticated, invalidateAdminControl])
   async function createMarketUser(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
     setMessage('')
@@ -656,15 +812,50 @@ export function AdminPage({ deviceStreamUrl }: { deviceStreamUrl?: string }) {
   return <main className="admin-shell" data-1p-ignore="true" data-lpignore="true">
     <header className="admin-header"><div><p className="eyebrow">ADMIN CONSOLE</p><h1>设备与队列控制</h1></div><div className="button-row"><span className={`status ${healthReady(health) ? 'status-completed' : health?.state === 'NEEDS_ADMIN' ? 'status-waiting_admin' : 'status-failed'}`}>{healthText(health)}</span><button className="secondary" onClick={logout}>退出管理台</button></div></header>
     <p className="notice"><span>密码仅用于本次请求，不会记录或展示。</span> 不要在此页面输入或粘贴同花顺账号凭据；本页面不会记录任何密码或按键内容。</p>
-    <section className="admin-controls"><div><h2>人工接管</h2><p>{locked ? '当前会话正在控制设备。' : '设备未由当前会话接管。'}</p></div><div className="button-row">{locked ? <button className="secondary" onClick={() => changeLock('release')}>交还控制</button> : <button onClick={() => changeLock('acquire')}>接管设备</button>}<button className="secondary" onClick={refreshHealth}>刷新运行端状态</button></div></section>
-    <section className="admin-controls"><div><h2>队列</h2><p>{queue?.paused ? '队列已暂停；已领取的任务会继续完成。' : '队列正在接收 Runner 的 FIFO 任务。'}</p></div><div className="button-row">{queue?.paused ? <button className="secondary" onClick={() => changeQueue('resume')} disabled={locked}>恢复队列</button> : <button className="secondary" onClick={() => changeQueue('pause')} disabled={!queue}>暂停队列</button>}</div></section>
-    <section className="admin-controls"><div><h2>恢复等待任务</h2><p>完成设备登录、验证或权限处理后，输入任务 ID 重新排入 FIFO 队列。</p></div><form className="button-row" onSubmit={resumeWaitingJob}><label htmlFor="waiting-task">等待任务 ID</label><input id="waiting-task" value={waitingTaskId} onChange={(event) => setWaitingTaskId(event.target.value)} autoComplete="off" /><button className="secondary" type="submit" disabled={!waitingTaskId.trim()}>恢复等待任务</button></form></section>
-    <section className="admin-controls"><div><h2>重试失败任务</h2><p>设备恢复后，输入失败任务 ID 重新排入 FIFO 队列；已有合格截图会保留。</p></div><form className="button-row" onSubmit={retryFailedJob}><label htmlFor="failed-task">失败任务 ID</label><input id="failed-task" value={failedTaskId} onChange={(event) => setFailedTaskId(event.target.value)} autoComplete="off" /><button className="secondary" type="submit" disabled={!failedTaskId.trim()}>重试失败任务</button></form></section>
-    <section className="admin-controls"><div><h2>修改管理员密码</h2><p>修改后当前会话会退出，使用新密码重新登录。</p></div><form className="password-change-form" onSubmit={changePassword} data-1p-ignore="true" data-lpignore="true"><label htmlFor="current-admin-password">当前管理员密码</label><input id="current-admin-password" type="password" autoComplete="current-password" data-1p-ignore="true" data-lpignore="true" value={currentPassword} onChange={(event) => setCurrentPassword(event.target.value)} required /><label htmlFor="new-admin-password">新管理员密码</label><input id="new-admin-password" type="password" autoComplete="new-password" data-1p-ignore="true" data-lpignore="true" value={newPassword} onChange={(event) => setNewPassword(event.target.value)} required /><label htmlFor="confirm-admin-password">确认新管理员密码</label><input id="confirm-admin-password" type="password" autoComplete="new-password" data-1p-ignore="true" data-lpignore="true" value={newPasswordConfirmation} onChange={(event) => setNewPasswordConfirmation(event.target.value)} required /><button className="secondary" type="submit">修改管理员密码</button></form></section>
-    <section className="admin-controls admin-market-users">
+    <nav className="admin-tabs" aria-label="管理台标签">
+      {([['overview', '运行概览'], ['market', '监控与推送'], ['market_list', '市场监控列表'], ['devices', '设备与队列'], ['users', '用户与安全'], ['logs', '查询日志']] as Array<[AdminTab, string]>).map(([tab, label]) => <button key={tab} type="button" className={activeTab === tab ? 'active' : ''} aria-selected={activeTab === tab} onClick={() => setActiveTab(tab)}>{label}</button>)}
+    </nav>
+    <div className="admin-tab-panel" hidden={activeTab !== 'logs'}>
+      <section className="admin-controls"><div><h2>查询日志</h2><p>完整记录访问者、功能、股票、请求路径和结果。</p></div></section>
+      <section className="admin-ops-card"><div className="admin-ops-grid four">
+        <label>股票代码<input value={logSymbol} onChange={(e) => setLogSymbol(e.target.value)} /></label><label>股票名称<input value={logStockName} onChange={(e) => setLogStockName(e.target.value)} /></label><label>用户账号<input value={logUserName} onChange={(e) => setLogUserName(e.target.value)} /></label><label>IP<input value={logIp} onChange={(e) => setLogIp(e.target.value)} /></label>
+        <label>功能<select aria-label="日志功能筛选" value={logAction} onChange={(e) => setLogAction(e.target.value)}><option value="">全部功能</option>{Object.entries(actionNames).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label>
+        <label>开始日期<input type="date" value={logFrom} onChange={(e) => setLogFrom(e.target.value)} /></label><label>结束日期<input type="date" value={logTo} onChange={(e) => setLogTo(e.target.value)} /></label><label>状态<select aria-label="日志状态筛选" value={logStatus} onChange={(e) => setLogStatus(e.target.value)}><option value="">全部状态</option><option value="成功">成功</option><option value="失败">失败</option></select></label>
+        <button className="secondary" onClick={() => { const q = new URLSearchParams(); if (logSymbol) q.set('symbol', logSymbol); if (logStockName) q.set('stock_name', logStockName); if (logUserName) q.set('user_name', logUserName); if (logIp) q.set('ip', logIp); if (logAction) q.set('action', logAction); if (logStatus) q.set('status', logStatus); if (logFrom) q.set('from', beijingDateBoundaryToUtc(logFrom, 'start')); if (logTo) q.set('to', beijingDateBoundaryToUtc(logTo, 'end')); q.set('offset', '0'); setLogPage(0); void api.logs('?' + q.toString()).then((r) => setLogs(r.items)).catch(invalidateAdminControl) }}>查询</button>
+      </div></section>
+      <section className="admin-ops-card" style={{overflowX: 'auto'}}>{logs.length ? <table><thead><tr>{['日期','时间','功能','股票代码','股票名称','用户账号','IP','设备类型','结果','错误码','耗时(ms)','任务ID'].map((h) => <th key={h}>{h}</th>)}</tr></thead><tbody>{logs.map((log) => { const timestamp = formatRequestLogTimestamp(log.timestamp); return <tr key={log.id}><td>{timestamp.date}</td><td>{timestamp.time}</td><td>{actionNames[log.action] ?? '其他功能'}</td><td>{log.symbol ?? '—'}</td><td>{log.stock_name ?? '—'}</td><td>{log.user_name ?? (log.user_id == null ? '匿名' : '未知账号')}</td><td>{log.ip ?? '未知'}</td><td>{log.device_type ?? '其他设备'}</td><td>{log.status_code < 400 && !['FAILED','PARTIAL'].includes(log.task_status ?? '') ? '成功' : '失败'}</td><td>{log.error_code ?? '—'}</td><td>{Math.round(log.duration_ms)}</td><td>{log.public_id ?? '—'}</td></tr> })}</tbody></table> : <p className="minor">暂无查询日志。</p>}</section>
+    </div>
+    <div className="admin-tab-panel" hidden={activeTab !== 'overview'}>
+      <section className="admin-controls"><div><h2>运行概览</h2><p>{healthText(health)} · {queue?.paused ? '队列已暂停' : '队列接收中'} · {locked ? '当前会话已接管设备' : '设备未接管'}</p></div><div className="button-row"><button className="secondary" onClick={refreshHealth}>刷新运行端状态</button></div></section>
+      <section className="admin-controls"><div><h2>恢复等待任务</h2><p>完成设备登录、验证或权限处理后，输入任务 ID 重新排入 FIFO 队列。</p></div><form className="button-row" onSubmit={resumeWaitingJob}><label htmlFor="waiting-task">等待任务 ID</label><input id="waiting-task" value={waitingTaskId} onChange={(event) => setWaitingTaskId(event.target.value)} autoComplete="off" /><button className="secondary" type="submit" disabled={!waitingTaskId.trim()}>恢复等待任务</button></form></section>
+      <section className="admin-controls"><div><h2>重试失败任务</h2><p>设备恢复后，输入失败任务 ID 重新排入 FIFO 队列；已有合格截图会保留。</p></div><form className="button-row" onSubmit={retryFailedJob}><label htmlFor="failed-task">失败任务 ID</label><input id="failed-task" value={failedTaskId} onChange={(event) => setFailedTaskId(event.target.value)} autoComplete="off" /><button className="secondary" type="submit" disabled={!failedTaskId.trim()}>重试失败任务</button></form></section>
+    </div>
+    <div className="admin-tab-panel" hidden={activeTab !== 'market'}>
+      <MonitoringPushAdmin onError={invalidateAdminControl} autoLoad={autoLoad} />
+    </div>
+    <div className="admin-tab-panel" hidden={activeTab !== 'market_list'}>
+      <section className="admin-controls"><div><h2>市场监控列表</h2><p>列出当前被行情用户纳入监控的股票。</p></div></section>
+      <section className="admin-ops-card">
+        {adminMonitoringLoading ? <p className="minor" role="status">正在加载市场监控列表…</p>
+          : adminMonitoringError ? <div><p className="error" role="alert">{adminMonitoringError}</p><button type="button" className="secondary" onClick={() => void loadAdminMonitoringList()}>重新加载列表</button></div>
+            : adminMonitoringList.length === 0 ? <p className="minor">当前没有纳入监控的股票。</p>
+              : <table className="admin-market-monitoring-list"><thead><tr>{['股票代码', '股票名称', '纳入监控日期', '监控人员'].map((title) => <th key={title}>{title}</th>)}</tr></thead><tbody>{adminMonitoringList.map((item) => <tr key={item.symbol}><td>{item.symbol}</td><td>{item.stock_name}</td><td>{item.monitoring_date ?? '未知'}</td><td>{item.monitoring_users.join('；')}</td></tr>)}</tbody></table>}
+      </section>
+    </div>
+    <div className="admin-tab-panel" hidden={activeTab !== 'devices'}>
+      <section className="admin-controls"><div><h2>人工接管</h2><p>{locked ? '当前会话正在控制设备。' : '设备未由当前会话接管。'}</p></div><div className="button-row">{locked ? <button className="secondary" onClick={() => changeLock('release')}>交还控制</button> : <button onClick={() => changeLock('acquire')}>接管设备</button>}<button className="secondary" onClick={refreshHealth}>刷新运行端状态</button></div></section>
+      <section className="admin-controls"><div><h2>队列</h2><p>{queue?.paused ? '队列已暂停；已领取的任务会继续完成。' : '队列正在接收 Runner 的 FIFO 任务。'}</p></div><div className="button-row">{queue?.paused ? <button className="secondary" onClick={() => changeQueue('resume')} disabled={locked}>恢复队列</button> : <button className="secondary" onClick={() => changeQueue('pause')} disabled={!queue}>暂停队列</button>}</div></section>
+      <div className="admin-device-grid">
+        <DeviceViewport title="八项账号" role="core_metrics" locked={locked} active={authenticated} lifecycle={devices.core_metrics?.lifecycle} actionPending={actionPending.core_metrics ?? null} actionError={actionErrors.core_metrics ?? null} sessionStatus={accountSessions.core_metrics ?? null} sessionRefreshPending={sessionRefreshPending.core_metrics} sessionError={sessionErrors.core_metrics ?? null} onLifecycleAction={openLifecycleDialog} onRefreshSession={refreshAccountSession} streamUrl={deviceStreamUrl ?? roleDeviceStreamUrl('core_metrics')} />
+        <DeviceViewport title="资金账号" role="main_fund_flow" warning="当前账号，禁止退出" locked={locked} active={authenticated} lifecycle={devices.main_fund_flow?.lifecycle} actionPending={actionPending.main_fund_flow ?? null} actionError={actionErrors.main_fund_flow ?? null} sessionStatus={accountSessions.main_fund_flow ?? null} sessionRefreshPending={sessionRefreshPending.main_fund_flow} sessionError={sessionErrors.main_fund_flow ?? null} onLifecycleAction={openLifecycleDialog} onRefreshSession={refreshAccountSession} streamUrl={deviceStreamUrl ?? roleDeviceStreamUrl('main_fund_flow')} />
+      </div>
+    </div>
+    <div className="admin-tab-panel" hidden={activeTab !== 'users'}>
+      <section className="admin-controls"><div><h2>修改管理员密码</h2><p>修改后当前会话会退出，使用新密码重新登录。</p></div><form className="password-change-form" onSubmit={changePassword} data-1p-ignore="true" data-lpignore="true"><label htmlFor="current-admin-password">当前管理员密码</label><input id="current-admin-password" type="password" autoComplete="current-password" data-1p-ignore="true" data-lpignore="true" value={currentPassword} onChange={(event) => setCurrentPassword(event.target.value)} required /><label htmlFor="new-admin-password">新管理员密码</label><input id="new-admin-password" type="password" autoComplete="new-password" data-1p-ignore="true" data-lpignore="true" value={newPassword} onChange={(event) => setNewPassword(event.target.value)} required /><label htmlFor="confirm-admin-password">确认新管理员密码</label><input id="confirm-admin-password" type="password" autoComplete="new-password" data-1p-ignore="true" data-lpignore="true" value={newPasswordConfirmation} onChange={(event) => setNewPasswordConfirmation(event.target.value)} required /><button className="secondary" type="submit">修改管理员密码</button></form></section>
+      <section className="admin-controls admin-market-users">
       <div><h2>行情用户</h2><p>创建普通用户、自选空间和临时密码。用户首次登录必须修改密码。</p></div>
       <div className="admin-market-user-actions">
-        {marketUsers === null ? <button type="button" className="secondary" onClick={loadMarketUsers}>加载行情用户</button> : <>
+        {marketUsers === null ? <div>{marketUsersLoading ? <p className="minor" role="status">正在加载行情用户…</p> : marketUsersError ? <p className="error" role="alert">{marketUsersError}</p> : null}<button type="button" className="secondary" onClick={loadMarketUsers} disabled={marketUsersLoading}>{marketUsersError ? '重新加载行情用户' : '加载行情用户'}</button></div> : <>
           <form className="password-change-form" onSubmit={createMarketUser}>
             <label htmlFor="new-market-username">新用户名</label><input id="new-market-username" value={marketUsername} onChange={(event) => setMarketUsername(event.target.value)} minLength={3} required />
             <label htmlFor="new-market-password">临时密码</label><input id="new-market-password" type="password" autoComplete="new-password" value={marketTemporaryPassword} onChange={(event) => setMarketTemporaryPassword(event.target.value)} minLength={8} required />
@@ -676,41 +867,9 @@ export function AdminPage({ deviceStreamUrl }: { deviceStreamUrl?: string }) {
           </div>)}</div>
         </>}
       </div>
-    </section>
-    {message && <p className={message.includes('获得') || message.includes('交还') || message.includes('重新') || message.includes('会话已刷新') ? 'success-message' : 'error'} role="status">{message}</p>}
-    <div className="admin-device-grid">
-      <DeviceViewport
-        title="八项账号"
-        role="core_metrics"
-        locked={locked}
-        active={authenticated}
-        lifecycle={devices.core_metrics?.lifecycle}
-        actionPending={actionPending.core_metrics ?? null}
-        actionError={actionErrors.core_metrics ?? null}
-        sessionStatus={accountSessions.core_metrics ?? null}
-        sessionRefreshPending={sessionRefreshPending.core_metrics}
-        sessionError={sessionErrors.core_metrics ?? null}
-        onLifecycleAction={openLifecycleDialog}
-        onRefreshSession={refreshAccountSession}
-        streamUrl={deviceStreamUrl ?? roleDeviceStreamUrl('core_metrics')}
-      />
-      <DeviceViewport
-        title="资金账号"
-        role="main_fund_flow"
-        warning="当前账号，禁止退出"
-        locked={locked}
-        active={authenticated}
-        lifecycle={devices.main_fund_flow?.lifecycle}
-        actionPending={actionPending.main_fund_flow ?? null}
-        actionError={actionErrors.main_fund_flow ?? null}
-        sessionStatus={accountSessions.main_fund_flow ?? null}
-        sessionRefreshPending={sessionRefreshPending.main_fund_flow}
-        sessionError={sessionErrors.main_fund_flow ?? null}
-        onLifecycleAction={openLifecycleDialog}
-        onRefreshSession={refreshAccountSession}
-        streamUrl={deviceStreamUrl ?? roleDeviceStreamUrl('main_fund_flow')}
-      />
+      </section>
     </div>
+    {message && <p className={message.includes('获得') || message.includes('交还') || message.includes('重新') || message.includes('会话已刷新') ? 'success-message' : 'error'} role="status">{message}</p>}
     {lifecycleDialog && <DeviceLifecycleDialog
       dialog={lifecycleDialog}
       pending={actionPending[lifecycleDialog.role] !== undefined}

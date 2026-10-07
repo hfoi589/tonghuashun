@@ -192,3 +192,47 @@ def test_password_change_revokes_preexisting_sessions_and_rotates_the_current_co
     assert client.cookies.get("ths_market_session") != old_session
     assert client.get("/api/v1/session").status_code == 200
     assert second.get("/api/v1/session").status_code == 401
+
+
+def test_market_user_can_disable_monitoring_without_removing_symbol(tmp_path) -> None:
+    client, _accounts = _market_client(tmp_path)
+    _create_user(client)
+    _login_and_change_password(client)
+    group_id = client.get("/api/v1/watchlists").json()["groups"][0]["id"]
+    assert client.post(
+        f"/api/v1/watchlists/groups/{group_id}/symbols",
+        headers={"X-CSRF-Token": client.cookies.get("ths_market_csrf")},
+        json={"symbol": "601872"},
+    ).status_code == 201
+
+    disabled = client.patch(
+        "/api/v1/monitoring/symbols/601872",
+        headers={"X-CSRF-Token": client.cookies.get("ths_market_csrf")},
+        json={"enabled": False},
+    )
+
+    assert disabled.status_code == 200
+    assert disabled.json() == {"symbol": "601872", "enabled": False}
+    assert client.get("/api/v1/watchlists").json()["groups"][0]["items"][0]["symbol"] == "601872"
+
+
+def test_admin_monitoring_list_requires_admin_and_returns_symbol_people_and_date(tmp_path) -> None:
+    client, _accounts = _market_client(tmp_path)
+    assert client.get("/api/admin/market-monitoring-list").status_code == 401
+    _create_user(client)
+    _login_and_change_password(client)
+    group_id = client.get("/api/v1/watchlists").json()["groups"][0]["id"]
+    assert client.post(
+        f"/api/v1/watchlists/groups/{group_id}/symbols",
+        headers={"X-CSRF-Token": client.cookies.get("ths_market_csrf")},
+        json={"symbol": "601872"},
+    ).status_code == 201
+
+    client.post("/api/admin/session", json={"password": "admin-secret"})
+    response = client.get("/api/admin/market-monitoring-list")
+
+    assert response.status_code == 200
+    assert response.json()[0]["symbol"] == "601872"
+    assert response.json()[0]["stock_name"] == "招商轮船"
+    assert response.json()[0]["monitoring_users"] == ["trader"]
+    assert response.json()[0]["monitoring_date"]

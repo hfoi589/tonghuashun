@@ -79,6 +79,75 @@ def test_sina_source_keeps_paging_when_the_server_caps_a_500_request_at_100_reco
     assert all("num=100" in url for url in page_calls)
 
 
+def test_sina_source_accepts_a_terminal_page_one_record_below_the_declared_count():
+    from level2_service.symbol_catalog import SinaSymbolCatalogSource
+
+    rows = [
+        {"symbol": "sh510050", "code": "510050", "name": "上证50ETF"},
+        {"symbol": "sh510300", "code": "510300", "name": "沪深300ETF"},
+        {"symbol": "sz159919", "code": "159919", "name": "深300ETF"},
+        {"symbol": "sh588000", "code": "588000", "name": "科创50ETF"},
+    ]
+
+    def fetch(url: str, _timeout: float) -> str:
+        if "getHQNodeStockCount" in url:
+            return "5"
+        page = int(url.split("page=")[1].split("&", 1)[0])
+        start = (page - 1) * 3
+        return json.dumps(rows[start:start + 3], ensure_ascii=False)
+
+    source = SinaSymbolCatalogSource(fetch=fetch)
+    source.page_size = 3
+
+    result = source._fetch_node("etf_hq_fund")
+
+    assert [item.symbol for item in result] == ["510050", "510300", "159919", "588000"]
+
+
+def test_sina_source_rejects_a_terminal_page_two_records_below_the_declared_count():
+    from level2_service.symbol_catalog import SinaSymbolCatalogSource, SymbolCatalogError
+
+    rows = [
+        {"symbol": "sh510050", "code": "510050", "name": "上证50ETF"},
+        {"symbol": "sh510300", "code": "510300", "name": "沪深300ETF"},
+        {"symbol": "sz159919", "code": "159919", "name": "深300ETF"},
+        {"symbol": "sh588000", "code": "588000", "name": "科创50ETF"},
+    ]
+
+    def fetch(url: str, _timeout: float) -> str:
+        if "getHQNodeStockCount" in url:
+            return "6"
+        page = int(url.split("page=")[1].split("&", 1)[0])
+        start = (page - 1) * 3
+        return json.dumps(rows[start:start + 3], ensure_ascii=False)
+
+    source = SinaSymbolCatalogSource(fetch=fetch)
+    source.page_size = 3
+
+    with pytest.raises(SymbolCatalogError, match="SYMBOL_CATALOG_SOURCE_INCOMPLETE"):
+        source._fetch_node("etf_hq_fund")
+
+
+def test_sina_source_accepts_known_lof_terminal_count_drift():
+    from level2_service.symbol_catalog import SinaSymbolCatalogSource
+
+    rows = [
+        {"symbol": "sz160001", "code": "160001", "name": "基金A"},
+        {"symbol": "sz160002", "code": "160002", "name": "基金B"},
+    ]
+
+    def fetch(url: str, _timeout: float) -> str:
+        if "getHQNodeStockCount" in url:
+            return "3"
+        page = int(url.split("page=")[1].split("&", 1)[0])
+        return json.dumps(rows if page == 1 else [], ensure_ascii=False)
+
+    source = SinaSymbolCatalogSource(fetch=fetch)
+    source.page_size = 2
+
+    assert len(source._fetch_node("lof_hq_fund")) == 2
+
+
 def test_sina_source_rejects_symbol_and_code_mismatch() -> None:
     from level2_service.symbol_catalog import SinaSymbolCatalogSource, SymbolCatalogError
 
@@ -122,6 +191,24 @@ def test_refresh_activates_a_complete_version_for_exact_lookup(tmp_path):
     assert len(refreshed.checksum) == 64
     assert catalog.lookup("600000") == SymbolLookup("600000", "浦发银行", "17")
     assert catalog.status().active_version == 1
+
+
+def test_refresh_normalizes_the_canonical_name_for_688027(tmp_path):
+    from level2_service.symbol_catalog import SQLiteSymbolCatalog
+
+    class Source:
+        def fetch_symbols(self):
+            return [SymbolLookup("688027", "科大国盾量子", "17")]
+
+    catalog = SQLiteSymbolCatalog(
+        tmp_path / "symbols.db",
+        Source(),
+        minimum_security_count=1,
+    )
+
+    catalog.refresh()
+
+    assert catalog.lookup("688027") == SymbolLookup("688027", "国盾量子", "17")
 
 
 def test_refresh_deduplicates_identical_rows_and_rejects_name_conflicts(tmp_path):
@@ -240,6 +327,11 @@ def test_lookup_and_search_fail_closed_after_the_catalog_is_stale(tmp_path):
         catalog.lookup("600000")
     with pytest.raises(SymbolCatalogError, match="SYMBOL_CATALOG_STALE"):
         catalog.search("浦发")
+
+    existing = catalog.lookup_existing("600000")
+    assert existing.symbol == "600000"
+    assert existing.name == "浦发银行"
+    assert existing.market == "17"
 
 
 def test_search_escapes_sql_like_wildcards(tmp_path):

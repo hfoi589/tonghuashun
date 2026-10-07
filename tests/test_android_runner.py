@@ -4,12 +4,15 @@ from io import BytesIO
 from random import Random
 import sys
 import types
+from datetime import datetime, timezone
 from pathlib import Path
 from time import monotonic
+from zoneinfo import ZoneInfo
 
 from PIL import Image
 import pytest
 
+from level2_service.market_data import MarketPhaseResolver, MarketSnapshot
 from level2_service.models import CaptureKind, CaptureStatus, MetricKind, TaskRecord, TaskStatus
 from level2_service.direct_market import Core9528Client, Core9528TemplateProtocol
 from level2_service.parsed_values import DirectReadOutcome
@@ -80,6 +83,7 @@ def _successful_runner(store, navigator, capture_root: Path, control: RunnerCont
             read_direct=lambda _symbol: dict(PARSED_VALUES),
         ),
         stitcher=lambda frames: b"\x89PNG\r\n\x1a\nlong:" + b"|".join(frames),
+        clock=lambda: datetime(2026, 9, 11, 10, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
     )
 
 
@@ -688,6 +692,56 @@ def test_data_only_runner_does_not_probe_app_ui_before_direct_read(tmp_path: Pat
     assert task.error_code is None
 
 
+def test_preopen_runner_keeps_core_result_when_fund_source_fails(tmp_path: Path) -> None:
+    store = InMemoryStreams()
+    store.enqueue(TaskRecord(task_id="preopen-core-only", symbol="601872", include_long_capture=False))
+    outcome = DirectReadOutcome(
+        values=dict(PARSED_VALUES),
+        source_errors={"core_metrics": None, "main_fund_flow": "DIRECT_FUND_FLOW_TIMEOUT"},
+    )
+    reader = types.SimpleNamespace(
+        read_direct=lambda _symbol: (_ for _ in ()).throw(AssertionError("strict reader must not run")),
+        read_direct_best_effort=lambda _symbol: outcome,
+    )
+    runner = Level2Runner(
+        store,
+        Level2Navigator(FakeDeviceBridge(symbol="601872")),
+        tmp_path,
+        RunnerControl(),
+        parsed_value_source=reader,
+        clock=lambda: datetime(2026, 8, 24, 1, 15, tzinfo=timezone.utc),
+    )
+
+    task = runner.run_once()
+
+    assert task is not None and task.status == TaskStatus.COMPLETED
+    assert task.error_code is None
+    assert task.source_errors["main_fund_flow"] == "DIRECT_FUND_FLOW_TIMEOUT"
+
+
+def test_preopen_runner_fails_with_specific_code_when_both_sources_fail(tmp_path: Path) -> None:
+    store = InMemoryStreams()
+    store.enqueue(TaskRecord(task_id="preopen-all-failed", symbol="601872", include_long_capture=False))
+    outcome = DirectReadOutcome(
+        values={kind: None for kind in MetricKind},
+        source_errors={"core_metrics": "CORE_TIMEOUT", "main_fund_flow": "FUND_TIMEOUT"},
+    )
+    runner = Level2Runner(
+        store,
+        Level2Navigator(FakeDeviceBridge(symbol="601872")),
+        tmp_path,
+        RunnerControl(),
+        parsed_value_source=types.SimpleNamespace(read_direct_best_effort=lambda _symbol: outcome),
+        clock=lambda: datetime(2026, 8, 24, 1, 15, tzinfo=timezone.utc),
+    )
+
+    task = runner.run_once()
+
+    assert task is not None and task.status == TaskStatus.FAILED
+    assert task.error_code == "PREOPEN_DATA_UNAVAILABLE"
+    assert task.source_errors == outcome.source_errors
+
+
 def test_data_only_runner_never_uses_ocr_for_missing_interface_values(tmp_path: Path) -> None:
     """A partial interface response must stay partial without opening the App UI."""
     store = InMemoryStreams()
@@ -966,6 +1020,200 @@ def test_runner_marks_login_requirement_waiting_for_admin(tmp_path: Path) -> Non
     assert runner.control.queue_paused is True
     assert runner.run_once() is None
     assert store.get("later-task").status == TaskStatus.QUEUED
+
+
+def test_lunch_break_runner_returns_the_last_app_metrics_and_hidden_fund_flow(tmp_path: Path) -> None:
+    store = InMemoryStreams()
+    store.enqueue(TaskRecord(task_id="lunch-values", symbol="601872", include_long_capture=False))
+    values = {kind: None for kind in MetricKind}
+    values.update(PARSED_VALUES)
+    values.update({
+        MetricKind.MAIN_FLOW_TODAY_UNIT: "亿元",
+        MetricKind.MAIN_FLOW_TODAY_NET: "10.67",
+        MetricKind.MAIN_FLOW_TODAY_VISIBLE: "5.30",
+        MetricKind.MAIN_FLOW_TODAY_HIDDEN: "5.37",
+        MetricKind.MAIN_FLOW_TODAY_RETAIL: "-10.67",
+    })
+    outcome = DirectReadOutcome(
+        values=values,
+        source_errors={"core_metrics": None, "main_fund_flow": None},
+        intraday_series={
+            MetricKind.LARGE_ORDER_NET: {
+                "unit": None,
+                "points": [{"time": "11:30", "value": "-0.02"}],
+            },
+        },
+    )
+    runner = Level2Runner(
+        store,
+        Level2Navigator(FakeDeviceBridge(symbol="601872")),
+        tmp_path,
+        RunnerControl(),
+        parsed_value_source=types.SimpleNamespace(read_direct=lambda _symbol: outcome),
+        market_snapshot_source=types.SimpleNamespace(
+            read_market_snapshot=lambda _symbol, *, detail: (_ for _ in ()).throw(
+                AssertionError("lunch break must not use the closed snapshot path")
+            )
+        ),
+        clock=lambda: datetime(2026, 9, 15, 12, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+    )
+
+    task = runner.run_once()
+
+    assert task is not None and task.status == TaskStatus.COMPLETED
+    assert legacy_values(task.values) == PARSED_VALUES
+    assert task.market_snapshot is None
+    public = task.as_public()
+    assert public["values"]["main_fund_flow"]["today"]["main_hidden_inflow"] == "5.37"
+    assert public["values"]["intraday_series"]["large_order_net"]["points"][-1] == {
+        "time": "11:30",
+        "value": "-0.02",
+    }
+
+
+def test_lunch_break_runner_respects_an_administrator_paused_queue(tmp_path: Path) -> None:
+    store = InMemoryStreams()
+    store.enqueue(TaskRecord(task_id="lunch-paused", symbol="601872", include_long_capture=False))
+    control = RunnerControl()
+    control.pause_queue()
+    runner = Level2Runner(
+        store,
+        Level2Navigator(FakeDeviceBridge(symbol="601872")),
+        tmp_path,
+        control,
+        parsed_value_source=types.SimpleNamespace(
+            read_direct=lambda _symbol: (_ for _ in ()).throw(
+                AssertionError("a paused lunch task must not read either App account")
+            )
+        ),
+        market_snapshot_source=types.SimpleNamespace(
+            read_market_snapshot=lambda _symbol, *, detail: (_ for _ in ()).throw(
+                AssertionError("a paused lunch task must not read a market snapshot")
+            )
+        ),
+        clock=lambda: datetime(2026, 9, 15, 12, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+    )
+
+    assert runner.run_once() is None
+    assert store.get("lunch-paused").status == TaskStatus.QUEUED
+
+
+def test_closed_market_runner_completes_snapshot_while_device_queue_is_paused(tmp_path: Path) -> None:
+    store = InMemoryStreams()
+    store.enqueue(
+        TaskRecord(
+            task_id="closed-snapshot",
+            symbol="601872",
+            include_long_capture=True,
+        )
+    )
+    control = RunnerControl()
+    control.pause_queue()
+    snapshot = MarketSnapshot(
+        symbol="601872",
+        name="招商轮船",
+        market="17",
+        sequence=0,
+        source_time="20260914 15:00:00",
+        collected_at=datetime(2026, 9, 14, 7, 0, tzinfo=timezone.utc),
+        quote={"price": "20.99", "change_percent": "+1.01%"},
+        source="TENCENT_PUBLIC",
+        stored_trade_dates={
+            "core_metrics": "20260909",
+            "main_fund_flow": "20260914",
+        },
+    )
+    runner = Level2Runner(
+        store,
+        Level2Navigator(FakeDeviceBridge(symbol="601872")),
+        tmp_path,
+        control,
+        parsed_value_source=types.SimpleNamespace(
+            read_direct=lambda _symbol: (_ for _ in ()).throw(
+                AssertionError("closed market must not read the App interface")
+            )
+        ),
+        market_snapshot_source=types.SimpleNamespace(
+            read_market_snapshot=lambda _symbol, *, detail: snapshot
+        ),
+        clock=lambda: datetime(2026, 9, 15, 8, 55, tzinfo=ZoneInfo("Asia/Shanghai")),
+    )
+
+    task = runner.run_once()
+
+    assert task is not None
+    assert task.status == TaskStatus.MARKET_SNAPSHOT
+    assert task.market_snapshot is not None
+    assert task.market_snapshot["source"] == "TENCENT_PUBLIC"
+    assert task.market_snapshot["stored_trade_dates"]["core_metrics"] == "20260909"
+    assert all(value is None for value in task.values.values())
+    assert all(capture.status == CaptureStatus.SKIPPED for capture in task.captures.values())
+    assert task.long_capture.status == CaptureStatus.SKIPPED
+    assert control.queue_paused is True
+
+
+def test_open_market_runner_leaves_task_queued_while_device_queue_is_paused(tmp_path: Path) -> None:
+    store = InMemoryStreams()
+    store.enqueue(TaskRecord(task_id="open-paused", symbol="601872", include_long_capture=False))
+    control = RunnerControl()
+    control.pause_queue()
+    runner = Level2Runner(
+        store,
+        Level2Navigator(FakeDeviceBridge(symbol="601872")),
+        tmp_path,
+        control,
+        parsed_value_source=types.SimpleNamespace(
+            read_direct=lambda _symbol: (_ for _ in ()).throw(
+                AssertionError("paused live task must not be claimed")
+            )
+        ),
+        market_snapshot_source=types.SimpleNamespace(
+            read_market_snapshot=lambda _symbol, *, detail: (_ for _ in ()).throw(
+                AssertionError("open market must not use the closed snapshot path")
+            )
+        ),
+        clock=lambda: datetime(2026, 9, 15, 10, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+    )
+
+    assert runner.run_once() is None
+    assert store.get("open-paused").status == TaskStatus.QUEUED
+
+
+def test_configured_holiday_calendar_routes_weekday_to_closed_snapshot(tmp_path: Path) -> None:
+    store = InMemoryStreams()
+    store.enqueue(TaskRecord(task_id="holiday-snapshot", symbol="601872", include_long_capture=False))
+    control = RunnerControl()
+    control.pause_queue()
+    snapshot = MarketSnapshot(
+        symbol="601872",
+        name="招商轮船",
+        market="17",
+        sequence=0,
+        source_time="20260915 15:00:00",
+        collected_at=datetime(2026, 9, 15, 7, 0, tzinfo=timezone.utc),
+        quote={"price": "20.99"},
+        source="MARKET_DATABASE",
+    )
+    runner = Level2Runner(
+        store,
+        Level2Navigator(FakeDeviceBridge(symbol="601872")),
+        tmp_path,
+        control,
+        market_phase_resolver=MarketPhaseResolver(is_trading_day=lambda _date: False),
+        market_snapshot_source=types.SimpleNamespace(
+            read_market_snapshot=lambda _symbol, *, detail: snapshot
+        ),
+        parsed_value_source=types.SimpleNamespace(
+            read_direct=lambda _symbol: (_ for _ in ()).throw(
+                AssertionError("holiday snapshot must not read the App interface")
+            )
+        ),
+        clock=lambda: datetime(2026, 9, 15, 10, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+    )
+
+    task = runner.run_once()
+
+    assert task is not None and task.status == TaskStatus.MARKET_SNAPSHOT
 
 
 def test_runner_does_not_leave_a_claimed_task_running_when_device_fails(tmp_path: Path) -> None:

@@ -11,6 +11,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from threading import RLock
 from typing import Callable
+from zoneinfo import ZoneInfo
 
 from argon2 import PasswordHasher
 from argon2.exceptions import InvalidHashError, VerifyMismatchError
@@ -21,6 +22,9 @@ from .parsed_values import SymbolLookup
 
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+_SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
 
 
 class DuplicateUserError(ValueError):
@@ -101,6 +105,8 @@ class SQLiteMarketAccountStore:
                     name TEXT NOT NULL,
                     market TEXT NOT NULL,
                     sort_order INTEGER NOT NULL,
+                    monitoring_enabled INTEGER NOT NULL DEFAULT 1,
+                    monitoring_enabled_at TEXT,
                     PRIMARY KEY(group_id, symbol)
                 );
                 CREATE INDEX IF NOT EXISTS watchlist_groups_user_order
@@ -119,6 +125,29 @@ class SQLiteMarketAccountStore:
                 self._connection.execute(
                     "ALTER TABLE watchlist_groups ADD COLUMN is_primary INTEGER NOT NULL DEFAULT 0"
                 )
+            item_columns = {
+                str(row["name"])
+                for row in self._connection.execute(
+                    "PRAGMA table_info(watchlist_items)"
+                ).fetchall()
+            }
+            if "monitoring_enabled" not in item_columns:
+                self._connection.execute(
+                    "ALTER TABLE watchlist_items ADD COLUMN monitoring_enabled INTEGER NOT NULL DEFAULT 1"
+                )
+            if "monitoring_enabled_at" not in item_columns:
+                self._connection.execute(
+                    "ALTER TABLE watchlist_items ADD COLUMN monitoring_enabled_at TEXT"
+                )
+            self._connection.execute(
+                """UPDATE watchlist_items
+                   SET monitoring_enabled_at=(
+                       SELECT u.created_at FROM watchlist_groups g
+                       JOIN market_users u ON u.id=g.user_id
+                       WHERE g.id=watchlist_items.group_id
+                   )
+                   WHERE monitoring_enabled=1 AND monitoring_enabled_at IS NULL"""
+            )
             user_ids = self._connection.execute(
                 "SELECT DISTINCT user_id FROM watchlist_groups"
             ).fetchall()
@@ -425,24 +454,29 @@ class SQLiteMarketAccountStore:
             if known >= self.max_symbols_per_user and already_known is None:
                 raise ValueError("watchlist symbol limit reached")
             try:
+                monitoring_enabled_at = _utc_now().isoformat()
                 self._connection.execute(
-                    """INSERT INTO watchlist_items(group_id,symbol,name,market,sort_order)
-                       VALUES(?,?,?,?,COALESCE((SELECT MAX(sort_order)+1 FROM watchlist_items WHERE group_id=?),0))""",
-                    (group_id, symbol.symbol, symbol.name, symbol.market, group_id),
+                    """INSERT INTO watchlist_items(
+                           group_id,symbol,name,market,sort_order,monitoring_enabled_at
+                       ) VALUES(?,?,?,?,COALESCE((SELECT MAX(sort_order)+1 FROM watchlist_items WHERE group_id=?),0),?)""",
+                    (group_id, symbol.symbol, symbol.name, symbol.market, group_id, monitoring_enabled_at),
                 )
                 if group_id != primary_group_id:
                     self._connection.execute(
-                        """INSERT INTO watchlist_items(group_id,symbol,name,market,sort_order)
-                           VALUES(?,?,?,?,COALESCE((SELECT MAX(sort_order)+1 FROM watchlist_items WHERE group_id=?),0))
+                        """INSERT INTO watchlist_items(
+                               group_id,symbol,name,market,sort_order,monitoring_enabled_at
+                           ) VALUES(?,?,?,?,COALESCE((SELECT MAX(sort_order)+1 FROM watchlist_items WHERE group_id=?),0),?)
                            ON CONFLICT(group_id,symbol) DO UPDATE SET
                                name=excluded.name,
-                               market=excluded.market""",
+                               market=excluded.market,
+                               monitoring_enabled_at=excluded.monitoring_enabled_at""",
                         (
                             primary_group_id,
                             symbol.symbol,
                             symbol.name,
                             symbol.market,
                             primary_group_id,
+                            monitoring_enabled_at,
                         ),
                     )
             except sqlite3.IntegrityError as error:
@@ -482,6 +516,111 @@ class SQLiteMarketAccountStore:
             for group_id in group_ids:
                 self._normalize_item_order(group_id)
 
+    def set_monitoring_enabled(
+        self,
+        user_id: int,
+        symbol: str,
+        enabled: bool,
+    ) -> bool:
+        """Toggle collection for one user's symbol without removing it."""
+        with self._lock, self._connection:
+            if enabled:
+                cursor = self._connection.execute(
+                    """UPDATE watchlist_items
+                       SET monitoring_enabled=1,monitoring_enabled_at=?
+                       WHERE symbol=? AND group_id IN (
+                           SELECT id FROM watchlist_groups WHERE user_id=?
+                       )""",
+                    (_utc_now().isoformat(), symbol, user_id),
+                )
+            else:
+                cursor = self._connection.execute(
+                    """UPDATE watchlist_items SET monitoring_enabled=0
+                   WHERE symbol=? AND group_id IN (
+                       SELECT id FROM watchlist_groups WHERE user_id=?
+                   )""",
+                    (symbol, user_id),
+                )
+            if cursor.rowcount < 1:
+                raise LookupError("watchlist symbol not found")
+        return enabled
+
+    def monitoring_state(self, user_id: int) -> dict[str, bool]:
+        with self._lock:
+            rows = self._connection.execute(
+                """SELECT i.symbol,MAX(i.monitoring_enabled) AS enabled
+                   FROM watchlist_items i
+                   JOIN watchlist_groups g ON g.id=i.group_id
+                   WHERE g.user_id=? GROUP BY i.symbol ORDER BY i.symbol""",
+                (user_id,),
+            ).fetchall()
+        return {str(row["symbol"]): bool(row["enabled"]) for row in rows}
+
+    def list_monitored_symbols(self) -> list[str]:
+        """Return the de-duplicated union enabled by any active market user."""
+        with self._lock:
+            rows = self._connection.execute(
+                """SELECT DISTINCT i.symbol
+                   FROM watchlist_items i
+                   JOIN watchlist_groups g ON g.id=i.group_id
+                   JOIN market_users u ON u.id=g.user_id
+                   WHERE u.enabled=1 AND i.monitoring_enabled=1
+                   ORDER BY i.symbol"""
+            ).fetchall()
+        return [str(row["symbol"]) for row in rows]
+
+    def list_admin_monitored_symbols(self) -> list[dict[str, object]]:
+        """Return globally monitored symbols with their active users and dates."""
+        with self._lock:
+            rows = self._connection.execute(
+                """SELECT i.symbol,i.name,i.monitoring_enabled_at,u.username
+                   FROM watchlist_items i
+                   JOIN watchlist_groups g ON g.id=i.group_id
+                   JOIN market_users u ON u.id=g.user_id
+                   WHERE u.enabled=1 AND i.monitoring_enabled=1
+                   ORDER BY i.symbol,i.monitoring_enabled_at,u.id"""
+            ).fetchall()
+        result: dict[str, dict[str, object]] = {}
+        for row in rows:
+            symbol = str(row["symbol"])
+            entry = result.setdefault(
+                symbol,
+                {
+                    "symbol": symbol,
+                    "stock_name": str(row["name"]),
+                    "monitoring_date": None,
+                    "monitoring_users": [],
+                },
+            )
+            timestamp = row["monitoring_enabled_at"]
+            date_value = None
+            if timestamp:
+                parsed = datetime.fromisoformat(str(timestamp))
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=timezone.utc)
+                date_value = parsed.astimezone(_SHANGHAI_TZ).date().isoformat()
+            current_date = entry["monitoring_date"]
+            if date_value is not None and (current_date is None or date_value < current_date):
+                entry["monitoring_date"] = date_value
+            users = entry["monitoring_users"]
+            username = str(row["username"])
+            if username not in users:
+                users.append(username)
+        return list(result.values())
+
+    def list_watchlist_symbols(self) -> list[str]:
+        """Return every symbol held by an enabled market user, de-duplicated globally."""
+        with self._lock:
+            rows = self._connection.execute(
+                """SELECT DISTINCT i.symbol
+                   FROM watchlist_items i
+                   JOIN watchlist_groups g ON g.id=i.group_id
+                   JOIN market_users u ON u.id=g.user_id
+                   WHERE u.enabled=1
+                   ORDER BY i.symbol"""
+            ).fetchall()
+        return [str(row["symbol"]) for row in rows]
+
     def reorder_symbols(self, user_id: int, group_id: int, symbols: list[str]) -> None:
         with self._lock, self._connection:
             self._owned_group(user_id, group_id)
@@ -512,7 +651,7 @@ class SQLiteMarketAccountStore:
             self._owned_group(user_id, source_group_id)
             self._owned_group(user_id, target_group_id)
             row = self._connection.execute(
-                "SELECT name,market FROM watchlist_items WHERE group_id=? AND symbol=?",
+                "SELECT name,market,monitoring_enabled,monitoring_enabled_at FROM watchlist_items WHERE group_id=? AND symbol=?",
                 (source_group_id, symbol),
             ).fetchone()
             if row is None:
@@ -548,8 +687,18 @@ class SQLiteMarketAccountStore:
                 (target_group_id, index),
             )
             self._connection.execute(
-                "INSERT INTO watchlist_items(group_id,symbol,name,market,sort_order) VALUES(?,?,?,?,?)",
-                (target_group_id, symbol, row["name"], row["market"], index),
+                """INSERT INTO watchlist_items(
+                       group_id,symbol,name,market,sort_order,monitoring_enabled,monitoring_enabled_at
+                   ) VALUES(?,?,?,?,?,?,?)""",
+                (
+                    target_group_id,
+                    symbol,
+                    row["name"],
+                    row["market"],
+                    index,
+                    row["monitoring_enabled"],
+                    row["monitoring_enabled_at"],
+                ),
             )
 
     def _normalize_group_order(self, user_id: int) -> None:

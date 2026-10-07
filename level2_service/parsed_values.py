@@ -113,6 +113,7 @@ class DirectReadOutcome:
     values: dict[MetricKind, str | None]
     source_errors: dict[str, str | None]
     intraday_series: dict[MetricKind, dict[str, Any]] = field(default_factory=dict)
+    stored_trade_dates: dict[str, str | None] = field(default_factory=dict)
 
     def __getitem__(self, kind: MetricKind) -> str | None:
         return self.values[kind]
@@ -165,6 +166,7 @@ class DualAccountParsedValueSource:
         core_source: Any,
         fund_source: Any,
         *,
+        fund_read_source: Any | None = None,
         symbol_source: Any | None = None,
         fund_market_interval_seconds: float = 15.0,
         max_fund_market_cache_entries: int = 512,
@@ -174,6 +176,7 @@ class DualAccountParsedValueSource:
             raise ValueError("max_fund_market_cache_entries must be positive")
         self.core_source = core_source
         self.fund_source = fund_source
+        self.fund_read_source = fund_read_source or fund_source
         self.symbol_source = symbol_source or core_source
         self.fund_market_interval_seconds = fund_market_interval_seconds
         self.max_fund_market_cache_entries = max_fund_market_cache_entries
@@ -196,7 +199,7 @@ class DualAccountParsedValueSource:
 
     def read_direct(self, symbol: str) -> DirectReadOutcome:
         core_future = self._executor.submit(self.core_source.read_direct, symbol)
-        fund_future = self._executor.submit(self.fund_source.read_direct, symbol)
+        fund_future = self._executor.submit(self.fund_read_source.read_direct, symbol)
         try:
             core_result = core_future.result()
         except DirectRequestError as error:
@@ -243,6 +246,62 @@ class DualAccountParsedValueSource:
             values=values,
             source_errors={
                 "core_metrics": None,
+                "main_fund_flow": fund_error,
+            },
+            intraday_series=intraday_series,
+        )
+
+    def read_direct_best_effort(self, symbol: str) -> DirectReadOutcome:
+        """Read both direct sources independently, retaining whichever responds."""
+        core_future = self._executor.submit(self.core_source.read_direct, symbol)
+        fund_future = self._executor.submit(self.fund_read_source.read_direct, symbol)
+
+        core_error: str | None = None
+        try:
+            core_result = core_future.result()
+        except DirectRequestError as error:
+            core_error = sanitized_direct_error_code(
+                error.error_code, "DIRECT_REQUEST_FAILED"
+            )
+            core_result = {}
+        except Exception:
+            core_error = "DIRECT_REQUEST_FAILED"
+            core_result = {}
+
+        fund_error: str | None = None
+        try:
+            fund_result = fund_future.result()
+        except DirectRequestError as error:
+            fund_error = sanitized_direct_error_code(
+                error.error_code, "DIRECT_FUND_FLOW_REQUEST_FAILED"
+            )
+            fund_result = {}
+        except Exception:
+            fund_error = "DIRECT_FUND_FLOW_REQUEST_FAILED"
+            fund_result = {}
+
+        if isinstance(core_result, DirectReadOutcome):
+            core_values = core_result.values
+            intraday_series = core_result.intraday_series
+            core_error = core_error or core_result.source_errors.get("core_metrics")
+        else:
+            core_values = core_result
+            intraday_series = {}
+        if isinstance(fund_result, DirectReadOutcome):
+            fund_values = fund_result.values
+            fund_error = fund_error or fund_result.source_errors.get("main_fund_flow")
+        else:
+            fund_values = fund_result
+
+        values = empty_metric_values()
+        for kind in REQUIRED_METRICS:
+            values[kind] = core_values.get(kind)
+        for kind in FUND_ONLY_METRICS:
+            values[kind] = fund_values.get(kind)
+        return DirectReadOutcome(
+            values=values,
+            source_errors={
+                "core_metrics": core_error,
                 "main_fund_flow": fund_error,
             },
             intraday_series=intraday_series,
@@ -297,8 +356,21 @@ class DualAccountParsedValueSource:
             if cached is not None and now - cached[2] < self.fund_market_interval_seconds:
                 return cached[0], cached[1]
         try:
-            fund = self.fund_source.read_market_snapshot(symbol, detail=False)
-            result = fund.main_fund_flow, fund.source_errors.get("main_fund_flow")
+            read_snapshot = getattr(self.fund_read_source, "read_market_snapshot", None)
+            if callable(read_snapshot):
+                fund = read_snapshot(symbol, detail=False)
+                result = fund.main_fund_flow, fund.source_errors.get("main_fund_flow")
+            else:
+                outcome = self.fund_read_source.read_direct(symbol)
+                values = outcome.values if isinstance(outcome, DirectReadOutcome) else outcome
+                main_fund_flow: dict[str, Any] = {}
+                for period, _label, unit_kind in FUND_FLOW_PERIODS:
+                    metrics = FUND_FLOW_METRICS[period]
+                    period_values = {name: values.get(kind) for name, kind in metrics.items()}
+                    unit = values.get(unit_kind)
+                    if unit is not None or any(value is not None for value in period_values.values()):
+                        main_fund_flow[period] = {"unit": unit, **period_values}
+                result = main_fund_flow, outcome.source_errors.get("main_fund_flow") if isinstance(outcome, DirectReadOutcome) else None
         except DirectRequestError as error:
             result = {}, sanitized_direct_error_code(
                 error.error_code, "DIRECT_FUND_FLOW_REQUEST_FAILED"
@@ -792,8 +864,8 @@ class FridaParsedValueSource:
         amount = latest_by_techid.get(7032)
         result[MetricKind.LARGE_ORDER_AMOUNT] = _format_number(
             amount / Decimal(10000) if amount is not None else None,
-            1,
-            suffix="万",
+            2,
+            suffix="万元",
         )
         result[MetricKind.RETAIL_COUNT] = _format_number(latest_by_techid.get(7034), 2)
         result[MetricKind.MACDFS] = _format_number(latest_by_techid.get(7051), 3, show_plus=True)
@@ -823,10 +895,10 @@ class FridaParsedValueSource:
             retail = _interface_decimal(retail_raw)
             if retail is None and main_in is not None:
                 retail = -main_in
-            result[metrics["main_net_inflow"]] = _format_number(main_in, 2)
-            result[metrics["main_visible_inflow"]] = _format_number(visible, 2)
-            result[metrics["main_hidden_inflow"]] = _format_number(hidden, 2)
-            result[metrics["retail_inflow"]] = _format_number(retail, 2)
+            result[metrics["main_net_inflow"]] = _market_number(main_in)
+            result[metrics["main_visible_inflow"]] = _market_number(visible)
+            result[metrics["main_hidden_inflow"]] = _market_number(hidden)
+            result[metrics["retail_inflow"]] = _market_number(retail)
         return result
 
     @staticmethod
@@ -835,7 +907,7 @@ class FridaParsedValueSource:
     ) -> dict[MetricKind, dict[str, Any]]:
         specs = {
             7031: (MetricKind.LARGE_ORDER_NET, 2, Decimal(1), None, False),
-            7032: (MetricKind.LARGE_ORDER_AMOUNT, 1, Decimal(10000), "万", False),
+            7032: (MetricKind.LARGE_ORDER_AMOUNT, 2, Decimal(10000), "万元", False),
             7034: (MetricKind.RETAIL_COUNT, 2, Decimal(1), None, False),
             7051: (MetricKind.MACDFS, 3, Decimal(1), None, True),
         }

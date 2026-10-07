@@ -1,4 +1,6 @@
 import json
+import threading
+import time
 from datetime import datetime, timezone
 
 import pytest
@@ -315,6 +317,58 @@ def test_public_market_falls_back_to_sina_quote_without_timeshare() -> None:
     assert snapshot.source_errors["tencent_public"] == "MARKET_QUOTE_UNAVAILABLE"
 
 
+def test_detail_quote_uses_fresh_tencent_quote_when_minute_endpoint_fails() -> None:
+    from level2_service.public_market import (
+        PublicMarketDataSource,
+        SinaPublicQuoteProvider,
+        TencentPublicMarketProvider,
+    )
+
+    class Catalog:
+        @staticmethod
+        def lookup(symbol: str) -> SymbolLookup:
+            return SymbolLookup(symbol, "招商轮船", "17")
+
+    quote_fields = _tencent_quote_fields(
+        "601872",
+        "招商轮船",
+        price="21.13",
+        previous_close="20.78",
+        open_price="20.98",
+        high="21.35",
+        low="20.78",
+        volume_lots="630376",
+        amount_wan="133289.9819",
+        turnover="0.87",
+        change_percent="1.68",
+    )
+    quote_fields[30] = "20260924110821"
+
+    def tencent_fetch(url: str, _timeout: float) -> bytes:
+        if "minute/query" in url:
+            raise OSError("Tencent minute endpoint returned HTTP 501")
+        return _quote_wire("sh601872", quote_fields)
+
+    def sina_fetch(_url: str, _timeout: float) -> bytes:
+        raise AssertionError("Sina must not replace an available fresh Tencent quote")
+
+    source = PublicMarketDataSource(
+        Catalog(),
+        TencentPublicMarketProvider(fetch=tencent_fetch),
+        SinaPublicQuoteProvider(fetch=sina_fetch),
+    )
+
+    snapshot = source.read_market_snapshot("601872", detail=True)
+
+    assert snapshot.source == "TENCENT_PUBLIC"
+    assert snapshot.quote["price"] == "21.13"
+    assert snapshot.source_time == "11:08"
+    assert snapshot.timeshare == ()
+    assert snapshot.capabilities["timeshare"]["available"] is False
+    assert snapshot.source_errors["tencent_public"] is None
+    assert snapshot.source_errors["tencent_intraday"] == "MARKET_QUOTE_UNAVAILABLE"
+
+
 def test_public_market_rejects_provider_identity_mismatch_with_fixed_error() -> None:
     from level2_service.public_market import PublicMarketError, TencentPublicMarketProvider
 
@@ -345,7 +399,41 @@ def test_public_market_rejects_provider_identity_mismatch_with_fixed_error() -> 
     assert "错误股票" not in str(caught.value)
 
 
-def test_tencent_quote_rejects_incompatible_name_and_impossible_price_range() -> None:
+def test_tencent_quote_accepts_provider_name_alias_when_symbol_matches() -> None:
+    from level2_service.public_market import TencentPublicMarketProvider
+
+    fields = _tencent_quote_fields(
+        "688027",
+        "科大国盾量子",
+        price="360.80",
+        previous_close="359.00",
+        open_price="361.00",
+        high="362.98",
+        low="358.58",
+        volume_lots="11249",
+        amount_wan="40200.00",
+        turnover="1.23",
+        change_percent="0.50",
+    )
+    provider = TencentPublicMarketProvider(
+        fetch=lambda _url, _timeout: _quote_wire("sh688027", fields),
+    )
+
+    snapshot = provider.read_snapshot(
+        SymbolLookup("688027", "国盾量子", "17"),
+        detail=False,
+    )
+
+    assert snapshot.name == "国盾量子"
+    assert snapshot.quote["open"] == "361.00"
+    assert snapshot.quote["high"] == "362.98"
+    assert snapshot.quote["low"] == "358.58"
+    assert snapshot.quote["previous_close"] == "359.00"
+    assert snapshot.quote["turnover_rate"] == "1.23%"
+    assert snapshot.quote["volume"] == "1124900"
+
+
+def test_tencent_quote_rejects_impossible_price_range_even_when_name_differs() -> None:
     from level2_service.public_market import PublicMarketError, TencentPublicMarketProvider
 
     fields = _tencent_quote_fields(
@@ -516,6 +604,85 @@ def test_direct_enrichment_merges_only_l2_owned_fields_and_is_cached() -> None:
     assert direct_calls == ["601872", "601872"]
 
 
+def test_public_market_uses_existing_identity_when_strict_catalog_is_stale() -> None:
+    from level2_service.public_market import PublicMarketDataSource
+
+    class Catalog:
+        @staticmethod
+        def lookup(_symbol: str):
+            raise DirectRequestError("SYMBOL_CATALOG_STALE")
+
+        @staticmethod
+        def lookup_existing(symbol: str):
+            return SymbolLookup(symbol=symbol, name="招商轮船", market="17")
+
+    class Tencent:
+        @staticmethod
+        def read_snapshot(identity: SymbolLookup, *, detail: bool):
+            assert detail is True
+            return MarketSnapshot(
+                symbol=identity.symbol,
+                name=identity.name,
+                market=identity.market,
+                sequence=0,
+                source_time="15:00",
+                collected_at=datetime.now(timezone.utc),
+                quote={"price": "20.99"},
+                source="TENCENT_PUBLIC",
+            )
+
+    result = PublicMarketDataSource(Catalog(), Tencent(), object()).read_market_snapshot(
+        "601872", detail=True
+    )
+
+    assert result.name == "招商轮船"
+    assert result.quote["price"] == "20.99"
+
+
+def test_public_market_uses_database_snapshot_only_for_watchlist_when_public_sources_fail() -> None:
+    from level2_service.public_market import PublicMarketDataSource, PublicMarketError
+
+    stored = MarketSnapshot(
+        symbol="601872",
+        name="招商轮船",
+        market="17",
+        sequence=0,
+        source_time="20260909 15:00:00",
+        collected_at=datetime(2026, 9, 9, 7, 0, tzinfo=timezone.utc),
+        quote={"price": "20.99"},
+        source="MARKET_DATABASE",
+        stored_trade_dates={"core_metrics": "20260909"},
+    )
+
+    class Catalog:
+        @staticmethod
+        def lookup_existing(symbol: str):
+            return SymbolLookup(symbol=symbol, name="招商轮船", market="17")
+
+    class Failing:
+        @staticmethod
+        def read_snapshot(_identity: SymbolLookup, *, detail: bool):
+            raise PublicMarketError("MARKET_QUOTE_UNAVAILABLE")
+
+    class FailingSina:
+        @staticmethod
+        def read_snapshot(_identity: SymbolLookup):
+            raise PublicMarketError("MARKET_QUOTE_UNAVAILABLE")
+
+    source = PublicMarketDataSource(
+        Catalog(),
+        Failing(),
+        FailingSina(),
+        database_fallback=lambda _symbol: stored,
+        is_watchlist_symbol=lambda _symbol: True,
+    )
+
+    result = source.read_market_snapshot("601872", detail=True)
+
+    assert result.source == "MARKET_DATABASE"
+    assert result.quote["price"] == "20.99"
+
+
 def test_direct_enrichment_skips_l2_for_watchlist_snapshots() -> None:
     from level2_service.public_market import DirectEnrichedMarketDataSource
 
@@ -583,6 +750,201 @@ def test_direct_enrichment_failure_keeps_the_public_snapshot_available() -> None
     assert result.quote["price"] == "18.62"
     assert result.capabilities["l2"]["available"] is False
     assert result.source_errors["core_metrics"] == "DIRECT_SESSION_UNAVAILABLE"
+
+
+def test_closed_direct_enrichment_uses_stored_outcome_without_live_interface() -> None:
+    from level2_service.public_market import DirectEnrichedMarketDataSource
+
+    snapshot = MarketSnapshot(
+        symbol="601872",
+        name="招商轮船",
+        market="17",
+        sequence=0,
+        source_time="15:00",
+        collected_at=datetime.now(timezone.utc),
+        quote={"price": "20.99"},
+        source="TENCENT_PUBLIC",
+    )
+    values = {kind: None for kind in MetricKind}
+    values.update(
+        {
+            MetricKind.LARGE_ORDER_NET: "0.33",
+            MetricKind.LARGE_ORDER_AMOUNT: "54165.0万",
+            MetricKind.RETAIL_COUNT: "-2.32",
+            MetricKind.MACDFS: "0.000",
+            MetricKind.MAIN_FLOW_TODAY_UNIT: "亿元",
+            MetricKind.MAIN_FLOW_TODAY_NET: "10.67",
+            MetricKind.MAIN_FLOW_TODAY_VISIBLE: "5.30",
+            MetricKind.MAIN_FLOW_TODAY_HIDDEN: "5.37",
+            MetricKind.MAIN_FLOW_TODAY_RETAIL: "-10.67",
+        }
+    )
+    stored = DirectReadOutcome(
+        values=values,
+        source_errors={"core_metrics": None, "main_fund_flow": None},
+    )
+
+    class Base:
+        @staticmethod
+        def read_market_snapshot(_symbol: str, *, detail: bool):
+            return snapshot
+
+    class Direct:
+        @staticmethod
+        def read_direct(_symbol: str):
+            raise AssertionError("closed snapshots must not call live enrichment")
+
+    result = DirectEnrichedMarketDataSource(
+        Base(),
+        Direct(),
+        is_market_open=lambda: False,
+        closed_enrichment=lambda _symbol: stored,
+    ).read_market_snapshot("601872", detail=True)
+
+    assert result.quote["large_order_net"] == "0.33"
+    assert result.main_fund_flow["today"]["main_net_inflow"] == "10.67"
+    assert result.source_errors["core_metrics"] is None
+
+
+def test_closed_direct_enrichment_hides_database_l2_for_non_watchlist_symbol() -> None:
+    from level2_service.public_market import DirectEnrichedMarketDataSource
+
+    snapshot = MarketSnapshot(
+        symbol="601872",
+        name="招商轮船",
+        market="17",
+        sequence=0,
+        source_time="15:00",
+        collected_at=datetime.now(timezone.utc),
+        quote={"price": "20.99"},
+        source="TENCENT_PUBLIC",
+    )
+    values = {kind: None for kind in MetricKind}
+    values[MetricKind.LARGE_ORDER_NET] = "0.33"
+
+    class Base:
+        @staticmethod
+        def read_market_snapshot(_symbol: str, *, detail: bool):
+            return snapshot
+
+    result = DirectEnrichedMarketDataSource(
+        Base(),
+        None,
+        is_market_open=lambda: False,
+        is_watchlist_symbol=lambda _symbol: False,
+        closed_enrichment=lambda _symbol: DirectReadOutcome(
+            values=values,
+            source_errors={"core_metrics": None, "main_fund_flow": None},
+        ),
+    ).read_market_snapshot("601872", detail=True)
+
+    assert result.quote.get("large_order_net") is None
+    assert result.capabilities["l2"]["available"] is False
+
+
+def test_closed_snapshot_never_falls_back_to_live_enrichment_when_history_is_missing() -> None:
+    from level2_service.public_market import DirectEnrichedMarketDataSource
+
+    snapshot = MarketSnapshot(
+        symbol="601872",
+        name="招商轮船",
+        market="17",
+        sequence=0,
+        source_time="15:00",
+        collected_at=datetime.now(timezone.utc),
+        quote={"price": "20.99"},
+        source="TENCENT_PUBLIC",
+    )
+    values = {kind: None for kind in MetricKind}
+    values.update({
+        MetricKind.LARGE_ORDER_NET: "0.33",
+        MetricKind.LARGE_ORDER_AMOUNT: "54165.0万",
+        MetricKind.RETAIL_COUNT: "-2.32",
+        MetricKind.MACDFS: "0.000",
+    })
+    direct_calls: list[str] = []
+
+    class Base:
+        @staticmethod
+        def read_market_snapshot(_symbol: str, *, detail: bool):
+            return snapshot
+
+    class Direct:
+        @staticmethod
+        def read_direct(symbol: str):
+            direct_calls.append(symbol)
+            return DirectReadOutcome(
+                values=values,
+                source_errors={"core_metrics": None, "main_fund_flow": None},
+            )
+
+    source = DirectEnrichedMarketDataSource(
+        Base(),
+        Direct(),
+        is_market_open=lambda: False,
+        closed_enrichment=lambda _symbol: None,
+    )
+
+    first = source.read_market_snapshot("601872", detail=True)
+    second = source.read_market_snapshot("601872", detail=True)
+
+    assert first.quote.get("large_order_net") is None
+    assert second.quote.get("large_order_net") is None
+    assert first.capabilities["l2"] == {
+        "available": False,
+        "reason": "MARKET_CLOSED_DATA_UNAVAILABLE",
+    }
+    assert direct_calls == []
+
+
+def test_busy_direct_enrichment_does_not_block_public_snapshot() -> None:
+    from level2_service.public_market import DirectEnrichedMarketDataSource
+
+    snapshot = MarketSnapshot(
+        symbol="601872",
+        name="招商轮船",
+        market="17",
+        sequence=0,
+        source_time="15:00",
+        collected_at=datetime.now(timezone.utc),
+        quote={"price": "18.62"},
+        source="TENCENT_PUBLIC",
+    )
+
+    class Base:
+        @staticmethod
+        def read_market_snapshot(_symbol: str, *, detail: bool):
+            assert detail is True
+            return snapshot
+
+    entered = threading.Event()
+    release = threading.Event()
+
+    class Direct:
+        @staticmethod
+        def read_direct(_symbol: str):
+            entered.set()
+            release.wait(timeout=2)
+            raise DirectRequestError("DIRECT_PROTOCOL_RESPONSE_TIMEOUT")
+
+    source = DirectEnrichedMarketDataSource(Base(), Direct())
+    first = threading.Thread(
+        target=lambda: source.read_market_snapshot("601872", detail=True),
+        daemon=True,
+    )
+    first.start()
+    assert entered.wait(timeout=1)
+
+    started = time.monotonic()
+    second = source.read_market_snapshot("601872", detail=True)
+    elapsed = time.monotonic() - started
+    release.set()
+    first.join(timeout=2)
+
+    assert elapsed < 0.2
+    assert second.quote["price"] == "18.62"
+    assert second.capabilities["l2"]["available"] is False
+    assert second.source_errors["core_metrics"] == "DIRECT_ENRICHMENT_BUSY"
 
 
 def test_empty_direct_enrichment_does_not_mark_l2_available() -> None:

@@ -111,6 +111,7 @@ class TaskStatus(str, Enum):
     RUNNING = "RUNNING"
     WAITING_ADMIN = "WAITING_ADMIN"
     COMPLETED = "COMPLETED"
+    MARKET_SNAPSHOT = "MARKET_SNAPSHOT"
     PARTIAL = "PARTIAL"
     FAILED = "FAILED"
     EXPIRED = "EXPIRED"
@@ -165,6 +166,7 @@ class TaskRecord:
     intraday_series: dict[MetricKind, dict[str, Any]] = field(
         default_factory=lambda: normalized_intraday_series(None)
     )
+    market_snapshot: dict[str, Any] | None = None
     long_capture: LongCaptureRecord = field(default_factory=LongCaptureRecord)
     maintenance_namespace: str | None = None
     maintenance_owner_digest: str | None = field(default=None, repr=False)
@@ -260,6 +262,7 @@ class TaskRecord:
                 "intraday_series": intraday_series_sources,
                 "main_fund_flow": main_fund_flow_sources,
             },
+            "market_snapshot": self.market_snapshot,
             "long_capture": {
                 "status": self.long_capture.status.value,
                 "url": (

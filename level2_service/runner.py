@@ -24,6 +24,7 @@ from typing import Callable, Iterator, Protocol
 from zoneinfo import ZoneInfo
 
 from .models import CaptureKind, MetricKind, TaskRecord, TaskStatus, utc_now
+from .market_data import MarketPhase, MarketPhaseResolver, is_china_preopen_window
 from .parsed_values import DirectReadOutcome, DirectRequestError, ParsedValueSource, UnsupportedMarketError, market_code_for_symbol
 from .queue import TaskStore
 
@@ -1242,11 +1243,26 @@ class RunnerControl:
             return True
 
     def claim_next_task(self, store: TaskStore) -> TaskRecord | None:
+        return self._claim_next_task(store, allow_when_paused=False)
+
+    def _claim_next_task(
+        self,
+        store: TaskStore,
+        *,
+        allow_when_paused: bool,
+    ) -> TaskRecord | None:
         """Atomically recheck pause state and claim under the maintenance gate."""
         with self._maintenance_gate:
             if self._operation_leases:
                 return None
-            if self.queue_paused:
+            if self.queue_paused and allow_when_paused:
+                try:
+                    lease = store.deployment_lease_status()
+                except Exception:
+                    return None
+                if lease is not None and lease.bound_task_id is not None:
+                    return None
+            elif self.queue_paused:
                 try:
                     lease = store.deployment_lease_status()
                 except Exception:
@@ -1353,6 +1369,9 @@ class Level2Runner:
         daily_check_state: DailyCheckState | None = None,
         stitcher: Callable[[tuple[bytes, ...]], bytes] = stitch_long_capture,
         long_capture_validator: Callable[[bytes], bool] | None = None,
+        clock: Callable[[], datetime] = utc_now,
+        market_snapshot_source: object | None = None,
+        market_phase_resolver: MarketPhaseResolver | None = None,
     ) -> None:
         self.store = store
         self.navigator = navigator
@@ -1363,9 +1382,20 @@ class Level2Runner:
         self.daily_check_state = daily_check_state
         self.stitcher = stitcher
         self.long_capture_validator = long_capture_validator
+        self.clock = clock
+        self.market_snapshot_source = market_snapshot_source
+        self.market_phase_resolver = market_phase_resolver or MarketPhaseResolver()
+
+    def _closed_market_phase(self) -> MarketPhase:
+        return self.market_phase_resolver.resolve(self.clock()).phase
 
     def run_once(self) -> TaskRecord | None:
-        task = self.control.claim_next_task(self.store)
+        phase = self._closed_market_phase()
+        allow_closed = phase is MarketPhase.CLOSED
+        task = self.control._claim_next_task(
+            self.store,
+            allow_when_paused=allow_closed,
+        )
         if task is None and self.control.queue_paused:
             if self.control.state == "OFFLINE":
                 self.control.heartbeat("READY" if self.device_online() else "OFFLINE")
@@ -1374,22 +1404,68 @@ class Level2Runner:
             self.control.heartbeat("READY")
             return None
         self.control.heartbeat("READY")
+        if allow_closed:
+            try:
+                source = self.market_snapshot_source
+                reader = getattr(source, "read_market_snapshot", None)
+                if not callable(reader):
+                    raise DirectRequestError("MARKET_CLOSED_DATA_UNAVAILABLE")
+                snapshot = reader(task.symbol, detail=True)
+                as_public = getattr(snapshot, "as_public", None)
+                if not callable(as_public):
+                    raise DirectRequestError("MARKET_CLOSED_DATA_UNAVAILABLE")
+                completed = self.store.complete_market_snapshot(
+                    task.task_id,
+                    as_public(),
+                )
+                self.control.heartbeat("READY")
+                return completed
+            except DirectRequestError as error:
+                failed = self.store.transition(
+                    task.task_id,
+                    TaskStatus.FAILED,
+                    error_code=error.error_code,
+                )
+                self.control.heartbeat("READY")
+                return failed
+            except Exception:
+                failed = self.store.transition(
+                    task.task_id,
+                    TaskStatus.FAILED,
+                    error_code="MARKET_CLOSED_DATA_UNAVAILABLE",
+                )
+                self.control.heartbeat("READY")
+                return failed
         source_errors: dict[str, str | None] | None = None
         intraday_series: dict[MetricKind, dict[str, object]] | None = None
+        preopen = is_china_preopen_window(self.clock())
         try:
             frames: tuple[bytes, ...] | None = None
             long_capture: bytes | None = None
             direct_reader = getattr(self.parsed_value_source, "read_direct", None)
-            if not callable(direct_reader):
+            best_effort_reader = getattr(
+                self.parsed_value_source, "read_direct_best_effort", None
+            )
+            reader = best_effort_reader if preopen and callable(best_effort_reader) else direct_reader
+            if not callable(reader):
                 raise DirectRequestError(
                     "DIRECT_REQUEST_UNAVAILABLE",
                     "App interface value source is not configured",
                 )
-            direct_result = direct_reader(task.symbol)
+            direct_result = reader(task.symbol)
             if isinstance(direct_result, DirectReadOutcome):
                 values = direct_result.values
                 source_errors = direct_result.source_errors
                 intraday_series = direct_result.intraday_series
+                if preopen and all(source_errors.get(role) for role in ("core_metrics", "main_fund_flow")):
+                    failed = self.store.transition(
+                        task.task_id,
+                        TaskStatus.FAILED,
+                        error_code="PREOPEN_DATA_UNAVAILABLE",
+                        source_errors=source_errors,
+                    )
+                    self.control.heartbeat("READY")
+                    return failed
             else:
                 values = direct_result
             if task.include_long_capture:
@@ -1422,6 +1498,15 @@ class Level2Runner:
             self.control.heartbeat("READY")
             return failed
         except DirectRequestError as error:
+            if preopen:
+                failed = self.store.transition(
+                    task.task_id,
+                    TaskStatus.FAILED,
+                    error_code="PREOPEN_DATA_UNAVAILABLE",
+                    source_errors={"core_metrics": error.error_code, "main_fund_flow": None},
+                )
+                self.control.heartbeat("READY")
+                return failed
             failed = self.store.get(task.task_id) or task
             if failed.status in {TaskStatus.RUNNING, TaskStatus.PARTIAL}:
                 failed = self.store.transition(
@@ -1447,6 +1532,7 @@ class Level2Runner:
                 str(path) if path is not None else None,
                 source_errors=source_errors,
                 intraday_series=intraday_series,
+                ignore_fund_source_error=preopen,
             )
         except Exception:
             failed = self.store.get(task.task_id) or task

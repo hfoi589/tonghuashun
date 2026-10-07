@@ -314,17 +314,17 @@ def test_fund_client_builds_three_exact_requests_and_formats_values() -> None:
     five_day = FUND_FLOW_METRICS["five_day"]
     units = {period: unit for period, _label, unit in FUND_FLOW_PERIODS}
     assert outcome.values[units["today"]] == "亿元"
-    assert outcome.values[today["main_net_inflow"]] == "1.23"
-    assert outcome.values[today["main_visible_inflow"]] == "1.00"
-    assert outcome.values[today["main_hidden_inflow"]] == "0.23"
-    assert outcome.values[today["retail_inflow"]] == "-1.23"
+    assert outcome.values[today["main_net_inflow"]] == "1.23456789"
+    assert outcome.values[today["main_visible_inflow"]] == "1"
+    assert outcome.values[today["main_hidden_inflow"]] == "0.23456789"
+    assert outcome.values[today["retail_inflow"]] == "-1.23456789"
     assert outcome.values[units["three_day"]] == "万元"
-    assert outcome.values[three_day["main_net_inflow"]] == "1971.50"
-    assert outcome.values[three_day["main_visible_inflow"]] == "-3638.90"
-    assert outcome.values[three_day["main_hidden_inflow"]] == "5610.40"
-    assert outcome.values[three_day["retail_inflow"]] == "-1971.50"
+    assert outcome.values[three_day["main_net_inflow"]] == "1971.5"
+    assert outcome.values[three_day["main_visible_inflow"]] == "-3638.9"
+    assert outcome.values[three_day["main_hidden_inflow"]] == "5610.4"
+    assert outcome.values[three_day["retail_inflow"]] == "-1971.5"
     assert outcome.values[units["five_day"]] == "万元"
-    assert outcome.values[five_day["main_net_inflow"]] == "0.00"
+    assert outcome.values[five_day["main_net_inflow"]] == "0"
     assert all(
         outcome.values[kind] is None
         for kind in (
@@ -756,6 +756,84 @@ def test_core_template_protocol_sends_auth_then_patched_packets_to_decoder() -> 
     )
     assert decoder.frames
     assert socket.closed is True
+
+
+def test_core_template_protocol_returns_valid_quote_before_later_batch_timeout() -> None:
+    packet = core_request_packet()
+    auth = framed_9528(b"auth")
+    response = framed_9528(b"response")
+    quote = _core_curve_frame(
+        "601872",
+        "招商轮船",
+        [(1, "int"), (10, "hxl"), (13, "hxl"), (19, "hxl"), (34312, "hxl")],
+        [[930, 21.85, 100, 200000, 0.12]],
+        ext_values={6: ("hxl", 20.50), 34315: ("hxl", 6.58)},
+    )
+
+    class Socket:
+        def __init__(self) -> None:
+            self.sent = 0
+            self.reads: list[bytes | Exception] = [
+                response[:13], response[13:], TimeoutError("auth idle")
+            ]
+
+        def settimeout(self, _timeout: float) -> None:
+            pass
+
+        def sendall(self, _value: bytes) -> None:
+            self.sent += 1
+            if self.sent == 2:
+                self.reads.extend([quote[:13], quote[13:]])
+
+        def recv(self, size: int) -> bytes:
+            if not self.reads:
+                raise TimeoutError("later batch idle")
+            value = self.reads.pop(0)
+            if isinstance(value, Exception):
+                raise value
+            return value[:size]
+
+        def close(self) -> None:
+            pass
+
+    material = replace(
+        session(),
+        role="core_metrics",
+        core_material={
+            "server_ip": "127.0.0.1",
+            "server_port": "9528",
+            "auth_packet_hex": auth.hex(),
+            "base64_alphabet": CORE_BASE64_ALPHABET,
+            "template_symbol": "600519",
+            "request_packets_hex": json.dumps([packet.hex(), packet.hex(), packet.hex()]),
+            "macdfs_params": json.dumps([10, 20, 5]),
+        },
+    )
+
+    outcome = Core9528TemplateProtocol(
+        socket_factory=lambda _address, _timeout: Socket(),
+        response_decoder=Core9528CurveDecoder(),
+    ).read_direct(material, "601872", "17")
+
+    assert outcome.values[MetricKind.CURRENT_PRICE] == "21.85"
+    assert outcome.values[MetricKind.CHANGE_PERCENT] == "6.58%"
+
+
+def test_core_curve_decoder_accepts_cv2_quote_frames() -> None:
+    frame = _core_curve_frame(
+        "601872",
+        "招商轮船",
+        [(1, "int"), (10, "hxl"), (13, "hxl"), (19, "hxl"), (34312, "hxl")],
+        [[930, 21.85, 100, 200000, 0.12]],
+        ext_values={6: ("hxl", 20.50), 34315: ("hxl", 6.58)},
+    )
+    body_start = 13 + struct.unpack_from("<H", frame, 13)[0]
+    frame = frame[:body_start] + b"cv2" + frame[body_start + 3 :]
+
+    outcome = Core9528CurveDecoder()([frame], "601872", "17")
+
+    assert outcome.values[MetricKind.CURRENT_PRICE] == "21.85"
+    assert outcome.values[MetricKind.CHANGE_PERCENT] == "6.58%"
 
 
 def test_core_template_protocol_passes_macdfs_parameters_to_decoder() -> None:
@@ -2019,11 +2097,11 @@ def test_core_curve_decoder_extracts_focus_metrics_and_intraday_points() -> None
     assert outcome.values[MetricKind.CHANGE_PERCENT] == "1.23%"
     assert outcome.values[MetricKind.TURNOVER_RATE] == "0.56%"
     assert outcome.values[MetricKind.LARGE_ORDER_NET] == "-0.01"
-    assert outcome.values[MetricKind.LARGE_ORDER_AMOUNT] == "-21116.5万"
+    assert outcome.values[MetricKind.LARGE_ORDER_AMOUNT] == "-21116.50万元"
     assert outcome.values[MetricKind.RETAIL_COUNT] == "12.68"
     assert outcome.values[MetricKind.MACDFS] == "+0.001"
     assert outcome.intraday_series[MetricKind.LARGE_ORDER_NET]["points"][-1]["value"] == "-0.01"
-    assert outcome.intraday_series[MetricKind.LARGE_ORDER_AMOUNT]["points"][-1]["value"] == "-21116.5"
+    assert outcome.intraday_series[MetricKind.LARGE_ORDER_AMOUNT]["points"][-1]["value"] == "-21116.50"
     assert outcome.intraday_series[MetricKind.RETAIL_COUNT]["points"][-1]["value"] == "12.68"
     assert outcome.intraday_series[MetricKind.MACDFS]["points"][-1]["value"] == "+0.001"
 

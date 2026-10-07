@@ -509,9 +509,9 @@ class Core9528CurveDecoder:
                     series = self._series(
                         curve,
                         33015,
-                        places=1,
+                        places=2,
                         divisor=Decimal(10000),
-                        unit="万",
+                        unit="万元",
                     )
                     values[MetricKind.LARGE_ORDER_AMOUNT] = series["latest"]
                     intraday[MetricKind.LARGE_ORDER_AMOUNT] = series["intraday"]
@@ -576,8 +576,8 @@ class Core9528CurveDecoder:
                 body = decode_core_snappy(body)
             elif compression_type == 0x3000:
                 raise ValueError("core Zstd mini body is unsupported")
-            if body[:3].lower() != b"cv3":
-                if body[4:7].lower() == b"cv3":
+            if body[:3].lower() not in {b"cv2", b"cv3"}:
+                if body[4:7].lower() in {b"cv2", b"cv3"}:
                     body = body[4:]
                 else:
                     return None
@@ -594,7 +594,7 @@ class Core9528CurveDecoder:
                 row_width,
                 field_count,
             ) = struct.unpack_from("<6s i I i H H H", body, 0)
-            if name_raw[:3].lower() != b"cv3" or point_count <= 0 or point_count > 1441:
+            if name_raw[:3].lower() not in {b"cv2", b"cv3"} or point_count <= 0 or point_count > 1441:
                 raise ValueError("core curve header is invalid")
             if (
                 first_index < 0
@@ -645,6 +645,12 @@ class Core9528CurveDecoder:
             expected_bytes = point_count * row_width
 
             def decode_data(data_segment: bytes) -> bytearray:
+                # ``cv2`` quote frames emitted by current servers may carry
+                # the row bytes uncompressed. Prefer the exact raw shape
+                # before interpreting the first eight bytes as a compression
+                # header.
+                if len(data_segment) == expected_bytes:
+                    return bytearray(data_segment)
                 if len(data_segment) >= 8:
                     compressed_length = int.from_bytes(data_segment[:4], "little")
                     declared_output = int.from_bytes(data_segment[4:8], "big")
@@ -663,8 +669,6 @@ class Core9528CurveDecoder:
                                 column * point_count + row
                             ]
                     return decoded_rows
-                if len(data_segment) == expected_bytes:
-                    return bytearray(data_segment)
                 raise ValueError("core curve data is truncated")
 
             row_bytes = decode_data(remaining)
@@ -980,10 +984,10 @@ def _decimal(value: object) -> Decimal | None:
 def _formatted(value: Decimal | None) -> str | None:
     if value is None:
         return None
-    rounded = value.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-    if rounded == 0:
-        rounded = abs(rounded)
-    return f"{rounded:.2f}"
+    normalized = value.normalize()
+    if normalized == 0:
+        normalized = abs(normalized)
+    return format(normalized, "f")
 
 
 class FundFlowHttpClient:
@@ -1049,7 +1053,7 @@ class FundFlowHttpClient:
         market: str,
     ) -> dict[str, Decimal | None]:
         try:
-            payload = json.loads(response.body.decode("utf-8"))
+            payload = json.loads(response.body.decode("utf-8"), parse_float=Decimal)
             if not isinstance(payload, dict) or int(payload.get("status_code")) != 0:
                 raise ValueError("fund flow service returned a failure status")
             data = payload["data"]
@@ -1573,7 +1577,7 @@ class Core9528TemplateProtocol:
                 return False
         elif head_type & 0xF000 == 0x3000:
             return False
-        return body[:3].lower() == b"cv3" or body[4:7].lower() == b"cv3"
+        return body[:3].lower() in {b"cv2", b"cv3"} or body[4:7].lower() in {b"cv2", b"cv3"}
 
     def _read_frames(
         self,
@@ -1670,14 +1674,25 @@ class Core9528TemplateProtocol:
                 seen_batches.add(batch)
                 for packet in batch:
                     warm.connection.sendall(packet)
-                frames.extend(
-                    self._read_frames(
-                        warm.connection,
-                        prepared.timeout_seconds,
-                        deadline=deadline,
-                        stop_after_curves=1,
+                try:
+                    frames.extend(
+                        self._read_frames(
+                            warm.connection,
+                            prepared.timeout_seconds,
+                            deadline=deadline,
+                            stop_after_curves=1,
+                        )
                     )
-                )
+                except DirectRequestError as error:
+                    # The core quote curve is sufficient for price/change.
+                    # Later indicator batches may legitimately stay silent;
+                    # preserve an already received curve and decode it below.
+                    if (
+                        error.error_code == "DIRECT_PROTOCOL_RESPONSE_TIMEOUT"
+                        and any(self._is_curve_frame(frame) for frame in frames)
+                    ):
+                        break
+                    raise
             assert self.response_decoder is not None
             response_decoder = self.response_decoder
             if prepared.macdfs_params is not None:

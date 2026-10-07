@@ -1,14 +1,18 @@
-import { FormEvent, KeyboardEvent, useEffect, useMemo, useRef, useState } from 'react'
+import { FormEvent, KeyboardEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { AdminPage } from './AdminPage'
-import { ApiError, api, type IntradaySeriesValues, type Job, type JobStatus, type JobStreamState, type MainFundFlowPeriod, type SymbolLookup, type SymbolSuggestion, type ValueSource, subscribeToJob } from './api'
+import { ApiError, api, type IntradaySeriesValues, type Job, type JobStatus, type JobStreamState, type MainFundFlowPeriod, type MainFundFlowValues, type SymbolLookup, type SymbolSuggestion, type TaskFundFlowDaily, type TaskFundFlowHistory, type ValueSource, subscribeToJob } from './api'
 import { IntradayMetricChart } from './IntradayMetricChart'
+import { FundFlowHistoryChart } from './FundFlowHistoryChart'
+import { FundFlowDailyChart } from './FundFlowDailyChart'
+import type { FundFlowDailyPoint } from './market-api'
 import './styles.css'
 
 const LEGACY_HISTORY_STORAGE_KEY = 'ths_level2_job_history'
 const STOCK_TABS_STORAGE_KEY = 'ths_level2_stock_tabs_v2'
 const ACTIVE_TAB_STORAGE_KEY = 'ths_level2_active_stock_tab'
 const MAX_STOCK_TABS = 50
-const terminalStatuses = new Set<JobStatus>(['COMPLETED', 'PARTIAL', 'FAILED', 'EXPIRED'])
+const terminalStatuses = new Set<JobStatus>(['COMPLETED', 'MARKET_SNAPSHOT', 'PARTIAL', 'FAILED', 'EXPIRED'])
+const loadingStatuses = new Set<JobStatus>(['QUEUED', 'RUNNING', 'WAITING_ADMIN'])
 
 interface StoredStockTab {
   public_id: string
@@ -34,12 +38,16 @@ const statusText: Record<JobStatus, string> = {
   RUNNING: '正在采集',
   WAITING_ADMIN: '等待管理员处理',
   COMPLETED: '数据已就绪',
+  MARKET_SNAPSHOT: '盘后快照',
   PARTIAL: '部分数据未读取',
   FAILED: '采集未完成',
   EXPIRED: '结果已过期',
 }
 
 function taskStatusText(task: Job): string {
+  if (task.status === 'MARKET_SNAPSHOT' && task.market_snapshot?.market_phase === 'BREAK') {
+    return '午间休市'
+  }
   return statusText[task.status]
 }
 
@@ -112,6 +120,13 @@ function formatDirectionalValue(value: string): { text: string, tone: MarketTone
   return { text: `${digits}${suffix}`, tone: 'neutral' }
 }
 
+function formatSnapshotLargeOrderAmount(value: string | null | undefined): string | null {
+  if (value == null) return null
+  const normalized = value.trim()
+  if (!/^[+-]?\d[\d,]*(?:\.\d+)?$/.test(normalized)) return normalized
+  return `${normalized}万`
+}
+
 function ValueCard({ name, value, source, finished, directional = false }: {
   name: string,
   value: string | null,
@@ -134,12 +149,64 @@ function ValueCard({ name, value, source, finished, directional = false }: {
   </article>
 }
 
+function QuoteSummary({ task, finished }: { task: Job, finished: boolean }) {
+  const change = task.values.change_percent
+    ? formatDirectionalValue(task.values.change_percent)
+    : null
+  const quoteName = task.values.stock_name || task.symbol
+  const priceTone = change?.tone ?? 'neutral'
+  return <section className="quote-summary" aria-label="行情摘要">
+    <div className="quote-primary">
+      <div className="quote-stock">
+        <span className="quote-stock-label sr-only">股票</span>
+        <strong>{quoteName}</strong>
+        <small className="quote-stock-symbol">{task.symbol}</small>
+      </div>
+      <div className="quote-metric quote-price-stack">
+        <p className="quote-metric-label sr-only">当前股价</p>
+        <p className={`quote-metric-value market-${priceTone} quote-price`}>{task.values.current_price ?? '未识别'}</p>
+        <p aria-label="当前涨跌幅" className={`quote-change-value market-${priceTone}`}>{change?.text ?? '未识别'}</p>
+      </div>
+    </div>
+    <div className="quote-secondary-metrics compact-metrics">
+      <ValueCard name="换手率" value={task.values.turnover_rate} source={task.value_sources?.turnover_rate} finished={finished} />
+      <ValueCard name="大单净量" value={task.values.large_order_net} source={task.value_sources?.large_order_net} finished={finished} directional />
+      <ValueCard name="大单金额" value={task.values.large_order_amount} source={task.value_sources?.large_order_amount} finished={finished} directional />
+      <ValueCard name="散户数量" value={task.values.retail_count} source={task.value_sources?.retail_count} finished={finished} directional />
+      <ValueCard name="MACDFS" value={task.values.macdfs} source={task.value_sources?.macdfs} finished={finished} directional />
+    </div>
+  </section>
+}
+
+function JobResultSkeleton() {
+  return <div className="job-result-skeleton" data-testid="job-result-skeleton">
+    <div className="skeleton-line skeleton-line-wide" />
+    <div className="skeleton-line skeleton-line-short" />
+    <div className="skeleton-quote-grid">
+      <div className="skeleton-block skeleton-block-hero" />
+      <div className="skeleton-block" />
+      <div className="skeleton-block" />
+    </div>
+    <div className="skeleton-metric-grid">
+      {Array.from({ length: 5 }, (_, index) => <div className="skeleton-block" key={index} />)}
+    </div>
+    <div className="skeleton-section" />
+    <div className="skeleton-section skeleton-section-chart" />
+  </div>
+}
+
 const emptyFundFlowPeriod: MainFundFlowPeriod = {
   unit: null,
   main_net_inflow: null,
   main_visible_inflow: null,
   main_hidden_inflow: null,
   retail_inflow: null,
+}
+
+const emptyFundFlowValues = {
+  today: emptyFundFlowPeriod,
+  three_day: emptyFundFlowPeriod,
+  five_day: emptyFundFlowPeriod,
 }
 
 const fundFlowRows = [
@@ -155,39 +222,35 @@ const fundFlowColumns = [
   ['five_day', '5日'],
 ] as const
 
-function formatFundFlowInYi(value: string | null, unit: string | null): string | null {
+function formatFundFlowInWan(value: string | null, unit: string | null): string | null {
   if (value === null) return null
   const numericValue = Number(value.replaceAll(',', ''))
   if (!Number.isFinite(numericValue)) return null
-  const divisor = unit === '万元' || unit === '万'
-    ? 10_000
-    : unit === '亿元' || unit === '亿' ? 1 : null
-  if (divisor === null) return null
-  const absoluteYi = Math.abs(numericValue) / divisor
-  const roundedYi = Math.round((absoluteYi + Number.EPSILON) * 100) / 100
-  const signedYi = numericValue < 0 ? -roundedYi : roundedYi
-  return (Object.is(signedYi, -0) ? 0 : signedYi).toFixed(2)
+  const multiplier = unit === '万元' || unit === '万'
+    ? 1
+    : unit === '亿元' || unit === '亿' ? 10_000 : null
+  if (multiplier === null) return null
+  const absoluteWan = Math.abs(numericValue) * multiplier
+  const roundedWan = Math.round((absoluteWan + Number.EPSILON) * 100) / 100
+  const signedWan = numericValue < 0 ? -roundedWan : roundedWan
+  return (Object.is(signedWan, -0) ? 0 : signedWan).toFixed(2)
 }
 
-function FundFlowTable({ task, finished }: { task: Job, finished: boolean }) {
-  const fundFlow = task.values.main_fund_flow ?? {
-    today: emptyFundFlowPeriod,
-    three_day: emptyFundFlowPeriod,
-    five_day: emptyFundFlowPeriod,
-  }
-  const sources = task.value_sources?.main_fund_flow
+function FundFlowTable({ task, finished, override }: { task: Job, finished: boolean, override?: MainFundFlowValues | null }) {
+  const fundFlow = override === undefined ? task.values.main_fund_flow ?? emptyFundFlowValues : override ?? emptyFundFlowValues
+  const sources = override === undefined ? task.value_sources?.main_fund_flow : undefined
 
   return <section className="fund-flow-section" aria-labelledby={`fund-flow-title-${task.public_id}`}>
     <div className="section-heading fund-flow-heading">
-      <div>
+      <div className="fund-flow-heading-title">
         <p className="eyebrow">资金增强指标</p>
         <h3 id={`fund-flow-title-${task.public_id}`}>主力流向</h3>
       </div>
-      <span className="minor">统一单位：亿元</span>
+      <span className="minor">统一单位：万元</span>
     </div>
     <div className="fund-flow-table-wrap">
       <table className="fund-flow-table">
-        <caption className="sr-only">主力流向当日、3日、5日对比，单位亿元</caption>
+        <caption className="sr-only">主力流向当日、3日、5日对比，单位万元</caption>
         <thead>
           <tr>
             <th scope="col">指标</th>
@@ -198,7 +261,7 @@ function FundFlowTable({ task, finished }: { task: Job, finished: boolean }) {
           {fundFlowRows.map(([field, label]) => <tr key={field}>
             <th scope="row">{label}</th>
             {fundFlowColumns.map(([period]) => {
-              const value = formatFundFlowInYi(
+              const value = formatFundFlowInWan(
                 fundFlow[period]?.[field] ?? null,
                 fundFlow[period]?.unit ?? null,
               )
@@ -216,41 +279,256 @@ function FundFlowTable({ task, finished }: { task: Job, finished: boolean }) {
   </section>
 }
 
+type FundFlowChartTab = 'today' | 'daily'
+const FUND_FLOW_REFRESH_INTERVAL_MS = 15_000
+
+function fundFlowValuesForDailyPoint(point: FundFlowDailyPoint): MainFundFlowValues | null {
+  if (point.periods === null || point.periods === undefined) return null
+  return {
+    today: point.periods.today ?? emptyFundFlowPeriod,
+    three_day: point.periods.three_day ?? emptyFundFlowPeriod,
+    five_day: point.periods.five_day ?? emptyFundFlowPeriod,
+  }
+}
+
+function TaskFundFlowHistory({ history, state, onRetry }: {
+  history?: TaskFundFlowHistory
+  state: 'idle' | 'loading' | 'ready' | 'empty' | 'error'
+  onRetry: () => void
+}) {
+  return <section className="fund-flow-history-inline" aria-label="当天主力流向历史">
+    <div className="section-heading fund-flow-heading">
+      <div className="fund-flow-inline-title"><p className="eyebrow">当天资金曲线</p><h3>主力流向趋势</h3></div>
+      <span className="minor">{history?.trade_date ?? '当日'}</span>
+    </div>
+    {state === 'loading' && <p className="fund-flow-chart-status">正在加载当天资金曲线…</p>}
+    {state === 'error' && <p className="fund-flow-chart-status error">当天资金曲线加载失败。<button type="button" className="inline-retry" onClick={onRetry}>重新加载</button></p>}
+    {state === 'empty' && <p className="fund-flow-chart-status">暂无当天资金曲线。</p>}
+    {state === 'ready' && history && <FundFlowHistoryChart period={{ points: history.points }} />}
+  </section>
+}
+
+function TaskFundFlowDaily({ daily, state, onRetry, onPointChange }: {
+  daily?: TaskFundFlowDaily
+  state: 'idle' | 'loading' | 'ready' | 'empty' | 'error'
+  onRetry: () => void
+  onPointChange: (point: FundFlowDailyPoint) => void
+}) {
+  return <section className="fund-flow-history-inline" aria-label="近30日资金流向">
+    <div className="section-heading fund-flow-heading">
+      <div className="fund-flow-inline-title"><p className="eyebrow">近30日资金流向</p><h3>收盘资金趋势</h3></div>
+      <span className="minor">单位：万元</span>
+    </div>
+    {state === 'loading' && <p className="fund-flow-chart-status">正在加载近30日资金流向…</p>}
+    {state === 'error' && <p className="fund-flow-chart-status error">近30日资金流向加载失败。<button type="button" className="inline-retry" onClick={onRetry}>重新加载</button></p>}
+    {state === 'empty' && <p className="fund-flow-chart-status">暂无近30日收盘资金数据。</p>}
+    {state === 'ready' && daily && <FundFlowDailyChart points={daily.points} onSelectedPointChange={onPointChange} />}
+  </section>
+}
+
+function TaskFundFlowTabs({ publicId, finished, hasFundFlow, allowHistoricalFallback, onTabChange, onDailyPointChange }: {
+  publicId: string
+  finished: boolean
+  hasFundFlow: boolean
+  allowHistoricalFallback: boolean
+  onTabChange: (tab: FundFlowChartTab) => void
+  onDailyPointChange: (point: FundFlowDailyPoint) => void
+}) {
+  const [activeTab, setActiveTab] = useState<FundFlowChartTab>('today')
+  const [history, setHistory] = useState<TaskFundFlowHistory>()
+  const [daily, setDaily] = useState<TaskFundFlowDaily>()
+  const [historyState, setHistoryState] = useState<'idle' | 'loading' | 'ready' | 'empty' | 'error'>('idle')
+  const [dailyState, setDailyState] = useState<'idle' | 'loading' | 'ready' | 'empty' | 'error'>('idle')
+  const [reloadVersion, setReloadVersion] = useState(0)
+  const eligible = (finished || allowHistoricalFallback) && (hasFundFlow || allowHistoricalFallback)
+
+  useEffect(() => {
+    if (!eligible) {
+      setHistory(undefined)
+      setDaily(undefined)
+      setHistoryState('idle')
+      setDailyState('idle')
+      return
+    }
+    let active = true
+    let inFlight = false
+    const load = (showLoading: boolean) => {
+      if (inFlight) return
+      inFlight = true
+      if (showLoading) {
+        setHistory(undefined)
+        setDaily(undefined)
+        setHistoryState('loading')
+        setDailyState('loading')
+      }
+      let completed = 0
+      const finish = () => {
+        completed += 1
+        if (completed === 2) inFlight = false
+      }
+      void api.fundFlowHistory(publicId).then((result) => {
+        if (!active) return
+        if (Array.isArray(result.points) && result.points.length > 0) {
+          setHistory(result)
+          setHistoryState('ready')
+        } else {
+          setHistoryState('empty')
+        }
+      }).catch((reason) => {
+        if (!active) return
+        setHistoryState(reason instanceof ApiError && reason.status === 404 ? 'empty' : 'error')
+      }).finally(finish)
+      void api.fundFlowDaily(publicId, 30).then((result) => {
+        if (!active) return
+        if (Array.isArray(result.points) && result.points.length > 0) {
+          setDaily(result)
+          setDailyState('ready')
+        } else {
+          setDailyState('empty')
+        }
+      }).catch((reason) => {
+        if (!active) return
+        setDailyState(reason instanceof ApiError && reason.status === 404 ? 'empty' : 'error')
+      }).finally(finish)
+    }
+    load(true)
+    const refreshTimer = window.setInterval(() => load(false), FUND_FLOW_REFRESH_INTERVAL_MS)
+    return () => {
+      active = false
+      window.clearInterval(refreshTimer)
+    }
+  }, [eligible, publicId, reloadVersion])
+
+  if (!eligible) return null
+  const selectTab = (tab: FundFlowChartTab) => {
+    setActiveTab(tab)
+    onTabChange(tab)
+  }
+  const todayPanelId = `fund-flow-today-panel-${publicId}`
+  const dailyPanelId = `fund-flow-daily-panel-${publicId}`
+  return <section className="fund-flow-chart-tabs" aria-label="资金曲线切换">
+    <div className="fund-flow-chart-tablist" role="tablist" aria-label="资金曲线类型">
+      <button type="button" role="tab" aria-selected={activeTab === 'today'} aria-controls={todayPanelId} className={activeTab === 'today' ? 'active' : ''} onClick={() => selectTab('today')}>当天资金曲线</button>
+      <button type="button" role="tab" aria-selected={activeTab === 'daily'} aria-controls={dailyPanelId} className={activeTab === 'daily' ? 'active' : ''} onClick={() => selectTab('daily')}>近30日资金流向</button>
+    </div>
+    <div id={activeTab === 'today' ? todayPanelId : dailyPanelId} role="tabpanel" aria-label={activeTab === 'today' ? '当天资金曲线内容' : '近30日资金流向内容'}>
+      {activeTab === 'today'
+        ? <TaskFundFlowHistory history={history} state={historyState} onRetry={() => setReloadVersion((version) => version + 1)} />
+        : <TaskFundFlowDaily daily={daily} state={dailyState} onRetry={() => setReloadVersion((version) => version + 1)} onPointChange={onDailyPointChange} />}
+    </div>
+  </section>
+}
+
+function MarketSnapshotResult({ task }: { task: Job }) {
+  const [historicalFundFlow, setHistoricalFundFlow] = useState<MainFundFlowValues | null | undefined>()
+  const handleFundFlowTabChange = useCallback((tab: FundFlowChartTab) => {
+    if (tab === 'today') setHistoricalFundFlow(undefined)
+  }, [])
+  const handleDailyPointChange = useCallback((point: FundFlowDailyPoint) => {
+    setHistoricalFundFlow(fundFlowValuesForDailyPoint(point))
+  }, [])
+  const snapshot = task.market_snapshot!
+  const isLunchBreak = snapshot.market_phase === 'BREAK'
+  const snapshotLabel = isLunchBreak ? '上午收盘数据' : '盘后快照'
+  const ariaLabel = isLunchBreak ? '午间休市行情' : '盘后行情快照'
+  const quote = snapshot.quote ?? {}
+  const snapshotFundFlow = {
+    today: { ...emptyFundFlowPeriod, ...snapshot.main_fund_flow?.today },
+    three_day: { ...emptyFundFlowPeriod, ...snapshot.main_fund_flow?.three_day },
+    five_day: { ...emptyFundFlowPeriod, ...snapshot.main_fund_flow?.five_day },
+  }
+  const snapshotTask: Job = {
+    ...task,
+    values: {
+      ...task.values,
+      stock_name: snapshot.name,
+      current_price: quote.price ?? quote.current_price ?? null,
+      change_percent: quote.change_percent ?? null,
+      turnover_rate: quote.turnover_rate ?? null,
+      large_order_net: quote.large_order_net ?? null,
+      large_order_amount: formatSnapshotLargeOrderAmount(quote.large_order_amount),
+      retail_count: quote.retail_count ?? null,
+      macdfs: quote.macdfs ?? null,
+      main_fund_flow: snapshotFundFlow,
+    },
+  }
+  return <section className="market-snapshot-result" aria-label={ariaLabel}>
+    <div className="section-heading">
+      <div><p className="eyebrow">MARKET SNAPSHOT</p><h3>{snapshot.name ?? snapshot.symbol} · {snapshotLabel}</h3></div>
+      <span className="minor">
+        {snapshot.source ?? 'MARKET_DATABASE'}
+        {snapshot.source_time ? ` · ${snapshot.source_time}` : ''}
+        {snapshot.stale ? ' · 历史' : ''}
+      </span>
+    </div>
+    <QuoteSummary task={snapshotTask} finished />
+    <div className="fund-flow-result-layout">
+      <FundFlowTable task={snapshotTask} finished override={historicalFundFlow} />
+      <TaskFundFlowTabs
+        publicId={task.public_id}
+        finished
+        hasFundFlow
+        allowHistoricalFallback
+        onTabChange={handleFundFlowTabChange}
+        onDailyPointChange={handleDailyPointChange}
+      />
+    </div>
+    {snapshot.stored_trade_dates && <p className="minor market-snapshot-dates">
+      大单数据：{snapshot.stored_trade_dates.core_metrics ?? '—'} · 资金流：{snapshot.stored_trade_dates.main_fund_flow ?? '—'}
+    </p>}
+  </section>
+}
+
 function IntradayCharts({ series, publicId }: { series: IntradaySeriesValues, publicId: string }) {
-  const [open, setOpen] = useState(false)
   const charts = [
     ['large_order_net', '大单净量', true, 2],
-    ['large_order_amount', '大单金额', true, 1],
+    ['large_order_amount', '大单金额', true, 2],
     ['retail_count', '散户数量', false, 2],
   ] as const
 
-  if (!charts.some(([key]) => series[key].points.length > 0)) return null
+  const availableCharts = charts.filter(([key]) => series[key].points.length > 0)
+  const availableKeySignature = availableCharts.map(([key]) => key).join(',')
+  const fallbackKey = availableCharts[0]?.[0] ?? 'large_order_net'
+  const [activeKey, setActiveKey] = useState<typeof charts[number][0]>('large_order_net')
+  useEffect(() => {
+    if (availableCharts.some(([key]) => key === activeKey)) return
+    setActiveKey(fallbackKey)
+  }, [activeKey, availableKeySignature, fallbackKey])
+  if (availableCharts.length === 0) return null
+  const activeChart = charts.find(([key]) => key === activeKey) ?? availableCharts[0]
   const chartsId = `intraday-charts-${publicId}`
+  const [key, title, directional, precision] = activeChart
   return <section className="intraday-section" aria-labelledby={`intraday-title-${publicId}`}>
     <div className="section-heading intraday-heading">
       <div>
         <p className="eyebrow">App 内部曲线</p>
         <h3 id={`intraday-title-${publicId}`}>当日分时</h3>
       </div>
-      <button
-        type="button"
-        className="secondary intraday-toggle"
-        aria-controls={chartsId}
-        aria-expanded={open}
-        onClick={() => setOpen((current) => !current)}
-      >
-        {open ? '收起曲线' : '展开曲线'}
-      </button>
+      <span className="minor">{title}</span>
     </div>
-    {open && <div className="intraday-chart-list" id={chartsId}>
-      {charts.map(([key, title, directional, precision]) => <IntradayMetricChart
-          directional={directional}
-          key={key}
-          precision={precision}
-          series={series[key]}
-          title={title}
-        />)}
-      </div>}
+    <div className="intraday-metric-tabs" role="tablist" aria-label="分时指标">
+      {charts.map(([chartKey, chartTitle]) => {
+        const hasPoints = series[chartKey].points.length > 0
+        return <button
+          type="button"
+          role="tab"
+          key={chartKey}
+          aria-selected={chartKey === key}
+          aria-controls={chartsId}
+          disabled={!hasPoints}
+          className={`intraday-metric-tab${chartKey === key ? ' active' : ''}`}
+          onClick={() => setActiveKey(chartKey)}
+        >{chartTitle}</button>
+      })}
+    </div>
+    <div className="intraday-chart-list" id={chartsId} role="tabpanel" aria-label={`${title}分时曲线`}>
+      <IntradayMetricChart
+        directional={directional}
+        precision={precision}
+        series={series[key]}
+        title={title}
+      />
+    </div>
   </section>
 }
 
@@ -260,18 +538,28 @@ export function JobResult({ task, isLatest = false, onRetry, retrying = false }:
   onRetry?: () => void,
   retrying?: boolean,
 }) {
+  const [historicalFundFlow, setHistoricalFundFlow] = useState<MainFundFlowValues | null | undefined>()
+  const handleFundFlowTabChange = useCallback((tab: FundFlowChartTab) => {
+    if (tab === 'today') setHistoricalFundFlow(undefined)
+  }, [])
+  const handleDailyPointChange = useCallback((point: FundFlowDailyPoint) => {
+    setHistoricalFundFlow(fundFlowValuesForDailyPoint(point))
+  }, [])
+  useEffect(() => {
+    setHistoricalFundFlow(undefined)
+  }, [task.public_id])
   const finished = task.status === 'COMPLETED' || task.status === 'PARTIAL'
-  const stockDisplayName = task.values.stock_name ? `${task.values.stock_name}（${task.symbol}）` : null
+  const loading = loadingStatuses.has(task.status)
+  const stockDisplayName = task.values.stock_name ? `${task.values.stock_name}（${task.symbol}）` : task.symbol
 
-  return <article className={`job-result${isLatest ? ' latest-job' : ''}`} aria-live="polite">
+  return <article className={`job-result${isLatest ? ' latest-job' : ''}`} aria-live="polite" aria-busy={loading}>
     <div className="job-heading">
       <div className="job-identity">
         <div className="job-kicker">
           {isLatest && <span className="latest-badge">最新</span>}
-          <span>任务 {task.public_id.slice(0, 12)}</span>
+          <span>结果状态</span>
         </div>
-        <p className="job-time">提交时间 {new Date(task.created_at).toLocaleString('zh-CN')}</p>
-        {task.collected_at && <p className="job-time">采集时间 {new Date(task.collected_at).toLocaleString('zh-CN')}</p>}
+        <p className="job-time">更新于 {new Date(task.collected_at ?? task.created_at).toLocaleString('zh-CN')}</p>
       </div>
       <div className="job-heading-actions">
         <span className={`status status-${task.status.toLowerCase()}`}>{taskStatusText(task)}</span>
@@ -284,6 +572,14 @@ export function JobResult({ task, isLatest = false, onRetry, retrying = false }:
         >
           {retrying ? '重试中…' : '重试'}
         </button>}
+        <details className="job-details">
+          <summary>任务详情</summary>
+          <div className="job-details-body">
+            <span>任务 {task.public_id.slice(0, 12)}</span>
+            <span>提交时间 {new Date(task.created_at).toLocaleString('zh-CN')}</span>
+            {task.collected_at && <span>采集时间 {new Date(task.collected_at).toLocaleString('zh-CN')}</span>}
+          </div>
+        </details>
       </div>
     </div>
 
@@ -292,23 +588,29 @@ export function JobResult({ task, isLatest = false, onRetry, retrying = false }:
     {task.status === 'FAILED' && <p className="error">{task.error_code ? `错误代码：${task.error_code}` : '请稍后重新提交任务。'}</p>}
     {task.status === 'EXPIRED' && <p className="expired">截图仅保留 24 小时；此任务的下载链接已失效。</p>}
 
-    {task.status !== 'EXPIRED' && <div className="value-grid">
-      <ValueCard name="股票名称" value={stockDisplayName} source={task.value_sources?.stock_name} finished={finished} />
-      <ValueCard name="当前股价" value={task.values.current_price} source={task.value_sources?.current_price} finished={finished} />
-      <ValueCard name="当前涨跌幅" value={task.values.change_percent} source={task.value_sources?.change_percent} finished={finished} directional />
-      <ValueCard name="换手率" value={task.values.turnover_rate} source={task.value_sources?.turnover_rate} finished={finished} />
-      <ValueCard name="大单净量" value={task.values.large_order_net} source={task.value_sources?.large_order_net} finished={finished} directional />
-      <ValueCard name="大单金额" value={task.values.large_order_amount} source={task.value_sources?.large_order_amount} finished={finished} directional />
-      <ValueCard name="散户数量" value={task.values.retail_count} source={task.value_sources?.retail_count} finished={finished} directional />
-      <ValueCard name="MACDFS" value={task.values.macdfs} source={task.value_sources?.macdfs} finished={finished} directional />
-    </div>}
+    {loading && <JobResultSkeleton />}
 
-    {task.status !== 'EXPIRED' && <FundFlowTable task={task} finished={finished} />}
+    {!loading && task.status !== 'EXPIRED' && task.status !== 'MARKET_SNAPSHOT' && <>
+      <QuoteSummary task={task} finished={finished} />
 
-    {task.status !== 'EXPIRED' && task.values.intraday_series && <IntradayCharts
+      <div className="fund-flow-result-layout">
+      <FundFlowTable task={task} finished={finished} override={historicalFundFlow} />
+      <TaskFundFlowTabs
+        publicId={task.public_id}
+        finished={finished}
+        hasFundFlow={Object.values(task.values.main_fund_flow ?? {}).some((period) => Object.entries(period).some(([key, value]) => key !== 'unit' && value !== null))}
+        allowHistoricalFallback={task.status === 'FAILED' && task.error_code === 'DIRECT_PROTOCOL_RESPONSE_TIMEOUT'}
+        onTabChange={handleFundFlowTabChange}
+        onDailyPointChange={handleDailyPointChange}
+      />
+      </div>
+
+      {task.values.intraday_series && <IntradayCharts
       publicId={task.public_id}
       series={task.values.intraday_series}
-    />}
+      />}
+    </>}
+    {task.status === 'MARKET_SNAPSHOT' && task.market_snapshot && <MarketSnapshotResult task={task} />}
 
   </article>
 }
@@ -443,6 +745,7 @@ export default function App({ initialTask }: { initialTask?: Job }) {
   const [streamState, setStreamState] = useState<JobStreamState | undefined>()
   const [retryingTaskId, setRetryingTaskId] = useState<string | null>(null)
   const [deleteTabId, setDeleteTabId] = useState<string | null>(null)
+  const [moreOpen, setMoreOpen] = useState(false)
   const symbolInputRef = useRef<HTMLInputElement>(null)
   const symbolEntryRef = useRef<HTMLDivElement>(null)
   const lookupSequence = useRef(0)
@@ -696,8 +999,9 @@ export default function App({ initialTask }: { initialTask?: Job }) {
   }
 
   function selectTab(publicId: string) {
+    const isCurrent = publicId === activePublicId
     moveTabToTop(publicId)
-    void retryTask(publicId)
+    if (!isCurrent) void retryTask(publicId)
   }
 
   async function submit(event: FormEvent<HTMLFormElement>) {
@@ -826,12 +1130,19 @@ export default function App({ initialTask }: { initialTask?: Job }) {
     focusable[nextIndex].focus()
   }
 
-  if (isAdmin) return <AdminPage />
+  if (isAdmin) return <AdminPage autoLoad />
 
   return <main className="page-shell">
-    <header className="hero">
-      <p className="eyebrow">THS LEVEL2</p>
-      <h1>同花顺数据采集</h1>
+    <header className="query-header">
+      <h1 className="sr-only">股票数据查询</h1>
+      <div className="more-menu">
+        <button type="button" aria-expanded={moreOpen} aria-controls="more-menu-panel" onClick={() => setMoreOpen((open) => !open)}>更多</button>
+        {moreOpen && <nav className="more-menu-panel" id="more-menu-panel" aria-label="辅助入口">
+          <a href="/market">进入行情中心</a>
+          <a href="/#admin">管理台</a>
+          {!initialTask && tabs.length > 0 && <button type="button" className="menu-danger" onClick={clearHistory}>清空本机记录</button>}
+        </nav>}
+      </div>
     </header>
 
     <section className="panel submit-panel" aria-label="提交采集任务">
@@ -891,7 +1202,7 @@ export default function App({ initialTask }: { initialTask?: Job }) {
               </button>)}
             </div>}
           </div>
-          <button type="submit" disabled={submitting || !verifiedSymbol}>{submitting ? '正在提交…' : '提交采集任务'}</button>
+          <button type="submit" aria-label="提交采集任务" disabled={submitting || !verifiedSymbol}>{submitting ? '提交中…' : '查询'}</button>
         </div>
         <div
           id="symbol-lookup-status"
@@ -926,7 +1237,6 @@ export default function App({ initialTask }: { initialTask?: Job }) {
           <h2 id="history-title">股票页签</h2>
           <p>股票和指标结果会永久保存在当前浏览器。</p>
         </div>
-        {!initialTask && tabs.length > 0 && <button type="button" className="secondary clear-history" onClick={clearHistory}>清空本机记录</button>}
       </div>
 
       {restoring ? <div className="history-empty" role="status">正在恢复本机记录…</div> : tabs.length === 0 ? <div className="history-empty">

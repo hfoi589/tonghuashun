@@ -7,7 +7,7 @@ import socket
 import time
 from math import isfinite
 from dataclasses import dataclass, field
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from functools import partial
 from pathlib import Path
 from typing import Callable, Mapping
@@ -25,6 +25,8 @@ from .app_sessions import (
 )
 from .daily_kline import DailyKlineMarketDataSource, TonghuashunPublicDailyKlineProvider
 from .device_lifecycle import DeviceLifecycleClient
+from .database_first_fund_flow import DatabaseFirstFundFlowSource
+from .fund_flow_history import FundFlowHistoryMonitor
 from .direct_market import (
     Core9528Client,
     Core9528CurveDecoder,
@@ -34,18 +36,34 @@ from .direct_market import (
     ShadowParsedValueSource,
 )
 from .market_accounts import RedisMarketSessionStore, SQLiteMarketAccountStore
-from .market_data import MarketDataBroker, is_china_market_open
-from .parsed_values import DualAccountParsedValueSource, FridaParsedValueSource
+from .market_data import LocalTradingCalendar, MarketDataBroker, MarketPhaseResolver, SHANGHAI_TZ, is_china_market_open
+from .parsed_values import (
+    FUND_ONLY_METRICS,
+    DirectReadOutcome,
+    DualAccountParsedValueSource,
+    FridaParsedValueSource,
+)
 from .public_market import (
     DirectEnrichedMarketDataSource,
     PublicMarketDataSource,
     SinaPublicQuoteProvider,
     TencentPublicMarketProvider,
 )
+from .preopen_market import (
+    CoreDirectPreopenQuoteClient,
+    PreopenMarketDataSource,
+    RedisPreopenQuoteCache,
+)
 from .queue import RedisStreamsStore
+from .research_store import SQLiteResearchStore
+from .research_monitor import ResearchMonitor
+from .research_push import PushDispatcher
+from .research_premium import PublicPremiumProvider
+from .premium_monitor import PremiumMonitor
 from .runner import ADBDeviceBridge, DailyCheckState, Level2Navigator, Level2Runner, OpenCVTemplateFallback, RunnerControl, TAB_LABELS, long_capture_has_net_heading
 from .security import persist_password_hash
 from .symbol_catalog import SinaSymbolCatalogSource, SQLiteSymbolCatalog
+from .request_logs import RequestLogStore
 
 
 @dataclass(frozen=True)
@@ -74,7 +92,9 @@ class DeploymentSettings:
     fund_frida_server_endpoint: str | None
     daily_check_state_file: Path
     market_database_path: Path
+    research_database_path: Path
     symbol_catalog_path: Path
+    trading_calendar_path: Path
     symbol_catalog_max_age_seconds: float
     symbol_catalog_refresh_hour: int
     symbol_catalog_refresh_minute: int
@@ -84,6 +104,7 @@ class DeploymentSettings:
     core_warm_connection_max_idle_seconds: float
     core_metrics_transport: str
     fund_flow_transport: str
+    market_preopen_transport: str
     device_lifecycle_url: str | None
     device_lifecycle_token: str | None = field(repr=False)
     device_lifecycle_timeout_seconds: float
@@ -145,9 +166,17 @@ class DeploymentSettings:
             if mode not in {"frida", "shadow", "direct"}:
                 raise ValueError(f"{name} must be frida, shadow, or direct")
             transport_modes[name] = mode
+        market_preopen_transport = (
+            values.get("MARKET_PREOPEN_TRANSPORT", "off").strip().lower()
+            or "off"
+        )
+        if market_preopen_transport not in {"off", "shadow", "direct"}:
+            raise ValueError(
+                "MARKET_PREOPEN_TRANSPORT must be off, shadow, or direct"
+            )
         direct_transport_enabled = any(
             mode != "frida" for mode in transport_modes.values()
-        )
+        ) or market_preopen_transport != "off"
         session_encryption_key = values.get("THS_SESSION_ENCRYPTION_KEY", "").strip()
         if direct_transport_enabled and not session_encryption_key:
             raise ValueError(
@@ -197,6 +226,12 @@ class DeploymentSettings:
             values.get(
                 "MARKET_DATABASE_PATH",
                 str(capture_root.parent / "market" / "market.db"),
+            )
+        ).expanduser().resolve()
+        research_database_path = Path(
+            values.get(
+                "RESEARCH_DATABASE_PATH",
+                str(market_database_path.with_name("research.db")),
             )
         ).expanduser().resolve()
         positive_values: dict[str, float] = {}
@@ -300,10 +335,17 @@ class DeploymentSettings:
                 values.get("DAILY_CHECK_STATE_FILE", "/data/admin/daily-check.json")
             ).expanduser().resolve(),
             market_database_path=market_database_path,
+            research_database_path=research_database_path,
             symbol_catalog_path=Path(
                 values.get(
                     "SYMBOL_CATALOG_PATH",
                     str(market_database_path.with_name("symbol-catalog.db")),
+                )
+            ).expanduser().resolve(),
+            trading_calendar_path=Path(
+                values.get(
+                    "TRADING_CALENDAR_PATH",
+                    str(market_database_path.with_name("trading-calendar.json")),
                 )
             ).expanduser().resolve(),
             symbol_catalog_max_age_seconds=positive_values[
@@ -323,6 +365,7 @@ class DeploymentSettings:
             ],
             core_metrics_transport=transport_modes["CORE_METRICS_TRANSPORT"],
             fund_flow_transport=transport_modes["FUND_FLOW_TRANSPORT"],
+            market_preopen_transport=market_preopen_transport,
             device_lifecycle_url=lifecycle_url,
             device_lifecycle_token=lifecycle_token,
             device_lifecycle_timeout_seconds=lifecycle_timeout,
@@ -495,9 +538,28 @@ def create_production_app(
                     templates[f"tab:{label}"] = candidate
                     break
     navigator = Level2Navigator(core_bridge, OpenCVTemplateFallback(templates))
+    market_accounts = SQLiteMarketAccountStore(config.market_database_path)
+    research_store = SQLiteResearchStore(config.research_database_path)
+    trading_calendar = LocalTradingCalendar(config.trading_calendar_path)
+
+    def market_is_open() -> bool:
+        local = datetime.now(timezone.utc).astimezone(SHANGHAI_TZ)
+        return trading_calendar.is_trading_day(local.date()) and is_china_market_open(local)
+
+    def previous_trading_date(value: str) -> str:
+        current = datetime.strptime(value, "%Y%m%d").date()
+        current -= timedelta(days=1)
+        while not trading_calendar.is_trading_day(current):
+            current -= timedelta(days=1)
+        return current.strftime("%Y%m%d")
+
+    market_phase_resolver = MarketPhaseResolver(
+        is_trading_day=trading_calendar.is_trading_day,
+    )
     account_session_provider = None
     account_session_refreshers: dict[str, Callable] = {}
     direct_core_source = None
+    fund_flow_source = None
     if config.dual_account_mode:
         assert config.core_frida_server_endpoint is not None
         assert config.fund_frida_server_endpoint is not None
@@ -573,9 +635,17 @@ def create_production_app(
                     role="main_fund_flow",
                 )
             )
+        fund_flow_source = fund_source
+        database_first_fund_source = DatabaseFirstFundFlowSource(
+            fund_source,
+            market_accounts,
+            research_store,
+            is_market_open=market_is_open,
+        )
         parsed_value_source = DualAccountParsedValueSource(
             core_source,
             fund_source,
+            fund_read_source=database_first_fund_source,
             symbol_source=symbol_catalog,
             fund_market_interval_seconds=config.market_direct_enrichment_ttl_seconds,
         )
@@ -585,6 +655,19 @@ def create_production_app(
             if config.frida_server_endpoint
             else None
         )
+        fund_flow_source = parsed_value_source
+        database_first_fund_source = (
+            DatabaseFirstFundFlowSource(
+                parsed_value_source,
+                market_accounts,
+                research_store,
+                is_market_open=market_is_open,
+            )
+            if parsed_value_source is not None
+            else None
+        )
+        if database_first_fund_source is not None:
+            parsed_value_source = database_first_fund_source
     runner = runner_factory(
         store,
         navigator,
@@ -594,7 +677,6 @@ def create_production_app(
         daily_check_state=DailyCheckState(config.daily_check_state_file),
         long_capture_validator=long_capture_has_net_heading,
     )
-    market_accounts = SQLiteMarketAccountStore(config.market_database_path)
     market_sessions = RedisMarketSessionStore(redis_client)
     public_market_source = PublicMarketDataSource(
         symbol_catalog,
@@ -604,6 +686,13 @@ def create_production_app(
         SinaPublicQuoteProvider(
             timeout_seconds=config.public_market_timeout_seconds
         ),
+        database_fallback=(
+            research_store.latest_market_snapshot
+            if callable(getattr(research_store, "latest_market_snapshot", None))
+            else None
+        ),
+        is_watchlist_symbol=lambda symbol: symbol
+        in set(market_accounts.list_watchlist_symbols()),
     )
     direct_market_enrichment = (
         parsed_value_source
@@ -612,17 +701,93 @@ def create_production_app(
         and config.fund_flow_transport == "direct"
         else None
     )
-    market_broker = MarketDataBroker(
-        DailyKlineMarketDataSource(
-            DirectEnrichedMarketDataSource(
-                public_market_source,
-                direct_market_enrichment,
-                ttl_seconds=config.market_direct_enrichment_ttl_seconds,
-            ),
-            TonghuashunPublicDailyKlineProvider(),
-            is_market_open=is_china_market_open,
+
+    def closed_market_enrichment(symbol: str) -> DirectReadOutcome | None:
+        stored = research_store.latest_market_enrichment(symbol)
+        if stored is not None and any(stored.values.get(kind) is not None for kind in FUND_ONLY_METRICS):
+            return stored
+        if database_first_fund_source is None:
+            return stored
+        try:
+            fund = database_first_fund_source.read_direct(symbol)
+        except Exception:
+            return stored
+        if stored is None:
+            return fund
+        values = dict(stored.values)
+        values.update({kind: fund.values.get(kind) for kind in FUND_ONLY_METRICS})
+        return DirectReadOutcome(
+            values=values,
+            source_errors={"core_metrics": None, "main_fund_flow": None},
+            intraday_series={**stored.intraday_series, **fund.intraday_series},
+            stored_trade_dates={
+                **stored.stored_trade_dates,
+                **fund.stored_trade_dates,
+            },
+        )
+
+    public_market_data_source = DailyKlineMarketDataSource(
+        DirectEnrichedMarketDataSource(
+            public_market_source,
+            direct_market_enrichment,
+            ttl_seconds=config.market_direct_enrichment_ttl_seconds,
+            is_market_open=market_is_open,
+            is_watchlist_symbol=lambda symbol: symbol
+            in set(market_accounts.list_watchlist_symbols()),
+            closed_enrichment=closed_market_enrichment,
         ),
-        is_market_open=is_china_market_open,
+        TonghuashunPublicDailyKlineProvider(),
+        is_market_open=market_is_open,
+    )
+    market_source = (
+        PreopenMarketDataSource(
+            public_market_data_source,
+            preopen_client=(
+                CoreDirectPreopenQuoteClient(direct_core_source)
+                if config.market_preopen_transport == "direct"
+                and direct_core_source is not None
+                else None
+            ),
+            enforce_preopen=config.market_preopen_transport == "direct",
+            phase_resolver=market_phase_resolver,
+            cache=(
+                RedisPreopenQuoteCache(redis_client)
+                if config.market_preopen_transport != "off"
+                else None
+            ),
+        )
+        if config.market_preopen_transport != "off"
+        else public_market_data_source
+    )
+    market_broker = MarketDataBroker(
+        market_source,
+        is_market_open=market_is_open,
+    )
+    if runner is not None and hasattr(runner, "market_snapshot_source"):
+        runner.market_snapshot_source = market_source
+    if runner is not None and hasattr(runner, "market_phase_resolver"):
+        runner.market_phase_resolver = market_phase_resolver
+    push_dispatcher = PushDispatcher()
+    research_monitor = ResearchMonitor(
+        market_accounts,
+        market_broker,
+        research_store,
+        dispatcher=push_dispatcher,
+    )
+    fund_flow_monitor = (
+        FundFlowHistoryMonitor(
+            market_accounts,
+            fund_flow_source,
+            research_store,
+            is_market_open=market_is_open,
+        )
+        if fund_flow_source is not None
+        else None
+    )
+    premium_monitor = PremiumMonitor(
+        PublicPremiumProvider(timeout_seconds=config.public_market_timeout_seconds),
+        research_store,
+        push_dispatcher,
     )
     device_lifecycle = (
         DeviceLifecycleClient(
@@ -654,6 +819,7 @@ def create_production_app(
         symbol_catalog=symbol_catalog,
         symbol_catalog_refresh_hour=config.symbol_catalog_refresh_hour,
         symbol_catalog_refresh_minute=config.symbol_catalog_refresh_minute,
+        previous_trading_date=previous_trading_date,
         core_prewarmer=(
             direct_core_source.prewarm
             if direct_core_source is not None
@@ -666,15 +832,21 @@ def create_production_app(
         ),
         managed_resources=tuple(
             resource
-            for resource in (direct_core_source, parsed_value_source)
+            for resource in (direct_core_source, parsed_value_source, research_store)
             if resource is not None and callable(getattr(resource, "close", None))
         ),
         market_account_store=market_accounts,
         market_session_store=market_sessions,
         market_data_broker=market_broker,
+        research_store=research_store,
+        research_monitor=research_monitor,
+        fund_flow_monitor=fund_flow_monitor,
+        push_dispatcher=push_dispatcher,
+        premium_monitor=premium_monitor,
         account_session_provider=account_session_provider,
         account_session_refreshers=account_session_refreshers,
         device_lifecycle=device_lifecycle,
+        request_log_store=RequestLogStore(config.research_database_path),
     )
     app.state.deployment_settings = config
     app.state.runner = runner

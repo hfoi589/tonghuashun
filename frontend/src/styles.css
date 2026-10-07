@@ -94,6 +94,13 @@ button:focus-visible, input:focus-visible, a:focus-visible, .device-canvas:focus
   line-height: 1.08;
   letter-spacing: -.052em;
 }
+.hero { display: flex; align-items: end; justify-content: space-between; gap: 1.5rem; }
+.hero-heading { min-width: 0; }
+.hero-links { display: flex; gap: .65rem; flex-wrap: wrap; }
+.hero-links a { display: inline-flex; align-items: center; min-height: 36px; padding: 0 .8rem; border: 1px solid #c8d3d9; border-radius: 999px; color: #344850; background: #fff; font-size: .78rem; font-weight: 700; text-decoration: none; }
+.hero-links a:first-child { border-color: #24363e; color: #fff; background: #24363e; }
+.hero-links a:hover, .hero-links a:focus-visible { border-color: #d95555; color: #d95555; outline: none; }
+.hero-links a:first-child:hover, .hero-links a:first-child:focus-visible { color: #fff; background: #b83e3e; border-color: #b83e3e; }
 
 .eyebrow {
   margin: 0 0 .4rem;
@@ -532,6 +539,26 @@ button.tab-delete-confirm:not(:disabled):hover { background: #7f2919; }
   content: "";
 }
 
+.market-snapshot-result {
+  margin-top: 1rem;
+  padding: 1rem;
+  border: 1px solid var(--line, #d5e0e4);
+  background: var(--surface, #fff);
+}
+.market-snapshot-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: .75rem;
+  margin-top: .9rem;
+}
+.market-snapshot-grid > div { display: grid; gap: .2rem; }
+.market-snapshot-grid span { color: var(--muted, #71808a); font-size: .72rem; }
+.market-snapshot-grid strong { font-variant-numeric: tabular-nums; }
+.market-snapshot-dates { margin: .9rem 0 0; }
+@media (max-width: 640px) {
+  .market-snapshot-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+
 .job-heading, .section-heading, .admin-header, .admin-controls {
   display: flex;
   align-items: center;
@@ -680,9 +707,32 @@ button.tab-delete-confirm:not(:disabled):hover { background: #7f2919; }
   padding: 1rem;
 }
 
+.fund-flow-result-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 2fr) minmax(0, 3fr);
+  align-items: stretch;
+  gap: .9rem;
+}
+
+.fund-flow-result-layout > .fund-flow-section,
+.fund-flow-result-layout > .fund-flow-history-inline {
+  min-width: 0;
+  height: calc(100% - 1.2rem);
+  margin-top: 1.2rem;
+}
+
 .fund-flow-heading {
   margin-bottom: .8rem;
 }
+
+.fund-flow-inline-title {
+  display: flex;
+  align-items: baseline;
+  gap: .65rem;
+  min-width: 0;
+}
+
+.fund-flow-inline-title .eyebrow { margin: 0; white-space: nowrap; }
 
 .fund-flow-heading h3 {
   margin: 0;
@@ -750,6 +800,141 @@ button.tab-delete-confirm:not(:disabled):hover { background: #7f2919; }
 .fund-flow-table tbody tr:last-child td {
   border-bottom: 0;
 }
+
+.fund-flow-history-inline {
+  border: 1px solid #dfe9e9;
+  border-radius: 14px;
+  background: var(--surface-muted);
+  padding: 1rem;
+}
+
+.fund-flow-history-inline .fund-flow-history-head,
+.fund-flow-history-inline .fund-flow-history-readout,
+.fund-flow-history-inline .fund-flow-history-periods,
+.fund-flow-history-inline .fund-flow-history-toolbar,
+.fund-flow-history-inline .fund-flow-history-scrubber {
+  font-size: .78rem;
+}
+
+.fund-flow-history-inline .fund-flow-history-svg {
+  width: 100%;
+  height: auto;
+  overflow: visible;
+  background-image: linear-gradient(#eef2f2 1px, transparent 1px);
+  background-size: 100% 25%;
+}
+.fund-flow-history-inline .fund-flow-history-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: .7rem;
+  color: #60747a;
+  font-size: .72rem;
+}
+.fund-flow-history-inline .fund-flow-history-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: .35rem .7rem;
+}
+.fund-flow-history-inline .fund-flow-history-legend span {
+  display: inline-flex;
+  align-items: center;
+  gap: .28rem;
+  white-space: nowrap;
+}
+.fund-flow-history-inline .fund-flow-history-legend i {
+  width: .48rem;
+  height: .48rem;
+  flex: 0 0 .48rem;
+  border-radius: 50%;
+}
+.fund-flow-history-inline .fund-flow-history-head time { color: #17333b; font-weight: 750; }
+.fund-flow-history-inline .fund-flow-history-svg text { fill: #8b999d; font-size: 9px; }
+.fund-flow-history-inline .fund-flow-history-svg line:not(.fund-flow-history-zero):not(.fund-flow-history-cursor) { stroke: #edf2f1; stroke-width: 1; vector-effect: non-scaling-stroke; }
+.fund-flow-history-inline .fund-flow-history-cursor { stroke: #9aa8aa; stroke-width: 1; vector-effect: non-scaling-stroke; }
+.fund-flow-history-inline .fund-flow-history-dot { stroke: #fff; stroke-width: 1.5; vector-effect: non-scaling-stroke; }
+.fund-flow-history-inline .fund-flow-history-scrubber {
+  display: block;
+  width: 100%;
+  min-width: 0;
+  margin: .55rem 0 0;
+  accent-color: var(--primary);
+}
+
+.fund-flow-history-inline .fund-flow-history-readout {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: .5rem 2rem;
+  padding: .45rem 0;
+}
+
+.fund-flow-history-inline .fund-flow-history-readout > span {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: .15rem .35rem;
+}
+
+.fund-flow-history-inline .fund-flow-history-readout small { color: #60747a; font-size: .68rem; }
+.fund-flow-history-inline .fund-flow-history-readout strong { font-size: .88rem; text-align: left; }
+.fund-flow-history-inline .fund-flow-history-readout em { grid-column: 2; color: #8b9b9f; font-size: .62rem; font-style: normal; text-align: left; }
+.fund-flow-history-inline .fund-flow-history-readout > span:nth-child(1) strong { color: #16803c; }
+.fund-flow-history-inline .fund-flow-history-readout > span:nth-child(2) strong { color: #d92d20; }
+.fund-flow-history-inline .fund-flow-history-readout > span:nth-child(3) strong { color: #7f1d1d; }
+.fund-flow-history-inline .fund-flow-history-readout > span:nth-child(4) strong { color: #b7791f; }
+.fund-flow-history-inline .fund-flow-history-series { fill: none; stroke-width: 2.2; vector-effect: non-scaling-stroke; }
+.fund-flow-history-inline .fund-flow-history-series-hidden { stroke-dasharray: 5 4; }
+.fund-flow-history-inline .fund-flow-history-zero { stroke: #b9bec5; stroke-dasharray: 3 3; vector-effect: non-scaling-stroke; }
+
+.fund-flow-daily-chart { min-width: 0; overflow: hidden; }
+.fund-flow-daily-readout {
+  min-height: 3.15rem;
+  display: grid;
+  grid-template-columns: auto repeat(4, minmax(0, 1fr));
+  align-items: baseline;
+  gap: .45rem 1.1rem;
+  padding: .4rem 0 .75rem;
+}
+.fund-flow-daily-readout time {
+  color: var(--text-muted);
+  font: 700 .72rem ui-monospace, SFMono-Regular, monospace;
+  white-space: nowrap;
+}
+.fund-flow-daily-readout span {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: .12rem .3rem;
+  align-items: baseline;
+}
+.fund-flow-daily-readout small { color: var(--text-muted); font-size: .64rem; white-space: nowrap; }
+.fund-flow-daily-readout strong {
+  min-width: 0;
+  font: 700 .82rem ui-monospace, SFMono-Regular, monospace;
+  text-align: right;
+  white-space: nowrap;
+}
+.fund-flow-daily-readout em {
+  grid-column: 2;
+  color: #8b9b9f;
+  font-size: .58rem;
+  font-style: normal;
+  text-align: right;
+}
+.fund-flow-daily-value-retail { color: #16803c; }
+.fund-flow-daily-value-visible { color: #d92d20; }
+.fund-flow-daily-value-hidden { color: #7f1d1d; }
+.fund-flow-daily-value-net { color: #b7791f; }
+.fund-flow-daily-svg {
+  display: block;
+  width: 100%;
+  height: auto;
+  min-width: 0;
+  outline: none;
+  touch-action: pan-y;
+}
+.fund-flow-daily-svg line:not(.fund-flow-history-zero):not(.fund-flow-history-cursor) { stroke: #edf0f2; stroke-width: 1; vector-effect: non-scaling-stroke; }
+.fund-flow-daily-svg text { fill: #6e8494; font: 9px ui-monospace, SFMono-Regular, monospace; }
+.fund-flow-daily-svg .fund-flow-daily-axis-label { fill: var(--text-muted); font-size: .68rem; font-weight: 650; }
 
 .capture-drawer {
   margin-top: 1rem;
@@ -877,8 +1062,35 @@ button.capture-toggle:active { box-shadow: inset 0 2px 5px rgba(18, 49, 54, .08)
 .admin-login form { display: grid; gap: .7rem; }
 .admin-header { margin-bottom: 1rem; }
 .admin-controls, .device-panel { margin-top: 1rem; padding: clamp(1.1rem, 3vw, 1.7rem); }
+.admin-tabs { margin-top: 1rem; display: flex; gap: 4px; overflow-x: auto; padding: 4px; border: 1px solid #ccd8de; border-radius: 12px; background: #eef3f5; }
+.admin-tabs button { flex: 1 0 auto; min-height: 40px; padding: 0 1rem; border: 0; border-radius: 8px; background: transparent; color: #5c6d75; font-size: .82rem; font-weight: 750; cursor: pointer; }
+.admin-tabs button:hover, .admin-tabs button:focus-visible { color: #17252d; background: #fff; outline: none; }
+.admin-tabs button.active, .admin-tabs button[aria-selected="true"] { color: #fff; background: #24363e; box-shadow: 0 2px 6px rgba(23,37,45,.16); }
+.admin-tab-panel[hidden] { display: none; }
 .admin-controls h2, .device-panel h2 { margin: 0; font-size: 1.05rem; }
 .admin-controls p { margin: .35rem 0 0; color: #61727d; }
+.admin-monitoring-loader button { flex: 0 0 auto; }
+.admin-operations-suite { margin-top: 1rem; padding: clamp(1.1rem, 3vw, 1.7rem); border: 1px solid #cad4d9; border-top: 4px solid #17252d; border-radius: 14px; background: #f8fafb; box-shadow: 0 12px 32px rgba(25, 45, 55, .08); }
+.admin-operations-suite > header { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+.admin-operations-suite > header h2 { margin: 0; font-size: 1.3rem; }
+.admin-ops-card { margin-top: 14px; padding: 16px; border: 1px solid #d7e0e4; border-radius: 10px; background: white; }
+.admin-ops-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
+.admin-ops-heading h3, .admin-channel-grid h3, .admin-rules-editor h3 { margin: 0; font-size: .96rem; }
+.admin-ops-grid { display: grid; gap: 12px; }
+.admin-ops-grid.four { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+.admin-ops-grid label, .admin-channel-grid label, .admin-rules-editor label { display: grid; gap: 5px; color: #53646e; font-size: .78rem; }
+.admin-ops-grid input, .admin-channel-grid input, .admin-channel-grid textarea, .admin-rules-editor textarea { width: 100%; border: 1px solid #cbd5da; border-radius: 7px; background: #fbfcfd; color: #17252d; }
+.admin-channel-grid textarea, .admin-rules-editor textarea { padding: 10px; resize: vertical; font: .74rem/1.45 ui-monospace, SFMono-Regular, Menlo, monospace; }
+.admin-switch-row { display: flex; flex-wrap: wrap; gap: 10px 24px; margin-bottom: 13px; }
+.admin-switch-row label, .admin-channel-grid label:has(input[type="checkbox"]) { display: flex; align-items: center; gap: 7px; color: #334851; font-size: .82rem; }
+.admin-switch-row input, .admin-channel-grid input[type="checkbox"] { width: auto; }
+.admin-channel-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
+.admin-channel-grid > section { min-width: 0; padding: 13px; display: grid; align-content: start; gap: 10px; border: 1px solid #e0e6e9; border-radius: 8px; background: #f9fbfc; }
+.admin-rules-editor { margin-top: 13px; padding-top: 13px; border-top: 1px solid #e1e6e9; }
+.admin-monitoring-table { display: grid; }
+.admin-monitoring-table > div { min-width: 0; padding: 9px 0; display: grid; grid-template-columns: 100px 180px 1fr; gap: 12px; border-top: 1px solid #edf0f2; font-size: .78rem; }
+.admin-monitoring-table > div:first-child { border-top: 0; }
+.admin-monitoring-table small { min-width: 0; overflow-wrap: anywhere; color: #71818a; }
 .button-row { display: flex; flex-wrap: wrap; gap: .6rem; }
 .password-change-form { display: grid; gap: .55rem; min-width: min(360px, 100%); }
 .device-actions { display: flex; flex-wrap: wrap; gap: .6rem; margin-top: .8rem; }
@@ -1026,6 +1238,202 @@ button.device-danger-button:not(:disabled):not([aria-disabled="true"]):hover { b
 .stream-online { color: var(--success); }
 .stream-offline { color: var(--danger); }
 
+.query-header {
+  display: flex;
+  justify-content: flex-end;
+  min-height: 2.25rem;
+  margin-bottom: .35rem;
+}
+
+.more-menu { position: relative; z-index: 40; }
+.more-menu > button {
+  display: inline-flex;
+  min-height: 42px;
+  align-items: center;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--surface);
+  color: #27434b;
+  padding: .55rem .85rem;
+  cursor: pointer;
+  font-size: .84rem;
+  font-weight: 750;
+  cursor: pointer;
+}
+.more-menu > button[aria-expanded="true"] { border-color: var(--border-strong); background: var(--primary-soft); color: var(--primary); }
+.more-menu-panel {
+  position: absolute;
+  top: calc(100% + .45rem);
+  right: 0;
+  display: grid;
+  width: 180px;
+  gap: .2rem;
+  border: 1px solid var(--border-strong);
+  border-radius: 14px;
+  background: var(--surface);
+  padding: .4rem;
+  box-shadow: 0 18px 48px rgba(24, 54, 59, .16);
+}
+.more-menu-panel a,
+.more-menu-panel .menu-danger {
+  display: flex;
+  min-height: 42px;
+  align-items: center;
+  border: 0;
+  border-radius: 9px;
+  background: transparent;
+  color: #27434b;
+  padding: .55rem .7rem;
+  font-size: .84rem;
+  font-weight: 700;
+  text-decoration: none;
+  text-align: left;
+}
+.more-menu-panel a:hover,
+.more-menu-panel a:focus-visible,
+.more-menu-panel .menu-danger:hover,
+.more-menu-panel .menu-danger:focus-visible { background: var(--primary-soft); color: var(--primary); outline: none; }
+.more-menu-panel .menu-danger { border-top: 1px solid var(--border); border-radius: 0 0 9px 9px; color: var(--danger); }
+
+.submit-panel { margin-bottom: 1.15rem; padding: 1rem; }
+.submit-panel form { gap: .55rem; }
+.form-row { grid-template-columns: minmax(0, 1fr) auto; gap: .55rem; }
+.form-row button { min-width: 72px; }
+.symbol-lookup { min-height: 38px; justify-content: flex-start; padding: .45rem .65rem; font-size: .82rem; }
+
+.job-details { position: relative; }
+.job-details summary {
+  min-height: 38px;
+  display: inline-flex;
+  align-items: center;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  background: var(--surface-muted);
+  color: #426169;
+  padding: .45rem .65rem;
+  cursor: pointer;
+  font-size: .78rem;
+  font-weight: 700;
+  list-style: none;
+}
+.job-details summary::-webkit-details-marker { display: none; }
+.job-details-body {
+  position: absolute;
+  z-index: 10;
+  top: calc(100% + .4rem);
+  right: 0;
+  display: grid;
+  min-width: 230px;
+  gap: .35rem;
+  border: 1px solid var(--border-strong);
+  border-radius: 11px;
+  background: var(--surface);
+  padding: .7rem;
+  color: var(--text-muted);
+  font-size: .75rem;
+  box-shadow: 0 16px 42px rgba(24, 54, 59, .14);
+}
+
+.quote-summary {
+  display: grid;
+  grid-template-columns: minmax(0, .8fr) minmax(0, 1.65fr);
+  gap: .7rem;
+  margin-top: 1rem;
+  border: 1px solid #d8e5e4;
+  border-radius: 14px;
+  background: #f7faf9;
+  padding: .8rem;
+}
+.quote-primary { display: grid; align-content: center; gap: .45rem; min-width: 0; }
+.quote-stock,
+.quote-metric { min-width: 0; }
+.quote-stock { display: grid; align-content: center; gap: .3rem; padding: .35rem .25rem; }
+.quote-stock-label,
+.quote-metric-label { color: #60747a; font-size: .75rem; font-weight: 750; }
+.quote-stock strong { overflow-wrap: anywhere; color: #17333b; font-size: clamp(1.12rem, 2.6vw, 1.5rem); line-height: 1.15; }
+.quote-stock-symbol { color: #60747a; font-size: .76rem; font-variant-numeric: tabular-nums; }
+.quote-metric { display: grid; align-content: center; gap: .3rem; }
+.quote-metric-value { margin: 0; color: var(--market-neutral); font-size: 1.15rem; font-weight: 800; font-variant-numeric: tabular-nums; }
+.quote-metric-value.market-up { color: var(--market-up); }
+.quote-metric-value.market-down { color: var(--market-down); }
+.quote-metric-value.market-neutral { color: var(--market-neutral); }
+.quote-price { font-size: clamp(1.8rem, 4vw, 2.35rem); letter-spacing: -.035em; }
+.quote-change-value { margin: 0; font-size: clamp(1.05rem, 2.5vw, 1.35rem); font-weight: 800; font-variant-numeric: tabular-nums; }
+.compact-metrics { grid-template-columns: repeat(4, minmax(0, 1fr)); gap: .55rem; margin-top: .65rem; }
+.quote-secondary-metrics { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); align-content: center; gap: .45rem; margin: 0; }
+.quote-secondary-metrics .value-card:last-child { grid-column: auto; }
+.compact-metrics .value-card { padding: .7rem .75rem; }
+.compact-metrics .value-label { margin-bottom: .3rem; font-size: .72rem; }
+.compact-metrics .indicator-value { font-size: clamp(1.05rem, 2.4vw, 1.45rem); }
+
+.intraday-metric-tabs {
+  display: flex;
+  gap: .4rem;
+  margin-bottom: .7rem;
+  overflow-x: auto;
+  scrollbar-width: thin;
+}
+.intraday-metric-tab {
+  min-height: 40px;
+  flex: 0 0 auto;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--surface);
+  color: #426169;
+  padding: .45rem .75rem;
+  font-size: .78rem;
+  font-weight: 750;
+}
+.intraday-metric-tab.active,
+.intraday-metric-tab[aria-selected="true"] { border-color: #79aeb5; background: var(--primary); color: #fff; }
+.intraday-metric-tab:disabled { opacity: .42; }
+
+.fund-flow-chart-tabs {
+  min-width: 0;
+  height: calc(100% - 1.2rem);
+  margin-top: 1.2rem;
+}
+.fund-flow-chart-tablist {
+  display: flex;
+  gap: .4rem;
+  margin-bottom: .7rem;
+  overflow-x: auto;
+  scrollbar-width: thin;
+}
+.fund-flow-chart-tablist button {
+  min-height: 40px;
+  flex: 0 0 auto;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--surface);
+  color: #426169;
+  padding: .45rem .75rem;
+  font-size: .78rem;
+  font-weight: 750;
+}
+.fund-flow-chart-tablist button.active,
+.fund-flow-chart-tablist button[aria-selected="true"] { border-color: #79aeb5; background: var(--primary); color: #fff; }
+.fund-flow-chart-tabs > [role="tabpanel"] { min-width: 0; }
+.fund-flow-chart-tabs .fund-flow-history-inline { margin-top: 0; }
+.fund-flow-chart-status { margin: 0; padding: 2.2rem .4rem; color: var(--text-muted); font-size: .8rem; text-align: center; }
+.fund-flow-chart-status.error { color: var(--danger); }
+.inline-retry { margin-left: .35rem; border: 0; background: transparent; color: var(--primary); font: inherit; font-weight: 750; text-decoration: underline; cursor: pointer; }
+
+.job-result-skeleton { margin-top: 1rem; }
+.skeleton-line,
+.skeleton-block,
+.skeleton-section { border-radius: 11px; background: linear-gradient(100deg, #e8f0ef 20%, #f6faf9 45%, #e8f0ef 70%); background-size: 220% 100%; animation: skeleton-shimmer 1.35s ease-in-out infinite; }
+.skeleton-line { height: .85rem; }
+.skeleton-line-wide { width: 38%; }
+.skeleton-line-short { width: 22%; margin-top: .55rem; }
+.skeleton-quote-grid { display: grid; grid-template-columns: 1.4fr .8fr .8fr; gap: .7rem; margin-top: 1rem; }
+.skeleton-metric-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: .55rem; margin-top: .65rem; }
+.skeleton-block { min-height: 62px; }
+.skeleton-block-hero { min-height: 86px; }
+.skeleton-section { min-height: 170px; margin-top: 1rem; }
+.skeleton-section-chart { min-height: 220px; }
+@keyframes skeleton-shimmer { from { background-position: 100% 0; } to { background-position: -100% 0; } }
+
 @keyframes drawer-in {
   from { opacity: 0; transform: translateY(-6px); }
   to { opacity: 1; transform: translateY(0); }
@@ -1034,11 +1442,13 @@ button.device-danger-button:not(:disabled):not([aria-disabled="true"]):hover { b
 @media (max-width: 900px) {
   .value-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .admin-device-grid { grid-template-columns: 1fr; }
+  .admin-channel-grid { grid-template-columns: 1fr; }
+  .admin-ops-grid.four { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
 
 @media (max-width: 720px) {
   .page-shell, .admin-shell { width: min(100% - 1.5rem, 1040px); padding: 2rem 0; }
-  .hero { margin-bottom: 1.5rem; }
+  .hero { margin-bottom: 1.5rem; align-items: flex-start; flex-direction: column; gap: .8rem; }
   .hero h1 { font-size: clamp(2.1rem, 11vw, 3.2rem); }
   .submit-panel { margin-bottom: 2.5rem; }
   .history-heading { align-items: flex-start; }
@@ -1056,6 +1466,9 @@ button.device-danger-button:not(:disabled):not([aria-disabled="true"]):hover { b
   .status { align-self: flex-start; max-width: 100%; text-align: left; }
   .button-row { width: 100%; }
   .button-row button { flex: 1; }
+  .admin-operations-suite > header, .admin-ops-heading { align-items: flex-start; flex-direction: column; }
+  .admin-monitoring-table > div { grid-template-columns: 90px 1fr; }
+  .admin-monitoring-table small { grid-column: 1 / -1; }
 }
 
 @media (max-width: 520px) {
@@ -1077,14 +1490,34 @@ button.device-danger-button:not(:disabled):not([aria-disabled="true"]):hover { b
   .tab-delete-actions { display: grid; grid-template-columns: 1fr 1fr; }
   .all-stocks-toggle { min-height: 46px; padding-inline: .7rem; }
   .all-stocks-list { grid-template-columns: 1fr; }
-  .value-grid { grid-template-columns: 1fr; gap: .55rem; }
-  .value-card { display: flex; align-items: center; justify-content: space-between; gap: 1rem; padding: .78rem .9rem; }
-  .value-label { margin: 0; }
-  .indicator-value { font-size: 1.35rem; text-align: right; }
+  .value-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: .34rem; margin-top: .9rem; }
+  .value-card { min-height: 50px; display: flex; align-items: center; justify-content: space-between; gap: .6rem; padding: .42rem .55rem; border-radius: 10px; }
+  .value-grid .value-card:first-child { grid-column: 1 / -1; }
+  .value-label { min-width: 0; flex: 1 1 auto; margin: 0; font-size: .62rem; line-height: 1.1; }
+  .indicator-value { flex: 0 0 auto; font-size: .96rem; line-height: 1.05; text-align: right; }
+  .value-grid .value-card:first-child { min-height: 54px; }
+  .value-grid .value-card:first-child .indicator-value { font-size: 1.04rem; }
   .fund-flow-section { margin-top: .9rem; padding: .75rem; }
+  .fund-flow-result-layout { grid-template-columns: 1fr; gap: 0; }
+  .fund-flow-result-layout > .fund-flow-section,
+  .fund-flow-result-layout > .fund-flow-history-inline,
+  .fund-flow-result-layout > .fund-flow-chart-tabs { height: auto; margin-top: .9rem; }
+  .fund-flow-result-layout > .fund-flow-history-inline { padding: .75rem; }
+  .fund-flow-chart-tablist button { min-height: 38px; padding-inline: .65rem; }
+  .fund-flow-chart-tabs .fund-flow-history-inline { padding: .75rem; }
   .intraday-section { margin-top: .9rem; padding: .75rem; }
-  .fund-flow-heading { align-items: flex-start; }
-  .fund-flow-heading .minor { font-size: .78rem; }
+  .fund-flow-heading { align-items: baseline; flex-direction: row; justify-content: space-between; gap: .5rem; }
+  .fund-flow-inline-title { gap: .45rem; flex-wrap: nowrap; }
+  .fund-flow-inline-title h3 { white-space: nowrap; }
+  .fund-flow-heading .minor { align-self: flex-start; margin-top: .1rem; font-size: .72rem; white-space: nowrap; }
+  .fund-flow-history-inline .fund-flow-history-readout { gap: .3rem; }
+  .fund-flow-history-inline .fund-flow-history-readout > span { gap: .08rem; }
+  .fund-flow-history-inline .fund-flow-history-readout strong { font-size: .72rem; }
+  .fund-flow-history-inline .fund-flow-history-readout em { grid-column: 1; font-size: .56rem; }
+  .fund-flow-daily-readout { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: .35rem .8rem; }
+  .fund-flow-daily-readout time { grid-column: 1 / -1; }
+  .fund-flow-daily-readout strong { font-size: .72rem; }
+  .fund-flow-daily-readout em { font-size: .56rem; }
   .fund-flow-table th, .fund-flow-table td { padding: .5rem .16rem; }
   .fund-flow-table thead th, .fund-flow-table tbody th { font-size: .72rem; }
   .fund-flow-table tbody td { font-size: .8rem; }
@@ -1097,8 +1530,706 @@ button.device-danger-button:not(:disabled):not([aria-disabled="true"]):hover { b
   .device-session-controls > button { width: 100%; }
   .device-dialog-actions { display: grid; grid-template-columns: 1fr; }
   .device-dialog-actions button { width: 100%; }
+  .admin-ops-grid.four { grid-template-columns: 1fr; }
 }
 
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { scroll-behavior: auto !important; transition-duration: .01ms !important; animation-duration: .01ms !important; animation-iteration-count: 1 !important; }
+}
+
+@media (max-width: 520px) {
+  .page-shell { width: min(100% - 1rem, 1040px); padding-top: .7rem; }
+  .query-header { min-height: 1.8rem; margin-bottom: .2rem; }
+  .more-menu > button { min-height: 38px; padding-inline: .7rem; }
+  .submit-panel { border-radius: 14px; padding: .65rem; }
+  .form-row { gap: .4rem; }
+  .form-row button { min-width: 64px; padding-inline: .7rem; }
+  .symbol-lookup { min-height: 34px; }
+  .history-heading { display: none; }
+  .history-section { margin-top: .7rem; }
+  .stock-tabs-shell { margin-bottom: .55rem; }
+  .stock-tabs-toolbar { gap: .4rem; padding: .4rem; }
+  button.stock-tab { min-height: 44px; padding: .45rem 2rem .45rem .62rem; }
+  .job-result { padding: .8rem; }
+  .job-heading { align-items: flex-start; gap: .55rem; }
+  .job-heading-actions { width: 100%; justify-content: flex-start; gap: .4rem; }
+  .job-time { margin-top: .2rem; font-size: .75rem; }
+  .job-details-body { left: 0; right: auto; }
+  .quote-summary { grid-template-columns: minmax(0, .82fr) minmax(0, 1.45fr); gap: .45rem; padding: .65rem; }
+  .quote-primary { gap: .3rem; }
+  .quote-stock { grid-column: auto; padding-inline: 0; }
+  .quote-stock strong { font-size: 1.15rem; }
+  .quote-metric-value { font-size: 1rem; }
+  .quote-price { font-size: 1.6rem; }
+  .quote-change-value { font-size: 1.05rem; }
+  .compact-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: .35rem; margin-top: .45rem; }
+  .compact-metrics .value-card { min-height: 52px; display: flex; align-items: center; justify-content: space-between; gap: .45rem; padding: .45rem .55rem; border-radius: 9px; }
+  .compact-metrics .value-label { min-width: 0; margin: 0; font-size: .62rem; line-height: 1.1; }
+  .compact-metrics .indicator-value { flex: 0 0 auto; font-size: .94rem; text-align: right; }
+  .compact-metrics .value-card:last-child { grid-column: 1 / -1; }
+  .quote-secondary-metrics { gap: .3rem; margin: 0; }
+  .quote-secondary-metrics .value-card:last-child { grid-column: auto; }
+  .fund-flow-section,
+  .fund-flow-history-inline,
+  .intraday-section { padding: .65rem; }
+  .fund-flow-table th, .fund-flow-table td { padding: .48rem .12rem; }
+  .fund-flow-table thead th, .fund-flow-table tbody th { font-size: .7rem; }
+  .fund-flow-table tbody td { font-size: .78rem; }
+  .fund-flow-heading h3, .intraday-heading h3 { font-size: 1rem; }
+  .fund-flow-heading .minor, .intraday-heading .minor { font-size: .72rem; }
+  .intraday-metric-tab { min-height: 38px; padding-inline: .65rem; }
+  .skeleton-quote-grid { grid-template-columns: minmax(0, 1fr) minmax(0, .78fr); gap: .45rem; }
+  .skeleton-quote-grid .skeleton-block-hero { grid-column: 1 / -1; min-height: 64px; }
+  .skeleton-metric-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: .35rem; }
+  .skeleton-metric-grid .skeleton-block:last-child { grid-column: 1 / -1; }
+  .skeleton-section { min-height: 150px; }
+  .skeleton-section-chart { min-height: 190px; }
+}
+
+@media (max-width: 520px) {
+  :root {
+    --primary: #2dd4bf;
+    --primary-hover: #5eead4;
+    --primary-soft: rgba(45, 212, 191, .13);
+    --surface: #0b1c27;
+    --surface-muted: #0d2430;
+    --border: #214656;
+    --border-strong: #397488;
+    --text: #e4f7fb;
+    --text-muted: #8caeba;
+    --success: #39d98a;
+    --success-bg: rgba(57, 217, 138, .14);
+    --warning: #f4c86a;
+    --warning-bg: rgba(244, 200, 106, .14);
+    --danger: #ff6b78;
+    --danger-bg: rgba(255, 107, 120, .14);
+    --market-up: #ff6b78;
+    --market-down: #39d98a;
+    --market-neutral: #e4f7fb;
+    --shadow-sm: 0 10px 30px rgba(0, 8, 15, .28);
+    --shadow-md: 0 20px 54px rgba(0, 8, 15, .38);
+    --intraday-neutral: #d7eff5;
+    --intraday-up: #ff6b78;
+    --intraday-down: #39d98a;
+    --intraday-ink: #d7eff5;
+    --intraday-muted: #8caeba;
+    --intraday-grid: #1d3d4b;
+    --intraday-zero: #5b7f8e;
+    --intraday-cursor: #84aebb;
+    --intraday-surface: #0b1c27;
+    --intraday-axis: #8caeba;
+  }
+
+  body {
+    color: var(--text);
+    background-color: #06131b;
+    background-image:
+      linear-gradient(rgba(46, 213, 191, .045) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(46, 213, 191, .045) 1px, transparent 1px),
+      radial-gradient(circle at 15% 0%, rgba(45, 212, 191, .16), transparent 17rem),
+      linear-gradient(180deg, #071823 0, #06131b 70%);
+    background-size: 24px 24px, 24px 24px, auto, auto;
+  }
+
+  .page-shell { color: var(--text); }
+  .panel,
+  .job-result,
+  .stock-tabs-toolbar,
+  .history-empty,
+  .fund-flow-section,
+  .fund-flow-history-inline,
+  .intraday-section,
+  .quote-summary,
+  .value-card,
+  .more-menu-panel,
+  .job-details-body {
+    border-color: var(--border);
+    background: var(--surface);
+    box-shadow: var(--shadow-sm);
+  }
+  .job-result.latest-job { border-color: #397488; box-shadow: var(--shadow-md); }
+  .job-result.latest-job::before { background: var(--primary); }
+  .history-heading h2,
+  .fund-flow-heading h3,
+  .intraday-heading h3,
+  .quote-stock strong { color: var(--text); }
+  .history-heading > div > p:last-child,
+  .job-time,
+  .minor,
+  .page-shell footer { color: var(--text-muted); }
+  .eyebrow { color: var(--primary); }
+
+  .more-menu > button,
+  button.secondary,
+  .job-details summary {
+    border-color: var(--border);
+    background: #0d2430;
+    color: var(--text);
+  }
+  .more-menu > button[aria-expanded="true"],
+  button.secondary:not(:disabled):hover,
+  .job-details[open] summary { border-color: var(--border-strong); background: var(--primary-soft); color: var(--primary); }
+  .more-menu-panel a,
+  .more-menu-panel .menu-danger { color: var(--text); }
+  .more-menu-panel a:hover,
+  .more-menu-panel a:focus-visible,
+  .more-menu-panel .menu-danger:hover,
+  .more-menu-panel .menu-danger:focus-visible { background: var(--primary-soft); color: var(--primary); }
+  .more-menu-panel .menu-danger { border-top-color: var(--border); color: var(--danger); }
+
+  input,
+  .symbol-lookup,
+  .symbol-suggestion-list { border-color: var(--border-strong); background: #0a1a24; color: var(--text); }
+  input::placeholder { color: #6f929f; }
+  .form-row button { background: #138f8b; color: #effffc; box-shadow: 0 0 0 1px rgba(45, 212, 191, .18), 0 8px 22px rgba(19, 143, 139, .22); }
+  .symbol-lookup-loading { color: #9ee9e0; }
+  .symbol-lookup-valid { border-color: rgba(57, 217, 138, .52); background: var(--success-bg); color: var(--success); }
+  .symbol-lookup-invalid, .symbol-lookup-unavailable { border-color: rgba(255, 107, 120, .54); background: var(--danger-bg); color: var(--danger); }
+
+  .stock-tabs-toolbar { background: rgba(11, 28, 39, .92); }
+  button.stock-tab { border-color: var(--border); background: #0d2430; color: var(--text); }
+  button.stock-tab span { color: var(--text-muted); }
+  button.stock-tab[aria-selected="true"] { border-color: var(--primary); background: var(--primary-soft); color: var(--primary); box-shadow: inset 0 0 0 1px rgba(45, 212, 191, .16); }
+  button.stock-tab[aria-selected="true"] span { color: var(--primary); }
+  button.stock-tab-delete { color: var(--text-muted); }
+  .history-empty { color: var(--text-muted); }
+  .history-empty strong { color: var(--text); }
+
+  .status,
+  .job-retry,
+  .job-details summary,
+  .query-header .more-menu > button,
+  .form-row input,
+  .form-row button,
+  .symbol-lookup { min-height: 42px; height: 42px; box-sizing: border-box; }
+  .job-heading-actions { align-items: center; }
+  .status { border: 1px solid transparent; }
+  .status-completed { background: var(--success-bg); color: var(--success); }
+  .status-failed, .status-expired { background: var(--danger-bg); color: var(--danger); }
+  .status-waiting_admin, .status-partial { background: var(--warning-bg); color: var(--warning); }
+  .symbol-lookup { align-items: center; flex-direction: row; white-space: nowrap; }
+  button.symbol-edit { min-height: 32px; height: 32px; width: auto; position: static; transform: none; border-color: rgba(57, 217, 138, .4); background: transparent; color: var(--success); }
+
+  .quote-summary {
+    grid-template-columns: minmax(0, .65fr) minmax(0, 1.8fr);
+    gap: .45rem;
+    border-color: #2b6474;
+    background: linear-gradient(135deg, #0d2531 0%, #0a1a24 100%);
+    box-shadow: inset 0 0 0 1px rgba(45, 212, 191, .07), var(--shadow-sm);
+  }
+  .quote-primary { gap: .3rem; }
+  .quote-stock { padding-inline: 0; }
+  .quote-stock-label,
+  .quote-metric-label,
+  .compact-metrics .value-label { color: #8caeba; }
+  .quote-stock strong { font-size: 1.02rem; letter-spacing: -.045em; }
+  .quote-stock-symbol { color: #8caeba; font-size: .68rem; }
+  .quote-metric-value { color: var(--text); }
+  .quote-price { font-size: 1.62rem; }
+  .quote-change-value { font-size: 1.05rem; }
+  .quote-secondary-metrics { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: .3rem; margin: 0; }
+  .quote-secondary-metrics .value-card {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    min-width: 0;
+    min-height: 48px;
+    align-items: center;
+    gap: .25rem;
+    border-color: #1f4a5a;
+    border-radius: 8px;
+    background: rgba(13, 36, 48, .86);
+    padding: .35rem .42rem;
+  }
+  .quote-secondary-metrics .value-label {
+    min-width: 0;
+    margin: 0;
+    overflow: visible;
+    white-space: nowrap;
+    word-break: keep-all;
+    font-size: clamp(.55rem, 2.2vw, .68rem);
+    letter-spacing: -.055em;
+  }
+  .quote-secondary-metrics .indicator-value {
+    min-width: 0;
+    overflow: visible;
+    white-space: nowrap;
+    font-size: clamp(.74rem, 3.1vw, .96rem);
+    letter-spacing: -.045em;
+  }
+  .quote-secondary-metrics .value-card:last-child { grid-column: auto; }
+
+  .fund-flow-section,
+  .fund-flow-history-inline,
+  .intraday-section { border-color: #214c5a; background: rgba(11, 28, 39, .9); }
+  .fund-flow-table th, .fund-flow-table td { border-bottom-color: #1c3e4c; }
+  .fund-flow-table thead th,
+  .fund-flow-table tbody th { color: #8caeba; }
+  .fund-flow-history-inline .fund-flow-history-svg { background-image: linear-gradient(rgba(140, 174, 186, .12) 1px, transparent 1px); }
+  .fund-flow-history-inline .fund-flow-history-svg text { fill: #8caeba; }
+  .fund-flow-history-inline .fund-flow-history-svg line:not(.fund-flow-history-zero):not(.fund-flow-history-cursor) { stroke: #1d3d4b; }
+  .fund-flow-history-inline .fund-flow-history-cursor { stroke: #84aebb; }
+  .fund-flow-history-inline .fund-flow-history-zero { stroke: #567583; }
+  .fund-flow-history-inline .fund-flow-history-scrubber { height: 28px; accent-color: var(--primary); }
+  .intraday-metric-tab { border-color: var(--border); background: #0d2430; color: var(--text); }
+  .intraday-metric-tab.active, .intraday-metric-tab[aria-selected="true"] { border-color: var(--primary); background: #138f8b; color: #effffc; }
+  .intraday-metric-tab:disabled { color: var(--text-muted); }
+}
+
+/* Stock Analytics light glass system: red UI accents, semantic data colors preserved. */
+:root {
+  --primary: #dc2626;
+  --primary-hover: #b42318;
+  --primary-soft: rgba(220, 38, 38, .10);
+  --surface: rgba(255, 255, 255, .76);
+  --surface-muted: rgba(248, 250, 252, .82);
+  --border: rgba(148, 163, 184, .30);
+  --border-strong: rgba(100, 116, 139, .46);
+  --text: #102a43;
+  --text-muted: #5b7083;
+  --success: #0f8a5f;
+  --success-bg: rgba(15, 138, 95, .11);
+  --warning: #9a6700;
+  --warning-bg: rgba(234, 179, 8, .14);
+  --danger: #b42318;
+  --danger-bg: rgba(180, 35, 24, .10);
+  --market-up: #b42318;
+  --market-down: #0f8a5f;
+  --market-neutral: #102a43;
+  --shadow-sm: 0 12px 36px rgba(30, 64, 96, .10);
+  --shadow-md: 0 22px 64px rgba(30, 64, 96, .15);
+  --intraday-neutral: #102a43;
+  --intraday-up: #b42318;
+  --intraday-down: #0f8a5f;
+  --intraday-ink: #102a43;
+  --intraday-muted: #5b7083;
+  --intraday-grid: #dbe7f0;
+  --intraday-zero: #9db2c1;
+  --intraday-cursor: #6f8796;
+  --intraday-surface: #fff;
+  --intraday-axis: #6e8494;
+}
+
+body {
+  color: var(--text);
+  background-color: #f6f9fc;
+  background-image:
+    radial-gradient(circle at 12% 0%, rgba(37, 99, 235, .11), transparent 24rem),
+    radial-gradient(circle at 88% 8%, rgba(124, 58, 237, .08), transparent 22rem),
+    linear-gradient(180deg, #f9fbfe 0, #f1f6fb 100%);
+}
+
+.panel,
+.job-result,
+.admin-controls,
+.device-panel,
+.admin-operations-suite,
+.admin-ops-card,
+.device-lifecycle-dialog,
+.history-empty,
+.stock-tabs-toolbar,
+.quote-summary,
+.value-card,
+.fund-flow-section,
+.fund-flow-history-inline,
+.intraday-section,
+.more-menu-panel,
+.job-details-body {
+  border-color: rgba(148, 163, 184, .32);
+  background: rgba(255, 255, 255, .76);
+  box-shadow: var(--shadow-sm);
+  -webkit-backdrop-filter: blur(16px);
+  backdrop-filter: blur(16px);
+}
+.job-result.latest-job { border-color: rgba(220, 38, 38, .42); box-shadow: var(--shadow-md); }
+.job-result.latest-job::before { background: var(--primary); }
+.history-heading h2,
+.fund-flow-heading h3,
+.intraday-heading h3,
+.quote-stock strong,
+.admin-shell h1,
+.admin-controls h2,
+.device-panel h2 { color: var(--text); }
+.history-heading > div > p:last-child,
+.job-time,
+.minor,
+.page-shell footer,
+.admin-controls p { color: var(--text-muted); }
+.eyebrow { color: var(--primary); }
+button.secondary,
+.job-details summary,
+.more-menu > button {
+  border-color: rgba(148, 163, 184, .34);
+  background: rgba(255, 255, 255, .72);
+  color: var(--text);
+}
+button.secondary:not(:disabled):hover,
+.job-details[open] summary,
+.more-menu > button[aria-expanded="true"] { border-color: rgba(220, 38, 38, .45); background: var(--primary-soft); color: var(--primary); }
+input { border-color: rgba(100, 116, 139, .38); background: rgba(255, 255, 255, .84); color: var(--text); }
+input::placeholder { color: #71869a; }
+.symbol-lookup { border-color: rgba(148, 163, 184, .34); background: rgba(248, 250, 252, .78); color: var(--text-muted); }
+.form-row button { background: var(--primary); color: #fff; box-shadow: 0 8px 20px rgba(180, 35, 24, .18); }
+.form-row button:not(:disabled):hover { background: var(--primary-hover); }
+button.stock-tab { border-color: rgba(148, 163, 184, .30); background: rgba(248, 250, 252, .72); color: var(--text); }
+button.stock-tab[aria-selected="true"] { border-color: rgba(220, 38, 38, .55); background: var(--primary-soft); color: var(--primary); box-shadow: inset 0 0 0 1px rgba(220, 38, 38, .09); }
+button.stock-tab[aria-selected="true"] span { color: var(--primary); }
+.quote-summary { border-color: rgba(148, 163, 184, .30); background: rgba(255, 255, 255, .78); }
+.quote-stock-label, .quote-metric-label, .quote-stock-symbol, .compact-metrics .value-label { color: var(--text-muted); }
+.quote-secondary-metrics .value-card { border-color: rgba(148, 163, 184, .28); background: rgba(248, 250, 252, .74); }
+.fund-flow-section,
+.fund-flow-history-inline,
+.intraday-section { border-color: rgba(148, 163, 184, .32); background: rgba(255, 255, 255, .74); }
+.fund-flow-table th, .fund-flow-table td { border-bottom-color: #dbe7f0; }
+.fund-flow-table thead th, .fund-flow-table tbody th { color: var(--text-muted); }
+.fund-flow-history-inline .fund-flow-history-svg { background-image: linear-gradient(rgba(148, 163, 184, .10) 1px, transparent 1px); }
+.fund-flow-history-inline .fund-flow-history-svg text { fill: var(--text-muted); }
+.fund-flow-history-inline .fund-flow-history-svg line:not(.fund-flow-history-zero):not(.fund-flow-history-cursor) { stroke: #dbe7f0; }
+.fund-flow-history-inline .fund-flow-history-cursor { stroke: #6f8796; }
+.fund-flow-history-inline .fund-flow-history-zero { stroke: #9db2c1; }
+.fund-flow-history-inline .fund-flow-history-scrubber { accent-color: var(--primary); }
+.intraday-metric-tab { border-color: rgba(148, 163, 184, .34); background: rgba(255, 255, 255, .72); color: var(--text); }
+.intraday-metric-tab.active,
+.intraday-metric-tab[aria-selected="true"] { border-color: var(--primary); background: var(--primary); color: #fff; }
+.intraday-metric-tab:disabled { color: var(--text-muted); }
+.admin-tabs { border-color: rgba(148, 163, 184, .32); background: rgba(248, 250, 252, .78); }
+.admin-tabs button { color: var(--text-muted); }
+.admin-tabs button:hover, .admin-tabs button:focus-visible { color: var(--text); background: rgba(255,255,255,.8); }
+.admin-tabs button.active, .admin-tabs button[aria-selected="true"] { color: #fff; background: var(--primary); }
+.admin-operations-suite { border-color: rgba(148, 163, 184, .32); border-top-color: var(--primary); background: rgba(255,255,255,.74); }
+.admin-ops-card, .admin-channel-grid > section { border-color: rgba(148, 163, 184, .28); background: rgba(248,250,252,.72); }
+.device-health > div { border-color: rgba(148, 163, 184, .30); background: rgba(248,250,252,.72); }
+.device-lifecycle-controls, .device-session-controls { border-top-color: rgba(148,163,184,.28); }
+.device-lifecycle-controls h3, .device-session-controls h3 { color: var(--text); }
+.device-account-warning { border-color: rgba(180,35,24,.34); background: var(--danger-bg); color: var(--danger); }
+.device-canvas { border-color: rgba(148,163,184,.34); background: repeating-linear-gradient(45deg, #eef4f8, #eef4f8 10px, #e5edf3 10px, #e5edf3 20px); }
+
+@media (max-width: 520px) {
+  body { background-image: linear-gradient(rgba(37,99,235,.035) 1px, transparent 1px), linear-gradient(90deg, rgba(37,99,235,.035) 1px, transparent 1px), radial-gradient(circle at 18% 0%, rgba(37,99,235,.10), transparent 18rem), linear-gradient(180deg, #f9fbfe 0, #f1f6fb 100%); background-size: 24px 24px, 24px 24px, auto, auto; }
+  .panel, .job-result, .stock-tabs-toolbar, .quote-summary, .value-card, .fund-flow-section, .fund-flow-history-inline, .intraday-section { box-shadow: 0 12px 34px rgba(30,64,96,.10); }
+  .job-result { border-radius: 18px; }
+  .quote-secondary-metrics .value-label { color: var(--text-muted); }
+  .quote-secondary-metrics .indicator-value { color: var(--market-neutral); }
+  .status, .job-retry, .job-details summary, .query-header .more-menu > button, .form-row input, .form-row button, .symbol-lookup { min-height: 42px; height: 42px; }
+}
+
+/* The result card is the single visual frame; its data sections stay open and
+   use spacing, typography, and table rules for grouping instead of nested boxes. */
+.job-result.latest-job::before { width: 1px; }
+.job-result > .quote-summary,
+.job-result > .market-snapshot-result,
+.job-result .quote-secondary-metrics .value-card,
+.job-result > .fund-flow-result-layout > .fund-flow-section,
+.job-result > .fund-flow-result-layout > .fund-flow-history-inline,
+.job-result > .fund-flow-result-layout > .fund-flow-chart-tabs .fund-flow-history-inline,
+.job-result > .intraday-section,
+.job-result > .market-snapshot-result > .quote-summary,
+.job-result > .market-snapshot-result > .fund-flow-result-layout > .fund-flow-section,
+.job-result > .market-snapshot-result > .fund-flow-result-layout > .fund-flow-history-inline {
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
+}
+
+.job-result > .fund-flow-result-layout > .fund-flow-chart-tabs .fund-flow-history-inline { padding: 0; }
+
+.job-result > .market-snapshot-result { padding: 0; }
+
+@media (max-width: 520px) {
+  .fund-flow-history-inline .fund-flow-history-readout {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: .45rem .8rem;
+  }
+
+  .fund-flow-history-inline .fund-flow-history-readout > span {
+    grid-template-columns: auto minmax(0, 1fr);
+    gap: .08rem .3rem;
+  }
+
+  .fund-flow-history-inline .fund-flow-history-readout strong,
+  .fund-flow-history-inline .fund-flow-history-readout em {
+    grid-column: 2;
+    text-align: right;
+  }
+}
+
+/* Compact quote rail: labels remain available to assistive technology, while
+   the visual treatment follows the dense mobile quote reference. */
+.quote-summary {
+  grid-template-columns: minmax(0, .98fr) minmax(0, 1.52fr);
+  gap: .55rem;
+  padding: .58rem .68rem;
+}
+.quote-primary {
+  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-areas:
+    "stock stock"
+    "price price";
+  align-content: center;
+  align-items: baseline;
+  gap: .16rem .38rem;
+}
+.quote-stock {
+  grid-area: stock;
+  display: flex;
+  align-items: baseline;
+  gap: .36rem;
+  min-width: 0;
+  padding: 0;
+}
+.quote-stock strong {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: clamp(1rem, 2.4vw, 1.28rem);
+}
+.quote-stock-symbol { flex: 0 0 auto; font-size: .68rem; }
+.quote-price-stack {
+  grid-area: price;
+  display: grid;
+  align-content: center;
+  justify-items: start;
+  gap: .02rem;
+}
+.quote-metric-value.quote-price { font-size: clamp(1.48rem, 3.5vw, 2rem); }
+.quote-change-value {
+  grid-area: auto;
+  white-space: nowrap;
+  font-size: clamp(.92rem, 2.3vw, 1.16rem);
+}
+.quote-secondary-metrics {
+  gap: .18rem .55rem;
+}
+.quote-secondary-metrics .value-card {
+  display: flex;
+  min-height: 27px;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: .42rem;
+  padding: .2rem 0;
+}
+.quote-secondary-metrics .value-label {
+  min-width: 0;
+  margin: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: .66rem;
+  line-height: 1.1;
+}
+.quote-secondary-metrics .indicator-value {
+  flex: 0 0 auto;
+  font-size: clamp(.84rem, 2vw, 1.05rem);
+  line-height: 1.1;
+  text-align: right;
+}
+.quote-secondary-metrics .indicator-value.market-up { color: var(--market-up); }
+.quote-secondary-metrics .indicator-value.market-down { color: var(--market-down); }
+.quote-secondary-metrics .indicator-value.market-neutral { color: var(--market-neutral); }
+
+/* Align the two financial section titles on one baseline and let the
+   descriptive eyebrow carry the stronger visual emphasis. */
+.fund-flow-heading-title,
+.fund-flow-inline-title {
+  display: flex;
+  min-width: 0;
+  align-items: baseline;
+  gap: .45rem;
+}
+.fund-flow-heading-title .eyebrow,
+.fund-flow-inline-title .eyebrow {
+  flex: 0 0 auto;
+  margin: 0;
+  color: var(--primary);
+  font-size: .96rem;
+  font-weight: 820;
+  letter-spacing: .01em;
+  line-height: 1.2;
+  white-space: nowrap;
+}
+.fund-flow-heading-title h3,
+.fund-flow-inline-title h3 {
+  min-width: 0;
+  margin: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: .94rem;
+  line-height: 1.2;
+}
+
+/* Keep status, retry, and details in a single compact rail at the top-right. */
+.job-heading { align-items: flex-start; }
+.job-heading-actions {
+  flex-wrap: nowrap;
+  align-items: center;
+  gap: .3rem;
+}
+.job-heading-actions .status,
+.job-heading-actions .job-retry,
+.job-heading-actions .job-details summary {
+  min-height: 34px;
+  height: 34px;
+  padding: .28rem .5rem;
+  font-size: .72rem;
+  line-height: 1.1;
+  white-space: nowrap;
+}
+.job-heading-actions .status { max-width: none; }
+
+@media (max-width: 720px) {
+  .job-heading {
+    flex-direction: row;
+    align-items: flex-start;
+    gap: .35rem;
+  }
+  .job-identity {
+    min-width: 0;
+    flex: 1 1 auto;
+  }
+  .job-heading-actions {
+    width: auto;
+    flex: 0 0 auto;
+    justify-content: flex-end;
+    gap: .2rem;
+  }
+  .job-kicker { gap: .25rem; font-size: .68rem; }
+  .job-time {
+    max-width: 100%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: .68rem;
+  }
+}
+
+@media (max-width: 520px) {
+  .quote-summary {
+    grid-template-columns: minmax(0, .88fr) minmax(0, 1.52fr);
+    gap: .35rem;
+    padding: .45rem .52rem;
+  }
+  .quote-primary { gap: .12rem .26rem; }
+  .quote-stock strong { font-size: 1rem; }
+  .quote-stock-symbol { font-size: .62rem; }
+  .quote-primary { column-gap: .45rem; }
+  .quote-metric-value.quote-price { font-size: 1.42rem; }
+  .quote-change-value { font-size: .9rem; }
+  .quote-secondary-metrics { gap: .08rem .4rem; }
+  .quote-secondary-metrics .value-card {
+    min-height: 24px;
+    padding: .14rem 0;
+  }
+  .quote-secondary-metrics .value-label {
+    font-size: .58rem;
+    letter-spacing: -.045em;
+  }
+  .quote-secondary-metrics .indicator-value { font-size: .8rem; }
+  .quote-secondary-metrics .value-card:nth-child(3) .value-label { font-size: .54rem; }
+  .quote-secondary-metrics .value-card:nth-child(3) .indicator-value { font-size: .74rem; }
+  .fund-flow-heading-title,
+  .fund-flow-inline-title { gap: .35rem; }
+  .fund-flow-heading-title .eyebrow,
+  .fund-flow-inline-title .eyebrow { font-size: .88rem; }
+  .fund-flow-heading-title h3,
+  .fund-flow-inline-title h3 { font-size: .86rem; }
+  .job-heading-actions .status,
+  .job-heading-actions .job-retry,
+  .job-heading-actions .job-details summary {
+    min-height: 32px;
+    height: 32px;
+    padding-inline: .38rem;
+    font-size: .66rem;
+  }
+}
+
+@media (max-width: 340px) {
+  .quote-summary { grid-template-columns: minmax(0, .9fr) minmax(0, 1.1fr); }
+  .quote-primary {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-areas: "stock" "price";
+    gap: .08rem;
+  }
+  .quote-stock {
+    display: grid;
+    align-items: start;
+    gap: .02rem;
+  }
+  .quote-stock strong { max-width: 100%; }
+  .quote-stock-symbol { font-size: .58rem; }
+  .quote-metric-value.quote-price { font-size: 1.38rem; }
+  .quote-change-value { justify-self: start; font-size: .82rem; }
+  .quote-secondary-metrics { gap: .05rem .2rem; }
+  .quote-secondary-metrics .value-card { gap: .16rem; }
+  .quote-secondary-metrics .value-label {
+    overflow: visible;
+    text-overflow: clip;
+    font-size: .48rem;
+    letter-spacing: -.06em;
+  }
+  .quote-secondary-metrics .indicator-value { font-size: .68rem; }
+  .quote-secondary-metrics .value-card:nth-child(3) .value-label { font-size: .36rem; letter-spacing: -.08em; }
+  .quote-secondary-metrics .value-card:nth-child(3) .indicator-value { font-size: .56rem; }
+}
+
+/* The result card keeps a quiet neutral outline; the old red rail and
+   elevation competed with the quote data and are intentionally removed. */
+.job-result.latest-job {
+  border-color: rgba(148, 163, 184, .32);
+  box-shadow: none;
+}
+.job-result.latest-job::before { display: none; }
+
+/* Give the identity the same visual priority as the quote without restoring
+   the removed labels. */
+.quote-stock strong { font-size: clamp(1.08rem, 2.6vw, 1.42rem); }
+.quote-stock-symbol { font-size: .74rem; }
+@media (max-width: 520px) {
+  .quote-stock strong { font-size: 1.08rem; }
+  .quote-stock-symbol { font-size: .72rem; }
+}
+@media (max-width: 340px) {
+  .quote-stock strong { font-size: 1.08rem; }
+  .quote-stock-symbol { font-size: .64rem; }
+}
+.admin-tab-panel table { width: 100%; border-collapse: collapse; font-size: 12px; table-layout: auto; }
+.admin-tab-panel th, .admin-tab-panel td { padding: 8px 10px; border-bottom: 1px solid var(--line, #d8dee8); text-align: left; vertical-align: top; white-space: nowrap; }
+.admin-tab-panel td:nth-child(6), .admin-tab-panel td:nth-child(9) { white-space: normal; max-width: 260px; overflow-wrap: anywhere; }
+.admin-tab-panel th { font-size: 12px; color: #38516b; }
+.admin-market-monitoring-list td:last-child { white-space: normal; overflow-wrap: anywhere; }
+.admin-ops-grid.four { align-items: end; gap: 14px; }
+.admin-ops-grid.four label { display: grid; gap: 6px; color: #38516b; font-size: 13px; font-weight: 600; }
+.admin-ops-grid.four input, .admin-ops-grid.four select { min-height: 42px; box-sizing: border-box; border: 1px solid #c7d2df; border-radius: 10px; background: #fff; color: #18324b; padding: 0 12px; font-size: 14px; }
+.admin-ops-grid.four input:focus, .admin-ops-grid.four select:focus { outline: 2px solid rgba(28, 104, 190, .22); border-color: #1c68be; }
+.admin-ops-grid.four button { min-height: 42px; border-radius: 10px; font-size: 14px; font-weight: 700; }
+.admin-tab-panel table { font-size: 12px; }
+.admin-tab-panel th { background: #f3f6fa; font-weight: 700; }
+
+/* 8001 result-page density: keep labels and values visually adjacent and
+   give the three fund-flow columns enough room for long numeric strings. */
+@media (min-width: 521px) {
+  .job-result .quote-secondary-metrics .value-card {
+    display: grid;
+    grid-template-columns: max-content minmax(0, 1fr);
+    align-items: baseline;
+    justify-content: initial;
+    gap: .32rem;
+    padding: .2rem .12rem;
+  }
+
+  .job-result .quote-secondary-metrics .value-label { margin: 0; }
+  .job-result .quote-secondary-metrics .indicator-value { min-width: 0; }
+
+  .job-result .fund-flow-result-layout {
+    grid-template-columns: minmax(0, 2.15fr) minmax(0, 2.85fr);
+    gap: .65rem;
+  }
+
+  .job-result .fund-flow-table thead th:first-child { width: 25%; }
+  .job-result .fund-flow-table th,
+  .job-result .fund-flow-table td { padding-inline: .24rem; }
+  .job-result .fund-flow-table tbody td { font-size: .82rem; letter-spacing: -.025em; }
 }

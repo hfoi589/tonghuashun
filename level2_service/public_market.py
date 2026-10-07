@@ -9,7 +9,7 @@ from dataclasses import replace
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
-from threading import RLock
+from threading import Lock, RLock
 from typing import Callable
 from urllib.request import Request, urlopen
 
@@ -111,17 +111,6 @@ def _session_time(value: str) -> str | None:
     return f"{compact[:2]}:{compact[2:]}"
 
 
-def _names_compatible(expected: str, actual: str) -> bool:
-    expected_normalized = re.sub(r"\s+", "", expected).casefold()
-    actual_normalized = re.sub(r"\s+", "", actual).casefold()
-    if expected_normalized == actual_normalized:
-        return True
-    return min(len(expected_normalized), len(actual_normalized)) >= 3 and (
-        expected_normalized.startswith(actual_normalized)
-        or actual_normalized.startswith(expected_normalized)
-    )
-
-
 def _quote_snapshot(
     identity: SymbolLookup,
     fields: list[str],
@@ -132,9 +121,9 @@ def _quote_snapshot(
 ) -> MarketSnapshot:
     if len(fields) < 39 or fields[2].strip() != identity.symbol:
         raise PublicMarketError("PUBLIC_MARKET_RESPONSE_INVALID")
-    name = fields[1].strip()
-    if not name or not _names_compatible(identity.name, name):
-        raise PublicMarketError("PUBLIC_MARKET_RESPONSE_INVALID")
+    # The symbol code is the upstream identity key. Provider display names can
+    # legitimately differ after a rename or between public quote sources.
+    name = identity.name.strip() or fields[1].strip()
     precision = _precision(identity)
     price = _decimal(fields[3])
     previous_close = _decimal(fields[4])
@@ -216,6 +205,8 @@ def _quote_snapshot(
             "sina_public": None,
             "core_metrics": None,
             "main_fund_flow": None,
+            "market_phase": None,
+            "auction_quote": None,
         },
     )
 
@@ -487,13 +478,20 @@ class PublicMarketDataSource:
         catalog: object,
         tencent: TencentPublicMarketProvider,
         sina: SinaPublicQuoteProvider,
+        *,
+        database_fallback: Callable[[str], MarketSnapshot | None] | None = None,
+        is_watchlist_symbol: Callable[[str], bool] = lambda _symbol: False,
     ) -> None:
         self.catalog = catalog
         self.tencent = tencent
         self.sina = sina
+        self.database_fallback = database_fallback
+        self.is_watchlist_symbol = is_watchlist_symbol
 
     def _identity(self, symbol: str) -> SymbolLookup:
-        lookup = getattr(self.catalog, "lookup", None)
+        lookup = getattr(self.catalog, "lookup_existing", None)
+        if not callable(lookup):
+            lookup = getattr(self.catalog, "lookup", None)
         if not callable(lookup):
             lookup = getattr(self.catalog, "lookup_symbol", None)
         if not callable(lookup):
@@ -511,12 +509,31 @@ class PublicMarketDataSource:
             return self.tencent.read_snapshot(identity, detail=detail)
         except PublicMarketError as error:
             tencent_error = error.error_code
+        intraday_error = tencent_error if detail else None
+        if detail:
+            try:
+                snapshot = self.tencent.read_snapshot(identity, detail=False)
+            except PublicMarketError as error:
+                tencent_error = error.error_code
+            else:
+                source_errors = dict(snapshot.source_errors)
+                source_errors["tencent_intraday"] = intraday_error
+                return replace(snapshot, source_errors=source_errors)
         try:
             snapshot = self.sina.read_snapshot(identity)
         except PublicMarketError:
+            if self.is_watchlist_symbol(symbol) and self.database_fallback is not None:
+                try:
+                    stored = self.database_fallback(symbol)
+                except Exception:
+                    stored = None
+                if isinstance(stored, MarketSnapshot):
+                    return stored
             raise PublicMarketError("MARKET_QUOTE_UNAVAILABLE") from None
         errors = dict(snapshot.source_errors)
         errors["tencent_public"] = tencent_error
+        if intraday_error is not None:
+            errors["tencent_intraday"] = intraday_error
         return replace(snapshot, source_errors=errors)
 
     def read_market_series(
@@ -559,6 +576,9 @@ class DirectEnrichedMarketDataSource:
         ttl_seconds: float = 5.0,
         max_cache_entries: int = 512,
         clock: Callable[[], float] = time.monotonic,
+        is_market_open: Callable[[], bool] = lambda: True,
+        is_watchlist_symbol: Callable[[str], bool] = lambda _symbol: True,
+        closed_enrichment: Callable[[str], DirectReadOutcome | None] | None = None,
     ) -> None:
         if ttl_seconds <= 0:
             raise ValueError("ttl_seconds must be positive")
@@ -569,8 +589,17 @@ class DirectEnrichedMarketDataSource:
         self.ttl_seconds = ttl_seconds
         self.max_cache_entries = max_cache_entries
         self.clock = clock
+        self.is_market_open = is_market_open
+        self.is_watchlist_symbol = is_watchlist_symbol
+        self.closed_enrichment = closed_enrichment
         self._lock = RLock()
+        # Direct L2 reads are optional and may serialize behind the App
+        # protocol client's connection lock. Never let one slow read stall
+        # every public snapshot for the watchlist.
+        self._enrichment_lock = Lock()
         self._cache: dict[str, _EnrichmentEntry] = {}
+        self._closed_fallback_attempted: set[str] = set()
+        self._closed_fallback_outcomes: dict[str, DirectReadOutcome] = {}
 
     def _read_enrichment(self, symbol: str) -> _EnrichmentEntry:
         now = self.clock()
@@ -578,40 +607,49 @@ class DirectEnrichedMarketDataSource:
             cached = self._cache.get(symbol)
             if cached is not None and now - cached.stored_at < self.ttl_seconds:
                 return cached
-        if self.direct_source is None:
-            entry = _EnrichmentEntry(
+        if not self._enrichment_lock.acquire(blocking=False):
+            return _EnrichmentEntry(
                 outcome=None,
-                error_code="DIRECT_SESSION_UNAVAILABLE",
+                error_code="DIRECT_ENRICHMENT_BUSY",
                 stored_at=now,
             )
-        else:
-            read_direct = getattr(self.direct_source, "read_direct", None)
-            try:
-                if not callable(read_direct):
-                    raise DirectRequestError("DIRECT_REQUEST_UNAVAILABLE")
-                outcome = read_direct(symbol)
-                if not isinstance(outcome, DirectReadOutcome):
-                    raise DirectRequestError("DIRECT_REQUEST_FAILED")
-                entry = _EnrichmentEntry(
-                    outcome=outcome,
-                    error_code=None,
-                    stored_at=now,
-                )
-            except DirectRequestError as error:
+        try:
+            if self.direct_source is None:
                 entry = _EnrichmentEntry(
                     outcome=None,
-                    error_code=sanitized_direct_error_code(
-                        error.error_code,
-                        "DIRECT_REQUEST_FAILED",
-                    ),
+                    error_code="DIRECT_SESSION_UNAVAILABLE",
                     stored_at=now,
                 )
-            except Exception:
-                entry = _EnrichmentEntry(
-                    outcome=None,
-                    error_code="DIRECT_REQUEST_FAILED",
-                    stored_at=now,
-                )
+            else:
+                read_direct = getattr(self.direct_source, "read_direct", None)
+                try:
+                    if not callable(read_direct):
+                        raise DirectRequestError("DIRECT_REQUEST_UNAVAILABLE")
+                    outcome = read_direct(symbol)
+                    if not isinstance(outcome, DirectReadOutcome):
+                        raise DirectRequestError("DIRECT_REQUEST_FAILED")
+                    entry = _EnrichmentEntry(
+                        outcome=outcome,
+                        error_code=None,
+                        stored_at=now,
+                    )
+                except DirectRequestError as error:
+                    entry = _EnrichmentEntry(
+                        outcome=None,
+                        error_code=sanitized_direct_error_code(
+                            error.error_code,
+                            "DIRECT_REQUEST_FAILED",
+                        ),
+                        stored_at=now,
+                    )
+                except Exception:
+                    entry = _EnrichmentEntry(
+                        outcome=None,
+                        error_code="DIRECT_REQUEST_FAILED",
+                        stored_at=now,
+                    )
+        finally:
+            self._enrichment_lock.release()
         with self._lock:
             self._cache[symbol] = entry
             while len(self._cache) > self.max_cache_entries:
@@ -701,6 +739,7 @@ class DirectEnrichedMarketDataSource:
             main_fund_flow=main_fund_flow,
             capabilities=capabilities,
             source_errors=source_errors,
+            stored_trade_dates=dict(outcome.stored_trade_dates),
         )
 
     def read_market_snapshot(
@@ -719,6 +758,28 @@ class DirectEnrichedMarketDataSource:
         snapshot = read_snapshot(symbol, detail=detail)
         if not detail:
             return snapshot
+        if not self.is_market_open():
+            if self.is_watchlist_symbol(symbol) and self.closed_enrichment is not None:
+                try:
+                    stored = self.closed_enrichment(symbol)
+                except Exception:
+                    stored = None
+                if isinstance(stored, DirectReadOutcome):
+                    return self._merge(snapshot, stored)
+            capabilities = dict(snapshot.capabilities)
+            capabilities["l2"] = {
+                "available": False,
+                "reason": "MARKET_CLOSED_DATA_UNAVAILABLE",
+            }
+            return replace(
+                snapshot,
+                capabilities=capabilities,
+                source_errors={
+                    **snapshot.source_errors,
+                    "core_metrics": None,
+                    "main_fund_flow": None,
+                },
+            )
         entry = self._read_enrichment(symbol)
         if entry.outcome is None:
             return self._without_enrichment(

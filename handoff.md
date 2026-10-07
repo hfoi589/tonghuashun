@@ -162,6 +162,17 @@ Redis 仍是持久 FIFO 权威，`RUNNER_POLL_INTERVAL_SECONDS` 只作为外部 
 它不得覆盖公开名称、价格、OHLC、涨跌幅、换手率、成交量、成交额或公开分时。
 增强失败只更新 `source_errors`，公开快照仍返回。
 
+### 集合竞价行情切换
+
+`MARKET_PREOPEN_TRANSPORT=direct` 时，工作日 09:10–09:30 的 Market 价格和涨跌幅
+由核心账号 9528 直连提供，虚拟机可以关闭；直连失败只保留当日 Redis 最近有效值，
+不会在竞价期间混用腾讯/新浪。09:30 自动回到公开行情链路。
+
+当前已验证并启用的是 `43/7001` 价格/涨跌幅回退路径。APK 实际使用的是 `1004/6002`；
+`1004/6002` 虚拟撮合价和
+`4051/34834` App 状态读取仍需在真实交易时段完成脱敏抓包和市场类别验证，未验证前
+不得宣称已经启用。
+
 ### 推送和前端
 
 - Broker 按 client+symbol 保留最新事件，不同股票不再互相覆盖。
@@ -181,12 +192,14 @@ FUND_FRIDA_SERVER_ENDPOINT=host.docker.internal:27042
 CORE_METRICS_TRANSPORT=direct
 FUND_FLOW_TRANSPORT=direct
 SYMBOL_CATALOG_PATH=/data/market/symbol-catalog.db
+TRADING_CALENDAR_PATH=/data/market/trading-calendar.json
 SYMBOL_CATALOG_MAX_AGE_SECONDS=604800
 SYMBOL_CATALOG_REFRESH_HOUR=16
 SYMBOL_CATALOG_REFRESH_MINUTE=20
 PUBLIC_MARKET_TIMEOUT_SECONDS=8
 MARKET_DIRECT_ENRICHMENT=1
 MARKET_DIRECT_ENRICHMENT_TTL_SECONDS=5
+MARKET_PREOPEN_TRANSPORT=direct
 CORE_WARM_CONNECTION_MAX_IDLE_SECONDS=25
 ```
 
@@ -194,14 +207,15 @@ CORE_WARM_CONNECTION_MAX_IDLE_SECONDS=25
 `THS_DEVICE_LIFECYCLE_TOKEN`，不得提交；后二者不得在后加载的
 `deploy/macos.env` 中出现任何赋值（包括空值）。
 
-## 8. 2026-08-27 验收证据
+## 8. 2026-09-11 竞价切换增量验证
 
-本地测试：
-
-- Python：511 passed；
-- 前端：82 passed；
+- Python 竞价阶段、协议解码、缓存和 Broker 批量刷新：41 passed；
+- 相关部署配置回归：11 passed；
 - `npm run build` 成功；
-- `git diff --check` 成功。
+- 前端全量 Vitest 当前环境仍因既有 `React.act is not a function` 依赖问题失败，
+  不是 TypeScript 编译错误；需升级测试运行时后重新验收；
+- 1004 虚拟撮合和 4051 App 状态尚未完成真实交易时段抓包，当前生产回退为
+  已验证的 43/7001 直连路径。
 
 部署：
 

@@ -3,16 +3,174 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 import time
 from dataclasses import asdict, dataclass, field, replace
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
+from enum import Enum
+from pathlib import Path
 from typing import Any, Callable, Protocol
 from zoneinfo import ZoneInfo
+
+from .workday_calendar import ChinaLegalWorkdayCalendar
 
 
 MARKET_PERIODS = frozenset({"timeshare", "five_day", "min5", "min15", "min30", "min60", "day", "week", "month"})
 _FIXED_MARKET_ERROR = re.compile(r"[A-Z][A-Z0-9_]{2,63}\Z")
+SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
+
+
+class MarketPhase(str, Enum):
+    CLOSED = "CLOSED"
+    PREOPEN_QUOTE = "PREOPEN_QUOTE"
+    CALL_AUCTION = "CALL_AUCTION"
+    AUCTION_LOCKED = "AUCTION_LOCKED"
+    CONTINUOUS = "CONTINUOUS"
+    BREAK = "BREAK"
+
+
+@dataclass(frozen=True)
+class MarketPhaseState:
+    phase: MarketPhase
+    source: str
+    local_time: str
+    server_time: str | None = None
+
+
+def _weekday_trading_day(value: date) -> bool:
+    return value.weekday() < 5
+
+
+class LocalTradingCalendar:
+    """Read a versioned local trading-day list with a weekday fallback."""
+
+    def __init__(
+        self,
+        path: str | Path | None,
+        *,
+        fallback: Callable[[date], bool] = _weekday_trading_day,
+    ) -> None:
+        self.path = Path(path).expanduser() if path is not None else None
+        self.fallback = fallback
+        self._signature: tuple[int, int] | None = None
+        self._trading_days: frozenset[date] | None = None
+        self._legal_calendar: ChinaLegalWorkdayCalendar | None = None
+        self._bundled_path = Path(__file__).with_name("china_workdays.json")
+
+    def _load(self) -> frozenset[date] | None:
+        candidate = self.path
+        if candidate is None or not candidate.is_file():
+            candidate = self._bundled_path if self._bundled_path.is_file() else None
+        if candidate is None:
+            return None
+        try:
+            stat = candidate.stat()
+            signature = (stat.st_mtime_ns, stat.st_size)
+        except OSError:
+            return None
+        if signature == self._signature:
+            return self._trading_days
+        self._signature = signature
+        try:
+            payload = json.loads(candidate.read_text(encoding="utf-8"))
+            values = payload.get("trading_days") if isinstance(payload, dict) else payload
+            if isinstance(values, list):
+                parsed = {
+                    date.fromisoformat(str(value))
+                    for value in values
+                    if isinstance(value, str)
+                }
+                self._legal_calendar = None
+                self._trading_days = frozenset(parsed) if parsed else None
+            elif isinstance(payload, dict) and {
+                "coverage_start", "coverage_end", "holidays", "adjusted_workdays"
+            } <= payload.keys():
+                self._legal_calendar = ChinaLegalWorkdayCalendar.from_file(candidate)
+                self._trading_days = None
+            else:
+                raise ValueError
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            self._trading_days = None
+            self._legal_calendar = None
+        return self._trading_days
+
+    def is_trading_day(self, value: date) -> bool:
+        trading_days = self._load()
+        if self._legal_calendar is not None:
+            legal = self._legal_calendar.is_workday(value)
+            if legal is not None:
+                return legal
+        return value in trading_days if trading_days is not None else self.fallback(value)
+
+
+class MarketPhaseResolver:
+    """Resolve the quote phase with App status taking precedence over local time."""
+
+    def __init__(
+        self,
+        *,
+        is_trading_day: Callable[[date], bool] | None = None,
+    ) -> None:
+        self.is_trading_day = is_trading_day or _weekday_trading_day
+
+    @staticmethod
+    def _coerce_app_phase(value: MarketPhase | str | None) -> MarketPhase | None:
+        if isinstance(value, MarketPhase):
+            return value
+        if value is None:
+            return None
+        try:
+            return MarketPhase(str(value).strip().upper())
+        except ValueError:
+            return None
+
+    def resolve(
+        self,
+        now: datetime | None = None,
+        *,
+        app_phase: MarketPhase | str | None = None,
+        app_server_time: str | None = None,
+    ) -> MarketPhaseState:
+        current = now or datetime.now(timezone.utc)
+        local = current.astimezone(SHANGHAI_TZ)
+        local_time = local.strftime("%H:%M:%S")
+        app_value = self._coerce_app_phase(app_phase)
+        if app_value is not None:
+            return MarketPhaseState(
+                phase=app_value,
+                source="APP_STATUS",
+                local_time=local_time,
+                server_time=app_server_time,
+            )
+        if not self.is_trading_day(local.date()):
+            return MarketPhaseState(
+                phase=MarketPhase.CLOSED,
+                source="LOCAL_CALENDAR",
+                local_time=local_time,
+            )
+        seconds = local.hour * 3600 + local.minute * 60 + local.second
+        if seconds < 9 * 3600 + 10 * 60:
+            phase = MarketPhase.CLOSED
+        elif seconds < 9 * 3600 + 15 * 60:
+            phase = MarketPhase.PREOPEN_QUOTE
+        elif seconds < 9 * 3600 + 25 * 60:
+            phase = MarketPhase.CALL_AUCTION
+        elif seconds < 9 * 3600 + 30 * 60:
+            phase = MarketPhase.AUCTION_LOCKED
+        elif seconds <= 11 * 3600 + 30 * 60:
+            phase = MarketPhase.CONTINUOUS
+        elif seconds < 13 * 3600:
+            phase = MarketPhase.BREAK
+        elif seconds <= 15 * 3600:
+            phase = MarketPhase.CONTINUOUS
+        else:
+            phase = MarketPhase.CLOSED
+        return MarketPhaseState(
+            phase=phase,
+            source="LOCAL_CALENDAR",
+            local_time=local_time,
+        )
 
 
 def fixed_market_error_code(
@@ -29,11 +187,21 @@ def fixed_market_error_code(
 def is_china_market_open(now: datetime | None = None) -> bool:
     """Return whether the A-share quote refresh window is active at this instant."""
     current = now or datetime.now(timezone.utc)
-    local = current.astimezone(ZoneInfo("Asia/Shanghai"))
+    local = current.astimezone(SHANGHAI_TZ)
     if local.weekday() >= 5:
         return False
     minute = local.hour * 60 + local.minute
     return 9 * 60 + 10 <= minute <= 11 * 60 + 30 or 13 * 60 <= minute <= 15 * 60
+
+
+def is_china_preopen_window(now: datetime | None = None) -> bool:
+    """Return whether it is a weekday between 09:00 and 09:30 in Shanghai."""
+    current = now or datetime.now(timezone.utc)
+    local = current.astimezone(SHANGHAI_TZ)
+    if local.weekday() >= 5:
+        return False
+    minute = local.hour * 60 + local.minute
+    return 9 * 60 <= minute < 9 * 60 + 30
 
 
 @dataclass(frozen=True)
@@ -81,6 +249,8 @@ class MarketSnapshot:
     collected_at: datetime
     quote: dict[str, str | None]
     source: str | None = None
+    market_phase: MarketPhase = MarketPhase.CLOSED
+    market_phase_source: str | None = None
     price_precision: int = 2
     timeshare: tuple[TimesharePoint, ...] = ()
     intraday_series: dict[str, dict[str, Any]] = field(default_factory=dict)
@@ -89,6 +259,7 @@ class MarketSnapshot:
     main_fund_flow: dict[str, Any] = field(default_factory=dict)
     capabilities: dict[str, dict[str, Any]] = field(default_factory=dict)
     source_errors: dict[str, str | None] = field(default_factory=dict)
+    stored_trade_dates: dict[str, str | None] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if not 1 <= self.price_precision <= 6:
@@ -146,16 +317,20 @@ class MarketDataBroker:
         watchlist_interval_seconds: float = 2.0,
         closed_interval_seconds: float | None = None,
         max_concurrent_refreshes: int = 8,
+        refresh_timeout_seconds: float = 12.0,
         clock: Callable[[], float] = time.monotonic,
         is_market_open: Callable[[], bool] = lambda: True,
     ) -> None:
         if not isinstance(max_concurrent_refreshes, int) or max_concurrent_refreshes <= 0:
             raise ValueError("max_concurrent_refreshes must be positive")
+        if refresh_timeout_seconds <= 0:
+            raise ValueError("refresh_timeout_seconds must be positive")
         self.source = source
         self.detail_interval_seconds = detail_interval_seconds
         self.watchlist_interval_seconds = watchlist_interval_seconds
         self.closed_interval_seconds = closed_interval_seconds
         self.max_concurrent_refreshes = max_concurrent_refreshes
+        self.refresh_timeout_seconds = refresh_timeout_seconds
         self.clock = clock
         self.is_market_open = is_market_open
         self._subscriptions: dict[str, tuple[set[str], set[str]]] = {}
@@ -233,6 +408,7 @@ class MarketDataBroker:
             "cached_symbols": len(self._cache),
             "detail_interval_seconds": float(self.detail_interval_seconds),
             "watchlist_interval_seconds": float(self.watchlist_interval_seconds),
+            "refresh_timeout_seconds": float(self.refresh_timeout_seconds),
             "closed_interval_seconds": (
                 None
                 if self.closed_interval_seconds is None
@@ -300,8 +476,14 @@ class MarketDataBroker:
     ) -> MarketSnapshot:
         lock = self._refresh_locks.setdefault(symbol, asyncio.Lock())
         async with lock:
+            cached = self._cache.get(symbol)
+            if (
+                not self.is_market_open()
+                and cached is not None
+                and (not detail or self._cache_detail.get(symbol, False))
+            ):
+                return cached
             if max_age_seconds > 0:
-                cached = self._cache.get(symbol)
                 last = self._last_polled.get(symbol)
                 if (
                     cached is not None
@@ -310,10 +492,13 @@ class MarketDataBroker:
                     and (not detail or self._cache_detail.get(symbol, False))
                 ):
                     return cached
-            snapshot = await asyncio.to_thread(
-                self.source.read_market_snapshot,
-                symbol,
-                detail=detail,
+            snapshot = await asyncio.wait_for(
+                asyncio.to_thread(
+                    self.source.read_market_snapshot,
+                    symbol,
+                    detail=detail,
+                ),
+                timeout=self.refresh_timeout_seconds,
             )
             sequence = self._sequence.get(symbol, 0) + 1
             current = replace(snapshot, sequence=sequence)
@@ -336,29 +521,32 @@ class MarketDataBroker:
         market_open = self.is_market_open()
         semaphore = asyncio.Semaphore(self.max_concurrent_refreshes)
 
+        def publish_failure(symbol: str, error: object, timestamp: float) -> None:
+            self._last_polled[symbol] = timestamp
+            failures = self._failure_counts.get(symbol, 0) + 1
+            self._failure_counts[symbol] = failures
+            self._retry_after[symbol] = timestamp + min(
+                30.0,
+                max(self.detail_interval_seconds, self.watchlist_interval_seconds)
+                * (2 ** min(failures - 1, 4)),
+            )
+            error_code = fixed_market_error_code(error)
+            self._publish(
+                symbol,
+                {
+                    "type": "source_status",
+                    "symbol": symbol,
+                    "status": "OFFLINE",
+                    "error_code": error_code,
+                },
+            )
+
         async def refresh_one(symbol: str, detail: bool) -> None:
             async with semaphore:
                 try:
                     await self.refresh(symbol, detail=detail)
                 except Exception as error:
-                    self._last_polled[symbol] = now
-                    failures = self._failure_counts.get(symbol, 0) + 1
-                    self._failure_counts[symbol] = failures
-                    self._retry_after[symbol] = now + min(
-                        30.0,
-                        max(self.detail_interval_seconds, self.watchlist_interval_seconds)
-                        * (2 ** min(failures - 1, 4)),
-                    )
-                    error_code = fixed_market_error_code(error)
-                    self._publish(
-                        symbol,
-                        {
-                            "type": "source_status",
-                            "symbol": symbol,
-                            "status": "OFFLINE",
-                            "error_code": error_code,
-                        },
-                    )
+                    publish_failure(symbol, error, now)
 
         if not market_open:
             self._closed_refresh_requests.intersection_update(
@@ -377,6 +565,53 @@ class MarketDataBroker:
                 await asyncio.gather(*tasks)
             return
         self._closed_refresh_requests.clear()
+        batch_reader = getattr(self.source, "read_market_snapshots", None)
+        if callable(batch_reader):
+            due_symbols = {
+                symbol
+                for symbol in watchlist_symbols | detail_symbols
+                if (
+                    self._last_polled.get(symbol) is None
+                    or now - self._last_polled[symbol]
+                    >= (
+                        self.detail_interval_seconds
+                        if symbol in detail_symbols
+                        else self.watchlist_interval_seconds
+                    )
+                )
+                and self._retry_after.get(symbol, 0.0) <= now
+            }
+            if due_symbols:
+                try:
+                    snapshots = await asyncio.to_thread(
+                        batch_reader,
+                        due_symbols,
+                        detail_symbols=detail_symbols & due_symbols,
+                    )
+                    if not isinstance(snapshots, dict):
+                        raise RuntimeError("MARKET_BATCH_RESPONSE_INVALID")
+                    for symbol in due_symbols:
+                        snapshot = snapshots.get(symbol)
+                        if not isinstance(snapshot, MarketSnapshot):
+                            publish_failure(
+                                symbol,
+                                RuntimeError("MARKET_BATCH_RESPONSE_INVALID"),
+                                now,
+                            )
+                            continue
+                        sequence = self._sequence.get(symbol, 0) + 1
+                        current = replace(snapshot, sequence=sequence)
+                        self._sequence[symbol] = sequence
+                        self._cache[symbol] = current
+                        self._cache_detail[symbol] = symbol in detail_symbols
+                        self._last_polled[symbol] = now
+                        self._failure_counts.pop(symbol, None)
+                        self._retry_after.pop(symbol, None)
+                        self._publish(symbol, {"type": "snapshot", "data": current.as_public()})
+                except Exception as error:
+                    for symbol in due_symbols:
+                        publish_failure(symbol, error, now)
+                return
         tasks: list[asyncio.Future | asyncio.Task] = []
         for symbol in sorted(watchlist_symbols | detail_symbols, key=lambda value: (value not in detail_symbols, value)):
             detail = symbol in detail_symbols

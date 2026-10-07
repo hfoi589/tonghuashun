@@ -7,6 +7,7 @@ from level2_service.api import create_app
 from level2_service.market_accounts import InMemoryMarketSessionStore, SQLiteMarketAccountStore
 from level2_service.market_data import KlineBar, MarketDataBroker, MarketSeriesPage, MarketSnapshot
 from level2_service.parsed_values import SymbolLookup
+from level2_service.parsed_values import DirectRequestError
 
 
 class ApiMarketSource:
@@ -95,6 +96,36 @@ def test_market_snapshot_and_kline_routes_require_user_authentication(tmp_path) 
         "stale": False,
         "source_errors": {"public_kline": None, "app_kline": None},
     }
+
+
+def test_market_read_routes_do_not_require_a_fresh_symbol_catalog(tmp_path) -> None:
+    accounts = SQLiteMarketAccountStore(tmp_path / "market.db")
+    user = accounts.create_user("trader", "temporary-123")
+    accounts.change_password(user.id, "temporary-123", "permanent-456")
+
+    def stale_lookup(_symbol: str):
+        raise DirectRequestError("SYMBOL_CATALOG_STALE")
+
+    app = create_app(
+        secure_admin_cookies=False,
+        market_account_store=accounts,
+        market_session_store=InMemoryMarketSessionStore(),
+        market_data_broker=MarketDataBroker(ApiMarketSource()),
+        symbol_lookup=stale_lookup,
+    )
+
+    with TestClient(app) as client:
+        client.post(
+            "/api/v1/session",
+            json={"username": "trader", "password": "permanent-456"},
+        )
+        snapshot = client.get("/api/v1/market/symbols/601872/snapshot")
+        series = client.get(
+            "/api/v1/market/symbols/601872/series?period=day&limit=120"
+        )
+
+    assert snapshot.status_code == 200
+    assert series.status_code == 200
 
 
 def test_market_snapshot_redacts_arbitrary_upstream_exception_details(tmp_path) -> None:
@@ -191,5 +222,6 @@ def test_admin_market_health_reports_broker_cadence_and_cache(tmp_path) -> None:
         "cached_symbols": 0,
         "detail_interval_seconds": 2.0,
         "watchlist_interval_seconds": 2.0,
+        "refresh_timeout_seconds": 12.0,
         "closed_interval_seconds": None,
     }

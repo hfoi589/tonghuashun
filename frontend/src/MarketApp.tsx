@@ -1,15 +1,26 @@
-import { FormEvent, useEffect, useMemo, useRef, useState } from 'react'
-import { ApiError } from './api'
+import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { ApiError, type MainFundFlowPeriod } from './api'
 import { DailyKChart, type DailyKSelection } from './DailyKChart'
+import { FundFlowHistoryPanel } from './FundFlowHistoryPanel'
+import { FundFlowDailyPanel } from './FundFlowDailyChart'
 import { IntradayMacdChart, IntradayMetricChart } from './IntradayMetricChart'
 import { intradayAxisTicks, intradayPointIndexForTime, intradayPointRatio, intradayTimeRatio, nearestIntradayPointIndex } from './intraday-axis'
 import {
+  marketAuthExpiredEvent,
   marketApi,
   marketStreamUrl,
+  type FundFlowDailyPoint,
+  type FundFlowHistoryResponse,
   type KlineBar,
   type MarketSeriesPage,
+  type MarketPhase,
   type MarketSnapshot,
   type MarketUser,
+  type PortfolioMonitoringItem,
+  type PremiumSnapshot,
+  type ReplayEvaluation,
+  type ReplayRule,
+  type ResearchSeries,
   type TimesharePoint,
   type WatchlistGroup,
   type WatchlistItem,
@@ -17,9 +28,10 @@ import {
 import './market.css'
 
 type AuthState = 'loading' | 'anonymous' | 'authenticated'
-type ChartPeriod = 'timeshare' | 'five_day' | 'day' | 'week' | 'month'
+type ChartPeriod = 'dark_pool' | 'timeshare' | 'five_day' | 'day' | 'week' | 'month'
 
-const chartPeriods: Array<[ChartPeriod, string]> = [
+export const chartPeriods: Array<[ChartPeriod, string]> = [
+  ['dark_pool', '暗盘'],
   ['timeshare', '分时'],
   ['day', '日K'],
   ['five_day', '五日'],
@@ -27,9 +39,37 @@ const chartPeriods: Array<[ChartPeriod, string]> = [
   ['month', '月K'],
 ]
 
+export function isFundFlowPeriod(period: ChartPeriod): boolean {
+  return period === 'dark_pool'
+}
+
 function tone(value: string | null | undefined): 'up' | 'down' | 'flat' {
   const number = Number(String(value ?? '').replace('%', ''))
   return number > 0 ? 'up' : number < 0 ? 'down' : 'flat'
+}
+
+export function marketPhaseLabel(phase: MarketPhase | null | undefined): string {
+  switch (phase) {
+    case 'PREOPEN_QUOTE': return '盘前报价'
+    case 'CALL_AUCTION': return '集合竞价'
+    case 'AUCTION_LOCKED': return '竞价锁定'
+    case 'CONTINUOUS': return '交易中'
+    case 'BREAK': return '午间休市'
+    default: return '休市'
+  }
+}
+
+export function marketSourceLabel(
+  source: MarketSnapshot['source'] | null | undefined,
+  phase?: MarketPhase | null,
+): string {
+  switch (source) {
+    case 'THS_AUCTION': return '同花顺集合竞价'
+    case 'THS_DIRECT_QUOTE': return '同花顺盘前直连'
+    case 'TENCENT_PUBLIC': return '腾讯公开行情'
+    case 'SINA_PUBLIC': return '新浪公开行情'
+    default: return phase === 'CALL_AUCTION' || phase === 'AUCTION_LOCKED' ? '竞价行情' : '公开行情'
+  }
 }
 
 function display(value: string | null | undefined, suffix = ''): string {
@@ -49,6 +89,15 @@ function compact(value: string | null | undefined, unit: '股' | '元'): string 
   if (Math.abs(number) >= 100_000_000) return `${(number / 100_000_000).toFixed(2)}亿${unit}`
   if (Math.abs(number) >= 10_000) return `${(number / 10_000).toFixed(2)}万${unit}`
   return `${number.toFixed(2)}${unit}`
+}
+
+function fundFlowToWan(value: string | null | undefined, unit: string | null | undefined): string | null {
+  if (value === null || value === undefined || value === '') return null
+  const numeric = Number(String(value).replaceAll(',', ''))
+  if (!Number.isFinite(numeric)) return null
+  const multiplier = unit === '亿元' || unit === '亿' ? 10_000 : unit === '万元' || unit === '万' ? 1 : null
+  if (multiplier === null) return null
+  return (numeric * multiplier).toFixed(2)
 }
 
 function percentChange(close: string | null, previousClose: string | null): string | null {
@@ -324,25 +373,122 @@ function Login({ onLogin }: { onLogin: (user: MarketUser) => void }) {
   </main>
 }
 
-function FundFlow({ values }: { values: MarketSnapshot['main_fund_flow'] }) {
-  const periods = [['today', '当日'], ['three_day', '3日'], ['five_day', '5日']] as const
-  const rows = [['main_net_inflow', '主力净流入'], ['main_visible_inflow', '主力明盘'], ['main_hidden_inflow', '主力暗盘'], ['retail_inflow', '散户流入']] as const
-  if (Object.keys(values).length === 0) return null
+type FundFlowPeriodKey = 'today' | 'three_day' | 'five_day'
+type FundFlowChartTab = 'today' | 'daily'
+
+const fundFlowPeriods: Array<[FundFlowPeriodKey, string]> = [
+  ['today', '当日'],
+  ['three_day', '3日'],
+  ['five_day', '5日'],
+]
+
+const fundFlowRows = [
+  ['main_net_inflow', '主力净流入'],
+  ['main_visible_inflow', '主力明盘'],
+  ['main_hidden_inflow', '主力暗盘'],
+  ['retail_inflow', '散户流入'],
+] as const
+
+const emptyFundFlowPeriod = {
+  unit: null,
+  main_net_inflow: null,
+  main_visible_inflow: null,
+  main_hidden_inflow: null,
+  retail_inflow: null,
+}
+
+function normalizeFundFlowPeriod(period: MainFundFlowPeriod | null | undefined): Record<string, string | null> {
+  return period === null || period === undefined ? emptyFundFlowPeriod : {
+    unit: period.unit,
+    main_net_inflow: period.main_net_inflow,
+    main_visible_inflow: period.main_visible_inflow,
+    main_hidden_inflow: period.main_hidden_inflow,
+    retail_inflow: period.retail_inflow,
+  }
+}
+
+function fundFlowValuesForDailyPoint(point: FundFlowDailyPoint): MarketSnapshot['main_fund_flow'] | null {
+  if (point.periods === null || point.periods === undefined) return null
+  return {
+    today: normalizeFundFlowPeriod(point.periods.today),
+    three_day: normalizeFundFlowPeriod(point.periods.three_day),
+    five_day: normalizeFundFlowPeriod(point.periods.five_day),
+  }
+}
+
+function FundFlow({ symbol, values, refreshEnabled }: { symbol: string, values: MarketSnapshot['main_fund_flow'], refreshEnabled: boolean }) {
+  const [history, setHistory] = useState<FundFlowHistoryResponse>()
+  const [activeTab, setActiveTab] = useState<FundFlowChartTab>('today')
+  const [dailyValues, setDailyValues] = useState<MarketSnapshot['main_fund_flow'] | null | undefined>()
+  useEffect(() => {
+    setHistory(undefined)
+    setActiveTab('today')
+    setDailyValues(undefined)
+  }, [symbol])
+  const historicalValues = useMemo<MarketSnapshot['main_fund_flow'] | undefined>(() => {
+    if (!history?.trade_date) return undefined
+    const result: MarketSnapshot['main_fund_flow'] = {}
+    fundFlowPeriods.forEach(([period]) => {
+      const point = history.periods[period].points.at(-1)
+      if (!point) return
+      result[period] = {
+        unit: point.unit,
+        main_net_inflow: point.main_net_inflow,
+        main_visible_inflow: point.main_visible_inflow,
+        main_hidden_inflow: point.main_hidden_inflow,
+        retail_inflow: point.retail_inflow,
+      }
+    })
+    return Object.keys(result).length ? result : undefined
+  }, [history])
+  const selectTab = useCallback((tab: FundFlowChartTab) => {
+    setActiveTab(tab)
+    if (tab === 'today') setDailyValues(undefined)
+  }, [])
+  const handleDailyPointChange = useCallback((point: FundFlowDailyPoint) => {
+    setDailyValues(fundFlowValuesForDailyPoint(point))
+  }, [])
+  const displayedValues = activeTab === 'daily' ? dailyValues ?? {} : historicalValues ?? values
+  const todayPanelId = `market-fund-flow-today-${symbol}`
+  const dailyPanelId = `market-fund-flow-daily-${symbol}`
+  const fundFlowDateLabel = history?.trade_date ?? (Object.keys(values).length ? '数据库优先' : '暂无实时值')
   return <section className="market-section market-fund-flow">
-    <div className="market-section-title"><div><span>CAPITAL FLOW</span><h3>主力流向</h3></div><small>直连接口</small></div>
-    <table className="market-fund-table"><thead><tr><th>指标</th>{periods.map(([, label]) => <th key={label}>{label}</th>)}</tr></thead>
-      <tbody>{rows.map(([field, label]) => <tr key={field}><th>{label}</th>{periods.map(([period]) => {
-        const value = values[period]?.[field]
-        const unit = values[period]?.unit ?? ''
-        return <td key={period} className={`market-number-${tone(value)}`}>{display(value, unit)}</td>
-      })}</tr>)}</tbody>
-    </table>
+    <div className="market-fund-layout">
+      <div className="market-fund-table-column">
+        <div className="market-fund-column-head">
+          <div className="market-fund-column-title"><span>CAPITAL FLOW</span><h3>主力流向</h3></div>
+          <small className="market-fund-meta"><strong>统一单位：万元</strong><span>{fundFlowDateLabel}</span></small>
+        </div>
+        <div className="market-fund-table-wrap">
+        <table className="market-fund-table"><thead className="market-fund-table-head"><tr><th>指标</th>{fundFlowPeriods.map(([, label]) => <th key={label}>{label}</th>)}</tr></thead>
+          <tbody>{fundFlowRows.map(([field, label]) => <tr key={field}><th>{label}</th>{fundFlowPeriods.map(([period]) => {
+            const value = displayedValues[period]?.[field]
+            const unit = displayedValues[period]?.unit ?? ''
+            const normalized = fundFlowToWan(value, unit)
+            return <td key={period} className={`market-number-${tone(value)}`}>{display(normalized)}</td>
+          })}</tr>)}</tbody>
+        </table>
+        </div>
+      </div>
+      <div className="market-fund-chart-tabs" aria-label="资金曲线切换">
+        <div className="market-fund-tablist" role="tablist" aria-label="资金曲线类型">
+          <button type="button" role="tab" aria-selected={activeTab === 'today'} aria-controls={todayPanelId} className={activeTab === 'today' ? 'active' : ''} onClick={() => selectTab('today')}>当天资金曲线</button>
+          <button type="button" role="tab" aria-selected={activeTab === 'daily'} aria-controls={dailyPanelId} className={activeTab === 'daily' ? 'active' : ''} onClick={() => selectTab('daily')}>近30日资金流向</button>
+        </div>
+        <div id={todayPanelId} role="tabpanel" aria-label="当天资金曲线内容" hidden={activeTab !== 'today'}>
+          <FundFlowHistoryPanel symbol={symbol} pollingEnabled={refreshEnabled} onHistoryChange={setHistory} />
+        </div>
+        <div id={dailyPanelId} role="tabpanel" aria-label="近30日资金流向内容" hidden={activeTab !== 'daily'}>
+          <FundFlowDailyPanel symbol={symbol} pollingEnabled={refreshEnabled} onSelectedPointChange={handleDailyPointChange} />
+        </div>
+      </div>
+    </div>
   </section>
 }
 
 const marketIntradayCharts = [
   ['large_order_net', '大单净量', true, 2],
-  ['large_order_amount', '大单金额', true, 1],
+  ['large_order_amount', '大单金额', true, 2],
   ['retail_count', '散户数量', false, 2],
 ] as const
 
@@ -374,6 +520,133 @@ function MarketIntradayCharts({ symbol, series, selectedTime }: {
   </div>
 }
 
+function ReplayPriceChart({ series, evaluation }: { series: ResearchSeries, evaluation?: ReplayEvaluation }) {
+  const points = series.points.filter((point) => Number.isFinite(Number(point.price)))
+  if (!points.length) return <div className="market-research-empty">当前交易日没有可绘制的分钟价格。</div>
+  const width = 900
+  const height = 300
+  const pad = { left: 54, right: 18, top: 24, bottom: 28 }
+  const prices = points.map((point) => Number(point.price))
+  const min = Math.min(...prices)
+  const max = Math.max(...prices)
+  const range = Math.max(0.001, max - min)
+  const x = (index: number) => pad.left + index / Math.max(1, points.length - 1) * (width - pad.left - pad.right)
+  const y = (value: number) => pad.top + (max - value) / range * (height - pad.top - pad.bottom)
+  const path = points.map((point, index) => `${index ? 'L' : 'M'}${x(index).toFixed(2)},${y(Number(point.price)).toFixed(2)}`).join(' ')
+  return <svg className="market-replay-chart" viewBox={`0 0 ${width} ${height}`} role="img" aria-label={`${series.name ?? series.symbol}复盘价格图`}>
+    <path d={path} className="market-replay-line" />
+    {(evaluation?.markers ?? []).map((marker) => {
+      const cx = x(Math.min(points.length - 1, Math.max(0, marker.index)))
+      const cy = y(marker.price)
+      return <g key={`${marker.rule_id}-${marker.index}-${marker.side}`} className={`market-replay-marker market-replay-marker-${marker.side}`}>
+        <circle cx={cx} cy={cy} r="9" />
+        <text x={cx} y={cy} textAnchor="middle" dominantBaseline="central">{marker.side === 'buy' ? 'B' : 'S'}</text>
+      </g>
+    })}
+    <text x={pad.left} y={height - 7}>{points[0].time}</text>
+    <text x={width - pad.right} y={height - 7} textAnchor="end">{points.at(-1)?.time}</text>
+  </svg>
+}
+
+function ResearchReplayPanel({ symbol }: { symbol: string }) {
+  const [open, setOpen] = useState(false)
+  const [loading, setLoading] = useState(false)
+  const [enabled, setEnabled] = useState(true)
+  const [rules, setRules] = useState<ReplayRule[]>([])
+  const [selectedRules, setSelectedRules] = useState<string[]>([])
+  const [series, setSeries] = useState<ResearchSeries>()
+  const [evaluation, setEvaluation] = useState<ReplayEvaluation>()
+  const [message, setMessage] = useState('')
+
+  async function load(tradeDate?: string) {
+    setLoading(true)
+    setMessage('')
+    try {
+      const [monitoring, nextRules] = await Promise.all([marketApi.monitoring(), marketApi.replayRules()])
+      setEnabled(monitoring.find((item) => item.symbol === symbol)?.enabled ?? true)
+      setRules(nextRules)
+      setSelectedRules((current) => current.length ? current : nextRules.map((rule) => rule.id))
+      try { setSeries(await marketApi.replaySeries(symbol, tradeDate)) }
+      catch (reason) {
+        if (!(reason instanceof ApiError && reason.status === 404)) throw reason
+        setSeries(undefined)
+      }
+    } catch (reason) { setMessage(reason instanceof Error ? reason.message : '监控与复盘读取失败') }
+    finally { setLoading(false) }
+  }
+
+  async function toggleMonitoring() {
+    try { setEnabled((await marketApi.setMonitoring(symbol, !enabled)).enabled) }
+    catch (reason) { setMessage(reason instanceof Error ? reason.message : '监控状态更新失败') }
+  }
+
+  async function backfill() {
+    setLoading(true)
+    try {
+      const result = await marketApi.backfillMonitoring(symbol)
+      await load()
+      setMessage(result.changed_minutes.length ? `已更新 ${result.changed_minutes.length} 个分钟点。` : '当前数据没有变化。')
+    } catch (reason) { setMessage(reason instanceof Error ? reason.message : '补采失败'); setLoading(false) }
+  }
+
+  async function runReplay() {
+    if (!series) return
+    setLoading(true)
+    try { setEvaluation(await marketApi.evaluateReplay(symbol, series.trade_date, selectedRules)); setMessage('复盘计算完成。') }
+    catch (reason) { setMessage(reason instanceof Error ? reason.message : '复盘计算失败') }
+    finally { setLoading(false) }
+  }
+
+  if (!open) return <section className="market-section market-research-launch">
+    <div><span>MONITOR &amp; REPLAY</span><h3>监控与复盘</h3><p>按当前批准的数据源积累分钟历史，并使用管理员规则回放 B/S 点。</p></div>
+    <button type="button" onClick={() => { setOpen(true); void load() }} aria-label="打开监控与复盘">打开</button>
+  </section>
+
+  const performance = evaluation?.performance
+  const latest = series?.points.at(-1)
+  return <section className="market-section market-research-panel">
+    <div className="market-section-title">
+      <div><span>MONITOR &amp; REPLAY</span><h3>监控与复盘</h3></div>
+      <div className="market-research-actions"><button type="button" onClick={toggleMonitoring}>{enabled ? '暂停监控' : '启用监控'}</button><button type="button" onClick={backfill} disabled={loading}>补采当前日</button><button type="button" onClick={() => setOpen(false)}>收起</button></div>
+    </div>
+    {message && <p className="market-research-message" role="status">{message}</p>}
+    {loading && !series ? <div className="market-research-empty">正在读取监控历史…</div> : series ? <>
+      <div className="market-research-toolbar"><span>历史来源：{series.source ?? '未知'}</span><label>交易日<select value={series.trade_date} onChange={(event) => { setEvaluation(undefined); void load(event.target.value) }}>{series.available_dates.map((date) => <option key={date} value={date}>{date}</option>)}</select></label><span>MACD {series.macd_settings.short}/{series.macd_settings.long}/{series.macd_settings.signal}</span></div>
+      <ReplayPriceChart series={series} evaluation={evaluation} />
+      <div className="market-research-rules"><div>{rules.length ? rules.map((rule) => <label key={rule.id}><input type="checkbox" checked={selectedRules.includes(rule.id)} onChange={(event) => setSelectedRules((current) => event.target.checked ? [...current, rule.id] : current.filter((id) => id !== rule.id))} />{rule.title}</label>) : <span>管理员尚未启用复盘规则。</span>}</div><button type="button" onClick={runReplay} disabled={loading || !rules.length || !selectedRules.length}>运行规则复盘</button></div>
+      {performance && <div className="market-replay-performance"><strong>收益率 {performance.formula_return_pct === null ? '—' : `${performance.formula_return_pct.toFixed(2)}%`}</strong><span>盈亏 {performance.profit.toFixed(2)}</span><span>买点 {performance.buy_count}</span><span>卖点 {performance.sell_count}</span>{performance.forced_exit && <span>末仓 {performance.forced_exit.time} 强制卖出</span>}</div>}
+      {latest && <div className="market-research-latest">{[['DIFF', latest.diff], ['DEA', latest.dea], ['MACD', latest.macd], ['大单净量', latest.large_order_net]].map(([label, value]) => <div key={label}><span>{label}</span><strong>{value ?? '—'}</strong></div>)}</div>}
+    </> : <div className="market-research-empty"><strong>历史数据尚未建立</strong><span>点击“补采当前日”后，系统会通过当前 Market 数据契约写入分钟历史。</span></div>}
+  </section>
+}
+
+function PortfolioMonitor({ onSelect }: { onSelect: (symbol: string) => void }) {
+  const [open, setOpen] = useState(false)
+  const [items, setItems] = useState<PortfolioMonitoringItem[]>([])
+  const [message, setMessage] = useState('')
+  async function load() {
+    try { setItems((await marketApi.monitoringPortfolio()).items); setOpen(true) }
+    catch (reason) { setMessage(reason instanceof Error ? reason.message : '组合监控读取失败') }
+  }
+  if (!open) return <div className="market-portfolio-launch"><button type="button" aria-label="打开组合监控" onClick={load}>组合监控</button>{message && <span>{message}</span>}</div>
+  return <section className="market-portfolio-panel">
+    <div className="market-portfolio-head"><div><span>PORTFOLIO MONITOR</span><h2>组合监控</h2></div><div><button type="button" onClick={load}>刷新</button><button type="button" onClick={() => setOpen(false)}>收起</button></div></div>
+    <div className="market-portfolio-grid">{items.length ? items.map((item) => <button type="button" key={item.symbol} onClick={() => onSelect(item.symbol)}><span><strong>{item.name}</strong><small>{item.symbol}</small></span><span><strong>{item.latest_price ?? '—'}</strong><small>{item.latest_trade_date ?? '未采集'} {item.latest_time ?? ''}</small></span><em className={item.latest_signal?.side === 'buy' ? 'buy' : item.latest_signal?.side === 'sell' ? 'sell' : ''}>{item.latest_signal ? `最新信号：${item.latest_signal.rule_title}` : item.last_error ?? '暂无最新信号'}</em></button>) : <p>当前没有启用监控的自选标的。</p>}</div>
+  </section>
+}
+
+function PremiumMonitor() {
+  const [open, setOpen] = useState(false)
+  const [snapshot, setSnapshot] = useState<PremiumSnapshot>()
+  const [message, setMessage] = useState('')
+  async function load() {
+    try { setSnapshot(await marketApi.premiumMonitoring()); setOpen(true) }
+    catch (reason) { setMessage(reason instanceof Error ? reason.message : '溢价监控读取失败') }
+  }
+  if (!open) return <div className="market-premium-launch"><button type="button" aria-label="查看 QDII/LOF 溢价" onClick={load}>QDII/LOF 溢价</button>{message && <span>{message}</span>}</div>
+  return <section className="market-premium-panel"><div className="market-premium-head"><div><span>PREMIUM MONITOR</span><h2>QDII/LOF 溢价</h2></div><div><button type="button" onClick={load}>刷新</button><button type="button" onClick={() => setOpen(false)}>收起</button></div></div>{snapshot?.rows.length ? <div className="market-premium-table"><div className="market-premium-row market-premium-row-head"><span>代码 / 名称</span><span>现价</span><span>估价</span><span>溢价</span></div>{snapshot.rows.map((row) => <div className="market-premium-row" key={row.code}><span><strong>{row.code}</strong><small>{row.name}</small></span><span>{row.current_price?.toFixed(3) ?? '—'}</span><span>{row.estimated_price?.toFixed(4) ?? '—'}</span><strong className={row.premium_rate !== null && row.premium_rate >= 0 ? 'up' : 'down'}>{row.premium_rate === null ? '—' : `${row.premium_rate >= 0 ? '+' : ''}${(row.premium_rate * 100).toFixed(2)}%`}</strong></div>)}</div> : <p className="market-research-empty">暂无有效溢价快照，管理员可在后台刷新。</p>}</section>
+}
+
 function Detail({ item, snapshot, period, setPeriod, series, dailyLoading, dailyError, onRetryDaily }: {
   item: { symbol: string, name: string },
   snapshot?: MarketSnapshot,
@@ -387,6 +660,7 @@ function Detail({ item, snapshot, period, setPeriod, series, dailyLoading, daily
   const quote = snapshot?.quote ?? {}
   const pricePrecision = snapshot?.price_precision ?? 2
   const l2Available = snapshot?.capabilities.l2?.available === true
+  const coreL2Error = snapshot?.source_errors?.core_metrics
   const depthAvailable = snapshot?.capabilities.order_book?.available === true || snapshot?.capabilities.trades?.available === true
   const latestIntradayTime = snapshot?.timeshare.at(-1)?.time
   const intradayTimes = snapshot?.timeshare.map((point) => point.time) ?? []
@@ -434,29 +708,30 @@ function Detail({ item, snapshot, period, setPeriod, series, dailyLoading, daily
       ['换手', display(quote.turnover_rate)],
       ['成交量', display(quote.volume)],
     ]
-  const sourceLabel = snapshot?.source === 'TENCENT_PUBLIC'
-    ? '腾讯公开行情'
-    : snapshot?.source === 'SINA_PUBLIC'
-      ? '新浪公开行情'
-      : '公开行情'
+  const sourceLabel = marketSourceLabel(snapshot?.source, snapshot?.market_phase)
+  const phaseLabel = marketPhaseLabel(snapshot?.market_phase)
   return <section className="market-detail">
     <header className="market-quote-head">
       <div><p>{item.symbol} · {selectedDailyBar ? `${selectedDailyBar.time} 日K` : '实时行情'}</p><h1>{snapshot?.name ?? item.name}</h1></div>
       <div className={`market-last-price market-number-${changeTone}`}><strong>{displayedPrice}</strong><span>{displayedChange}</span></div>
-      <div className="market-live-status"><i className={snapshot?.stale ? 'stale' : ''} /><span>{sourceLabel}</span><span>{selectedDailyBar ? '十字线选中日' : snapshot?.source_time ? `${snapshot.source_time} 更新` : '正在读取公开行情'}</span></div>
+      <div className="market-live-status"><i className={snapshot?.stale ? 'stale' : ''} /><span>{phaseLabel}</span><span>{sourceLabel}</span><span>{selectedDailyBar ? '十字线选中日' : snapshot?.source_time ? `${snapshot.source_time} 更新` : '正在读取行情'}</span></div>
     </header>
     <div className="market-quote-strip">
       {quoteFields.map(([label, value]) => <div key={label}><span>{label}</span><strong>{value}</strong></div>)}
     </div>
     <section className="market-chart-panel">
       <nav className="market-period-tabs" aria-label="图表周期">{chartPeriods.map(([value, label]) => <button type="button" key={value} className={period === value ? 'active' : ''} onClick={() => setPeriod(value)}>{label}</button>)}</nav>
-      {l2Available && <section className="market-metric-grid">
+      {!isFundFlowPeriod(period) && l2Available && <section className="market-metric-grid">
         {[
-          ['大单净量', quote.large_order_net], ['大单金额', quote.large_order_amount], ['散户数量', quote.retail_count], ['MACDFS', quote.macdfs],
+          ['大单净量', quote.large_order_net], ['大单金额', quote.large_order_amount == null ? null : `${Number(quote.large_order_amount.replace(/万元?$/, '')).toFixed(2)}万元`], ['散户数量', quote.retail_count], ['MACDFS', quote.macdfs],
         ].map(([label, value]) => <article key={label}><span>{label}</span><strong className={`market-number-${tone(value)}`}>{display(value)}</strong></article>)}
       </section>}
-      {l2Available && snapshot && <FundFlow values={snapshot.main_fund_flow} />}
-      {period === 'timeshare'
+      {isFundFlowPeriod(period) && snapshot && <FundFlow symbol={item.symbol} values={snapshot.main_fund_flow} refreshEnabled={snapshot.market_phase === 'CONTINUOUS' || snapshot.market_phase === 'PREOPEN_QUOTE' || snapshot.market_phase === 'CALL_AUCTION' || snapshot.market_phase === 'AUCTION_LOCKED'} />}
+      {isFundFlowPeriod(period) && !snapshot && <FundFlowHistoryPanel symbol={item.symbol} pollingEnabled={false} />}
+      {!isFundFlowPeriod(period) && !l2Available && coreL2Error && <div className="market-capability-gap market-core-l2-gap"><strong>核心八项直连暂不可用</strong><span>{coreL2Error}</span></div>}
+      {period === 'dark_pool'
+        ? null
+        : period === 'timeshare'
         ? <>
           <LineChart name={snapshot?.name ?? item.name} points={snapshot?.timeshare ?? []} pricePrecision={pricePrecision} selectedTime={intradaySelectedTime} onSelectionChange={setIntradaySelectedTime} />
           {l2Available && <MarketIntradayCharts symbol={snapshot?.symbol ?? item.symbol} series={snapshot?.intraday_series ?? {}} selectedTime={intradaySelectedTime} />}
@@ -467,6 +742,7 @@ function Detail({ item, snapshot, period, setPeriod, series, dailyLoading, daily
           ? <div className="market-capability-gap"><strong>公开 K 线暂不可用</strong><span>服务会保留最近一次已验证缓存，并允许稍后重试。</span></div>
           : <CandleChart name={snapshot?.name ?? item.name} bars={series?.bars ?? []} />}
     </section>
+    <ResearchReplayPanel symbol={item.symbol} />
     {depthAvailable && <section className="market-section market-level2">
       <div className="market-section-title"><div><span>LEVEL 2</span><h3>盘口与逐笔</h3></div></div>
       <div className="market-capability-grid">
@@ -484,7 +760,7 @@ export function MarketApp() {
   const [groupId, setGroupId] = useState<number | null>(null)
   const [selected, setSelected] = useState<string | null>(null)
   const [snapshots, setSnapshots] = useState<Record<string, MarketSnapshot>>({})
-  const [period, setPeriod] = useState<ChartPeriod>('timeshare')
+  const [period, setPeriod] = useState<ChartPeriod>('dark_pool')
   const [legacySeries, setLegacySeries] = useState<MarketSeriesPage>()
   const [dailySeries, setDailySeries] = useState<Record<string, MarketSeriesPage>>({})
   const [dailyLoading, setDailyLoading] = useState<Record<string, boolean>>({})
@@ -537,14 +813,35 @@ export function MarketApp() {
   }, [])
 
   useEffect(() => {
-    if (!selected || auth !== 'authenticated' || user?.must_change_password || connection === 'live') return
+    const handleAuthExpired = () => {
+      socket.current?.close()
+      socket.current = null
+      requestedDailySeries.current.clear()
+      setUser(null)
+      setAuth('anonymous')
+      setGroups([])
+      setGroupId(null)
+      setSelected(null)
+      setSnapshots({})
+      setLegacySeries(undefined)
+      setDailySeries({})
+      setDailyLoading({})
+      setDailyErrors({})
+      setMessage('')
+    }
+    window.addEventListener(marketAuthExpiredEvent, handleAuthExpired)
+    return () => window.removeEventListener(marketAuthExpiredEvent, handleAuthExpired)
+  }, [])
+
+  useEffect(() => {
+    if (!selected || auth !== 'authenticated' || user?.must_change_password) return
     let active = true
     const controller = new AbortController()
     void marketApi.snapshot(selected, controller.signal).then((snapshot) => {
       if (active) setSnapshots((current) => ({ ...current, [snapshot.symbol]: snapshot }))
     }).catch((reason) => { if (active && !controller.signal.aborted) setMessage(reason instanceof Error ? reason.message : '行情读取失败') })
     return () => { active = false; controller.abort() }
-  }, [auth, connection, selected, user?.must_change_password])
+  }, [auth, selected, user?.must_change_password])
 
   useEffect(() => {
     if (period !== 'day' || !selected || auth !== 'authenticated' || user?.must_change_password || requestedDailySeries.current.has(selected)) return
@@ -558,7 +855,7 @@ export function MarketApp() {
       delete next[requestedSymbol]
       return next
     })
-    void marketApi.series(requestedSymbol, 'day', controller.signal).then((value) => {
+    void marketApi.series(requestedSymbol, 'day', controller.signal, dailyRetryVersion > 0).then((value) => {
       completed = true
       setDailySeries((current) => ({ ...current, [requestedSymbol]: value }))
     }).catch((reason) => {
@@ -591,7 +888,7 @@ export function MarketApp() {
   }
 
   useEffect(() => {
-    if (period === 'timeshare' || period === 'day' || !selected || !selectedKlineAvailable) {
+    if (period === 'dark_pool' || period === 'timeshare' || period === 'day' || !selected || !selectedKlineAvailable) {
       setLegacySeries(undefined)
       return
     }
@@ -747,7 +1044,7 @@ export function MarketApp() {
           const snapshot = snapshots[item.symbol]
           const removing = removingSymbol === item.symbol
           return <div key={item.symbol} className={`market-symbol-row${selected === item.symbol ? ' active' : ''}`}>
-            <button type="button" className="market-symbol-select" onClick={() => { setSelected(item.symbol); setPeriod('timeshare') }} aria-label={`${item.name} ${item.symbol}`}>
+            <button type="button" className="market-symbol-select" onClick={() => { setSelected(item.symbol); setPeriod('dark_pool') }} aria-label={`${item.name} ${item.symbol}`}>
               <span><strong className="market-symbol-name">{item.name}</strong><small>{item.symbol}</small></span><span className={`market-number-${tone(snapshot?.quote.change_percent)}`}><strong>{display(snapshot?.quote.price)}</strong><small>{display(snapshot?.quote.change_percent)}</small></span>
             </button>
             <button
@@ -762,6 +1059,8 @@ export function MarketApp() {
         <footer>每位用户最多 50 只自选股</footer>
       </aside>
       <div className="market-main-pane">
+        <PortfolioMonitor onSelect={(symbol) => { setSelected(symbol); setPeriod('dark_pool') }} />
+        <PremiumMonitor />
         {message && <div className="market-message" role="status">{message}<button type="button" onClick={() => setMessage('')}>关闭</button></div>}
         {selectedItem ? <Detail key={selectedItem.symbol} item={selectedItem} snapshot={snapshots[selectedItem.symbol]} period={period} setPeriod={setPeriod} series={period === 'day' ? dailySeries[selectedItem.symbol] : legacySeries} dailyLoading={dailyLoading[selectedItem.symbol] === true} dailyError={dailyErrors[selectedItem.symbol]} onRetryDaily={() => retryDailySeries(selectedItem.symbol)} /> : <section className="market-no-selection"><div className="market-brand-mark">顺</div><h1>从自选中选择一只股票</h1><p>基础行情由公开数据源更新，直连指标作为可选增强。</p></section>}
       </div>

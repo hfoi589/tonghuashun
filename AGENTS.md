@@ -173,6 +173,13 @@ GET /api/v1/jobs/{public_id}
 
 ### Market 公开行情契约
 
+- 工作日 09:10–09:30 由 `MarketPhaseResolver` 切换到集合竞价阶段；`4051/34834`
+  App 状态优先，本地交易日判断只作回退。阶段快照新增
+  `market_phase`，来源可为 `THS_AUCTION` 或 `THS_DIRECT_QUOTE`。
+- 竞价阶段只允许已验证的 9528 直连和当日 Redis 最近有效值；直连失败不得回退
+  腾讯/新浪。1004 竞价请求使用 APK 实际页面参数 `6002`，不得使用未经验证的页面号。
+- 09:30 起恢复腾讯公开报价、失败回退新浪；公开源首次失败可暂时保留当日最后
+  竞价值，但必须通过 `source_errors.auction_quote` 标记异常。
 - Market 基础报价、当日分时和五日/周/月 K 线使用腾讯公开接口；腾讯基础报价
   失败时可使用新浪公开报价。
 - 前复权日 K 优先使用同花顺公开 Web K 线，失败时使用腾讯公开 qfq 日 K，
@@ -402,6 +409,17 @@ chart heading is present; it is never a source for any field in `values`.
 
 ### Public market contract
 
+- On trading days, 09:10–09:30 uses `MarketPhaseResolver`: verified App status
+  `4051/34834` has priority, with local trading-day/time only as fallback. The
+  snapshot includes `market_phase`; direct sources are `THS_AUCTION` or
+  `THS_DIRECT_QUOTE`.
+- During the auction window, only verified 9528 direct data or the same-day
+  Redis last-valid value is allowed. It must never fall back to Tencent/Sina;
+  the APK's verified 1004 request uses page `6002`; do not substitute an
+  unverified page identifier.
+- At 09:30 the source returns to Tencent then Sina. A first public-source
+  failure may retain the same-day auction value, but must set
+  `source_errors.auction_quote`.
 - Tencent public endpoints own basic quotes, current-day intraday data, and
   five-day/weekly/monthly series; Sina public quotes are the basic fallback.
 - Front-adjusted daily K-line uses the public Tonghuashun web feed, then
@@ -443,3 +461,21 @@ never use OCR, UI text, or a guessed public endpoint. The raw cookie, User-Agent
 auth packet, and protocol keys must not appear in logs, task records, or public
 responses. `frida` remains the default transport and the only allowed fallback
 when a direct client is not selected.
+
+<!-- CANVAS_DEV_PLATFORM_START -->
+## Canvas Dev 平台感知
+
+本项目可能由 Canvas Dev 平台管理。Canvas Dev 会管理工作区、会话、终端、文件、节点和多 Agent 协作。
+
+如果环境变量 `CANVAS_DEV=1` 存在，说明当前 agent 是由 Canvas Dev 启动的。常见环境变量：
+
+- `CANVAS_AGENT`: 当前 agent 类型
+- `CANVAS_SESSION_NAME`: 当前平台会话名
+- `CANVAS_WORKSPACE_ID`: 当前工作区 ID
+- `CANVAS_SPACE_ID`: 当前空间 ID
+- `CANVAS_PLATFORM_CONTEXT`: 当前会话的平台上下文文件路径
+
+默认不要读取其他 agent 的对话上下文，除非用户明确要求。需要了解当前平台动态信息时，优先读取 `CANVAS_PLATFORM_CONTEXT`。
+
+- Canvas workspace: `同花顺` (`86593fbc3214`)
+<!-- CANVAS_DEV_PLATFORM_END -->

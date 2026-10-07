@@ -251,6 +251,125 @@ def test_removing_a_symbol_everywhere_is_scoped_to_the_authenticated_user(tmp_pa
     assert [item.symbol for item in store.list_watchlists(second.id)[0].items] == ["601872"]
 
 
+def test_list_watchlist_symbols_deduplicates_across_users_and_groups(tmp_path) -> None:
+    store = SQLiteMarketAccountStore(tmp_path / "market.db")
+    first = store.create_user("first", "temporary-123")
+    second = store.create_user("second", "temporary-123")
+    first_group = store.list_watchlists(first.id)[0]
+    second_group = store.list_watchlists(second.id)[0]
+    store.add_symbol(first.id, first_group.id, SymbolLookup(symbol="601872", name="招商轮船", market="17"))
+    store.add_symbol(first.id, first_group.id, SymbolLookup(symbol="600026", name="中远海能", market="17"))
+    store.add_symbol(second.id, second_group.id, SymbolLookup(symbol="601872", name="招商轮船", market="17"))
+
+    assert store.list_watchlist_symbols() == ["600026", "601872"]
+
+
+def test_monitoring_enabled_timestamp_is_added_and_backfilled_from_user_creation(tmp_path) -> None:
+    store = SQLiteMarketAccountStore(tmp_path / "market.db")
+    user = store.create_user("first", "temporary-123")
+    group = store.list_watchlists(user.id)[0]
+    store.add_symbol(user.id, group.id, SymbolLookup("601872", "招商轮船", "17"))
+
+    columns = {
+        row["name"] for row in store._connection.execute("PRAGMA table_info(watchlist_items)")
+    }
+
+    assert "monitoring_enabled_at" in columns
+    rows = store._connection.execute(
+        "SELECT monitoring_enabled_at FROM watchlist_items WHERE symbol='601872'"
+    ).fetchall()
+    assert len(rows) == 1
+    assert rows[0]["monitoring_enabled_at"]
+
+
+def test_admin_monitoring_list_tracks_users_dates_and_deduplicates_groups(tmp_path) -> None:
+    store = SQLiteMarketAccountStore(tmp_path / "market.db")
+    first = store.create_user("first", "temporary-123")
+    second = store.create_user("second", "temporary-123")
+    first_group = store.create_group(first.id, "航运")
+    second_group = store.list_watchlists(second.id)[0]
+    item = SymbolLookup(symbol="601872", name="招商轮船", market="17")
+    store.add_symbol(first.id, first_group.id, item)
+    store.add_symbol(second.id, second_group.id, item)
+    first_since = "2026-09-20T03:00:00+00:00"
+    second_since = "2026-09-22T03:00:00+00:00"
+    with store._connection:
+        store._connection.execute(
+            "UPDATE watchlist_items SET monitoring_enabled_at=? WHERE group_id IN (SELECT id FROM watchlist_groups WHERE user_id=?) AND symbol=?",
+            (first_since, first.id, item.symbol),
+        )
+        store._connection.execute(
+            "UPDATE watchlist_items SET monitoring_enabled_at=? WHERE group_id IN (SELECT id FROM watchlist_groups WHERE user_id=?) AND symbol=?",
+            (second_since, second.id, item.symbol),
+        )
+
+    rows = store.list_admin_monitored_symbols()
+
+    assert rows == [{
+        "symbol": "601872",
+        "stock_name": "招商轮船",
+        "monitoring_date": "2026-09-20",
+        "monitoring_users": ["first", "second"],
+    }]
+
+
+def test_monitoring_reenable_resets_date_and_disabled_accounts_are_excluded(tmp_path, monkeypatch) -> None:
+    from datetime import datetime, timezone
+    import level2_service.market_accounts as market_accounts
+
+    current = datetime(2026, 9, 20, 3, tzinfo=timezone.utc)
+    monkeypatch.setattr(market_accounts, "_utc_now", lambda: current)
+    store = SQLiteMarketAccountStore(tmp_path / "market.db")
+    user = store.create_user("first", "temporary-123")
+    group = store.list_watchlists(user.id)[0]
+    store.add_symbol(user.id, group.id, SymbolLookup("601872", "招商轮船", "17"))
+
+    store.set_monitoring_enabled(user.id, "601872", False)
+    assert store.list_admin_monitored_symbols() == []
+    current = datetime(2026, 9, 24, 3, tzinfo=timezone.utc)
+    store.set_monitoring_enabled(user.id, "601872", True)
+
+    assert store._connection.execute(
+        "SELECT monitoring_enabled_at FROM watchlist_items WHERE symbol='601872'"
+    ).fetchone()[0] == "2026-09-24T03:00:00+00:00"
+    store.set_user_enabled(user.id, False)
+    assert store.list_admin_monitored_symbols() == []
+
+
+def test_legacy_enabled_watchlists_backfill_monitoring_date_from_user_creation(tmp_path) -> None:
+    import sqlite3
+
+    path = tmp_path / "legacy.db"
+    connection = sqlite3.connect(path)
+    connection.executescript(
+        """
+        CREATE TABLE market_users (
+            id INTEGER PRIMARY KEY, username TEXT NOT NULL, password_hash TEXT NOT NULL,
+            enabled INTEGER NOT NULL, must_change_password INTEGER NOT NULL, created_at TEXT NOT NULL
+        );
+        CREATE TABLE watchlist_groups (
+            id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL, name TEXT NOT NULL,
+            sort_order INTEGER NOT NULL, is_primary INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE TABLE watchlist_items (
+            group_id INTEGER NOT NULL, symbol TEXT NOT NULL, name TEXT NOT NULL,
+            market TEXT NOT NULL, sort_order INTEGER NOT NULL, monitoring_enabled INTEGER NOT NULL DEFAULT 1,
+            PRIMARY KEY(group_id,symbol)
+        );
+        INSERT INTO market_users VALUES(1,'legacy','hash',1,0,'2025-08-19T09:00:00+08:00');
+        INSERT INTO watchlist_groups VALUES(1,1,'自选',0,1);
+        INSERT INTO watchlist_items VALUES(1,'601872','招商轮船','17',0,1);
+        """
+    )
+    connection.close()
+
+    store = SQLiteMarketAccountStore(path)
+
+    assert store._connection.execute(
+        "SELECT monitoring_enabled_at FROM watchlist_items WHERE symbol='601872'"
+    ).fetchone()[0] == "2025-08-19T09:00:00+08:00"
+
+
 def test_market_sessions_expire_and_can_be_revoked_per_user() -> None:
     now = datetime(2026, 8, 23, tzinfo=timezone.utc)
     sessions = InMemoryMarketSessionStore(

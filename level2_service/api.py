@@ -6,10 +6,11 @@ import json
 import logging
 import re
 import secrets
+import time
 from threading import RLock
 from asyncio import FIRST_COMPLETED, CancelledError, Event, TimeoutError, create_task, gather, get_running_loop, sleep, to_thread, wait, wait_for
 from contextlib import asynccontextmanager
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import AsyncIterator, Callable, Mapping, Optional
 from zoneinfo import ZoneInfo
@@ -33,6 +34,7 @@ from .device_lifecycle import (
 )
 from .models import CaptureKind, CaptureStatus, TaskRecord, TaskStatus, ValueSource, utc_now
 from .market_api import install_market_routes
+from .market_data import is_china_market_open
 from .parsed_values import (
     DirectRequestError,
     SymbolLookup,
@@ -53,10 +55,96 @@ from .runner import (
 )
 from .security import AdminSessionManager, persist_password_hash
 from .symbol_cache import SymbolLookupCache
+from .request_logs import RequestLogStore
+from .workday_calendar import ChinaLegalWorkdayCalendar, default_china_workday_calendar
 
 
 logger = logging.getLogger(__name__)
 
+def detect_device_type(user_agent: str | None) -> str:
+    ua = (user_agent or "").lower()
+    if "iphone" in ua: return "iPhone"
+    if "ipad" in ua: return "iPad"
+    if "huawei" in ua or "honor" in ua: return "华为/荣耀手机"
+    if "samsung" in ua: return "三星手机"
+    if "xiaomi" in ua or "miui" in ua: return "小米手机"
+    if "oppo" in ua: return "OPPO 手机"
+    if "vivo" in ua: return "vivo 手机"
+    if "android" in ua: return "Android 手机"
+    if "macintosh" in ua or "mac os" in ua: return "Mac 电脑"
+    if "windows" in ua: return "Windows 电脑"
+    if "linux" in ua: return "Linux 电脑"
+    return "其他设备"
+
+
+
+class AdminLogsResponse(BaseModel):
+    items: list[dict]
+    total: int
+    limit: int
+    offset: int
+
+
+def _request_log_stock_name(app: FastAPI, symbol: str | None) -> str | None:
+    if not symbol:
+        return None
+    try:
+        expected_market = market_code_for_symbol(symbol)
+    except UnsupportedMarketError:
+        return None
+
+    catalog = getattr(app.state, "symbol_catalog", None)
+    # Logs may show an exact identity from the active local snapshot while a
+    # stale catalog blocks new confirmations; public lookup remains strict.
+    lookups = (
+        getattr(catalog, "lookup", None),
+        getattr(catalog, "lookup_existing", None),
+    )
+    for lookup in lookups:
+        if not callable(lookup):
+            continue
+        try:
+            identity = lookup(symbol)
+        except Exception:
+            continue
+        name = getattr(identity, "name", None)
+        if (
+            getattr(identity, "symbol", None) == symbol
+            and getattr(identity, "market", None) == expected_market
+            and isinstance(name, str)
+            and name.strip()
+        ):
+            return name.strip()
+    return None
+
+
+def _request_log_error_detail(response: Response) -> str | None:
+    """Extract only the bounded JSON error detail for request diagnostics."""
+    body = getattr(response, "body", None)
+    if not isinstance(body, (bytes, bytearray)):
+        return None
+    try:
+        payload = json.loads(bytes(body).decode("utf-8"))
+    except (UnicodeDecodeError, ValueError, json.JSONDecodeError):
+        return None
+    detail = payload.get("detail") if isinstance(payload, dict) else None
+    if not isinstance(detail, str):
+        return None
+    cleaned = " ".join(detail.split())
+    return cleaned[:256] or None
+
+
+async def _refresh_symbol_catalog(catalog: object) -> None:
+    refresh = getattr(catalog, "refresh", None)
+    if not callable(refresh):
+        return
+    try:
+        await to_thread(refresh)
+    except Exception as error:
+        code = getattr(error, "error_code", None)
+        if not isinstance(code, str) or not re.fullmatch(r"[A-Z0-9_]{1,80}", code):
+            code = type(error).__name__
+        logger.warning("symbol catalog refresh failed (%s)", code)
 
 class RunnerWake:
     """Thread-safe wake signal for the lifespan-owned runner loop."""
@@ -233,6 +321,7 @@ class TaskResponse(BaseModel):
     captures: list[CaptureResponse]
     values: TaskValuesResponse
     value_sources: TaskValueSourcesResponse
+    market_snapshot: Optional[dict] = None
     long_capture: LongCaptureResponse
 
 
@@ -285,6 +374,7 @@ class AccountSessionStatusResponse(BaseModel):
     state: str
     updated_at: Optional[datetime]
     error_code: Optional[str]
+    expires_at: Optional[date]
 
 
 class AccountSessionsResponse(BaseModel):
@@ -326,12 +416,20 @@ def create_app(
     symbol_catalog: object | None = None,
     symbol_catalog_refresh_hour: int = 16,
     symbol_catalog_refresh_minute: int = 20,
+    previous_trading_date: Callable[[str], str] | None = None,
     core_prewarmer: Callable[[str | None], None] | None = None,
     core_session_invalidator: Callable[[], None] | None = None,
     managed_resources: tuple[object, ...] = (),
     market_account_store: object | None = None,
     market_session_store: object | None = None,
     market_data_broker: object | None = None,
+    research_store: object | None = None,
+    research_monitor: object | None = None,
+    fund_flow_monitor: object | None = None,
+    research_monitor_interval_seconds: float = 25.0,
+    push_dispatcher: object | None = None,
+    premium_monitor: object | None = None,
+    premium_monitor_interval_seconds: float = 15.0,
     account_session_provider: SessionProvider | None = None,
     account_session_refreshers: Mapping[
         str,
@@ -339,12 +437,18 @@ def create_app(
     ]
     | None = None,
     device_lifecycle: DeviceLifecycleClient | None = None,
+    request_log_store: RequestLogStore | None = None,
+    workday_calendar: ChinaLegalWorkdayCalendar | None = None,
 ) -> FastAPI:
     """Build an isolated application instance for one service process."""
     if cleanup_interval_seconds <= 0:
         raise ValueError("cleanup_interval_seconds must be positive")
     if runner_poll_interval_seconds <= 0:
         raise ValueError("runner_poll_interval_seconds must be positive")
+    if research_monitor_interval_seconds <= 0:
+        raise ValueError("research_monitor_interval_seconds must be positive")
+    if premium_monitor_interval_seconds <= 0:
+        raise ValueError("premium_monitor_interval_seconds must be positive")
     if not 0 <= symbol_catalog_refresh_hour <= 23:
         raise ValueError("symbol_catalog_refresh_hour must be between 0 and 23")
     if not 0 <= symbol_catalog_refresh_minute <= 59:
@@ -364,6 +468,19 @@ def create_app(
                 except Exception:
                     pass
         await to_thread(app.state.store.recover_running)
+        log_store = app.state.request_log_store
+        backfill_names = getattr(log_store, "backfill_stock_names", None)
+        if callable(backfill_names):
+            try:
+                await to_thread(
+                    backfill_names,
+                    lambda symbol: _request_log_stock_name(app, symbol),
+                )
+            except Exception as error:
+                logger.warning(
+                    "request log stock-name backfill failed (%s)",
+                    type(error).__name__,
+                )
         deduplicate = getattr(app.state.store, "deduplicate_by_symbol", None)
         app.state.task_migration = (
             await to_thread(deduplicate)
@@ -427,6 +544,34 @@ def create_app(
                 except TimeoutError:
                     continue
 
+        async def research_loop() -> None:
+            while not stop.is_set():
+                try:
+                    if app.state.research_monitor is not None:
+                        await app.state.research_monitor.poll_once()
+                    if app.state.fund_flow_monitor is not None:
+                        await app.state.fund_flow_monitor.poll_once()
+                except Exception:
+                    logger.exception("research monitoring poll failed")
+                try:
+                    await wait_for(
+                        stop.wait(),
+                        timeout=research_monitor_interval_seconds,
+                    )
+                except TimeoutError:
+                    continue
+
+        async def premium_loop() -> None:
+            while not stop.is_set():
+                try:
+                    await app.state.premium_monitor.poll_once()
+                except Exception:
+                    logger.exception("premium monitoring poll failed")
+                try:
+                    await wait_for(stop.wait(), timeout=premium_monitor_interval_seconds)
+                except TimeoutError:
+                    continue
+
         async def symbol_catalog_loop() -> None:
             catalog = app.state.symbol_catalog
             if catalog is None:
@@ -441,10 +586,7 @@ def create_app(
                 not callable(needs_startup_refresh)
                 or needs_startup_refresh()
             ):
-                try:
-                    await to_thread(refresh)
-                except Exception:
-                    pass
+                await _refresh_symbol_catalog(catalog)
             while not stop.is_set():
                 local_now = datetime.now(ZoneInfo("Asia/Shanghai"))
                 next_refresh = local_now.replace(
@@ -464,17 +606,21 @@ def create_app(
                     continue
                 except TimeoutError:
                     pass
-                if callable(refresh):
-                    try:
-                        await to_thread(refresh)
-                    except Exception:
-                        pass
+                await _refresh_symbol_catalog(catalog)
 
         app.state.cleanup_stop = stop
         app.state.cleanup_task = create_task(retention_loop())
         app.state.runner_task = create_task(runner_loop()) if runner is not None else None
         app.state.market_task = (
             create_task(market_loop()) if app.state.market_data_broker is not None else None
+        )
+        app.state.research_task = (
+            create_task(research_loop())
+            if app.state.research_monitor is not None or app.state.fund_flow_monitor is not None
+            else None
+        )
+        app.state.premium_task = (
+            create_task(premium_loop()) if app.state.premium_monitor is not None else None
         )
         app.state.symbol_catalog_task = (
             create_task(symbol_catalog_loop())
@@ -491,6 +637,10 @@ def create_app(
                 await app.state.runner_task
             if app.state.market_task is not None:
                 await app.state.market_task
+            if app.state.research_task is not None:
+                await app.state.research_task
+            if app.state.premium_task is not None:
+                await app.state.premium_task
             if app.state.symbol_catalog_task is not None:
                 await app.state.symbol_catalog_task
             for resource in reversed(app.state.managed_resources):
@@ -502,6 +652,96 @@ def create_app(
                         pass
 
     app = FastAPI(title="THS Level2 Capture Service", lifespan=lifespan)
+
+    @app.middleware("http")
+    async def request_log_middleware(request: Request, call_next):
+        started = time.perf_counter()
+        request_payload = {}
+        if request.method in {"POST", "PATCH", "PUT"} and (request.url.path == "/api/v1/jobs" or request.url.path.startswith("/api/v1/watchlists")) :
+            try:
+                request_payload = json.loads((await request.body()).decode("utf-8"))
+            except Exception:
+                request_payload = {}
+        response = await call_next(request)
+        if response.status_code >= 400 and not isinstance(getattr(response, "body", None), (bytes, bytearray)):
+            body_iterator = getattr(response, "body_iterator", None)
+            if body_iterator is not None:
+                body = b"".join([
+                    chunk if isinstance(chunk, bytes) else str(chunk).encode("utf-8")
+                    async for chunk in body_iterator
+                ])
+                response = Response(
+                    content=body,
+                    status_code=response.status_code,
+                    headers=dict(response.headers),
+                    background=getattr(response, "background", None),
+                )
+        path = request.url.path
+        log_store = getattr(request.app.state, "request_log_store", None)
+        should_log = (
+            path.startswith("/api/v1/symbols")
+            or (path == "/api/v1/jobs" and request.method == "POST")
+            or (path.startswith("/api/v1/jobs/") and request.method != "GET" and "/events" not in path)
+            or (path.startswith("/api/v1/market") and request.method == "GET")
+            or (path.startswith("/api/v1/watchlists") and request.method in {"POST", "PATCH", "PUT", "DELETE"})
+        )
+        if log_store is not None and should_log:
+            symbol = request_payload.get("symbol") if isinstance(request_payload.get("symbol"), str) else None
+            if path == "/api/v1/symbols" and request.query_params.get("query"):
+                action = "symbol_search"
+            elif path.startswith("/api/v1/symbols/"):
+                action = "symbol_lookup"
+            elif path == "/api/v1/jobs":
+                action = "job_submit"
+            elif path.endswith("/retry"):
+                action = "job_retry"
+            elif path.endswith("/snapshot"):
+                action = "market_tab"
+            elif path.endswith("/series"):
+                action = "market_retry" if request.query_params.get("retry") == "1" else "market_tab"
+            elif path.endswith("/fund-flow/history"):
+                action = "fund_flow_history"
+            elif path.startswith("/api/v1/market"):
+                action = "market_query"
+            elif "/groups" in path and "/symbols" not in path:
+                action = "watchlist_group"
+            elif "/symbols" in path:
+                action = "watchlist_symbol"
+            else:
+                action = "query"
+            parts = path.split("/")
+            for part in parts:
+                if len(part) == 6 and part.isdigit(): symbol = part; break
+            task_status = None
+            public_id = None
+            stock_name = None
+            if "/jobs/" in path:
+                public_id = path.split("/jobs/", 1)[1].split("/", 1)[0]
+                task = getattr(request.app.state, "store", None)
+                task = task.get(public_id) if task is not None and hasattr(task, "get") else None
+                if task is not None:
+                    symbol = task.symbol
+                    task_status = getattr(task.status, "value", task.status)
+                    if action in {"job_submit", "job_retry"}:
+                        task_status = "已提交"
+            stock_name = _request_log_stock_name(request.app, symbol)
+            user_id = None
+            user_name = None
+            if path.startswith("/api/v1/market") or path.startswith("/api/v1/watchlists"):
+                session_store = getattr(request.app.state, "market_session_store", None)
+                session = session_store.get(request.cookies.get("ths_market_session")) if session_store is not None else None
+                user_id = getattr(session, "user_id", None)
+                accounts = getattr(request.app.state, "market_account_store", None)
+                user = accounts.get_user(user_id) if accounts is not None and user_id is not None else None
+                user_name = getattr(user, "username", None)
+            ua = request.headers.get("user-agent")
+            device = detect_device_type(ua)
+            try:
+                from .request_logs import RequestLogEntry
+                log_store.record(RequestLogEntry(timestamp=utc_now(), ip=request.client.host if request.client else None, user_id=user_id, user_name=user_name, device_type=device, user_agent=ua, path=path, action=action, symbol=symbol, stock_name=stock_name, status_code=response.status_code, task_status=task_status, error_code=None if response.status_code < 400 else f"HTTP_{response.status_code}", error_detail=_request_log_error_detail(response), duration_ms=(time.perf_counter()-started)*1000, public_id=public_id))
+            except Exception:
+                logger.exception("request log write failed")
+        return response
     app.state.store = store or InMemoryStreams()
     persist = None if password_persist_path is None else lambda value: persist_password_hash(password_persist_path, value)
     app.state.admin_sessions = AdminSessionManager(
@@ -518,6 +758,7 @@ def create_app(
     app.state.device_bridge = configured_bridges["core_metrics"]
     app.state.device_health_probes = dict(device_health_probes or {})
     app.state.device_lifecycle = device_lifecycle
+    app.state.request_log_store = request_log_store
     app.state.capture_root = (capture_root or Path("captures")).resolve()
     app.state.frontend_root = frontend_root.resolve() if frontend_root is not None else None
     app.state.secure_admin_cookies = secure_admin_cookies
@@ -533,7 +774,13 @@ def create_app(
     app.state.market_account_store = market_account_store
     app.state.market_session_store = market_session_store
     app.state.market_data_broker = market_data_broker
+    app.state.research_store = research_store
+    app.state.research_monitor = research_monitor
+    app.state.fund_flow_monitor = fund_flow_monitor
+    app.state.push_dispatcher = push_dispatcher
+    app.state.premium_monitor = premium_monitor
     app.state.account_session_provider = account_session_provider
+    app.state.workday_calendar = workday_calendar or default_china_workday_calendar()
     app.state.account_session_refreshers = dict(account_session_refreshers or {})
     set_capture_root = getattr(app.state.store, "set_capture_root", None)
     if callable(set_capture_root):
@@ -744,6 +991,99 @@ def create_app(
             raise HTTPException(status_code=404, detail="task not found")
         return task_response(task)
 
+    @app.get("/api/v1/jobs/{public_id}/fund-flow-history")
+    def get_task_fund_flow_history(public_id: str):
+        task = app.state.store.get(public_id)
+        market_open = is_china_market_open()
+        can_use_closed_timeout_history = (
+            task is not None
+            and task.status == TaskStatus.FAILED
+            and task.error_code == "DIRECT_PROTOCOL_RESPONSE_TIMEOUT"
+            and not market_open
+        )
+        if task is None or (
+            task.status not in {
+                TaskStatus.COMPLETED,
+                TaskStatus.PARTIAL,
+                TaskStatus.MARKET_SNAPSHOT,
+            }
+            and not can_use_closed_timeout_history
+        ):
+            raise HTTPException(status_code=404, detail="fund flow history not found")
+        accounts = app.state.market_account_store
+        research_store = app.state.research_store
+        if accounts is None or research_store is None:
+            raise HTTPException(status_code=404, detail="fund flow history not found")
+        list_symbols = getattr(accounts, "list_watchlist_symbols", None)
+        if not callable(list_symbols) or task.symbol not in set(list_symbols()):
+            raise HTTPException(status_code=404, detail="fund flow history not found")
+        trade_date = datetime.now(ZoneInfo("Asia/Shanghai")).strftime("%Y%m%d")
+        try:
+            history = research_store.read_fund_flow_history(task.symbol, trade_date if market_open else None)
+        except LookupError:
+            raise HTTPException(status_code=404, detail="fund flow history not found") from None
+        points = history["periods"]["today"]["points"]
+        if not points and not market_open:
+            for previous_date in history.get("available_dates", []):
+                if previous_date == history.get("trade_date"):
+                    continue
+                try:
+                    previous_history = research_store.read_fund_flow_history(task.symbol, previous_date)
+                except LookupError:
+                    continue
+                previous_points = previous_history["periods"]["today"]["points"]
+                if previous_points:
+                    history = previous_history
+                    points = previous_points
+                    break
+        if not points:
+            raise HTTPException(status_code=404, detail="fund flow history not found")
+        return {
+            "symbol": task.symbol,
+            "trade_date": history["trade_date"],
+            "period": "today",
+            "points": points,
+        }
+
+    @app.get("/api/v1/jobs/{public_id}/fund-flow-daily")
+    def get_task_fund_flow_daily(public_id: str, limit: int = Query(30, ge=1, le=60)):
+        task = app.state.store.get(public_id)
+        market_open = is_china_market_open()
+        can_use_closed_timeout_history = (
+            task is not None
+            and task.status == TaskStatus.FAILED
+            and task.error_code == "DIRECT_PROTOCOL_RESPONSE_TIMEOUT"
+            and not market_open
+        )
+        if task is None or (
+            task.status not in {
+                TaskStatus.COMPLETED,
+                TaskStatus.PARTIAL,
+                TaskStatus.MARKET_SNAPSHOT,
+            }
+            and not can_use_closed_timeout_history
+        ):
+            raise HTTPException(status_code=404, detail="fund flow daily not found")
+        accounts = app.state.market_account_store
+        research_store = app.state.research_store
+        if accounts is None or research_store is None:
+            raise HTTPException(status_code=404, detail="fund flow daily not found")
+        list_symbols = getattr(accounts, "list_watchlist_symbols", None)
+        if not callable(list_symbols) or task.symbol not in set(list_symbols()):
+            raise HTTPException(status_code=404, detail="fund flow daily not found")
+        try:
+            daily = research_store.read_fund_flow_daily(
+                task.symbol,
+                limit,
+                previous_trading_date,
+            )
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from None
+        return {
+            **daily,
+            "name": task.values.get("stock_name") or task.symbol,
+        }
+
     @app.post("/api/v1/jobs/{public_id}/retry", status_code=202, response_model=TaskResponse)
     def retry_public_job(public_id: str) -> TaskResponse:
         task = app.state.store.get(public_id)
@@ -889,6 +1229,14 @@ def create_app(
         response.delete_cookie("ths_admin_session", httponly=True, samesite="strict", secure=secure_admin_cookies)
         response.delete_cookie("ths_csrf", httponly=False, samesite="strict", secure=secure_admin_cookies)
 
+    @app.get("/api/admin/logs", response_model=AdminLogsResponse)
+    def admin_logs(limit: int = Query(50, ge=1, le=200), offset: int = Query(0, ge=0), symbol: str | None = None, status: str | None = None, ip: str | None = None, action: str | None = None, stock_name: str | None = None, device_type: str | None = None, user_agent: str | None = None, user_name: str | None = None, error_code: str | None = None, public_id: str | None = None, user_id: str | None = None, from_date: str | None = Query(None, alias="from"), to_date: str | None = Query(None, alias="to"), _session=Depends(require_admin)) -> AdminLogsResponse:
+        store = app.state.request_log_store
+        if store is None:
+            return AdminLogsResponse(items=[], total=0, limit=limit, offset=offset)
+        items, total = store.list(limit, offset, {"symbol": symbol, "status": status, "ip": ip, "action": action, "stock_name": stock_name, "user_name": user_name, "device_type": device_type, "user_agent": user_agent, "error_code": error_code, "public_id": public_id, "user_id": user_id, "from": from_date, "to": to_date})
+        return AdminLogsResponse(items=[item.__dict__ for item in items], total=total, limit=limit, offset=offset)
+
     @app.get("/api/admin/runner")
     def runner_health(_session=Depends(require_admin)) -> RunnerHealthResponse:
         return RunnerHealthResponse.model_validate(app.state.runner_control.health())
@@ -900,9 +1248,15 @@ def create_app(
                 status_code=503,
                 detail="account session storage unavailable",
             )
-        return AccountSessionStatusResponse.model_validate(
-            provider.status(role).as_public()
+        status = provider.status(role)
+        public = status.as_public()
+        expiry = (
+            app.state.workday_calendar.expiry_date(status.updated_at)
+            if role == "main_fund_flow"
+            else None
         )
+        public["expires_at"] = expiry.isoformat() if expiry is not None else None
+        return AccountSessionStatusResponse.model_validate(public)
 
     @app.get(
         "/api/admin/account-sessions",
@@ -1308,6 +1662,7 @@ def create_app(
         require_admin_csrf=require_csrf,
         resolve_symbol=resolve_symbol,
         secure_cookies=secure_admin_cookies,
+        previous_trading_date=previous_trading_date,
     )
 
     if app.state.frontend_root is not None:

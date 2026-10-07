@@ -1,4 +1,4 @@
-const CACHE = 'ths-market-shell-v1'
+const CACHE = 'ths-market-shell-v2'
 const SHELL = ['/market', '/market.webmanifest', '/market-icon.svg']
 self.addEventListener('install', (event) => event.waitUntil(caches.open(CACHE).then((cache) => cache.addAll(SHELL))))
 self.addEventListener('activate', (event) => event.waitUntil(caches.keys().then((keys) => Promise.all(keys.filter((key) => key !== CACHE).map((key) => caches.delete(key))))))

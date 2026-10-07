@@ -7,10 +7,14 @@ import pytest
 
 from level2_service.market_data import (
     KlineBar,
+    MarketPhase,
+    MarketPhaseResolver,
+    LocalTradingCalendar,
     MarketDataBroker,
     MarketSeriesPage,
     MarketSnapshot,
     TimesharePoint,
+    is_china_preopen_window,
     is_china_market_open,
 )
 
@@ -57,6 +61,80 @@ def test_china_market_schedule_uses_asia_shanghai_sessions() -> None:
     assert is_china_market_open(datetime(2026, 8, 23, 1, 31, tzinfo=timezone.utc)) is False
 
 
+def test_china_preopen_window_is_weekday_0900_through_0929() -> None:
+    assert is_china_preopen_window(datetime(2026, 8, 24, 1, 0, tzinfo=timezone.utc)) is True
+    assert is_china_preopen_window(datetime(2026, 8, 24, 1, 29, 59, tzinfo=timezone.utc)) is True
+    assert is_china_preopen_window(datetime(2026, 8, 24, 1, 30, tzinfo=timezone.utc)) is False
+    assert is_china_preopen_window(datetime(2026, 8, 23, 1, 15, tzinfo=timezone.utc)) is False
+
+
+def test_market_phase_resolver_switches_sources_at_auction_boundaries() -> None:
+    resolver = MarketPhaseResolver(is_trading_day=lambda _date: True)
+
+    assert resolver.resolve(datetime(2026, 8, 24, 1, 9, 59, tzinfo=timezone.utc)).phase is MarketPhase.CLOSED
+    assert resolver.resolve(datetime(2026, 8, 24, 1, 10, tzinfo=timezone.utc)).phase is MarketPhase.PREOPEN_QUOTE
+    assert resolver.resolve(datetime(2026, 8, 24, 1, 15, tzinfo=timezone.utc)).phase is MarketPhase.CALL_AUCTION
+    assert resolver.resolve(datetime(2026, 8, 24, 1, 25, tzinfo=timezone.utc)).phase is MarketPhase.AUCTION_LOCKED
+    assert resolver.resolve(datetime(2026, 8, 24, 1, 30, tzinfo=timezone.utc)).phase is MarketPhase.CONTINUOUS
+
+
+def test_market_phase_resolver_prefers_app_status_over_local_clock() -> None:
+    resolver = MarketPhaseResolver(is_trading_day=lambda _date: True)
+
+    state = resolver.resolve(
+        datetime(2026, 8, 24, 1, 16, tzinfo=timezone.utc),
+        app_phase=MarketPhase.CLOSED,
+        app_server_time="09:16:00",
+    )
+
+    assert state.phase is MarketPhase.CLOSED
+    assert state.source == "APP_STATUS"
+    assert state.server_time == "09:16:00"
+
+
+def test_market_phase_resolver_rejects_non_trading_day_before_time_mapping() -> None:
+    resolver = MarketPhaseResolver(is_trading_day=lambda _date: False)
+
+    state = resolver.resolve(datetime(2026, 8, 24, 1, 16, tzinfo=timezone.utc))
+
+    assert state.phase is MarketPhase.CLOSED
+    assert state.source == "LOCAL_CALENDAR"
+
+
+def test_local_trading_calendar_reads_json_dates_and_falls_back_when_unavailable(tmp_path) -> None:
+    calendar_path = tmp_path / "trading-calendar.json"
+    calendar_path.write_text('{"trading_days":["2026-08-24"]}', encoding="utf-8")
+    calendar = LocalTradingCalendar(calendar_path)
+
+    assert calendar.is_trading_day(datetime(2026, 8, 24, tzinfo=timezone.utc).date()) is True
+    assert calendar.is_trading_day(datetime(2026, 8, 25, tzinfo=timezone.utc).date()) is False
+
+    missing = LocalTradingCalendar(tmp_path / "missing.json")
+    assert missing.is_trading_day(datetime(2026, 8, 25, tzinfo=timezone.utc).date()) is True
+
+
+def test_local_trading_calendar_uses_bundled_legal_calendar_when_runtime_file_is_missing(tmp_path) -> None:
+    missing = LocalTradingCalendar(tmp_path / "missing.json")
+
+    assert missing.is_trading_day(datetime(2026, 9, 25, tzinfo=timezone.utc).date()) is False
+    assert missing.is_trading_day(datetime(2026, 9, 27, tzinfo=timezone.utc).date()) is False
+    assert missing.is_trading_day(datetime(2026, 9, 20, tzinfo=timezone.utc).date()) is True
+
+
+def test_local_trading_calendar_reads_legal_workday_calendar_format(tmp_path) -> None:
+    calendar_path = tmp_path / "trading-calendar.json"
+    calendar_path.write_text(
+        '{"version":1,"coverage_start":"2026-09-01","coverage_end":"2026-10-31",'
+        '"holidays":["2026-09-25"],"adjusted_workdays":["2026-09-20"]}',
+        encoding="utf-8",
+    )
+    calendar = LocalTradingCalendar(calendar_path)
+
+    assert calendar.is_trading_day(datetime(2026, 9, 25, tzinfo=timezone.utc).date()) is False
+    assert calendar.is_trading_day(datetime(2026, 9, 20, tzinfo=timezone.utc).date()) is True
+    assert calendar.is_trading_day(datetime(2026, 9, 27, tzinfo=timezone.utc).date()) is False
+
+
 def test_watchlist_only_symbols_refresh_every_two_seconds_during_quote_session() -> None:
     source = FakeMarketSource()
     now = [100.0]
@@ -67,10 +145,53 @@ def test_watchlist_only_symbols_refresh_every_two_seconds_during_quote_session()
     now[0] += 1.9
     asyncio.run(broker.poll_due())
     assert source.snapshot_calls == [("601872", False)]
-
     now[0] += 0.1
     asyncio.run(broker.poll_due())
     assert source.snapshot_calls == [("601872", False), ("601872", False)]
+
+
+def test_market_refresh_enforces_end_to_end_source_deadline() -> None:
+    class SlowSource(FakeMarketSource):
+        def read_market_snapshot(self, symbol: str, *, detail: bool) -> MarketSnapshot:
+            time.sleep(0.05)
+            return super().read_market_snapshot(symbol, detail=detail)
+
+    broker = MarketDataBroker(SlowSource(), refresh_timeout_seconds=0.01)
+
+    with pytest.raises(asyncio.TimeoutError):
+        asyncio.run(broker.refresh("601872", detail=True))
+
+
+def test_broker_uses_optional_batch_snapshot_reader_for_due_symbols() -> None:
+    class BatchSource(FakeMarketSource):
+        def __init__(self) -> None:
+            super().__init__()
+            self.batch_calls: list[tuple[set[str], set[str]]] = []
+
+        def read_market_snapshots(
+            self,
+            symbols: set[str],
+            *,
+            detail_symbols: set[str],
+        ) -> dict[str, MarketSnapshot]:
+            self.batch_calls.append((set(symbols), set(detail_symbols)))
+            return {
+                symbol: self.read_market_snapshot(symbol, detail=symbol in detail_symbols)
+                for symbol in symbols
+            }
+
+    source = BatchSource()
+    broker = MarketDataBroker(source, is_market_open=lambda: True)
+    broker.subscribe(
+        "client",
+        watchlist_symbols={"601872", "300750"},
+        detail_symbols={"601872"},
+    )
+
+    asyncio.run(broker.poll_due())
+
+    assert source.batch_calls == [({"601872", "300750"}, {"601872"})]
+    assert set(source.snapshot_calls) == {("601872", True), ("300750", False)}
 
 
 def test_closed_subscriptions_read_once_and_detail_switch_only_reads_clicked_symbol() -> None:
@@ -101,6 +222,28 @@ def test_closed_subscriptions_read_once_and_detail_switch_only_reads_clicked_sym
     asyncio.run(broker.refresh("300750", detail=True))
     asyncio.run(broker.poll_due())
     assert source.snapshot_calls == [("601872", True), ("300750", False), ("300750", True)]
+
+
+def test_closed_detail_refresh_reuses_last_snapshot_without_querying_source() -> None:
+    source = FakeMarketSource()
+    broker = MarketDataBroker(source, clock=lambda: 100.0, is_market_open=lambda: False)
+    snapshot = MarketSnapshot(
+        symbol="601872",
+        name="招商轮船",
+        market="17",
+        sequence=15,
+        source_time="15:00",
+        collected_at=datetime.now(timezone.utc),
+        quote={"price": "20.99"},
+        main_fund_flow={"today": {"main_net_inflow": "10.67"}},
+        capabilities={"l2": {"available": True}},
+    )
+    broker.seed(snapshot)
+
+    result = asyncio.run(broker.refresh("601872", detail=True))
+
+    assert result.quote["price"] == "20.99"
+    assert source.snapshot_calls == []
 
 
 def test_market_snapshot_exposes_public_source_and_price_precision() -> None:

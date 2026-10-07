@@ -114,6 +114,7 @@ def _valid_legacy_bound_acceptance(
 def _terminal_acceptance_retryable(task: TaskRecord) -> bool:
     return task.status in {
         TaskStatus.COMPLETED,
+        TaskStatus.MARKET_SNAPSHOT,
         TaskStatus.FAILED,
         TaskStatus.EXPIRED,
     } or (
@@ -144,23 +145,25 @@ class TaskStore(Protocol):
     def refresh_task(self, task_id: str, include_long_capture: bool | None = None) -> TaskRecord: ...
     def transition(self, task_id: str, status: TaskStatus, *, error_code: str | None = None, source_errors: dict[str, str | None] | None = None) -> TaskRecord: ...
     def complete_capture(self, task_id: str, kind: CaptureKind, path: str) -> TaskRecord: ...
-    def complete_result(self, task_id: str, values: dict[MetricKind, str | None], path: str | None, *, ocr_metrics: set[MetricKind] | None = None, source_errors: dict[str, str | None] | None = None, intraday_series: dict[MetricKind, dict[str, object]] | None = None) -> TaskRecord: ...
+    def complete_result(self, task_id: str, values: dict[MetricKind, str | None], path: str | None, *, ocr_metrics: set[MetricKind] | None = None, source_errors: dict[str, str | None] | None = None, intraday_series: dict[MetricKind, dict[str, object]] | None = None, ignore_fund_source_error: bool = False) -> TaskRecord: ...
+    def complete_market_snapshot(self, task_id: str, snapshot: dict[str, object]) -> TaskRecord: ...
     def events_after(self, task_id: str, event_index: int = 0) -> list[dict[str, str]]: ...
     def cleanup(self, now: datetime) -> list[TaskRecord]: ...
 
 
 _ALLOWED_TRANSITIONS = {
     TaskStatus.QUEUED: {TaskStatus.RUNNING, TaskStatus.FAILED},
-    TaskStatus.RUNNING: {TaskStatus.WAITING_ADMIN, TaskStatus.PARTIAL, TaskStatus.COMPLETED, TaskStatus.FAILED},
+    TaskStatus.RUNNING: {TaskStatus.WAITING_ADMIN, TaskStatus.PARTIAL, TaskStatus.COMPLETED, TaskStatus.MARKET_SNAPSHOT, TaskStatus.FAILED},
     TaskStatus.WAITING_ADMIN: {TaskStatus.RUNNING, TaskStatus.PARTIAL, TaskStatus.FAILED},
     TaskStatus.PARTIAL: {TaskStatus.RUNNING, TaskStatus.WAITING_ADMIN, TaskStatus.COMPLETED, TaskStatus.FAILED},
     TaskStatus.COMPLETED: set(),
+    TaskStatus.MARKET_SNAPSHOT: set(),
     TaskStatus.FAILED: set(),
     TaskStatus.EXPIRED: set(),
 }
 
 _ACTIVE_STATUSES = {TaskStatus.QUEUED, TaskStatus.RUNNING, TaskStatus.WAITING_ADMIN}
-_REFRESHABLE_STATUSES = {TaskStatus.COMPLETED, TaskStatus.PARTIAL, TaskStatus.FAILED, TaskStatus.EXPIRED}
+_REFRESHABLE_STATUSES = {TaskStatus.COMPLETED, TaskStatus.MARKET_SNAPSHOT, TaskStatus.PARTIAL, TaskStatus.FAILED, TaskStatus.EXPIRED}
 
 
 def _normalized_source_errors(
@@ -186,6 +189,7 @@ def _reset_task_for_refresh(task: TaskRecord, include_long_capture: bool | None 
     task.values = {kind: None for kind in MetricKind}
     task.value_sources = {kind: None for kind in MetricKind}
     task.intraday_series = normalized_intraday_series(None)
+    task.market_snapshot = None
     task.long_capture = LongCaptureRecord(
         status=CaptureStatus.PENDING if task.include_long_capture else CaptureStatus.SKIPPED,
     )
@@ -205,6 +209,11 @@ def _canonical_task(tasks: list[TaskRecord]) -> TaskRecord:
 
 def _restore_expired_task(task: TaskRecord) -> None:
     if task.status != TaskStatus.EXPIRED:
+        return
+    if task.market_snapshot is not None:
+        task.status = TaskStatus.MARKET_SNAPSHOT
+        task.error_code = None
+        task.updated_at = utc_now()
         return
     required_complete = all(task.values[kind] is not None for kind in REQUIRED_METRICS)
     fund_error = task.source_errors.get("main_fund_flow")
@@ -687,7 +696,7 @@ class InMemoryStreams:
         if source_errors is not None:
             task.source_errors = _normalized_source_errors(source_errors)
         task.updated_at = utc_now()
-        if status in {TaskStatus.COMPLETED, TaskStatus.FAILED}:
+        if status in {TaskStatus.COMPLETED, TaskStatus.MARKET_SNAPSHOT, TaskStatus.FAILED}:
             task.completed_at = task.updated_at
         self._emit(task)
         return task
@@ -708,7 +717,7 @@ class InMemoryStreams:
         self._emit(task)
         return task
 
-    def complete_result(self, task_id: str, values: dict[MetricKind, str | None], path: str | None, *, ocr_metrics: set[MetricKind] | None = None, source_errors: dict[str, str | None] | None = None, intraday_series: dict[MetricKind, dict[str, object]] | None = None) -> TaskRecord:
+    def complete_result(self, task_id: str, values: dict[MetricKind, str | None], path: str | None, *, ocr_metrics: set[MetricKind] | None = None, source_errors: dict[str, str | None] | None = None, intraday_series: dict[MetricKind, dict[str, object]] | None = None, ignore_fund_source_error: bool = False) -> TaskRecord:
         task = self._tasks[task_id]
         if task.status not in {TaskStatus.RUNNING, TaskStatus.PARTIAL}:
             raise InvalidTransitionError(f"{task.status.value} cannot accept a result")
@@ -744,7 +753,7 @@ class InMemoryStreams:
         task.collected_at = now
         task.updated_at = now
         required_complete = all(task.values[kind] is not None for kind in REQUIRED_METRICS)
-        fund_error = task.source_errors["main_fund_flow"]
+        fund_error = None if ignore_fund_source_error else task.source_errors["main_fund_flow"]
         task.status = (
             TaskStatus.COMPLETED
             if required_complete and fund_error is None
@@ -756,6 +765,31 @@ class InMemoryStreams:
             else fund_error if required_complete else "VALUE_RECOGNITION_FAILED"
         )
         task.completed_at = task.updated_at
+        self._emit(task)
+        return task
+
+    def complete_market_snapshot(
+        self,
+        task_id: str,
+        snapshot: dict[str, object],
+    ) -> TaskRecord:
+        task = self._tasks[task_id]
+        if task.status != TaskStatus.RUNNING:
+            raise InvalidTransitionError(
+                f"{task.status.value} cannot accept a market snapshot"
+            )
+        now = utc_now()
+        task.market_snapshot = dict(snapshot)
+        task.status = TaskStatus.MARKET_SNAPSHOT
+        task.error_code = None
+        task.collected_at = now
+        task.updated_at = now
+        task.completed_at = now
+        task.captures = {
+            kind: CaptureRecord(kind, status=CaptureStatus.SKIPPED)
+            for kind in CaptureKind
+        }
+        task.long_capture = LongCaptureRecord(status=CaptureStatus.SKIPPED)
         self._emit(task)
         return task
 
@@ -1070,7 +1104,7 @@ if lease.bound_task_id and lease.bound_task_id ~= cjson.null then
   if redis.call('HGET', KEYS[6], existing_task.symbol) == lease.bound_task_id then
     redis.call('HDEL', KEYS[6], existing_task.symbol)
   end
-  if existing_task.status == 'COMPLETED' or existing_task.status == 'FAILED' or existing_task.status == 'EXPIRED' or (existing_task.status == 'PARTIAL' and existing_task.completed_at and existing_task.completed_at ~= cjson.null) then
+if existing_task.status == 'COMPLETED' or existing_task.status == 'MARKET_SNAPSHOT' or existing_task.status == 'FAILED' or existing_task.status == 'EXPIRED' or (existing_task.status == 'PARTIAL' and existing_task.completed_at and existing_task.completed_at ~= cjson.null) then
     local pending = 0
     for _, task_id in ipairs(redis.call('SMEMBERS', KEYS[4])) do
       local payload = redis.call('GET', KEYS[3] .. task_id)
@@ -1407,7 +1441,7 @@ end
 if current.status == 'QUEUED' or current.status == 'RUNNING' or current.status == 'WAITING_ADMIN' then
   return payload
 end
-if current.status ~= 'COMPLETED' and current.status ~= 'PARTIAL' and current.status ~= 'FAILED' and current.status ~= 'EXPIRED' then
+if current.status ~= 'COMPLETED' and current.status ~= 'MARKET_SNAPSHOT' and current.status ~= 'PARTIAL' and current.status ~= 'FAILED' and current.status ~= 'EXPIRED' then
   return false
 end
 local pending = tonumber(redis.call('GET', KEYS[6]) or '0')
@@ -1906,7 +1940,7 @@ return ARGV[2]
         if source_errors is not None:
             task.source_errors = _normalized_source_errors(source_errors)
         task.updated_at = utc_now()
-        if status in {TaskStatus.COMPLETED, TaskStatus.FAILED}:
+        if status in {TaskStatus.COMPLETED, TaskStatus.MARKET_SNAPSHOT, TaskStatus.FAILED}:
             task.completed_at = task.updated_at
         self._persist_with_event(
             task,
@@ -1937,7 +1971,7 @@ return ARGV[2]
         )
         return task
 
-    def complete_result(self, task_id: str, values: dict[MetricKind, str | None], path: str | None, *, ocr_metrics: set[MetricKind] | None = None, source_errors: dict[str, str | None] | None = None, intraday_series: dict[MetricKind, dict[str, object]] | None = None) -> TaskRecord:
+    def complete_result(self, task_id: str, values: dict[MetricKind, str | None], path: str | None, *, ocr_metrics: set[MetricKind] | None = None, source_errors: dict[str, str | None] | None = None, intraday_series: dict[MetricKind, dict[str, object]] | None = None, ignore_fund_source_error: bool = False) -> TaskRecord:
         task = self._required(task_id)
         previous_status = task.status
         previous_payload = self._serialize(task)
@@ -1975,7 +2009,7 @@ return ARGV[2]
         task.collected_at = now
         task.updated_at = now
         required_complete = all(task.values[kind] is not None for kind in REQUIRED_METRICS)
-        fund_error = task.source_errors["main_fund_flow"]
+        fund_error = None if ignore_fund_source_error else task.source_errors["main_fund_flow"]
         task.status = (
             TaskStatus.COMPLETED
             if required_complete and fund_error is None
@@ -1990,6 +2024,38 @@ return ARGV[2]
         self._persist_with_event(
             task,
             delta=int(task.status in _ACTIVE_STATUSES) - int(previous_status in _ACTIVE_STATUSES),
+            previous_payload=previous_payload,
+        )
+        return task
+
+    def complete_market_snapshot(
+        self,
+        task_id: str,
+        snapshot: dict[str, object],
+    ) -> TaskRecord:
+        task = self._required(task_id)
+        previous_status = task.status
+        previous_payload = self._serialize(task)
+        if task.status != TaskStatus.RUNNING:
+            raise InvalidTransitionError(
+                f"{task.status.value} cannot accept a market snapshot"
+            )
+        now = utc_now()
+        task.market_snapshot = dict(snapshot)
+        task.status = TaskStatus.MARKET_SNAPSHOT
+        task.error_code = None
+        task.collected_at = now
+        task.updated_at = now
+        task.completed_at = now
+        task.captures = {
+            kind: CaptureRecord(kind, status=CaptureStatus.SKIPPED)
+            for kind in CaptureKind
+        }
+        task.long_capture = LongCaptureRecord(status=CaptureStatus.SKIPPED)
+        self._persist_with_event(
+            task,
+            delta=int(task.status in _ACTIVE_STATUSES)
+            - int(previous_status in _ACTIVE_STATUSES),
             previous_payload=previous_payload,
         )
         return task
@@ -2234,6 +2300,7 @@ return ARGV[2]
                 for _, kind, _ in INTRADAY_METRICS
                 if (series := task.intraday_series.get(kind)) is not None
             },
+            "market_snapshot": task.market_snapshot,
             "long_capture": {
                 "status": task.long_capture.status.value,
                 "path": str(task.long_capture.path) if task.long_capture.path else None,
@@ -2274,6 +2341,7 @@ return ARGV[2]
             ),
             error_code=raw["error_code"],
             source_errors=_normalized_source_errors(raw.get("source_errors")),
+            market_snapshot=raw.get("market_snapshot"),
         )
         for kind in CaptureKind:
             capture = raw.get("captures", {}).get(

@@ -858,7 +858,7 @@ export function AdminPage({ deviceStreamUrl, autoLoad = false }: { deviceStreamU
         {marketUsers === null ? <div>{marketUsersLoading ? <p className="minor" role="status">正在加载行情用户…</p> : marketUsersError ? <p className="error" role="alert">{marketUsersError}</p> : null}<button type="button" className="secondary" onClick={loadMarketUsers} disabled={marketUsersLoading}>{marketUsersError ? '重新加载行情用户' : '加载行情用户'}</button></div> : <>
           <form className="password-change-form" onSubmit={createMarketUser}>
             <label htmlFor="new-market-username">新用户名</label><input id="new-market-username" value={marketUsername} onChange={(event) => setMarketUsername(event.target.value)} minLength={3} required />
-            <label htmlFor="new-market-password">临时密码</label><input id="new-market-password" type="password" autoComplete="new-password" value={marketTemporaryPassword} onChange={(event) => setMarketTemporaryPassword(event.target.value)} minLength={8} required />
+            <label htmlFor="new-market-password">临时密码</label><input id="new-market-password" type="password" autoComplete="new-password" value={marketTemporaryPassword} onChange={(event) => setMarketTemporaryPassword(event.target.value)} required />
             <button type="submit" className="secondary">创建行情用户</button>
           </form>
           <div className="admin-market-user-list">{marketUsers.length === 0 ? <p className="minor">还没有行情用户。</p> : marketUsers.map((target) => <div key={target.id}>

@@ -1404,7 +1404,7 @@ class Level2Runner:
             self.control.heartbeat("READY")
             return None
         self.control.heartbeat("READY")
-        if allow_closed:
+        if allow_closed and self.control.queue_paused:
             try:
                 source = self.market_snapshot_source
                 reader = getattr(source, "read_market_snapshot", None)

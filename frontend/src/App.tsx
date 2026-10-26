@@ -883,12 +883,10 @@ export default function App({ initialTask }: { initialTask?: Job }) {
 
   useEffect(() => {
     const normalized = symbol.trim()
-    const numericInput = /^\d+$/.test(normalized)
     if (
       isAdmin
       || composingSymbol
       || /^\d{6}$/.test(normalized)
-      || numericInput
       || normalized.length < 2
       || normalized.length > 32
     ) {
@@ -908,7 +906,7 @@ export default function App({ initialTask }: { initialTask?: Job }) {
     const timer = window.setTimeout(() => {
       api.searchSymbols(normalized, controller.signal).then((results) => {
         if (controller.signal.aborted || suggestionSequence.current !== sequence) return
-        setSuggestions(results)
+        setSuggestions(results.slice(0, 10))
         setSuggestionState(results.length === 0 ? 'empty' : 'ready')
         setSuggestionsOpen(true)
         setActiveSuggestionIndex(-1)
@@ -1174,7 +1172,7 @@ export default function App({ initialTask }: { initialTask?: Job }) {
               onFocus={() => {
                 if (suggestionState !== 'idle') setSuggestionsOpen(true)
               }}
-              placeholder="输入代码或名称，例如 国盾"
+              placeholder="输入代码、名称或拼音前缀"
               maxLength={32}
             />
             {suggestionsOpen && <div
@@ -1209,7 +1207,7 @@ export default function App({ initialTask }: { initialTask?: Job }) {
           className={`symbol-lookup symbol-lookup-${symbolLookup.status}`}
           aria-live="polite"
         >
-          {symbolLookup.status === 'idle' && suggestionState === 'idle' && <span>输入六位代码，或至少两个字搜索股票名称</span>}
+          {symbolLookup.status === 'idle' && suggestionState === 'idle' && <span>输入 2 位以上代码、名称或拼音前缀搜索</span>}
           {symbolLookup.status === 'idle' && suggestionState === 'ready' && <span>选择候选后将进行六位代码精确确认</span>}
           {symbolLookup.status === 'loading' && <span>正在查询股票…</span>}
           {symbolLookup.status === 'invalid' && <span>未找到该股票</span>}

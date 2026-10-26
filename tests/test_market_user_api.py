@@ -1,8 +1,16 @@
 from argon2 import PasswordHasher
 from fastapi.testclient import TestClient
+from pydantic import ValidationError
+import pytest
 
 from level2_service.api import create_app
 from level2_service.market_accounts import InMemoryMarketSessionStore, SQLiteMarketAccountStore
+from level2_service.market_api import (
+    AdminCreateMarketUserRequest,
+    AdminUpdateMarketUserRequest,
+    MarketLoginRequest,
+    MarketPasswordRequest,
+)
 from level2_service.parsed_values import SymbolLookup
 
 
@@ -54,6 +62,22 @@ def _login_and_change_password(client: TestClient, username: str = "trader") -> 
         },
     )
     assert changed.status_code == 204
+
+
+@pytest.mark.parametrize(
+    ("model", "payload"),
+    [
+        (MarketLoginRequest, {"username": "trader", "password": "x" * 257}),
+        (MarketPasswordRequest, {"current_password": "x" * 257, "new_password": "x", "new_password_confirmation": "x"}),
+        (MarketPasswordRequest, {"current_password": "x", "new_password": "x" * 257, "new_password_confirmation": "x"}),
+        (MarketPasswordRequest, {"current_password": "x", "new_password": "x", "new_password_confirmation": "x" * 257}),
+        (AdminCreateMarketUserRequest, {"username": "trader", "temporary_password": "x" * 257}),
+        (AdminUpdateMarketUserRequest, {"temporary_password": "x" * 257}),
+    ],
+)
+def test_market_password_request_schemas_reject_values_longer_than_256_characters(model, payload) -> None:
+    with pytest.raises(ValidationError):
+        model.model_validate(payload)
 
 
 def test_admin_creates_users_and_user_manages_grouped_watchlists(tmp_path) -> None:

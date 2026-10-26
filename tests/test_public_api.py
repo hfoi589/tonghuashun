@@ -63,7 +63,7 @@ def test_public_symbol_search_returns_app_candidates_without_confirming_them() -
 
     response = TestClient(app).get(
         "/api/v1/symbols",
-        params={"query": "国盾", "limit": 8},
+        params={"query": "国盾", "limit": 10},
     )
 
     assert response.status_code == 200
@@ -73,8 +73,19 @@ def test_public_symbol_search_returns_app_candidates_without_confirming_them() -
         "market": "17",
         "market_label": "科创",
     }]
-    assert search.calls == [("国盾", 8)]
+    assert search.calls == [("国盾", 10)]
     assert lookup.calls == []
+
+
+def test_public_symbol_search_rejects_more_than_ten_candidates() -> None:
+    app = create_app(symbol_lookup=FakeSymbolLookup(), symbol_search=FakeSymbolSearch())
+
+    response = TestClient(app).get(
+        "/api/v1/symbols",
+        params={"query": "国盾", "limit": 11},
+    )
+
+    assert response.status_code == 422
 
 
 def test_public_symbol_search_returns_empty_results_and_validates_parameters() -> None:
@@ -83,7 +94,7 @@ def test_public_symbol_search_returns_empty_results_and_validates_parameters() -
     assert client.get("/api/v1/symbols", params={"query": "空结果"}).json() == []
     assert client.get("/api/v1/symbols", params={"query": "国"}).status_code == 422
     assert client.get("/api/v1/symbols", params={"query": "国盾", "limit": 0}).status_code == 422
-    assert client.get("/api/v1/symbols", params={"query": "国盾", "limit": 9}).status_code == 422
+    assert client.get("/api/v1/symbols", params={"query": "国盾", "limit": 11}).status_code == 422
     assert client.get("/api/v1/symbols", params={"query": "  "}).status_code == 422
 
 
@@ -428,3 +439,18 @@ def test_public_status_reports_fifo_queue_position_until_a_job_is_claimed() -> N
     store.next_queued()
     assert client.get(f"/api/v1/jobs/{first['public_id']}").json()["queue_position"] is None
     assert client.get(f"/api/v1/jobs/{second['public_id']}").json()["queue_position"] == 1
+
+
+def test_frontend_static_assets_are_gzip_compressed_for_slow_public_links(tmp_path) -> None:
+    assets = tmp_path / "assets"
+    assets.mkdir()
+    payload = b"window.market = '" + b"dark-pool-data;" * 20_000 + b"';"
+    (tmp_path / "index.html").write_text('<div id="root"></div>', encoding="utf-8")
+    (assets / "app.js").write_bytes(payload)
+    client = TestClient(create_app(frontend_root=tmp_path))
+
+    response = client.get("/assets/app.js", headers={"Accept-Encoding": "gzip"})
+
+    assert response.status_code == 200
+    assert response.headers.get("content-encoding") == "gzip"
+    assert response.content == payload

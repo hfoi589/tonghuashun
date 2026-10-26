@@ -205,10 +205,43 @@ describe('Level2 web UI', () => {
     const option = await screen.findByRole('option', { name: /国盾量子.*688027.*科创/ })
     expect(option).toBeInTheDocument()
     expect(fetch).toHaveBeenCalledWith(
-      '/api/v1/symbols?query=%E5%9B%BD%E7%9B%BE&limit=8',
+      '/api/v1/symbols?query=%E5%9B%BD%E7%9B%BE&limit=10',
       expect.objectContaining({ credentials: 'include', signal: expect.any(AbortSignal) }),
     )
     expect(screen.getByRole('button', { name: '提交采集任务' })).toBeDisabled()
+  })
+
+  it('searches numeric stock-code prefixes after the input debounce', async () => {
+    vi.mocked(fetch).mockResolvedValueOnce(jsonResponse([
+      { symbol: '688008', name: '澜起科技', market: '17', market_label: '科创' },
+    ]))
+    const user = userEvent.setup()
+
+    render(<App />)
+    const input = screen.getByLabelText('股票代码或名称')
+    await user.type(input, '68')
+
+    await waitFor(() => expect(fetch).toHaveBeenCalledWith(
+      '/api/v1/symbols?query=68&limit=10',
+      expect.objectContaining({ signal: expect.any(AbortSignal) }),
+    ))
+    expect(await screen.findByRole('option', { name: /澜起科技.*688008/ })).toBeInTheDocument()
+  })
+
+  it('passes uppercase pinyin prefixes to the symbol-search endpoint', async () => {
+    vi.mocked(fetch).mockResolvedValueOnce(jsonResponse([
+      { symbol: '688008', name: '澜起科技', market: '17', market_label: '科创' },
+    ]))
+    const user = userEvent.setup()
+
+    render(<App />)
+    await user.type(screen.getByLabelText('股票代码或名称'), 'LQKJ')
+
+    expect(await screen.findByRole('option', { name: /澜起科技.*688008/ })).toBeInTheDocument()
+    expect(fetch).toHaveBeenCalledWith(
+      '/api/v1/symbols?query=LQKJ&limit=10',
+      expect.objectContaining({ signal: expect.any(AbortSignal) }),
+    )
   })
 
   it('exactly confirms a selected suggestion before submitting its six-digit code', async () => {

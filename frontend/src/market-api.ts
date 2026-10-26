@@ -1,4 +1,4 @@
-import { ApiError, type IntradayMetricSeries, type MainFundFlowPeriod, type SymbolLookup } from './api'
+import { ApiError, type IntradayMetricSeries, type MainFundFlowPeriod, type SymbolLookup, type SymbolSuggestion } from './api'
 
 export const marketAuthExpiredEvent = 'ths-market-auth-expired'
 
@@ -255,6 +255,10 @@ function jsonInit(method: string, body: unknown, csrf = false): RequestInit {
 }
 
 export const marketApi = {
+  searchSymbols: (query: string, signal?: AbortSignal) => request<SymbolSuggestion[]>(
+    `/api/v1/symbols?query=${encodeURIComponent(query)}&limit=10`,
+    { signal },
+  ),
   session: () => request<MarketUser>('/api/v1/session'),
   login: (username: string, password: string) => request<MarketUser>(
     '/api/v1/session',

@@ -87,7 +87,8 @@ button { cursor: pointer; }
 
 .market-app-shell { min-height: 100vh; background: var(--market-wash); }
 .market-topbar {
-  height: 62px;
+  height: auto;
+  min-height: 62px;
   display: grid;
   grid-template-columns: 250px minmax(320px, 680px) 1fr;
   align-items: center;
@@ -103,10 +104,19 @@ button { cursor: pointer; }
 .market-wordmark { display: flex; align-items: center; gap: 11px; color: white; text-decoration: none; }
 .market-wordmark span { width: 32px; height: 32px; display: grid; place-items: center; background: var(--market-red); border-radius: 2px; font-weight: 900; }
 .market-wordmark strong { font-size: 18px; letter-spacing: -.02em; }
+.market-search { position: relative; min-width: 0; }
 .market-search form { display: flex; }
 .market-search input { height: 36px; padding: 0 13px; border-radius: 3px 0 0 3px; border-color: #44484e; background: #25282d; color: white; }
 .market-search button { width: 68px; border-radius: 0 3px 3px 0; }
 .market-search button:disabled { opacity: .45; cursor: not-allowed; }
+.market-symbol-suggestion-list { position: static; width: 100%; max-height: min(320px, calc(100vh - 100px)); overflow-y: auto; margin-top: 5px; padding: 4px; border: 1px solid #44484e; border-radius: 0 0 6px 6px; background: #25282d; color: white; box-shadow: 0 14px 32px rgba(0,0,0,.26); }
+.market-symbol-suggestion-list > p { margin: 0; padding: 10px 11px; color: #b8bdc5; font-size: 12px; }
+.market-search button.market-symbol-suggestion-option { width: 100%; min-height: 42px; padding: 7px 10px; display: grid; grid-template-columns: minmax(0,1fr) auto auto; align-items: center; gap: 10px; border: 0; border-radius: 3px; background: transparent; color: white; text-align: left; font-size: 12px; }
+.market-search button.market-symbol-suggestion-option strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.market-search button.market-symbol-suggestion-option span,
+.market-search button.market-symbol-suggestion-option small { color: #b8bdc5; font-variant-numeric: tabular-nums; }
+.market-search button.market-symbol-suggestion-option[aria-selected="true"],
+.market-search button.market-symbol-suggestion-option:hover { background: rgba(255,255,255,.1); color: white; }
 .market-account { justify-self: end; display: flex; align-items: center; gap: 20px; font-size: 12px; }
 .market-account > span { color: #b8bdc5; display: flex; align-items: center; gap: 7px; }
 .market-account i,

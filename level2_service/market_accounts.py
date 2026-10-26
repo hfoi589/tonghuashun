@@ -204,8 +204,8 @@ class SQLiteMarketAccountStore:
 
     @staticmethod
     def _password(value: str) -> str:
-        if len(value) < 8 or len(value) > 256:
-            raise ValueError("password must contain 8-256 characters")
+        if not value or len(value) > 256:
+            raise ValueError("password must contain 1-256 characters")
         return value
 
     @staticmethod

@@ -28,18 +28,18 @@ class MarketLoginRequest(BaseModel):
 
 class MarketPasswordRequest(BaseModel):
     current_password: str = Field(min_length=1, max_length=256)
-    new_password: str = Field(min_length=8, max_length=256)
-    new_password_confirmation: str = Field(min_length=8, max_length=256)
+    new_password: str = Field(min_length=1, max_length=256)
+    new_password_confirmation: str = Field(min_length=1, max_length=256)
 
 
 class AdminCreateMarketUserRequest(BaseModel):
     username: str = Field(min_length=3, max_length=32)
-    temporary_password: str = Field(min_length=8, max_length=256)
+    temporary_password: str = Field(min_length=1, max_length=256)
 
 
 class AdminUpdateMarketUserRequest(BaseModel):
     enabled: bool | None = None
-    temporary_password: str | None = Field(default=None, min_length=8, max_length=256)
+    temporary_password: str | None = Field(default=None, min_length=1, max_length=256)
 
 
 class MarketUserResponse(BaseModel):

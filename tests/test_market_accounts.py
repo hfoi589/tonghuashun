@@ -40,6 +40,13 @@ def test_sqlite_accounts_reject_duplicate_usernames_case_insensitively(tmp_path)
         store.create_user("trader", "another-123")
 
 
+def test_sqlite_accounts_reject_passwords_longer_than_256_characters(tmp_path) -> None:
+    store = SQLiteMarketAccountStore(tmp_path / "market.db")
+
+    with pytest.raises(ValueError, match="password must contain 1-256 characters"):
+        store.create_user("trader", "x" * 257)
+
+
 def test_watchlists_are_grouped_ordered_and_isolated_by_user(tmp_path) -> None:
     store = SQLiteMarketAccountStore(tmp_path / "market.db")
     first = store.create_user("first", "temporary-123")

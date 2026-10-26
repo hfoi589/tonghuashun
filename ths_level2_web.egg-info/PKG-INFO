@@ -10,6 +10,7 @@ Requires-Dist: Pillow>=10.0.0
 Requires-Dist: numpy>=1.26.0
 Requires-Dist: opencv-python-headless>=4.10.0.84
 Requires-Dist: redis>=5.0.0
+Requires-Dist: pypinyin>=0.53.0
 Requires-Dist: uiautomator2>=3.2.0
 Requires-Dist: uvicorn[standard]>=0.30.0
 Requires-Dist: cryptography>=43.0.0

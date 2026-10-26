@@ -16,6 +16,7 @@ from threading import RLock
 from typing import Callable
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
+from pypinyin import lazy_pinyin
 
 from .parsed_values import (
     DirectRequestError,
@@ -79,6 +80,13 @@ def _text(value: object) -> str | None:
 
 def _canonical_symbol_name(symbol: str, name: str) -> str:
     return _CANONICAL_SYMBOL_NAMES.get(symbol, name)
+
+
+def _pinyin_search_aliases(name: str) -> tuple[str, str]:
+    parts = lazy_pinyin(name, errors=lambda value: list(value))
+    tokens = ["".join(char for char in part.casefold() if char.isalnum()) for part in parts]
+    tokens = [token for token in tokens if token]
+    return "".join(tokens), "".join(token[0] for token in tokens)
 
 
 class SinaSymbolCatalogSource:
@@ -272,6 +280,8 @@ class SQLiteSymbolCatalog:
                     market TEXT NOT NULL,
                     market_label TEXT,
                     name_normalized TEXT NOT NULL,
+                    name_pinyin TEXT NOT NULL DEFAULT '',
+                    name_initials TEXT NOT NULL DEFAULT '',
                     PRIMARY KEY(version_id, symbol, market)
                 );
                 CREATE INDEX IF NOT EXISTS catalog_securities_symbol
@@ -285,6 +295,38 @@ class SQLiteSymbolCatalog:
                 );
                 """
             )
+            columns = {
+                str(row[1])
+                for row in connection.execute("PRAGMA table_info(catalog_securities)").fetchall()
+            }
+            added_alias_column = False
+            for column in ("name_pinyin", "name_initials"):
+                if column not in columns:
+                    connection.execute(
+                        f"ALTER TABLE catalog_securities ADD COLUMN {column} TEXT NOT NULL DEFAULT ''"
+                    )
+                    added_alias_column = True
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS catalog_securities_pinyin "
+                "ON catalog_securities(version_id,name_pinyin,symbol,market)"
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS catalog_securities_initials "
+                "ON catalog_securities(version_id,name_initials,symbol,market)"
+            )
+            if added_alias_column:
+                rows = connection.execute(
+                    "SELECT version_id,symbol,market,name FROM catalog_securities"
+                ).fetchall()
+                aliases = [
+                    (*_pinyin_search_aliases(str(row[3])), row[0], row[1], row[2])
+                    for row in rows
+                ]
+                connection.executemany(
+                    "UPDATE catalog_securities SET name_pinyin=?,name_initials=? "
+                    "WHERE version_id=? AND symbol=? AND market=?",
+                    aliases,
+                )
 
     @staticmethod
     def _normalize(values: object) -> list[SymbolLookup]:
@@ -371,8 +413,9 @@ class SQLiteSymbolCatalog:
                 version = int(cursor.lastrowid)
                 connection.executemany(
                     """INSERT INTO catalog_securities(
-                       version_id,symbol,name,market,market_label,name_normalized
-                    ) VALUES(?,?,?,?,?,?)""",
+                       version_id,symbol,name,market,market_label,name_normalized,
+                       name_pinyin,name_initials
+                    ) VALUES(?,?,?,?,?,?,?,?)""",
                     [
                         (
                             version,
@@ -381,6 +424,7 @@ class SQLiteSymbolCatalog:
                             value.market,
                             value.market_label,
                             value.name.casefold(),
+                            *_pinyin_search_aliases(value.name),
                         )
                         for value in candidates
                     ],
@@ -451,30 +495,49 @@ class SQLiteSymbolCatalog:
     def lookup_symbol(self, symbol: str) -> SymbolLookup:
         return self.lookup(symbol)
 
-    def search(self, query: str, limit: int = 8) -> list[SymbolLookup]:
+    def search(self, query: str, limit: int = 10) -> list[SymbolLookup]:
         normalized = str(query).strip().casefold()
         if not 2 <= len(normalized) <= 32:
             raise ValueError("query must contain 2 to 32 characters")
-        if not 1 <= limit <= 8:
-            raise ValueError("limit must be between 1 and 8")
+        if not 1 <= limit <= 10:
+            raise ValueError("limit must be between 1 and 10")
         escaped = self._escape_like(normalized)
-        contains = f"%{escaped}%"
         prefix = f"{escaped}%"
+        numeric_prefix = normalized.isdigit()
+        if numeric_prefix:
+            match_clause = "symbol LIKE ? ESCAPE '\\'"
+            match_values = (prefix,)
+            order_clause = "CASE WHEN symbol=? THEN 0 ELSE 1 END"
+            order_values = (normalized,)
+        else:
+            contains = f"%{escaped}%"
+            match_clause = (
+                "name_normalized LIKE ? ESCAPE '\\' "
+                "OR name_pinyin LIKE ? ESCAPE '\\' "
+                "OR name_initials LIKE ? ESCAPE '\\'"
+            )
+            match_values = (contains, prefix, prefix)
+            order_clause = """CASE
+                WHEN name_normalized=? THEN 0
+                WHEN name_normalized LIKE ? ESCAPE '\\' THEN 1
+                WHEN name_initials LIKE ? ESCAPE '\\' THEN 2
+                WHEN name_pinyin LIKE ? ESCAPE '\\' THEN 3
+                ELSE 4 END"""
+            order_values = (normalized, prefix, prefix, prefix)
         with self._lock, self._connect() as connection:
             active = self._require_active(connection)
             rows = connection.execute(
-                """SELECT symbol,name,market,market_label FROM catalog_securities
-                   WHERE version_id=?
-                     AND (symbol LIKE ? ESCAPE '\\' OR name_normalized LIKE ? ESCAPE '\\')
-                   ORDER BY CASE
-                     WHEN symbol=? THEN 0
-                     WHEN symbol LIKE ? ESCAPE '\\' THEN 1
-                     WHEN name_normalized=? THEN 2
-                     WHEN name_normalized LIKE ? ESCAPE '\\' THEN 3
-                     ELSE 4 END,
+                f"""SELECT symbol,name,market,market_label FROM catalog_securities
+                   WHERE version_id=? AND ({match_clause})
+                   ORDER BY {order_clause},
                      symbol,market
                    LIMIT ?""",
-                (active["version_id"], contains, contains, normalized, prefix, normalized, prefix, limit),
+                (
+                    active["version_id"],
+                    *match_values,
+                    *order_values,
+                    limit,
+                ),
             ).fetchall()
         return [
             SymbolLookup(
@@ -489,7 +552,7 @@ class SQLiteSymbolCatalog:
     def search_symbols(
         self,
         query: str,
-        limit: int = 8,
+        limit: int = 10,
     ) -> list[SymbolLookup]:
         return self.search(query, limit)
 

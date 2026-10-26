@@ -280,7 +280,7 @@ async function request<T>(url: string, init?: RequestInit): Promise<T> {
 
 export const api = {
   searchSymbols: (query: string, signal?: AbortSignal) => request<SymbolSuggestion[]>(
-    `/api/v1/symbols?query=${encodeURIComponent(query)}&limit=8`,
+    `/api/v1/symbols?query=${encodeURIComponent(query)}&limit=10`,
     { signal },
   ),
   lookupSymbol: (symbol: string, signal?: AbortSignal) => request<SymbolLookup>(

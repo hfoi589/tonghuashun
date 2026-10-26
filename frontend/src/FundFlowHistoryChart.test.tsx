@@ -58,6 +58,22 @@ describe('FundFlowHistoryChart', () => {
     expect(container.querySelector('.fund-flow-history-series-visible')?.getAttribute('d')).toContain(' L')
   })
 
+  it('shows fixed half-hour time ticks with 11:30 marking the collapsed lunch boundary', () => {
+    const { container } = render(<FundFlowHistoryChart period={{ points: [
+      { ...period.points[0], time: '09:30' },
+      { ...period.points[1], time: '15:00' },
+    ] }} />)
+
+    const labels = [...container.querySelectorAll('.fund-flow-history-x-axis-label')]
+    expect(labels.map((label) => label.textContent)).toEqual([
+      '09:30', '10:00', '10:30', '11:00', '11:30',
+      '13:30', '14:00', '14:30', '15:00',
+    ])
+    expect(labels).toHaveLength(9)
+    expect(labels[4]?.getAttribute('x')).toBe('472')
+    expect(container.querySelectorAll('.fund-flow-history-x-axis-tick')).toHaveLength(9)
+  })
+
   it('renders a capability gap when the selected period has no points', () => {
     render(<FundFlowHistoryChart period={{ points: [] }} />)
     expect(screen.getByText('暂无该周期资金流历史')).toBeInTheDocument()

@@ -586,6 +586,64 @@ describe('MarketApp', () => {
     expect(await screen.findByText('+20.00%')).toBeInTheDocument()
   })
 
+  it('searches the Market top bar by uppercase pinyin and selects a candidate before adding it', async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url === '/api/v1/session') return jsonResponse({ id: 7, username: 'wilson', enabled: true, must_change_password: false, created_at: '2026-08-23T00:00:00+00:00' })
+      if (url === '/api/v1/watchlists') return jsonResponse({ groups: [{ id: 1, name: '自选', sort_order: 0, is_primary: true, items: [] }] })
+      if (url === '/api/v1/symbols?query=LQKJ&limit=10') return jsonResponse([
+        { symbol: '688008', name: '澜起科技', market: '17', market_label: '科创' },
+        { symbol: '688027', name: '国盾量子', market: '17', market_label: '科创' },
+      ])
+      throw new Error(`unexpected request: ${url}`)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    vi.stubGlobal('WebSocket', undefined)
+    const user = userEvent.setup()
+
+    render(<MarketApp />)
+
+    const input = await screen.findByLabelText('股票代码或名称')
+    await user.type(input, 'LQKJ')
+    const option = await screen.findByRole('option', { name: /澜起科技.*688008/ })
+
+    expect(fetchMock).toHaveBeenCalledWith('/api/v1/symbols?query=LQKJ&limit=10', expect.anything())
+    await user.click(option)
+
+    expect(input).toHaveValue('688008')
+    expect(screen.queryByRole('listbox')).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: '添加' })).toBeEnabled()
+  })
+
+  it('searches a complete Market stock code and shows its single exact candidate', async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url === '/api/v1/session') return jsonResponse({ id: 7, username: 'wilson', enabled: true, must_change_password: false, created_at: '2026-08-23T00:00:00+00:00' })
+      if (url === '/api/v1/watchlists') return jsonResponse({ groups: [{ id: 1, name: '自选', sort_order: 0, is_primary: true, items: [] }] })
+      if (url === '/api/v1/symbols?query=688008&limit=10') return jsonResponse([
+        { symbol: '688008', name: '澜起科技', market: '17', market_label: '科创' },
+      ])
+      throw new Error(`unexpected request: ${url}`)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    vi.stubGlobal('WebSocket', undefined)
+    const user = userEvent.setup()
+
+    render(<MarketApp />)
+
+    const input = await screen.findByLabelText('股票代码或名称')
+    await user.type(input, '688008')
+    const option = await screen.findByRole('option', { name: /澜起科技.*688008/ })
+
+    expect(fetchMock).toHaveBeenCalledWith('/api/v1/symbols?query=688008&limit=10', expect.anything())
+    expect(screen.getAllByRole('option')).toHaveLength(1)
+    expect(option).toHaveClass('market-symbol-suggestion-option')
+    await user.click(option)
+
+    expect(input).toHaveValue('688008')
+    expect(screen.getByRole('button', { name: '添加' })).toBeEnabled()
+  })
+
   it('loads grouped watchlists and opens a realtime stock detail', async () => {
     const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
       const url = String(input)

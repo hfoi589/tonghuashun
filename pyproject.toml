@@ -15,6 +15,7 @@ dependencies = [
   "numpy>=1.26.0",
   "opencv-python-headless>=4.10.0.84",
   "redis>=5.0.0",
+  "pypinyin>=0.53.0",
   "uiautomator2>=3.2.0",
   "uvicorn[standard]>=0.30.0",
   "cryptography>=43.0.0",

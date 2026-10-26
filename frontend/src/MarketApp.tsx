@@ -1,5 +1,5 @@
-import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { ApiError, type MainFundFlowPeriod } from './api'
+import { FormEvent, KeyboardEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { ApiError, type MainFundFlowPeriod, type SymbolSuggestion } from './api'
 import { DailyKChart, type DailyKSelection } from './DailyKChart'
 import { FundFlowHistoryPanel } from './FundFlowHistoryPanel'
 import { FundFlowDailyPanel } from './FundFlowDailyChart'
@@ -332,9 +332,9 @@ function PasswordChange({ user, onDone }: { user: MarketUser, onDone: (user: Mar
         <label htmlFor="market-current-password">当前临时密码</label>
         <input id="market-current-password" type="password" autoComplete="current-password" value={current} onChange={(event) => setCurrent(event.target.value)} required />
         <label htmlFor="market-new-password">新密码</label>
-        <input id="market-new-password" type="password" autoComplete="new-password" minLength={8} value={next} onChange={(event) => setNext(event.target.value)} required />
+        <input id="market-new-password" type="password" autoComplete="new-password" value={next} onChange={(event) => setNext(event.target.value)} required />
         <label htmlFor="market-confirm-password">确认新密码</label>
-        <input id="market-confirm-password" type="password" autoComplete="new-password" minLength={8} value={confirmation} onChange={(event) => setConfirmation(event.target.value)} required />
+        <input id="market-confirm-password" type="password" autoComplete="new-password" value={confirmation} onChange={(event) => setConfirmation(event.target.value)} required />
         <button type="submit">保存并进入行情</button>
       </form>
       {message && <p className="market-form-error" role="alert">{message}</p>}
@@ -767,13 +767,84 @@ export function MarketApp() {
   const [dailyErrors, setDailyErrors] = useState<Record<string, string>>({})
   const [dailyRetryVersion, setDailyRetryVersion] = useState(0)
   const [symbol, setSymbol] = useState('')
+  const [symbolSuggestions, setSymbolSuggestions] = useState<SymbolSuggestion[]>([])
+  const [symbolSuggestionState, setSymbolSuggestionState] = useState<'idle' | 'loading' | 'ready' | 'empty' | 'unavailable'>('idle')
+  const [symbolSuggestionsOpen, setSymbolSuggestionsOpen] = useState(false)
+  const [activeSymbolSuggestionIndex, setActiveSymbolSuggestionIndex] = useState(-1)
+  const [composingSymbol, setComposingSymbol] = useState(false)
   const [message, setMessage] = useState('')
   const [removingSymbol, setRemovingSymbol] = useState<string | null>(null)
   const [connection, setConnection] = useState<'live' | 'reconnecting' | 'unavailable'>('unavailable')
   const socket = useRef<WebSocket | null>(null)
   const selectedRef = useRef<string | null>(selected)
+  const symbolSearchRef = useRef<HTMLDivElement>(null)
+  const symbolSearchSequence = useRef(0)
+  const selectedSuggestionSymbol = useRef<string | null>(null)
   const requestedDailySeries = useRef(new Set<string>())
   selectedRef.current = selected
+
+  useEffect(() => {
+    function closeSuggestions(event: PointerEvent) {
+      if (!symbolSearchRef.current?.contains(event.target as Node)) {
+        setSymbolSuggestionsOpen(false)
+        setActiveSymbolSuggestionIndex(-1)
+      }
+    }
+    document.addEventListener('pointerdown', closeSuggestions)
+    return () => document.removeEventListener('pointerdown', closeSuggestions)
+  }, [])
+
+  useEffect(() => {
+    const normalized = symbol.trim()
+    if (selectedSuggestionSymbol.current === normalized) {
+      selectedSuggestionSymbol.current = null
+      symbolSearchSequence.current += 1
+      setSymbolSuggestions([])
+      setSymbolSuggestionState('idle')
+      setSymbolSuggestionsOpen(false)
+      setActiveSymbolSuggestionIndex(-1)
+      return
+    }
+    if (
+      auth !== 'authenticated'
+      || user?.must_change_password
+      || composingSymbol
+      || normalized.length < 2
+      || normalized.length > 32
+    ) {
+      symbolSearchSequence.current += 1
+      setSymbolSuggestions([])
+      setSymbolSuggestionState('idle')
+      setSymbolSuggestionsOpen(false)
+      setActiveSymbolSuggestionIndex(-1)
+      return
+    }
+
+    const sequence = ++symbolSearchSequence.current
+    const controller = new AbortController()
+    setSymbolSuggestionState('loading')
+    setSymbolSuggestionsOpen(true)
+    setActiveSymbolSuggestionIndex(-1)
+    const timer = window.setTimeout(() => {
+      marketApi.searchSymbols(normalized, controller.signal).then((results) => {
+        if (controller.signal.aborted || symbolSearchSequence.current !== sequence) return
+        const limited = results.slice(0, 10)
+        setSymbolSuggestions(limited)
+        setSymbolSuggestionState(limited.length === 0 ? 'empty' : 'ready')
+        setSymbolSuggestionsOpen(true)
+      }).catch(() => {
+        if (controller.signal.aborted || symbolSearchSequence.current !== sequence) return
+        setSymbolSuggestions([])
+        setSymbolSuggestionState('unavailable')
+        setSymbolSuggestionsOpen(true)
+      })
+    }, 300)
+
+    return () => {
+      window.clearTimeout(timer)
+      controller.abort()
+    }
+  }, [auth, composingSymbol, symbol, user?.must_change_password])
 
   const allItems = useMemo(() => {
     const found = new Map<string, { symbol: string, name: string, market: string }>()
@@ -885,6 +956,37 @@ export function MarketApp() {
       return next
     })
     setDailyRetryVersion((current) => current + 1)
+  }
+
+  function chooseMarketSymbol(suggestion: SymbolSuggestion) {
+    symbolSearchSequence.current += 1
+    selectedSuggestionSymbol.current = suggestion.symbol
+    setSymbolSuggestions([])
+    setSymbolSuggestionState('idle')
+    setSymbolSuggestionsOpen(false)
+    setActiveSymbolSuggestionIndex(-1)
+    setSymbol(suggestion.symbol)
+    setMessage('')
+  }
+
+  function handleMarketSymbolKeyDown(event: KeyboardEvent<HTMLInputElement>) {
+    if (event.key === 'Escape' && symbolSuggestionsOpen) {
+      event.preventDefault()
+      setSymbolSuggestionsOpen(false)
+      setActiveSymbolSuggestionIndex(-1)
+      return
+    }
+    if (!symbolSuggestionsOpen || symbolSuggestionState !== 'ready' || symbolSuggestions.length === 0) return
+    if (event.key === 'ArrowDown') {
+      event.preventDefault()
+      setActiveSymbolSuggestionIndex((current) => (current + 1 + symbolSuggestions.length) % symbolSuggestions.length)
+    } else if (event.key === 'ArrowUp') {
+      event.preventDefault()
+      setActiveSymbolSuggestionIndex((current) => (current - 1 + symbolSuggestions.length) % symbolSuggestions.length)
+    } else if (event.key === 'Enter' && activeSymbolSuggestionIndex >= 0) {
+      event.preventDefault()
+      chooseMarketSymbol(symbolSuggestions[activeSymbolSuggestionIndex])
+    }
   }
 
   useEffect(() => {
@@ -1032,7 +1134,58 @@ export function MarketApp() {
   return <main className="market-app-shell">
     <header className="market-topbar">
       <a href="/market" className="market-wordmark"><span>顺</span><strong>行情中心</strong></a>
-      <div className="market-search"><form onSubmit={addSymbol}><label className="sr-only" htmlFor="market-symbol">股票代码</label><input id="market-symbol" inputMode="numeric" placeholder="输入 6 位代码添加自选" value={symbol} onChange={(event) => setSymbol(event.target.value.replace(/\D/g, '').slice(0, 6))} /><button type="submit" disabled={symbol.length !== 6}>添加</button></form></div>
+      <div className="market-search" ref={symbolSearchRef}>
+        <form onSubmit={addSymbol}>
+          <label className="sr-only" htmlFor="market-symbol">股票代码或名称</label>
+          <input
+            id="market-symbol"
+            role="combobox"
+            aria-autocomplete="list"
+            aria-expanded={symbolSuggestionsOpen}
+            aria-controls="market-symbol-suggestion-list"
+            aria-activedescendant={activeSymbolSuggestionIndex >= 0 ? `market-symbol-suggestion-${activeSymbolSuggestionIndex}` : undefined}
+            aria-describedby="market-symbol-search-status"
+            inputMode="search"
+            autoComplete="off"
+            placeholder="输入名称、拼音或代码前缀"
+            maxLength={32}
+            value={symbol}
+            onChange={(event) => { selectedSuggestionSymbol.current = null; setSymbol(event.target.value); setMessage('') }}
+            onKeyDown={handleMarketSymbolKeyDown}
+            onCompositionStart={() => setComposingSymbol(true)}
+            onCompositionEnd={(event) => { setComposingSymbol(false); setSymbol(event.currentTarget.value) }}
+            onFocus={() => { if (symbolSuggestionState !== 'idle') setSymbolSuggestionsOpen(true) }}
+          />
+          <button type="submit" disabled={!/^\d{6}$/.test(symbol)}>添加</button>
+        </form>
+        {symbolSuggestionsOpen && <div
+          className="market-symbol-suggestion-list"
+          id="market-symbol-suggestion-list"
+          role="listbox"
+          aria-label="股票候选"
+        >
+          {symbolSuggestionState === 'loading' && <p role="status">正在搜索股票…</p>}
+          {symbolSuggestionState === 'empty' && <p>没有匹配的股票</p>}
+          {symbolSuggestionState === 'unavailable' && <p>股票候选查询暂时不可用</p>}
+          {symbolSuggestionState === 'ready' && symbolSuggestions.map((suggestion, index) => <button
+            type="button"
+            role="option"
+            aria-selected={index === activeSymbolSuggestionIndex}
+            id={`market-symbol-suggestion-${index}`}
+            key={`${suggestion.symbol}-${suggestion.market}`}
+            className="market-symbol-suggestion-option"
+            onMouseDown={(event) => event.preventDefault()}
+            onClick={() => chooseMarketSymbol(suggestion)}
+          >
+            <strong>{suggestion.name}</strong>
+            <span>{suggestion.symbol}</span>
+            <small>{suggestion.market_label || suggestion.market}</small>
+          </button>)}
+        </div>}
+        <span id="market-symbol-search-status" className="sr-only" aria-live="polite">
+          {symbolSuggestionState === 'loading' ? '正在搜索股票' : symbolSuggestionState === 'empty' ? '没有匹配的股票' : ''}
+        </span>
+      </div>
       <div className="market-account"><span><i className={connection} />{connection === 'live' ? '实时连接' : connection === 'reconnecting' ? '正在重连' : '轮询模式'}</span><button type="button" onClick={logout}>{user?.username} · 退出</button></div>
     </header>
     <div className="market-workspace">
@@ -1055,7 +1208,7 @@ export function MarketApp() {
               aria-label={`删除 ${item.symbol}（从${activeGroup.name}和所有分组）`}
             >{removing ? '删除中' : '删除'}</button>
           </div>
-        }) : <div className="market-watchlist-empty"><strong>还没有自选股</strong><span>在顶部输入代码，系统会通过本地证券目录精确确认。</span></div>}</div>
+        }) : <div className="market-watchlist-empty"><strong>还没有自选股</strong><span>在顶部输入名称、拼音前缀或代码搜索并添加。</span></div>}</div>
         <footer>每位用户最多 50 只自选股</footer>
       </aside>
       <div className="market-main-pane">

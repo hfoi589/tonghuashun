@@ -258,7 +258,7 @@ def test_exact_lookup_uses_the_existing_not_found_semantics(tmp_path):
         catalog.lookup("600001")
 
 
-def test_search_orders_code_prefix_before_name_match(tmp_path):
+def test_numeric_search_matches_code_prefixes_only_and_orders_them_first(tmp_path):
     from level2_service.symbol_catalog import SQLiteSymbolCatalog
 
     class Source:
@@ -272,7 +272,87 @@ def test_search_orders_code_prefix_before_name_match(tmp_path):
     catalog = SQLiteSymbolCatalog(tmp_path / "symbols.db", Source(), minimum_security_count=3)
     catalog.refresh()
 
-    assert [item.symbol for item in catalog.search("600")] == ["600000", "600001", "300750"]
+    assert [item.symbol for item in catalog.search("600")] == ["600000", "600001"]
+
+
+def test_search_matches_full_and_initial_pinyin_prefix_case_insensitively(tmp_path):
+    from level2_service.symbol_catalog import SQLiteSymbolCatalog
+
+    class Source:
+        def fetch_symbols(self):
+            return [
+                SymbolLookup("688008", "澜起科技", "17"),
+                SymbolLookup("688027", "国盾量子", "17"),
+            ]
+
+    catalog = SQLiteSymbolCatalog(tmp_path / "symbols.db", Source(), minimum_security_count=2)
+    catalog.refresh()
+
+    assert [item.symbol for item in catalog.search("LQKJ")] == ["688008"]
+    assert [item.symbol for item in catalog.search("lanqikeji")] == ["688008"]
+
+
+def test_search_limit_can_return_up_to_ten_results(tmp_path):
+    from level2_service.symbol_catalog import SQLiteSymbolCatalog
+
+    class Source:
+        def fetch_symbols(self):
+            return [
+                SymbolLookup(f"600{index:03d}", f"股票{index}", "17")
+                for index in range(12)
+            ]
+
+    catalog = SQLiteSymbolCatalog(tmp_path / "symbols.db", Source(), minimum_security_count=12)
+    catalog.refresh()
+
+    results = catalog.search("60", limit=10)
+
+    assert len(results) == 10
+    assert [item.symbol for item in results] == [f"600{index:03d}" for index in range(10)]
+
+
+def test_old_catalog_schema_backfills_pinyin_search_aliases(tmp_path):
+    import sqlite3
+    from level2_service.symbol_catalog import SQLiteSymbolCatalog
+
+    path = tmp_path / "symbols.db"
+    with sqlite3.connect(path) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE catalog_versions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source TEXT NOT NULL,
+                fetched_at TEXT NOT NULL,
+                security_count INTEGER NOT NULL,
+                checksum TEXT NOT NULL
+            );
+            CREATE TABLE catalog_securities (
+                version_id INTEGER NOT NULL REFERENCES catalog_versions(id) ON DELETE CASCADE,
+                symbol TEXT NOT NULL,
+                name TEXT NOT NULL,
+                market TEXT NOT NULL,
+                market_label TEXT,
+                name_normalized TEXT NOT NULL,
+                PRIMARY KEY(version_id, symbol, market)
+            );
+            CREATE TABLE catalog_active (
+                singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+                version_id INTEGER NOT NULL REFERENCES catalog_versions(id),
+                activated_at TEXT NOT NULL
+            );
+            INSERT INTO catalog_versions VALUES(1, 'test', '2026-10-14T00:00:00+00:00', 1, 'checksum');
+            INSERT INTO catalog_securities VALUES(1, '688008', '澜起科技', '17', '科创', '澜起科技');
+            INSERT INTO catalog_active VALUES(1, 1, '2026-10-14T00:00:00+00:00');
+            """
+        )
+
+    catalog = SQLiteSymbolCatalog(
+        path,
+        type("Source", (), {"fetch_symbols": lambda self: []})(),
+        clock=lambda: datetime(2026, 10, 14, 1, 0, tzinfo=timezone.utc),
+    )
+
+    assert [item.symbol for item in catalog.search("LQKJ")] == ["688008"]
 
 
 def test_refresh_rejects_a_shrunken_snapshot_without_replacing_the_active_version(tmp_path):

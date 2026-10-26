@@ -1010,6 +1010,7 @@ def test_runner_marks_login_requirement_waiting_for_admin(tmp_path: Path) -> Non
         parsed_value_source=types.SimpleNamespace(
             read_direct=lambda _symbol: dict(PARSED_VALUES)
         ),
+        clock=lambda: datetime(2026, 9, 15, 10, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
     )
 
     task = runner.run_once()
@@ -1067,6 +1068,59 @@ def test_lunch_break_runner_returns_the_last_app_metrics_and_hidden_fund_flow(tm
     assert public["values"]["main_fund_flow"]["today"]["main_hidden_inflow"] == "5.37"
     assert public["values"]["intraday_series"]["large_order_net"]["points"][-1] == {
         "time": "11:30",
+        "value": "-0.02",
+    }
+
+
+def test_closed_market_runner_returns_latest_app_dark_pool_data_when_queue_is_active(tmp_path: Path) -> None:
+    store = InMemoryStreams()
+    store.enqueue(TaskRecord(task_id="after-close-values", symbol="601872", include_long_capture=False))
+    values = {kind: None for kind in MetricKind}
+    values.update(PARSED_VALUES)
+    values.update({
+        MetricKind.MAIN_FLOW_TODAY_UNIT: "亿元",
+        MetricKind.MAIN_FLOW_TODAY_NET: "10.67",
+        MetricKind.MAIN_FLOW_TODAY_VISIBLE: "5.30",
+        MetricKind.MAIN_FLOW_TODAY_HIDDEN: "5.37",
+        MetricKind.MAIN_FLOW_TODAY_RETAIL: "-10.67",
+    })
+    outcome = DirectReadOutcome(
+        values=values,
+        source_errors={"core_metrics": None, "main_fund_flow": None},
+        intraday_series={
+            MetricKind.LARGE_ORDER_NET: {
+                "unit": None,
+                "points": [{"time": "14:59", "value": "-0.02"}],
+            },
+        },
+    )
+    direct_requests: list[str] = []
+    runner = Level2Runner(
+        store,
+        Level2Navigator(FakeDeviceBridge(symbol="601872")),
+        tmp_path,
+        RunnerControl(),
+        parsed_value_source=types.SimpleNamespace(
+            read_direct=lambda symbol: (direct_requests.append(symbol), outcome)[1]
+        ),
+        market_snapshot_source=types.SimpleNamespace(
+            read_market_snapshot=lambda _symbol, *, detail: (_ for _ in ()).throw(
+                AssertionError("an active closed-market task must query the App interface")
+            )
+        ),
+        clock=lambda: datetime(2026, 9, 15, 15, 1, tzinfo=ZoneInfo("Asia/Shanghai")),
+    )
+
+    task = runner.run_once()
+
+    assert task is not None and task.status == TaskStatus.COMPLETED
+    assert direct_requests == ["601872"]
+    assert legacy_values(task.values) == PARSED_VALUES
+    assert task.market_snapshot is None
+    public = task.as_public()
+    assert public["values"]["main_fund_flow"]["today"]["main_hidden_inflow"] == "5.37"
+    assert public["values"]["intraday_series"]["large_order_net"]["points"][-1] == {
+        "time": "14:59",
         "value": "-0.02",
     }
 

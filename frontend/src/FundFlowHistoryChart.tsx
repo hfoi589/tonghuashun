@@ -13,6 +13,18 @@ export const fundFlowSeriesConfig: Array<{ key: FundFlowSeriesKey, label: string
   { key: 'main_net_inflow', label: '主力净流入', className: 'net', color: '#b7791f' },
 ]
 
+const fundFlowTimeTicks = [
+  { time: '09:30', anchor: 'start' },
+  { time: '10:00', anchor: 'middle' },
+  { time: '10:30', anchor: 'middle' },
+  { time: '11:00', anchor: 'middle' },
+  { time: '11:30', anchor: 'middle' },
+  { time: '13:30', anchor: 'middle' },
+  { time: '14:00', anchor: 'middle' },
+  { time: '14:30', anchor: 'middle' },
+  { time: '15:00', anchor: 'end' },
+] as const
+
 export function fundFlowToWan(value: string | null, unit: string | null): number | null {
   if (value === null || value === undefined || value === '') return null
   const numeric = Number(String(value).replaceAll(',', ''))
@@ -47,6 +59,7 @@ export function FundFlowHistoryChart({ period }: { period: FundFlowHistoryPeriod
   const pad = { top: 24, right: 18, bottom: 42, left: 62 }
   const plotWidth = width - pad.left - pad.right
   const plotHeight = height - pad.top - pad.bottom
+  const plotBottom = pad.top + plotHeight
   const values = useMemo(
     () => fundFlowSeriesConfig.flatMap(({ key }) => points.flatMap((point) => {
       const value = seriesValue(point, key)
@@ -126,8 +139,14 @@ export function FundFlowHistoryChart({ period }: { period: FundFlowHistoryPeriod
         const value = seriesValue(activePoint, key)
         return value === null ? null : <circle key={key} className={`fund-flow-history-dot fund-flow-history-dot-${className}`} cx={x(activeIndex)} cy={y(value)} r="4" style={{ fill: color }} />
       })}
-      <text x={pad.left} y={height - 12}>{points[0].time}</text>
-      <text x={width - pad.right} y={height - 12} textAnchor="end">{points.at(-1)?.time}</text>
+      {fundFlowTimeTicks.map(({ time, anchor }) => {
+        const ratio = intradayTimeRatio(time)!
+        const tickX = pad.left + ratio * plotWidth
+        return <g className="fund-flow-history-x-axis-tick" key={time}>
+          <line x1={tickX} x2={tickX} y1={plotBottom} y2={plotBottom + 6} />
+          <text className="fund-flow-history-x-axis-label" x={tickX} y={height - 12} textAnchor={anchor}>{time}</text>
+        </g>
+      })}
     </svg>
     <input
       className="fund-flow-history-scrubber"

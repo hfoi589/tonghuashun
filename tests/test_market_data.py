@@ -1,6 +1,7 @@
 import asyncio
 from dataclasses import replace
 from datetime import datetime, timezone
+import threading
 import time
 
 import pytest
@@ -336,10 +337,22 @@ def test_low_detail_refresh_cannot_overwrite_detail_cache_capability() -> None:
 
 
 def test_poll_due_refreshes_symbols_with_bounded_concurrency() -> None:
+    active_reads = 0
+    peak_active_reads = 0
+    active_reads_lock = threading.Lock()
+
     class SlowSource(FakeMarketSource):
         def read_market_snapshot(self, symbol: str, *, detail: bool) -> MarketSnapshot:
-            time.sleep(0.05)
-            return super().read_market_snapshot(symbol, detail=detail)
+            nonlocal active_reads, peak_active_reads
+            with active_reads_lock:
+                active_reads += 1
+                peak_active_reads = max(peak_active_reads, active_reads)
+            try:
+                time.sleep(0.05)
+                return super().read_market_snapshot(symbol, detail=detail)
+            finally:
+                with active_reads_lock:
+                    active_reads -= 1
 
     source = SlowSource()
     broker = MarketDataBroker(
@@ -353,10 +366,9 @@ def test_poll_due_refreshes_symbols_with_bounded_concurrency() -> None:
         watchlist_symbols={"600000", "600001", "600002", "600003"},
         detail_symbols=set(),
     )
-    started = time.monotonic()
     asyncio.run(broker.poll_due())
 
-    assert time.monotonic() - started < 0.18
+    assert peak_active_reads == 2
     assert len(source.snapshot_calls) == 4
 
 

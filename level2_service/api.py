@@ -18,6 +18,7 @@ from zoneinfo import ZoneInfo
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.middleware.gzip import GZipMiddleware
 from starlette.websockets import WebSocketState
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -881,7 +882,7 @@ def create_app(
     @app.get("/api/v1/symbols", response_model=list[SymbolSearchResponse])
     def search_public_symbols(
         query: str = Query(min_length=2, max_length=32),
-        limit: int = Query(default=8, ge=1, le=8),
+        limit: int = Query(default=10, ge=1, le=10),
     ) -> list[SymbolSearchResponse]:
         normalized = query.strip()
         if not 2 <= len(normalized) <= 32:
@@ -1670,7 +1671,14 @@ def create_app(
         assets_root = app.state.frontend_root / "assets"
         if index_file.is_file():
             if assets_root.is_dir():
-                app.mount("/assets", StaticFiles(directory=assets_root), name="frontend-assets")
+                app.mount(
+                    "/assets",
+                    GZipMiddleware(
+                        StaticFiles(directory=assets_root),
+                        minimum_size=1000,
+                    ),
+                    name="frontend-assets",
+                )
 
             def frontend_public_file(filename: str, media_type: str):
                 path = app.state.frontend_root / filename

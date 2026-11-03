@@ -50,10 +50,10 @@ describe('FundFlowHistoryChart', () => {
     expect(screen.getByTestId('fund-flow-readout-main-net')).toHaveTextContent('12000.00')
     expect(container.querySelectorAll('.fund-flow-history-readout em')).toHaveLength(0)
     expect(container.querySelectorAll('.fund-flow-history-series')).toHaveLength(4)
-    expect(container.querySelector('.fund-flow-history-series-visible')).toHaveStyle({ stroke: '#d92d20' })
-    expect(container.querySelector('.fund-flow-history-series-hidden')).toHaveStyle({ stroke: '#7f1d1d' })
-    expect(container.querySelector('.fund-flow-history-series-retail')).toHaveStyle({ stroke: '#16803c' })
-    expect(container.querySelector('.fund-flow-history-series-net')).toHaveStyle({ stroke: '#b7791f' })
+    expect(container.querySelector('.fund-flow-history-series-visible')).toHaveStyle({ stroke: '#ff5a5f' })
+    expect(container.querySelector('.fund-flow-history-series-hidden')).toHaveStyle({ stroke: '#e879f9' })
+    expect(container.querySelector('.fund-flow-history-series-retail')).toHaveStyle({ stroke: '#34d399' })
+    expect(container.querySelector('.fund-flow-history-series-net')).toHaveStyle({ stroke: '#fbbf24' })
     expect([...container.querySelectorAll('.fund-flow-history-legend span')].map((node) => node.textContent)).toEqual(['散户流入', '主力明盘', '主力暗盘', '主力净流入'])
     expect(container.querySelector('.fund-flow-history-series-visible')?.getAttribute('d')).toContain(' L')
   })
@@ -113,10 +113,10 @@ describe('FundFlowHistoryChart', () => {
     const { container } = render(<FundFlowHistoryChart period={period} />)
 
     const legend = [...container.querySelectorAll('.fund-flow-history-legend span')]
-    expect(legend[0]?.querySelector('i')).toHaveStyle({ backgroundColor: '#16803c' })
-    expect(legend[1]?.querySelector('i')).toHaveStyle({ backgroundColor: '#d92d20' })
-    expect(legend[2]?.querySelector('i')).toHaveStyle({ backgroundColor: '#7f1d1d' })
-    expect(legend[3]?.querySelector('i')).toHaveStyle({ backgroundColor: '#b7791f' })
+    expect(legend[0]?.querySelector('i')).toHaveStyle({ backgroundColor: '#34d399' })
+    expect(legend[1]?.querySelector('i')).toHaveStyle({ backgroundColor: '#ff5a5f' })
+    expect(legend[2]?.querySelector('i')).toHaveStyle({ backgroundColor: '#e879f9' })
+    expect(legend[3]?.querySelector('i')).toHaveStyle({ backgroundColor: '#fbbf24' })
   })
 
   it('keeps main net inflow from its authoritative field when a component is missing', () => {

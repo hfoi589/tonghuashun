@@ -1,10 +1,12 @@
 # syntax=docker/dockerfile:1
 
 FROM node:22-bookworm-slim AS frontend-build
+WORKDIR /src
+COPY frontend/package.json frontend/package-lock.json ./frontend/
+RUN cd frontend && npm ci
+COPY frontend/ ./frontend/
+COPY vibe_research/desktop/src/ ./vibe_research/desktop/src/
 WORKDIR /src/frontend
-COPY frontend/package.json frontend/package-lock.json ./
-RUN npm ci
-COPY frontend/ ./
 RUN npm run build
 
 FROM debian:bookworm-slim AS mobile-assets

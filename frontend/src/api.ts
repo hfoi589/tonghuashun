@@ -213,6 +213,7 @@ export interface MarketAdminUser {
   username: string
   enabled: boolean
   must_change_password: boolean
+  role: 'admin' | 'user'
   created_at: string
 }
 
@@ -238,6 +239,37 @@ export interface AdminMacdSettings {
   marker_threshold: number
 }
 
+export interface AdminVibeSettings {
+  ai: {
+    configured: boolean
+    provider: string | null
+    baseURL: string | null
+    model: string | null
+    key_present: boolean
+    subscription: boolean
+  }
+  agents: Array<{ provider: string; name?: string; status?: string; available?: boolean; detail?: string; version?: string }>
+  sec_contact: { source: 'env' | 'saved' | 'none'; masked: string | null; valid: boolean } | null
+  update: {
+    current: string
+    install: 'portable' | 'source'
+    enabled: boolean
+    env_disabled: boolean
+    skip_version: string | null
+    checked_at: string | null
+    latest: { version: string; url: string; published_at: string | null } | null
+    error: string | null
+    update_available: boolean
+  }
+}
+
+export interface AdminVibeLlmConfig {
+  provider: string
+  baseURL: string
+  model: string
+  apiKey: string
+}
+
 export interface AdminPushConfig {
   enabled: boolean
   premium_push_enabled: boolean
@@ -261,6 +293,27 @@ export class ApiError extends Error {
   constructor(public readonly status: number, message: string) {
     super(message)
   }
+}
+
+export interface AdminMailConfig {
+  host: string
+  port: number
+  ssl: boolean
+  user: string
+  password_configured: boolean
+  sender: string
+  registration_enabled: boolean
+  ready: boolean
+}
+
+export interface AdminMailConfigInput {
+  host: string
+  port: number
+  ssl: boolean
+  user: string
+  password: string
+  sender: string
+  registration_enabled: boolean
 }
 
 async function request<T>(url: string, init?: RequestInit): Promise<T> {
@@ -375,6 +428,32 @@ export const api = {
   macdSettings: () => request<AdminMacdSettings>('/api/admin/research/macd'),
   saveMacdSettings: (settings: AdminMacdSettings, csrfToken: string) => request<AdminMacdSettings>('/api/admin/research/macd', {
     method: 'PUT', headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrfToken }, body: JSON.stringify(settings),
+  }),
+  vibeSettings: () => request<AdminVibeSettings>('/api/admin/vibe/settings'),
+  testVibeSettings: (llm: AdminVibeLlmConfig, csrfToken: string) => request<{ ok: true; duration_ms?: number }>('/api/admin/vibe/settings/test', {
+    method: 'POST', headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrfToken }, body: JSON.stringify({ llm }),
+  }),
+  saveVibeSettings: (settings: { llm: AdminVibeLlmConfig; sec_contact?: string | null; codebuddy_path?: string | null }, csrfToken: string) => request<{ ai: AdminVibeSettings['ai']; sec_contact: AdminVibeSettings['sec_contact'] }>('/api/admin/vibe/settings', {
+    method: 'PUT', headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrfToken }, body: JSON.stringify(settings),
+  }),
+  clearVibeSettings: (csrfToken: string) => request<{ ai: AdminVibeSettings['ai'] }>('/api/admin/vibe/settings', {
+    method: 'DELETE', headers: { 'X-CSRF-Token': csrfToken },
+  }),
+  saveVibeSecContact: (contact: string | null, csrfToken: string) => request<NonNullable<AdminVibeSettings['sec_contact']>>('/api/admin/vibe/settings/sec-contact', {
+    method: 'POST', headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrfToken }, body: JSON.stringify({ contact }),
+  }),
+  saveVibeCodeBuddyPath: (path: string | null, csrfToken: string) => request<Record<string, unknown>>('/api/admin/vibe/settings/codebuddy-path', {
+    method: 'POST', headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrfToken }, body: JSON.stringify({ path }),
+  }),
+  updateVibeSettings: (action: 'disable' | 'enable' | 'skip' | 'check', version: string | undefined, csrfToken: string) => request<AdminVibeSettings['update']>('/api/admin/vibe/settings/update', {
+    method: 'POST', headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrfToken }, body: JSON.stringify(version === undefined ? { action } : { action, version }),
+  }),
+  mailConfig: () => request<AdminMailConfig>('/api/admin/mail/config'),
+  saveMailConfig: (config: AdminMailConfigInput, csrfToken: string) => request<AdminMailConfig>('/api/admin/mail/config', {
+    method: 'PUT', headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrfToken }, body: JSON.stringify(config),
+  }),
+  testMail: (to: string, csrfToken: string) => request<{ sent: boolean }>('/api/admin/mail/test', {
+    method: 'POST', headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrfToken }, body: JSON.stringify({ to }),
   }),
   pushConfig: () => request<AdminPushConfig>('/api/admin/push/config'),
   savePushConfig: (config: AdminPushConfig, csrfToken: string) => request<AdminPushConfig>('/api/admin/push/config', {

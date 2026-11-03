@@ -35,6 +35,7 @@ from .device_lifecycle import (
 )
 from .models import CaptureKind, CaptureStatus, TaskRecord, TaskStatus, ValueSource, utc_now
 from .market_api import install_market_routes
+from .vibe_api import install_vibe_routes
 from .market_data import is_china_market_open
 from .parsed_values import (
     DirectRequestError,
@@ -812,6 +813,8 @@ def create_app(
             app.state.runner_wake.notify()
 
     def trigger_core_prewarm(symbol: str | None) -> None:
+        # Explicit administrator session maintenance may warm the core connection.
+        # Symbol lookup itself intentionally never calls this path.
         prewarm = app.state.core_prewarmer
         if not callable(prewarm):
             return
@@ -838,7 +841,6 @@ def create_app(
                             "SYMBOL_LOOKUP_INVALID",
                             "cached symbol lookup returned a mismatched stock",
                         )
-                    trigger_core_prewarm(symbol)
                     return cached
             lookup = app.state.symbol_lookup
             if lookup is None:
@@ -855,7 +857,6 @@ def create_app(
             if cache is not None:
                 with app.state.symbol_lookup_cache_lock:
                     cache.set(result)
-            trigger_core_prewarm(symbol)
             return result
         except SymbolLookupNotFoundError as error:
             raise HTTPException(status_code=404, detail="symbol not found") from error
@@ -1666,6 +1667,14 @@ def create_app(
         previous_trading_date=previous_trading_date,
     )
 
+    install_vibe_routes(
+        app,
+        require_ready_market_user=app.state.require_ready_market_user,
+        resolve_symbol=resolve_symbol,
+        require_admin=require_admin,
+        require_admin_csrf=require_csrf,
+    )
+
     if app.state.frontend_root is not None:
         index_file = app.state.frontend_root / "index.html"
         assets_root = app.state.frontend_root / "assets"
@@ -1680,11 +1689,12 @@ def create_app(
                     name="frontend-assets",
                 )
 
-            def frontend_public_file(filename: str, media_type: str):
+            def frontend_public_file(filename: str, media_type: str, cache_control: str | None = None):
                 path = app.state.frontend_root / filename
                 if not path.is_file():
                     raise HTTPException(status_code=404, detail="Not Found")
-                return FileResponse(path, media_type=media_type)
+                headers = {"Cache-Control": cache_control} if cache_control else None
+                return FileResponse(path, media_type=media_type, headers=headers)
 
             @app.get("/market.webmanifest", include_in_schema=False)
             def market_manifest():
@@ -1692,11 +1702,15 @@ def create_app(
 
             @app.get("/market-sw.js", include_in_schema=False)
             def market_service_worker():
-                return frontend_public_file("market-sw.js", "text/javascript")
+                return frontend_public_file("market-sw.js", "text/javascript", "no-cache")
 
             @app.get("/market-icon.svg", include_in_schema=False)
             def market_icon():
                 return frontend_public_file("market-icon.svg", "image/svg+xml")
+
+            @app.get("/haoyunqi-mascot.png", include_in_schema=False)
+            def haoyunqi_mascot():
+                return frontend_public_file("haoyunqi-mascot.png", "image/png", "no-cache")
 
             @app.api_route("/{frontend_path:path}", methods=["GET", "HEAD"], include_in_schema=False)
             def frontend_fallback(frontend_path: str):

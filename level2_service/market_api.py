@@ -14,11 +14,25 @@ import secrets
 from fastapi import Depends, FastAPI, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel, Field
 
-from .market_accounts import DuplicateUserError, MarketUser, WatchlistGroup, WatchlistItem
+from .market_accounts import (
+    DuplicateUserError,
+    EmailCodeRateLimited,
+    MarketUser,
+    WatchlistGroup,
+    WatchlistItem,
+)
+from .market_mail import MailError, MailSender, SmtpSettings
 from .market_data import MARKET_PERIODS, fixed_market_error_code
 from .parsed_values import SymbolLookup
 from .research_replay import build_replay_markers, calculate_replay_performance
 from .research_premium import format_premium_body
+from .vibe_watchlist import (
+    VibeWatchlistSyncError,
+    add_symbol_to_vibe,
+    read_vibe_watchlist,
+    reconcile_vibe_watchlist,
+    remove_symbol_from_vibe,
+)
 
 
 class MarketLoginRequest(BaseModel):
@@ -42,11 +56,36 @@ class AdminUpdateMarketUserRequest(BaseModel):
     temporary_password: str | None = Field(default=None, min_length=1, max_length=256)
 
 
+class RegisterCodeRequest(BaseModel):
+    username: str = Field(min_length=1, max_length=64)
+    email: str = Field(min_length=1, max_length=254)
+
+
+class ResetCodeRequest(BaseModel):
+    email: str = Field(min_length=1, max_length=254)
+
+
+class VerifyCodeRequest(BaseModel):
+    email: str = Field(min_length=1, max_length=254)
+    code: str = Field(min_length=1, max_length=16)
+
+
+class TicketPasswordRequest(BaseModel):
+    ticket: str = Field(min_length=1, max_length=256)
+    password: str = Field(min_length=1, max_length=256)
+    password_confirmation: str = Field(min_length=1, max_length=256)
+
+
+class SmtpTestRequest(BaseModel):
+    to: str = Field(min_length=1, max_length=254)
+
+
 class MarketUserResponse(BaseModel):
     id: int
     username: str
     enabled: bool
     must_change_password: bool
+    role: str
     created_at: datetime
 
 
@@ -119,6 +158,11 @@ class WatchlistGroupResponse(BaseModel):
 
 class WatchlistsResponse(BaseModel):
     groups: list[WatchlistGroupResponse]
+
+
+class VibeWatchlistBootstrapResponse(WatchlistsResponse):
+    synced: bool
+    warning: str | None = None
 
 
 def _user_response(user: MarketUser) -> MarketUserResponse:
@@ -220,6 +264,18 @@ def install_market_routes(
             raise HTTPException(status_code=503, detail="market application is not configured")
         return accounts, sessions
 
+    def _sync_vibe_symbol(user_id: int, symbol: SymbolLookup) -> None:
+        try:
+            add_symbol_to_vibe(user_id, symbol)
+        except VibeWatchlistSyncError:
+            raise HTTPException(status_code=503, detail="资金暗盘已更新，但 Vibe 自选同步失败；请重试。") from None
+
+    def _remove_vibe_symbol(user_id: int, symbol: str) -> None:
+        try:
+            remove_symbol_from_vibe(user_id, symbol)
+        except VibeWatchlistSyncError:
+            raise HTTPException(status_code=503, detail="资金暗盘已更新，但 Vibe 自选同步失败；请重试。") from None
+
     def require_market_session(request: Request):
         accounts, sessions = stores()
         session_id = request.cookies.get("ths_market_session")
@@ -247,6 +303,8 @@ def install_market_routes(
         if user.must_change_password:
             raise HTTPException(status_code=403, detail="password change required")
         return user
+
+    app.state.require_ready_market_user = require_ready_user
 
     def require_ready_csrf(identity=Depends(require_market_csrf)) -> MarketUser:
         _session, user = identity
@@ -321,6 +379,200 @@ def install_market_routes(
         sessions.revoke_user(user.id)
         set_market_session_cookies(response, sessions.create(user.id))
 
+    # ---- email registration and password reset ----
+
+    code_requests: dict[str, deque[datetime]] = {}
+    code_request_lock = RLock()
+
+    def mail_parts() -> tuple[Any, Any, Any]:
+        accounts, _sessions = stores()
+        sender = getattr(app.state, "mail_sender", None)
+        if sender is None:
+            sender = MailSender()
+            app.state.mail_sender = sender
+        return accounts, SmtpSettings(accounts), sender
+
+    def throttle_code_request(request: Request) -> None:
+        host = request.client.host if request.client else "unknown"
+        now = datetime.now(timezone.utc)
+        with code_request_lock:
+            history = code_requests.setdefault(host, deque())
+            while history and history[0] <= now - timedelta(hours=1):
+                history.popleft()
+            if len(history) >= 10:
+                raise HTTPException(
+                    status_code=429,
+                    detail="验证码请求过于频繁，请稍后再试",
+                    headers={"Retry-After": "600"},
+                )
+            history.append(now)
+
+    def deliver_code(settings: Any, sender: Any, accounts: Any, purpose: str, email: str, username: str | None) -> None:
+        config = settings.load()
+        if not config.ready:
+            raise HTTPException(status_code=503, detail="邮件服务尚未配置，请联系管理员")
+        try:
+            code = accounts.issue_email_code(purpose, email, username)
+        except EmailCodeRateLimited as error:
+            raise HTTPException(
+                status_code=429,
+                detail="验证码发送过于频繁，请稍后再试",
+                headers={"Retry-After": str(error.retry_after)},
+            ) from None
+        try:
+            sender.send_code(config, email, purpose, code)
+        except MailError:
+            accounts.discard_email_codes(purpose, email)
+            raise HTTPException(status_code=502, detail="验证码邮件发送失败，请稍后重试或联系管理员") from None
+
+    def normalized_email(accounts: Any, value: str) -> str:
+        try:
+            return accounts.normalize_email(value)
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from None
+
+    def check_passwords(accounts: Any, payload: TicketPasswordRequest) -> str:
+        if payload.password != payload.password_confirmation:
+            raise HTTPException(status_code=422, detail="两次输入的密码不一致")
+        try:
+            return accounts.check_new_password(payload.password)
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from None
+
+    @app.get("/api/v1/registration")
+    def registration_status() -> dict[str, bool]:
+        _accounts, settings, _sender = mail_parts()
+        config = settings.load()
+        return {
+            "registration_enabled": config.registration_enabled and config.ready,
+            "password_reset_enabled": config.ready,
+        }
+
+    @app.post("/api/v1/register/code", status_code=202)
+    def request_register_code(payload: RegisterCodeRequest, request: Request) -> dict[str, bool]:
+        accounts, settings, sender = mail_parts()
+        if not settings.load().registration_enabled:
+            raise HTTPException(status_code=403, detail="注册暂未开放，请联系管理员")
+        try:
+            username = accounts._username(payload.username)
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from None
+        email = normalized_email(accounts, payload.email)
+        if accounts.username_taken(username):
+            raise HTTPException(status_code=409, detail="用户名已被使用")
+        if accounts.find_user_by_email(email) is not None:
+            raise HTTPException(status_code=409, detail="该邮箱已注册")
+        throttle_code_request(request)
+        deliver_code(settings, sender, accounts, "register", email, username)
+        return {"sent": True}
+
+    @app.post("/api/v1/register/verify")
+    def verify_register_code(payload: VerifyCodeRequest) -> dict[str, str]:
+        accounts, settings, _sender = mail_parts()
+        if not settings.load().registration_enabled:
+            raise HTTPException(status_code=403, detail="注册暂未开放，请联系管理员")
+        email = normalized_email(accounts, payload.email)
+        ticket = accounts.verify_email_code("register", email, payload.code)
+        if ticket is None:
+            raise HTTPException(status_code=400, detail="验证码错误或已过期")
+        return {"ticket": ticket}
+
+    @app.post("/api/v1/register", status_code=201, response_model=MarketUserResponse)
+    def complete_registration(
+        payload: TicketPasswordRequest, response: Response
+    ) -> MarketUserResponse:
+        accounts, settings, _sender = mail_parts()
+        _accounts, sessions = stores()
+        if not settings.load().registration_enabled:
+            raise HTTPException(status_code=403, detail="注册暂未开放，请联系管理员")
+        password = check_passwords(accounts, payload)
+        spent = accounts.consume_ticket("register", payload.ticket)
+        if spent is None or spent[1] is None:
+            raise HTTPException(status_code=400, detail="验证已失效，请重新获取验证码")
+        email, username = spent
+        try:
+            user = accounts.create_registered_user(username, email, password)
+        except DuplicateUserError:
+            raise HTTPException(status_code=409, detail="用户名或邮箱已被使用") from None
+        set_market_session_cookies(response, sessions.create(user.id))
+        return _user_response(user)
+
+    @app.post("/api/v1/password-reset/code", status_code=202)
+    def request_reset_code(payload: ResetCodeRequest, request: Request) -> dict[str, bool]:
+        accounts, settings, sender = mail_parts()
+        email = normalized_email(accounts, payload.email)
+        throttle_code_request(request)
+        user = accounts.find_user_by_email(email)
+        if user is not None and user.enabled:
+            try:
+                deliver_code(settings, sender, accounts, "reset", email, None)
+            except HTTPException as error:
+                # Throttling and delivery failures must not reveal that the address exists.
+                if error.status_code not in {429, 502}:
+                    raise
+        elif not settings.load().ready:
+            raise HTTPException(status_code=503, detail="邮件服务尚未配置，请联系管理员")
+        # Identical answer whether or not the address belongs to an account.
+        return {"sent": True}
+
+    @app.post("/api/v1/password-reset/verify")
+    def verify_reset_code(payload: VerifyCodeRequest) -> dict[str, str]:
+        accounts, _settings, _sender = mail_parts()
+        email = normalized_email(accounts, payload.email)
+        ticket = accounts.verify_email_code("reset", email, payload.code)
+        if ticket is None:
+            raise HTTPException(status_code=400, detail="验证码错误或已过期")
+        return {"ticket": ticket}
+
+    @app.post("/api/v1/password-reset/confirm", status_code=204)
+    def confirm_password_reset(payload: TicketPasswordRequest) -> None:
+        accounts, _settings, _sender = mail_parts()
+        _accounts, sessions = stores()
+        password = check_passwords(accounts, payload)
+        spent = accounts.consume_ticket("reset", payload.ticket)
+        if spent is None:
+            raise HTTPException(status_code=400, detail="验证已失效，请重新获取验证码")
+        user = accounts.find_user_by_email(spent[0])
+        if user is None or not user.enabled:
+            raise HTTPException(status_code=400, detail="验证已失效，请重新获取验证码")
+        accounts.set_password(user.id, password)
+        sessions.revoke_user(user.id)
+
+    @app.get("/api/admin/mail/config")
+    def admin_mail_config(_admin=Depends(require_admin)) -> dict[str, Any]:
+        _accounts, settings, _sender = mail_parts()
+        return settings.public()
+
+    @app.put("/api/admin/mail/config")
+    def update_admin_mail_config(
+        payload: dict[str, Any],
+        _admin=Depends(require_admin_csrf),
+    ) -> dict[str, Any]:
+        _accounts, settings, _sender = mail_parts()
+        try:
+            return settings.save(payload)
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from None
+
+    @app.post("/api/admin/mail/test")
+    def test_admin_mail(
+        payload: SmtpTestRequest,
+        _admin=Depends(require_admin_csrf),
+    ) -> dict[str, bool]:
+        _accounts, settings, sender = mail_parts()
+        try:
+            sender.send(
+                settings.load(),
+                payload.to,
+                "THS Market 邮件测试",
+                "这是一封来自 THS Market 后台的测试邮件，收到说明 SMTP 配置可用。",
+            )
+        except MailError as error:
+            raise HTTPException(status_code=502, detail=str(error)) from None
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from None
+        return {"sent": True}
+
     @app.get("/api/admin/users", response_model=list[MarketUserResponse])
     def list_market_users(_admin=Depends(require_admin)) -> list[MarketUserResponse]:
         accounts, _sessions = stores()
@@ -372,6 +624,63 @@ def install_market_routes(
             ]
         )
 
+    @app.post(
+        "/api/v1/watchlists/vibe-bootstrap",
+        response_model=VibeWatchlistBootstrapResponse,
+    )
+    def bootstrap_vibe_watchlist(
+        user=Depends(require_ready_csrf),
+    ) -> VibeWatchlistBootstrapResponse:
+        accounts, _sessions = stores()
+        warning = None
+        initialized = accounts.vibe_watchlist_synced(user.id)
+        if not initialized:
+            legacy_symbols: dict[str, SymbolLookup] = {}
+            try:
+                legacy_records = read_vibe_watchlist(user.id)
+            except VibeWatchlistSyncError:
+                raise HTTPException(status_code=503, detail="Vibe 自选同步暂不可用，请重试。") from None
+            for record in legacy_records:
+                symbol = record.get("symbol")
+                if not isinstance(symbol, str) or not re.fullmatch(r"[0-9]{6}", symbol):
+                    continue
+                try:
+                    legacy_symbols[symbol] = resolve_symbol(symbol)
+                except HTTPException as error:
+                    if error.status_code in {404, 409, 422}:
+                        continue
+                    raise
+                except Exception:
+                    raise HTTPException(status_code=503, detail="证券目录暂时不可用，自选同步稍后重试") from None
+            try:
+                accounts.merge_primary_symbols(user.id, list(legacy_symbols.values()))
+            except ValueError:
+                warning = "行情自选已达到数量上限；旧自选仍保留，释放名额后可再次同步。"
+
+        groups = accounts.list_watchlists(user.id)
+        market_symbols = {
+            item.symbol: SymbolLookup(item.symbol, item.name, item.market)
+            for group in groups
+            for item in group.items
+        }
+        try:
+            reconcile_vibe_watchlist(
+                user.id,
+                list(market_symbols.values()),
+                resolve_symbol,
+                remove_stale=warning is None,
+            )
+        except VibeWatchlistSyncError:
+            raise HTTPException(status_code=503, detail="Vibe 自选同步暂不可用，请重试。") from None
+
+        if warning is None:
+            accounts.mark_vibe_watchlist_synced(user.id)
+        return VibeWatchlistBootstrapResponse(
+            groups=[_group_response(group, resolve_symbol) for group in groups],
+            synced=warning is None,
+            warning=warning,
+        )
+
     @app.post("/api/v1/watchlists/groups", status_code=201, response_model=WatchlistGroupResponse)
     def create_watchlist_group(
         payload: GroupRequest,
@@ -407,7 +716,13 @@ def install_market_routes(
     def delete_watchlist_group(group_id: int, user=Depends(require_ready_csrf)) -> None:
         accounts, _sessions = stores()
         try:
+            group = next((item for item in accounts.list_watchlists(user.id) if item.id == group_id), None)
+            if group is None:
+                raise LookupError("watchlist group not found")
             accounts.delete_group(user.id, group_id)
+            for item in group.items:
+                if not accounts.has_watchlist_symbol(user.id, item.symbol):
+                    _remove_vibe_symbol(user.id, item.symbol)
         except LookupError:
             raise HTTPException(status_code=404, detail="watchlist group not found") from None
         except ValueError as error:
@@ -440,10 +755,9 @@ def install_market_routes(
         lookup = resolve_symbol(normalized)
         accounts, _sessions = stores()
         try:
-            return _item_response(
-                accounts.add_symbol(user.id, group_id, lookup),
-                resolve_symbol,
-            )
+            item = accounts.add_symbol(user.id, group_id, lookup)
+            _sync_vibe_symbol(user.id, lookup)
+            return _item_response(item, resolve_symbol)
         except LookupError:
             raise HTTPException(status_code=404, detail="watchlist group not found") from None
         except ValueError as error:
@@ -458,6 +772,8 @@ def install_market_routes(
         accounts, _sessions = stores()
         try:
             accounts.remove_symbol(user.id, group_id, symbol)
+            if not accounts.has_watchlist_symbol(user.id, symbol):
+                _remove_vibe_symbol(user.id, symbol)
         except LookupError:
             raise HTTPException(status_code=404, detail="watchlist symbol not found") from None
 
@@ -473,7 +789,9 @@ def install_market_routes(
         try:
             accounts.remove_symbol_everywhere(user.id, normalized)
         except LookupError:
-            raise HTTPException(status_code=404, detail="watchlist symbol not found") from None
+            # Idempotent removal also completes a previous cross-store retry.
+            pass
+        _remove_vibe_symbol(user.id, normalized)
 
     @app.put("/api/v1/watchlists/groups/{group_id}/symbols/order", status_code=204)
     def reorder_watchlist_symbols(

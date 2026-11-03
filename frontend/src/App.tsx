@@ -6,6 +6,7 @@ import { FundFlowHistoryChart } from './FundFlowHistoryChart'
 import { FundFlowDailyChart } from './FundFlowDailyChart'
 import type { FundFlowDailyPoint } from './market-api'
 import './styles.css'
+import './theme-glass.css'
 
 const LEGACY_HISTORY_STORAGE_KEY = 'ths_level2_job_history'
 const STOCK_TABS_STORAGE_KEY = 'ths_level2_stock_tabs_v2'
@@ -748,6 +749,7 @@ export default function App({ initialTask }: { initialTask?: Job }) {
   const [moreOpen, setMoreOpen] = useState(false)
   const symbolInputRef = useRef<HTMLInputElement>(null)
   const symbolEntryRef = useRef<HTMLDivElement>(null)
+  const moreMenuRef = useRef<HTMLDivElement>(null)
   const lookupSequence = useRef(0)
   const suggestionSequence = useRef(0)
   const retryRequests = useRef(new Map<string, Promise<void>>())
@@ -1128,13 +1130,36 @@ export default function App({ initialTask }: { initialTask?: Job }) {
     focusable[nextIndex].focus()
   }
 
+  useEffect(() => {
+    if (!moreOpen) return
+    const close = (event: Event) => {
+      if (event.type === 'keydown') {
+        if ((event as globalThis.KeyboardEvent).key !== 'Escape') return
+        moreMenuRef.current?.querySelector('button')?.focus()
+      } else if (moreMenuRef.current?.contains(event.target as Node)) return
+      setMoreOpen(false)
+    }
+    document.addEventListener('pointerdown', close)
+    document.addEventListener('keydown', close)
+    return () => {
+      document.removeEventListener('pointerdown', close)
+      document.removeEventListener('keydown', close)
+    }
+  }, [moreOpen])
+
   if (isAdmin) return <AdminPage autoLoad />
 
   return <main className="page-shell">
     <header className="query-header">
-      <h1 className="sr-only">股票数据查询</h1>
-      <div className="more-menu">
-        <button type="button" aria-expanded={moreOpen} aria-controls="more-menu-panel" onClick={() => setMoreOpen((open) => !open)}>更多</button>
+      <div className="query-brand">
+        <span className="query-brand-mark" aria-hidden="true">顺</span>
+        <div>
+          <h1>股票数据查询</h1>
+          <p>八项核心指标 · 主力资金 · 分时曲线</p>
+        </div>
+      </div>
+      <div className="more-menu" ref={moreMenuRef}>
+        <button type="button" aria-expanded={moreOpen} aria-haspopup="true" aria-controls="more-menu-panel" onClick={() => setMoreOpen((open) => !open)}>更多</button>
         {moreOpen && <nav className="more-menu-panel" id="more-menu-panel" aria-label="辅助入口">
           <a href="/market">进入行情中心</a>
           <a href="/#admin">管理台</a>

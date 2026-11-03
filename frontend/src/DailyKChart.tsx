@@ -18,10 +18,10 @@ export interface DailyKSelection {
 
 const UP_COLOR = '#e2232e'
 const DOWN_COLOR = '#00966d'
-const NEUTRAL_READOUT_COLOR = '#5d626a'
+const NEUTRAL_READOUT_COLOR = '#9fb0c3'
 
 const movingAverageLines = [
-  ['ma5', '#2d3439', 'MA5'],
+  ['ma5', '#e6edf5', 'MA5'],
   ['ma13', '#f28e2b', 'MA13'],
   ['ma21', '#7251a2', 'MA21'],
   ['ma60', '#2787d9', 'MA60'],
@@ -37,7 +37,7 @@ const bollLines = [
 
 const overlayLines = [...movingAverageLines, ...bollLines] as const
 const macdLines = [
-  ['macd_dif', '#30343a', 'DIF', 'readout-dif'],
+  ['macd_dif', '#e6edf5', 'DIF', 'readout-dif'],
   ['macd_dea', '#f06b35', 'DEA', 'readout-dea'],
 ] as const
 
@@ -126,18 +126,18 @@ export function DailyKChart({ name, page, pricePrecision = 2, onSelectionChange 
       autoSize: true,
       height: 720,
       layout: {
-        background: { type: ColorType.Solid, color: '#ffffff' },
-        textColor: '#747981',
+        background: { type: ColorType.Solid, color: '#0b1522' },
+        textColor: '#8da2b8',
         attributionLogo: true,
-        panes: { separatorColor: '#e7e8eb', separatorHoverColor: '#d5d8dd' },
+        panes: { separatorColor: '#1f3045', separatorHoverColor: '#2f4a68' },
       },
       crosshair: { mode: CrosshairMode.Normal },
       grid: {
-        vertLines: { color: '#f0f1f3' },
-        horzLines: { color: '#eceef1' },
+        vertLines: { color: '#14233a' },
+        horzLines: { color: '#182a42' },
       },
-      rightPriceScale: { borderColor: '#e2e4e7' },
-      timeScale: { borderColor: '#e2e4e7', timeVisible: false },
+      rightPriceScale: { borderColor: '#223650' },
+      timeScale: { borderColor: '#223650', timeVisible: false },
     })
 
     const candles = chart.addSeries(CandlestickSeries, {

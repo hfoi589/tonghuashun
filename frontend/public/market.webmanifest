@@ -1,11 +1,11 @@
 {
-  "name": "同花顺行情中心",
-  "short_name": "行情中心",
+  "name": "好运器",
+  "short_name": "好运器",
   "start_url": "/market",
   "display": "standalone",
   "background_color": "#f4f5f7",
   "theme_color": "#17191d",
   "icons": [
-    { "src": "/market-icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" }
+    { "src": "/haoyunqi-mascot.png", "sizes": "1324x1330", "type": "image/png", "purpose": "any maskable" }
   ]
 }

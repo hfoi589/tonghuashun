@@ -111,20 +111,20 @@ describe('DailyKChart', () => {
     value.indicators.macd_hist = ['-0.50', '0.50']
     render(<DailyKChart name="招商轮船" page={value} onSelectionChange={onSelectionChange} />)
 
-    expect(screen.getByTestId('readout-ma5')).toHaveStyle({ color: '#2d3439' })
+    expect(screen.getByTestId('readout-ma5')).toHaveStyle({ color: '#e6edf5' })
     expect(screen.getByTestId('readout-ma13')).toHaveStyle({ color: '#f28e2b' })
     expect(screen.getByTestId('readout-boll-mid')).toHaveStyle({ color: '#4b91e6' })
     expect(screen.getByTestId('readout-boll-upper')).toHaveStyle({ color: '#e2232e' })
     expect(screen.getByTestId('readout-boll-lower')).toHaveStyle({ color: '#159447' })
-    expect(screen.getByTestId('readout-dif')).toHaveStyle({ color: '#30343a' })
+    expect(screen.getByTestId('readout-dif')).toHaveStyle({ color: '#e6edf5' })
     expect(screen.getByTestId('readout-dea')).toHaveStyle({ color: '#f06b35' })
     expect(screen.getByTestId('readout-volume')).toHaveStyle({ color: '#e2232e' })
     expect(screen.getByTestId('readout-macd')).toHaveStyle({ color: '#e2232e' })
     expect(screen.queryByTestId('readout-ohlc')).not.toBeInTheDocument()
 
-    expect(chartHarness.series[1].options.color).toBe('#2d3439')
+    expect(chartHarness.series[1].options.color).toBe('#e6edf5')
     expect(chartHarness.series[7].options.color).toBe('#4b91e6')
-    expect(chartHarness.series[12].options.color).toBe('#30343a')
+    expect(chartHarness.series[12].options.color).toBe('#e6edf5')
     expect(chartHarness.series[13].options.color).toBe('#f06b35')
 
     act(() => {

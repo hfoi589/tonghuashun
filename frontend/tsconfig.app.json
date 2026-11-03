@@ -11,10 +11,32 @@
     "strict": true,
     "module": "ESNext",
     "moduleResolution": "Bundler",
+    "paths": {
+      "@/*": ["./../vibe_research/desktop/src/verticals/finance/*"],
+      "@ths/*": ["./src/*"],
+      "react": ["./node_modules/@types/react"],
+      "react/*": ["./node_modules/@types/react/*"],
+      "react-dom": ["./node_modules/@types/react-dom"],
+      "react-dom/*": ["./node_modules/@types/react-dom/*"],
+      "react-router-dom": ["./node_modules/react-router-dom/dist/index.d.ts"],
+      "lucide-react": ["./node_modules/lucide-react/dist/lucide-react.d.ts"],
+      "react-markdown": ["./node_modules/react-markdown/index.d.ts"],
+      "remark-gfm": ["./node_modules/remark-gfm/index.d.ts"],
+      "clsx": ["./node_modules/clsx/clsx.d.ts"],
+      "tailwind-merge": ["./node_modules/tailwind-merge/dist/types.d.ts"],
+      "zustand": ["./node_modules/zustand/index.d.ts"],
+      "echarts": ["./node_modules/echarts/index.d.ts"],
+      "echarts/*": ["./node_modules/echarts/*"],
+      "mdast": ["./node_modules/@types/mdast"],
+      "hast": ["./node_modules/@types/hast"],
+      "unist": ["./node_modules/@types/unist"]
+    },
+    "allowImportingTsExtensions": true,
     "resolveJsonModule": true,
     "isolatedModules": true,
     "noEmit": true,
     "jsx": "react-jsx"
   },
-  "include": ["src"]
+  "include": ["src", "../vibe_research/desktop/src"],
+  "exclude": ["src/**/*.test.ts", "src/**/*.test.tsx", "src/test"]
 }

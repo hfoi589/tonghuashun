@@ -3,10 +3,12 @@ import { ApiError, api, readCsrfToken, type AccountSessionStatus, type AdminDevi
 import { parseDeviceServerMessage, type DeviceInputEvent, type DeviceStatus } from './device-protocol'
 import { DeviceInputAdapter } from './device-stream'
 import { beijingDateBoundaryToUtc, formatRequestLogTimestamp } from './request-log-time'
+import { AdminMailSettings } from './AdminMailSettings'
+import { VibeAdminSettings } from './VibeAdminSettings'
 
 type DeviceConnection = 'UNCONFIGURED' | 'CONNECTING' | 'ONLINE' | 'OFFLINE'
 type AdminAuthentication = 'AUTHENTICATED' | 'ANONYMOUS'
-type AdminTab = 'overview' | 'market' | 'market_list' | 'devices' | 'users' | 'logs'
+type AdminTab = 'overview' | 'market' | 'market_list' | 'devices' | 'users' | 'mail' | 'logs' | 'vibe_ai'
 
 interface DeviceLifecycleDialogState {
   role: DeviceRole
@@ -303,6 +305,21 @@ function DeviceLifecycleDialog({
   </div>
 }
 
+const adminTabIds: AdminTab[] = ['overview', 'market', 'market_list', 'devices', 'users', 'mail', 'logs', 'vibe_ai']
+
+function adminTabFromLocation(): AdminTab {
+  const value = new URLSearchParams(window.location.search).get('adminTab')
+  if (value === 'vibe-ai') return 'vibe_ai'
+  return adminTabIds.find((tab) => tab === value) ?? 'devices'
+}
+
+// 标签写进地址栏：刷新或分享链接后仍停留在同一个标签
+function rememberAdminTab(tab: AdminTab) {
+  const url = new URL(window.location.href)
+  url.searchParams.set('adminTab', tab === 'vibe_ai' ? 'vibe-ai' : tab)
+  window.history.replaceState(window.history.state, '', url)
+}
+
 function healthText(health: RunnerHealth | null) {
   if (health?.state === 'READY') return '运行端就绪'
   if (health?.state === 'ADMIN_CONTROL') return '管理员正在控制设备'
@@ -457,7 +474,7 @@ export function AdminPage({ deviceStreamUrl, autoLoad = false }: { deviceStreamU
   const hadSessionCookie = useRef(Boolean(readCsrfToken()))
   const [authentication, setAuthentication] = useState<AdminAuthentication>(hadSessionCookie.current ? 'AUTHENTICATED' : 'ANONYMOUS')
   const authenticated = authentication === 'AUTHENTICATED'
-  const [activeTab, setActiveTab] = useState<AdminTab>('devices')
+  const [activeTab, setActiveTab] = useState<AdminTab>(adminTabFromLocation)
   const [sessionValidated, setSessionValidated] = useState(false)
   const [health, setHealth] = useState<RunnerHealth | null>(null)
   const [queue, setQueue] = useState<QueueState | null>(null)
@@ -790,6 +807,16 @@ export function AdminPage({ deviceStreamUrl, autoLoad = false }: { deviceStreamU
     void loadDeviceData()
   }, [authenticated, loadDeviceData, sessionValidated])
 
+  // 打开「查询日志」标签时自动加载最近记录，避免先看到误导性的“暂无日志”
+  const logsAutoLoaded = useRef(false)
+  const [logsLoading, setLogsLoading] = useState(false)
+  useEffect(() => {
+    if (activeTab !== 'logs' || !authenticated || !sessionValidated || logsAutoLoaded.current) return
+    logsAutoLoaded.current = true
+    setLogsLoading(true)
+    void api.logs().then((result) => setLogs(result.items)).catch(invalidateAdminControl).finally(() => setLogsLoading(false))
+  }, [activeTab, authenticated, invalidateAdminControl, sessionValidated])
+
   const lifecycleTransitioning = Object.values(devices).some((device) => device?.lifecycle.state === 'STARTING' || device?.lifecycle.state === 'STOPPING')
   useEffect(() => {
     if (!authenticated || !sessionValidated) return
@@ -813,8 +840,14 @@ export function AdminPage({ deviceStreamUrl, autoLoad = false }: { deviceStreamU
     <header className="admin-header"><div><p className="eyebrow">ADMIN CONSOLE</p><h1>设备与队列控制</h1></div><div className="button-row"><span className={`status ${healthReady(health) ? 'status-completed' : health?.state === 'NEEDS_ADMIN' ? 'status-waiting_admin' : 'status-failed'}`}>{healthText(health)}</span><button className="secondary" onClick={logout}>退出管理台</button></div></header>
     <p className="notice"><span>密码仅用于本次请求，不会记录或展示。</span> 不要在此页面输入或粘贴同花顺账号凭据；本页面不会记录任何密码或按键内容。</p>
     <nav className="admin-tabs" aria-label="管理台标签">
-      {([['overview', '运行概览'], ['market', '监控与推送'], ['market_list', '市场监控列表'], ['devices', '设备与队列'], ['users', '用户与安全'], ['logs', '查询日志']] as Array<[AdminTab, string]>).map(([tab, label]) => <button key={tab} type="button" className={activeTab === tab ? 'active' : ''} aria-selected={activeTab === tab} onClick={() => setActiveTab(tab)}>{label}</button>)}
+      {([['overview', '运行概览'], ['market', '监控与推送'], ['market_list', '市场监控列表'], ['devices', '设备与队列'], ['users', '用户与安全'], ['mail', '邮件与注册'], ['logs', '查询日志'], ['vibe_ai', 'Vibe AI 设置']] as Array<[AdminTab, string]>).map(([tab, label]) => <button key={tab} type="button" className={activeTab === tab ? 'active' : ''} aria-selected={activeTab === tab} onClick={() => { setActiveTab(tab); rememberAdminTab(tab) }}>{label}</button>)}
     </nav>
+    <div className="admin-tab-panel" hidden={activeTab !== 'mail'}>
+      <AdminMailSettings active={activeTab === 'mail'} />
+    </div>
+    <div className="admin-tab-panel" hidden={activeTab !== 'vibe_ai'}>
+      <VibeAdminSettings active={activeTab === 'vibe_ai'} />
+    </div>
     <div className="admin-tab-panel" hidden={activeTab !== 'logs'}>
       <section className="admin-controls"><div><h2>查询日志</h2><p>完整记录访问者、功能、股票、请求路径和结果。</p></div></section>
       <section className="admin-ops-card"><div className="admin-ops-grid four">
@@ -823,7 +856,7 @@ export function AdminPage({ deviceStreamUrl, autoLoad = false }: { deviceStreamU
         <label>开始日期<input type="date" value={logFrom} onChange={(e) => setLogFrom(e.target.value)} /></label><label>结束日期<input type="date" value={logTo} onChange={(e) => setLogTo(e.target.value)} /></label><label>状态<select aria-label="日志状态筛选" value={logStatus} onChange={(e) => setLogStatus(e.target.value)}><option value="">全部状态</option><option value="成功">成功</option><option value="失败">失败</option></select></label>
         <button className="secondary" onClick={() => { const q = new URLSearchParams(); if (logSymbol) q.set('symbol', logSymbol); if (logStockName) q.set('stock_name', logStockName); if (logUserName) q.set('user_name', logUserName); if (logIp) q.set('ip', logIp); if (logAction) q.set('action', logAction); if (logStatus) q.set('status', logStatus); if (logFrom) q.set('from', beijingDateBoundaryToUtc(logFrom, 'start')); if (logTo) q.set('to', beijingDateBoundaryToUtc(logTo, 'end')); q.set('offset', '0'); setLogPage(0); void api.logs('?' + q.toString()).then((r) => setLogs(r.items)).catch(invalidateAdminControl) }}>查询</button>
       </div></section>
-      <section className="admin-ops-card" style={{overflowX: 'auto'}}>{logs.length ? <table><thead><tr>{['日期','时间','功能','股票代码','股票名称','用户账号','IP','设备类型','结果','错误码','耗时(ms)','任务ID'].map((h) => <th key={h}>{h}</th>)}</tr></thead><tbody>{logs.map((log) => { const timestamp = formatRequestLogTimestamp(log.timestamp); return <tr key={log.id}><td>{timestamp.date}</td><td>{timestamp.time}</td><td>{actionNames[log.action] ?? '其他功能'}</td><td>{log.symbol ?? '—'}</td><td>{log.stock_name ?? '—'}</td><td>{log.user_name ?? (log.user_id == null ? '匿名' : '未知账号')}</td><td>{log.ip ?? '未知'}</td><td>{log.device_type ?? '其他设备'}</td><td>{log.status_code < 400 && !['FAILED','PARTIAL'].includes(log.task_status ?? '') ? '成功' : '失败'}</td><td>{log.error_code ?? '—'}</td><td>{Math.round(log.duration_ms)}</td><td>{log.public_id ?? '—'}</td></tr> })}</tbody></table> : <p className="minor">暂无查询日志。</p>}</section>
+      <section className="admin-ops-card" style={{overflowX: 'auto'}}>{logs.length ? <table><thead><tr>{['日期','时间','功能','股票代码','股票名称','用户账号','IP','设备类型','结果','错误码','耗时(ms)','任务ID'].map((h) => <th key={h}>{h}</th>)}</tr></thead><tbody>{logs.map((log) => { const timestamp = formatRequestLogTimestamp(log.timestamp); return <tr key={log.id}><td>{timestamp.date}</td><td>{timestamp.time}</td><td>{actionNames[log.action] ?? '其他功能'}</td><td>{log.symbol ?? '—'}</td><td>{log.stock_name ?? '—'}</td><td>{log.user_name ?? (log.user_id == null ? '匿名' : '未知账号')}</td><td>{log.ip ?? '未知'}</td><td>{log.device_type ?? '其他设备'}</td><td>{log.status_code < 400 && !['FAILED','PARTIAL'].includes(log.task_status ?? '') ? '成功' : '失败'}</td><td>{log.error_code ?? '—'}</td><td>{Math.round(log.duration_ms)}</td><td>{log.public_id ?? '—'}</td></tr> })}</tbody></table> : <p className="minor" role="status">{logsLoading ? '正在加载查询日志…' : '没有符合条件的查询日志。'}</p>}</section>
     </div>
     <div className="admin-tab-panel" hidden={activeTab !== 'overview'}>
       <section className="admin-controls"><div><h2>运行概览</h2><p>{healthText(health)} · {queue?.paused ? '队列已暂停' : '队列接收中'} · {locked ? '当前会话已接管设备' : '设备未接管'}</p></div><div className="button-row"><button className="secondary" onClick={refreshHealth}>刷新运行端状态</button></div></section>
@@ -853,7 +886,7 @@ export function AdminPage({ deviceStreamUrl, autoLoad = false }: { deviceStreamU
     <div className="admin-tab-panel" hidden={activeTab !== 'users'}>
       <section className="admin-controls"><div><h2>修改管理员密码</h2><p>修改后当前会话会退出，使用新密码重新登录。</p></div><form className="password-change-form" onSubmit={changePassword} data-1p-ignore="true" data-lpignore="true"><label htmlFor="current-admin-password">当前管理员密码</label><input id="current-admin-password" type="password" autoComplete="current-password" data-1p-ignore="true" data-lpignore="true" value={currentPassword} onChange={(event) => setCurrentPassword(event.target.value)} required /><label htmlFor="new-admin-password">新管理员密码</label><input id="new-admin-password" type="password" autoComplete="new-password" data-1p-ignore="true" data-lpignore="true" value={newPassword} onChange={(event) => setNewPassword(event.target.value)} required /><label htmlFor="confirm-admin-password">确认新管理员密码</label><input id="confirm-admin-password" type="password" autoComplete="new-password" data-1p-ignore="true" data-lpignore="true" value={newPasswordConfirmation} onChange={(event) => setNewPasswordConfirmation(event.target.value)} required /><button className="secondary" type="submit">修改管理员密码</button></form></section>
       <section className="admin-controls admin-market-users">
-      <div><h2>行情用户</h2><p>创建普通用户、自选空间和临时密码。用户首次登录必须修改密码。</p></div>
+      <div><h2>行情用户</h2><p>新建账号始终为普通用户；wilson 是默认管理员。用户首次登录必须修改密码。</p></div>
       <div className="admin-market-user-actions">
         {marketUsers === null ? <div>{marketUsersLoading ? <p className="minor" role="status">正在加载行情用户…</p> : marketUsersError ? <p className="error" role="alert">{marketUsersError}</p> : null}<button type="button" className="secondary" onClick={loadMarketUsers} disabled={marketUsersLoading}>{marketUsersError ? '重新加载行情用户' : '加载行情用户'}</button></div> : <>
           <form className="password-change-form" onSubmit={createMarketUser}>
@@ -862,7 +895,7 @@ export function AdminPage({ deviceStreamUrl, autoLoad = false }: { deviceStreamU
             <button type="submit" className="secondary">创建行情用户</button>
           </form>
           <div className="admin-market-user-list">{marketUsers.length === 0 ? <p className="minor">还没有行情用户。</p> : marketUsers.map((target) => <div key={target.id}>
-            <span><strong>{target.username}</strong><small>{target.must_change_password ? '首次登录需改密' : '密码已设置'}</small></span>
+            <span><strong>{target.username}</strong><small>{target.role === 'admin' ? '管理员' : '普通用户'} · {target.must_change_password ? '首次登录需改密' : '密码已设置'}</small></span>
             <button type="button" className="secondary" onClick={() => toggleMarketUser(target)}>{target.enabled ? '停用' : '启用'}</button>
           </div>)}</div>
         </>}

@@ -176,7 +176,7 @@ export function IntradayMetricChart({ title, series, directional, precision = 2,
   </figure>
 }
 
-const MACD_DIF_COLOR = '#30343a'
+const MACD_DIF_COLOR = '#e6edf5'
 const MACD_DEA_COLOR = '#f06b35'
 
 function seriesValueMap(series: IntradayMetricSeries): Map<string, number | null> {

@@ -67,7 +67,7 @@ describe('MarketApp', () => {
 
     render(<MarketApp />)
 
-    expect(await screen.findByRole('heading', { name: '登录行情中心' })).toBeInTheDocument()
+    expect(await screen.findByRole('heading', { name: '登录好运器行情中心' })).toBeInTheDocument()
     expect(screen.getByLabelText('用户名')).toBeInTheDocument()
     expect(screen.getByLabelText('密码')).toBeInTheDocument()
   })
@@ -89,7 +89,7 @@ describe('MarketApp', () => {
 
     render(<MarketApp />)
 
-    expect(await screen.findByRole('heading', { name: '登录行情中心' })).toBeInTheDocument()
+    expect(await screen.findByRole('heading', { name: '登录好运器行情中心' })).toBeInTheDocument()
     expect(screen.getByLabelText('用户名')).toBeInTheDocument()
     expect(screen.getByLabelText('密码')).toBeInTheDocument()
     expect(screen.queryByText('我的自选')).not.toBeInTheDocument()

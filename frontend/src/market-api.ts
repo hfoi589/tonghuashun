@@ -1,12 +1,37 @@
 import { ApiError, type IntradayMetricSeries, type MainFundFlowPeriod, type SymbolLookup, type SymbolSuggestion } from './api'
 
 export const marketAuthExpiredEvent = 'ths-market-auth-expired'
+const watchlistsChangedEvent = 'ths-market-watchlists-changed'
+let watchlistChannel: BroadcastChannel | null = null
+
+function channel(): BroadcastChannel | null {
+  if (typeof window === 'undefined' || typeof BroadcastChannel === 'undefined') return null
+  if (!watchlistChannel) {
+    watchlistChannel = new BroadcastChannel('ths-market-watchlists')
+    watchlistChannel.onmessage = () => window.dispatchEvent(new Event(watchlistsChangedEvent))
+  }
+  return watchlistChannel
+}
+
+export function notifyMarketWatchlistChanged(): void {
+  if (typeof window === 'undefined') return
+  window.dispatchEvent(new Event(watchlistsChangedEvent))
+  channel()?.postMessage({ type: 'changed' })
+}
+
+export function subscribeMarketWatchlistChanges(listener: () => void): () => void {
+  if (typeof window === 'undefined') return () => undefined
+  window.addEventListener(watchlistsChangedEvent, listener)
+  channel()
+  return () => window.removeEventListener(watchlistsChangedEvent, listener)
+}
 
 export interface MarketUser {
   id: number
   username: string
   enabled: boolean
   must_change_password: boolean
+  role: 'admin' | 'user'
   created_at: string
 }
 
@@ -22,6 +47,12 @@ export interface WatchlistGroup {
   sort_order: number
   is_primary?: boolean
   items: WatchlistItem[]
+}
+
+export interface VibeWatchlistBootstrap {
+  groups: WatchlistGroup[]
+  synced: boolean
+  warning: string | null
 }
 
 export interface TimesharePoint {
@@ -264,6 +295,31 @@ export const marketApi = {
     '/api/v1/session',
     jsonInit('POST', { username, password }),
   ),
+  registrationStatus: () => request<{ registration_enabled: boolean, password_reset_enabled: boolean }>('/api/v1/registration'),
+  requestRegisterCode: (username: string, email: string) => request<{ sent: boolean }>(
+    '/api/v1/register/code',
+    jsonInit('POST', { username, email }),
+  ),
+  verifyRegisterCode: (email: string, code: string) => request<{ ticket: string }>(
+    '/api/v1/register/verify',
+    jsonInit('POST', { email, code }),
+  ),
+  completeRegistration: (ticket: string, password: string, confirmation: string) => request<MarketUser>(
+    '/api/v1/register',
+    jsonInit('POST', { ticket, password, password_confirmation: confirmation }),
+  ),
+  requestResetCode: (email: string) => request<{ sent: boolean }>(
+    '/api/v1/password-reset/code',
+    jsonInit('POST', { email }),
+  ),
+  verifyResetCode: (email: string, code: string) => request<{ ticket: string }>(
+    '/api/v1/password-reset/verify',
+    jsonInit('POST', { email, code }),
+  ),
+  confirmPasswordReset: (ticket: string, password: string, confirmation: string) => request<void>(
+    '/api/v1/password-reset/confirm',
+    jsonInit('POST', { ticket, password, password_confirmation: confirmation }),
+  ),
   logout: () => request<void>('/api/v1/session', {
     method: 'DELETE',
     headers: { 'X-CSRF-Token': readMarketCsrfToken() },
@@ -277,6 +333,10 @@ export const marketApi = {
     }, true),
   ),
   watchlists: () => request<{ groups: WatchlistGroup[] }>('/api/v1/watchlists'),
+  bootstrapVibeWatchlist: () => request<VibeWatchlistBootstrap>(
+    '/api/v1/watchlists/vibe-bootstrap',
+    jsonInit('POST', {}, true),
+  ),
   createGroup: (name: string) => request<WatchlistGroup>(
     '/api/v1/watchlists/groups',
     jsonInit('POST', { name }, true),
@@ -284,15 +344,15 @@ export const marketApi = {
   addSymbol: (groupId: number, symbol: string) => request<WatchlistItem>(
     `/api/v1/watchlists/groups/${groupId}/symbols`,
     jsonInit('POST', { symbol }, true),
-  ),
+  ).then((item) => { notifyMarketWatchlistChanged(); return item }),
   removeSymbol: (groupId: number, symbol: string) => request<void>(
     `/api/v1/watchlists/groups/${groupId}/symbols/${encodeURIComponent(symbol)}`,
     { method: 'DELETE', headers: { 'X-CSRF-Token': readMarketCsrfToken() } },
-  ),
+  ).then((result) => { notifyMarketWatchlistChanged(); return result }),
   removeSymbolEverywhere: (symbol: string) => request<void>(
     `/api/v1/watchlists/symbols/${encodeURIComponent(symbol)}`,
     { method: 'DELETE', headers: { 'X-CSRF-Token': readMarketCsrfToken() } },
-  ),
+  ).then((result) => { notifyMarketWatchlistChanged(); return result }),
   lookupSymbol: (symbol: string) => request<SymbolLookup>(`/api/v1/symbols/${encodeURIComponent(symbol)}`),
   snapshot: (symbol: string, signal?: AbortSignal) => request<MarketSnapshot>(`/api/v1/market/symbols/${encodeURIComponent(symbol)}/snapshot`, { signal }),
   series: (symbol: string, period: string, signal?: AbortSignal, retry = false) => request<MarketSeriesPage>(

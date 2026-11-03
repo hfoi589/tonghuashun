@@ -1077,6 +1077,7 @@ button.capture-toggle:active { box-shadow: inset 0 2px 5px rgba(18, 49, 54, .08)
 .admin-ops-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
 .admin-ops-heading h3, .admin-channel-grid h3, .admin-rules-editor h3 { margin: 0; font-size: .96rem; }
 .admin-ops-grid { display: grid; gap: 12px; }
+.admin-ops-grid.two { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 .admin-ops-grid.four { grid-template-columns: repeat(4, minmax(0, 1fr)); }
 .admin-ops-grid label, .admin-channel-grid label, .admin-rules-editor label { display: grid; gap: 5px; color: #53646e; font-size: .78rem; }
 .admin-ops-grid input, .admin-channel-grid input, .admin-channel-grid textarea, .admin-rules-editor textarea { width: 100%; border: 1px solid #cbd5da; border-radius: 7px; background: #fbfcfd; color: #17252d; }
@@ -1092,6 +1093,17 @@ button.capture-toggle:active { box-shadow: inset 0 2px 5px rgba(18, 49, 54, .08)
 .admin-monitoring-table > div:first-child { border-top: 0; }
 .admin-monitoring-table small { min-width: 0; overflow-wrap: anywhere; color: #71818a; }
 .button-row { display: flex; flex-wrap: wrap; gap: .6rem; }
+.vibe-admin-settings .admin-controls { align-items: flex-start; }
+.vibe-admin-ai-form { display: grid; flex: 1 1 560px; gap: 14px; min-width: 0; }
+.vibe-admin-settings label { display: grid; gap: 5px; color: var(--text-muted); font-size: .8rem; }
+.vibe-admin-settings input:not([type="checkbox"]),
+.vibe-admin-settings select { width: 100%; min-height: 40px; border: 1px solid var(--line); border-radius: 8px; padding: 0 .7rem; background: var(--surface, #fff); color: var(--text); }
+.vibe-admin-settings input[type="checkbox"] { width: auto; }
+.vibe-admin-settings .vibe-admin-inline-form { display: flex; flex: 1 1 420px; align-items: end; flex-wrap: wrap; gap: .6rem; }
+.vibe-admin-settings .vibe-admin-inline-form label { flex: 1 1 280px; }
+.vibe-admin-settings .vibe-cli-status { display: grid; gap: .25rem; color: var(--text-muted); font-size: .8rem; }
+.vibe-admin-settings .vibe-cli-status p { margin: 0; }
+.vibe-admin-settings .vibe-update-toggle { display: flex; align-items: center; gap: .5rem; }
 .password-change-form { display: grid; gap: .55rem; min-width: min(360px, 100%); }
 .device-actions { display: flex; flex-wrap: wrap; gap: .6rem; margin-top: .8rem; }
 .admin-device-grid {
@@ -1444,6 +1456,7 @@ button.device-danger-button:not(:disabled):not([aria-disabled="true"]):hover { b
   .admin-device-grid { grid-template-columns: 1fr; }
   .admin-channel-grid { grid-template-columns: 1fr; }
   .admin-ops-grid.four { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .admin-ops-grid.two { grid-template-columns: 1fr; }
 }
 
 @media (max-width: 720px) {

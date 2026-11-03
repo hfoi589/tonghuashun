@@ -6,6 +6,11 @@ __pycache__
 node_modules
 frontend/node_modules
 frontend/dist
+vibe_research/.local
+vibe_research/.venv
+vibe_research/node_modules
+vibe_research/desktop/node_modules
+vibe_research/orchestrator/node_modules
 captures
 data
 .env

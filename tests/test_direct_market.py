@@ -405,9 +405,117 @@ def test_fund_client_reuses_a_symbol_result_for_fifteen_seconds() -> None:
     second = client.read_direct("601872")
     third = client.read_direct("601872")
 
-    assert second is first
-    assert third is not first
-    assert calls == 6
+    assert second.values == first.values
+    assert third.values == first.values
+    # t=100: 3 periods; t=110: cached; t=116: only the 15s "today" window.
+    assert calls == 4
+
+
+def _counting_requester(statuses: list[int] | None = None):
+    calls: list[int] = []
+
+    def request(_url, _headers, body, _timeout):
+        payload = json.loads(body)
+        window = int(payload["indexes"][0]["attribute"]["win_size"])
+        calls.append(window)
+        if statuses:
+            status = statuses.pop(0)
+            if status != 200:
+                return HttpResponse(status, {}, b"no")
+        ok = response_for(window)
+        data = json.loads(ok.body)
+        data["data"]["data"][0]["code"] = payload["code_selectors"]["include"][0][
+            "values"
+        ][0]
+        return replace(ok, body=json.dumps(data).encode())
+
+    return request, calls
+
+
+def test_fund_client_refreshes_periods_on_separate_schedules() -> None:
+    request, calls = _counting_requester()
+    now = [0.0]
+    client = FundFlowHttpClient(
+        StaticSessionProvider(session()),
+        requester=request,
+        clock=lambda: now[0],
+        max_requests_per_second=0,
+    )
+
+    client.read_direct("601872")
+    now[0] = 20.0
+    client.read_direct("601872")
+    now[0] = 130.0
+    client.read_direct("601872")
+    now[0] = 310.0
+    client.read_direct("601872")
+
+    assert calls == [1, 3, 5, 1, 1, 3, 1, 3, 5]
+
+
+def test_fund_client_spaces_requests_with_global_limiter() -> None:
+    request, _calls = _counting_requester()
+    sleeps: list[float] = []
+    clock = [0.0]
+    client = FundFlowHttpClient(
+        StaticSessionProvider(session()),
+        requester=request,
+        max_requests_per_second=2,
+        limiter_clock=lambda: clock[0],
+        sleeper=sleeps.append,
+    )
+
+    client.read_direct("601872")
+    client.read_direct("600000")
+
+    assert sleeps == pytest.approx([0.5, 1.0, 1.5, 2.0, 2.5])
+
+
+def test_fund_client_circuit_opens_after_repeated_4xx_and_keeps_error_code() -> None:
+    request, calls = _counting_requester([404, 404, 404])
+    now = [0.0]
+    client = FundFlowHttpClient(
+        StaticSessionProvider(session()),
+        requester=request,
+        max_requests_per_second=0,
+        limiter_clock=lambda: now[0],
+        breaker_threshold=3,
+        breaker_cooldown_seconds=60,
+    )
+
+    for _ in range(3):
+        with pytest.raises(DirectRequestError) as captured:
+            client.read_direct("601872")
+        assert captured.value.error_code == "DIRECT_HTTP_FORBIDDEN"
+    assert len(calls) == 3
+
+    with pytest.raises(DirectRequestError) as captured:
+        client.read_direct("600000")
+    assert captured.value.error_code == "DIRECT_HTTP_FORBIDDEN"
+    assert len(calls) == 3
+
+    now[0] = 61.0
+    assert client.read_direct("600000").values
+    assert len(calls) == 6
+
+
+@pytest.mark.parametrize("status_code", [401, 403, 429])
+def test_fund_client_circuit_opens_immediately_for_auth_and_rate_limit(
+    status_code: int,
+) -> None:
+    request, calls = _counting_requester([status_code])
+    client = FundFlowHttpClient(
+        StaticSessionProvider(session()),
+        requester=request,
+        max_requests_per_second=0,
+    )
+
+    with pytest.raises(DirectRequestError):
+        client.read_direct("601872")
+    with pytest.raises(DirectRequestError):
+        client.read_direct("600000")
+
+    assert len(calls) == 1
 
 
 def test_shadow_source_returns_primary_and_logs_only_mismatched_field_names(

@@ -53,17 +53,20 @@ function mockAuthenticatedDashboard(options: {
       { role: 'core_metrics', state: 'READY', updated_at: null, error_code: null, expires_at: null },
       { role: 'main_fund_flow', state: 'READY', updated_at: fundExpiresAt ? '2026-08-26T08:00:00Z' : null, error_code: null, expires_at: fundExpiresAt ?? null },
     ] })
+    if (url === '/api/admin/mail/config') return jsonResponse({ host: 'smtp.exmail.qq.com', port: 465, ssl: true, user: '', password_configured: false, sender: '', registration_enabled: false, ready: false })
     throw new Error(`unexpected request: ${url}`)
   })
 }
 
 describe('AdminPage', () => {
   beforeEach(() => {
+    window.history.replaceState(null, '', '/')
     vi.stubGlobal('fetch', vi.fn(async (input) => {
       const url = String(input)
       if (url === '/api/admin/devices') return jsonResponse({ devices: [] })
       if (url === '/api/admin/account-sessions') return jsonResponse({ sessions: [] })
       if (url === '/api/admin/premium') return jsonResponse({ as_of: null, valid_count: 0, errors: {}, rows: [] })
+      if (url === '/api/admin/mail/config') return jsonResponse({ host: 'smtp.exmail.qq.com', port: 465, ssl: true, user: '', password_configured: false, sender: '', registration_enabled: false, ready: false })
       throw new Error(`unexpected request: ${url}`)
     }))
     Object.defineProperty(document, 'cookie', { writable: true, value: 'ths_csrf=test-csrf' })
@@ -98,6 +101,7 @@ describe('AdminPage', () => {
         { role: 'core_metrics', state: 'READY', updated_at: '2026-08-27T10:00:00+00:00', error_code: null, expires_at: null },
         { role: 'main_fund_flow', state: 'MISSING', updated_at: null, error_code: null, expires_at: null },
       ] })
+      if (url === '/api/admin/mail/config') return jsonResponse({ host: 'smtp.exmail.qq.com', port: 465, ssl: true, user: '', password_configured: false, sender: '', registration_enabled: false, ready: false })
       throw new Error(`unexpected request: ${url}`)
     })
 
@@ -151,6 +155,7 @@ describe('AdminPage', () => {
       })
       if (url === '/api/admin/research/macd' && init?.method === 'PUT') return jsonResponse(JSON.parse(String(init.body)))
       if (url === '/api/admin/push/config' && init?.method === 'PUT') return jsonResponse(JSON.parse(String(init.body)))
+      if (url === '/api/admin/mail/config') return jsonResponse({ host: 'smtp.exmail.qq.com', port: 465, ssl: true, user: '', password_configured: false, sender: '', registration_enabled: false, ready: false })
       throw new Error(`unexpected request: ${url}`)
     })
 
@@ -261,6 +266,7 @@ describe('AdminPage', () => {
           },
         ] })
       }
+      if (url === '/api/admin/mail/config') return jsonResponse({ host: 'smtp.exmail.qq.com', port: 465, ssl: true, user: '', password_configured: false, sender: '', registration_enabled: false, ready: false })
       throw new Error(`unexpected request: ${url}`)
     })
     const user = userEvent.setup()
@@ -305,6 +311,7 @@ describe('AdminPage', () => {
           },
         ] })
       }
+      if (url === '/api/admin/mail/config') return jsonResponse({ host: 'smtp.exmail.qq.com', port: 465, ssl: true, user: '', password_configured: false, sender: '', registration_enabled: false, ready: false })
       throw new Error(`unexpected request: ${url}`)
     })
     const user = userEvent.setup()
@@ -453,7 +460,7 @@ describe('AdminPage', () => {
     await user.click(screen.getByRole('button', { name: '创建行情用户' }))
 
     expect(await screen.findByText('trader')).toBeInTheDocument()
-    expect(screen.getByText('首次登录需改密')).toBeInTheDocument()
+    expect(screen.getByText(/首次登录需改密/)).toBeInTheDocument()
     expect(fetch).toHaveBeenLastCalledWith('/api/admin/users', expect.objectContaining({
       method: 'POST',
       headers: expect.objectContaining({ 'X-CSRF-Token': 'test-csrf' }),
@@ -474,6 +481,7 @@ describe('AdminPage', () => {
       if (url === '/api/admin/market-monitoring-list') return jsonResponse([{
         symbol: '601872', stock_name: '招商轮船', monitoring_date: '2026-09-20', monitoring_users: ['alice', 'bob'],
       }])
+      if (url === '/api/admin/mail/config') return jsonResponse({ host: 'smtp.exmail.qq.com', port: 465, ssl: true, user: '', password_configured: false, sender: '', registration_enabled: false, ready: false })
       throw new Error(`unexpected request: ${url}`)
     })
 
@@ -495,6 +503,7 @@ describe('AdminPage', () => {
       if (url === '/api/admin/devices') return jsonResponse({ devices: [] })
       if (url === '/api/admin/account-sessions') return jsonResponse({ sessions: [] })
       if (url === '/api/admin/users') return jsonResponse({ detail: '暂时无法加载' }, 503)
+      if (url === '/api/admin/mail/config') return jsonResponse({ host: 'smtp.exmail.qq.com', port: 465, ssl: true, user: '', password_configured: false, sender: '', registration_enabled: false, ready: false })
       throw new Error(`unexpected request: ${url}`)
     })
 
@@ -552,6 +561,7 @@ describe('AdminPage', () => {
       if (url === '/api/admin/queue') return jsonResponse({ paused: false })
       if (url === '/api/admin/devices') return jsonResponse({ devices: [] })
       if (url === '/api/admin/account-sessions') return jsonResponse({ detail: 'admin authentication required' }, 401)
+      if (url === '/api/admin/mail/config') return jsonResponse({ host: 'smtp.exmail.qq.com', port: 465, ssl: true, user: '', password_configured: false, sender: '', registration_enabled: false, ready: false })
       throw new Error(`unexpected request: ${url}`)
     })
 
@@ -596,6 +606,7 @@ describe('AdminPage', () => {
           { role: 'main_fund_flow', state: 'READY', updated_at: null, error_code: null },
         ] })
       }
+      if (url === '/api/admin/mail/config') return jsonResponse({ host: 'smtp.exmail.qq.com', port: 465, ssl: true, user: '', password_configured: false, sender: '', registration_enabled: false, ready: false })
       throw new Error(`unexpected request: ${url}`)
     })
     const user = userEvent.setup()

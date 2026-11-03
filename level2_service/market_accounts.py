@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import re
 import secrets
@@ -31,13 +33,32 @@ class DuplicateUserError(ValueError):
     """The normalized username is already assigned."""
 
 
+class MonitorLimitError(ValueError):
+    """The site-wide distinct watchlist symbol limit has been reached."""
+
+
+MONITOR_LIMIT_MESSAGE = "监控数量达到上限，请联系管理员"
+
+EMAIL_PATTERN = re.compile(r"[^@\s<>\"',;:]{1,64}@[A-Za-z0-9.-]{1,190}\.[A-Za-z]{2,24}")
+
+
+class EmailCodeRateLimited(RuntimeError):
+    """A verification code was requested too soon or too often."""
+
+    def __init__(self, retry_after: int) -> None:
+        super().__init__("verification code requested too frequently")
+        self.retry_after = retry_after
+
+
 @dataclass(frozen=True)
 class MarketUser:
     id: int
     username: str
     enabled: bool
     must_change_password: bool
+    role: str
     created_at: datetime
+    email: str | None = None
 
 
 @dataclass(frozen=True)
@@ -67,10 +88,17 @@ class MarketSession:
 class SQLiteMarketAccountStore:
     """Small relational store suitable for the single API process deployment."""
 
-    def __init__(self, path: Path, *, max_symbols_per_user: int = 50) -> None:
+    def __init__(
+        self,
+        path: Path,
+        *,
+        max_symbols_per_user: int = 50,
+        max_total_symbols: int = 50,
+    ) -> None:
         self.path = path.expanduser().resolve()
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.max_symbols_per_user = max_symbols_per_user
+        self.max_total_symbols = max_total_symbols
         self._lock = RLock()
         self._hasher = PasswordHasher(type=Type.ID)
         self._connection = sqlite3.connect(self.path, check_same_thread=False)
@@ -89,6 +117,8 @@ class SQLiteMarketAccountStore:
                     password_hash TEXT NOT NULL,
                     enabled INTEGER NOT NULL DEFAULT 1,
                     must_change_password INTEGER NOT NULL DEFAULT 1,
+                    role TEXT NOT NULL DEFAULT 'user',
+                    vibe_watchlist_synced INTEGER NOT NULL DEFAULT 0,
                     created_at TEXT NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS watchlist_groups (
@@ -113,7 +143,61 @@ class SQLiteMarketAccountStore:
                     ON watchlist_groups(user_id, sort_order);
                 CREATE INDEX IF NOT EXISTS watchlist_items_group_order
                     ON watchlist_items(group_id, sort_order);
+                CREATE TABLE IF NOT EXISTS app_settings (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS email_codes (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    purpose TEXT NOT NULL,
+                    email TEXT NOT NULL,
+                    username TEXT,
+                    salt TEXT NOT NULL,
+                    code_hash TEXT NOT NULL,
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    expires_at TEXT NOT NULL,
+                    used INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE INDEX IF NOT EXISTS email_codes_lookup
+                    ON email_codes(purpose, email, id);
+                CREATE TABLE IF NOT EXISTS email_tickets (
+                    token_hash TEXT PRIMARY KEY,
+                    purpose TEXT NOT NULL,
+                    email TEXT NOT NULL,
+                    username TEXT,
+                    expires_at TEXT NOT NULL
+                );
                 """
+            )
+            user_columns = {
+                str(row["name"])
+                for row in self._connection.execute(
+                    "PRAGMA table_info(market_users)"
+                ).fetchall()
+            }
+            if "role" not in user_columns:
+                self._connection.execute(
+                    "ALTER TABLE market_users ADD COLUMN role TEXT NOT NULL DEFAULT 'user'"
+                )
+            if "email" not in user_columns:
+                self._connection.execute("ALTER TABLE market_users ADD COLUMN email TEXT")
+            self._connection.execute(
+                """CREATE UNIQUE INDEX IF NOT EXISTS market_users_email
+                   ON market_users(email COLLATE NOCASE) WHERE email IS NOT NULL"""
+            )
+            if "vibe_watchlist_synced" not in user_columns:
+                self._connection.execute(
+                    "ALTER TABLE market_users ADD COLUMN vibe_watchlist_synced INTEGER NOT NULL DEFAULT 0"
+                )
+            # Wilson is the single default administrator for the integrated workspace.
+            # User creation never accepts a role from the request and always uses the
+            # database default (ordinary user).
+            self._connection.execute(
+                "UPDATE market_users SET role='user' WHERE lower(username)<>'wilson'"
+            )
+            self._connection.execute(
+                "UPDATE market_users SET role='admin' WHERE lower(username)='wilson'"
             )
             columns = {
                 str(row["name"])
@@ -222,7 +306,26 @@ class SQLiteMarketAccountStore:
             username=str(row["username"]),
             enabled=bool(row["enabled"]),
             must_change_password=bool(row["must_change_password"]),
+            role=str(row["role"]),
             created_at=datetime.fromisoformat(str(row["created_at"])),
+            email=str(row["email"]) if row["email"] is not None else None,
+        )
+
+    def total_symbol_count(self) -> int:
+        """Distinct symbols across every user's watchlists."""
+        with self._lock:
+            return int(
+                self._connection.execute(
+                    "SELECT COUNT(DISTINCT symbol) FROM watchlist_items"
+                ).fetchone()[0]
+            )
+
+    def _symbol_tracked_by_anyone(self, symbol: str) -> bool:
+        return (
+            self._connection.execute(
+                "SELECT 1 FROM watchlist_items WHERE symbol=? LIMIT 1", (symbol,)
+            ).fetchone()
+            is not None
         )
 
     def create_user(self, username: str, temporary_password: str) -> MarketUser:
@@ -233,8 +336,8 @@ class SQLiteMarketAccountStore:
         try:
             with self._lock, self._connection:
                 cursor = self._connection.execute(
-                    "INSERT INTO market_users(username,password_hash,created_at) VALUES(?,?,?)",
-                    (normalized, password_hash, created_at),
+                    "INSERT INTO market_users(username,password_hash,created_at,role) VALUES(?,?,?,?)",
+                    (normalized, password_hash, created_at, "user"),
                 )
                 user_id = int(cursor.lastrowid)
                 self._connection.execute(
@@ -248,7 +351,7 @@ class SQLiteMarketAccountStore:
     def get_user(self, user_id: int) -> MarketUser:
         with self._lock:
             row = self._connection.execute(
-                "SELECT id,username,enabled,must_change_password,created_at FROM market_users WHERE id=?",
+                "SELECT id,username,enabled,must_change_password,role,created_at,email FROM market_users WHERE id=?",
                 (user_id,),
             ).fetchone()
         if row is None:
@@ -258,7 +361,7 @@ class SQLiteMarketAccountStore:
     def list_users(self) -> list[MarketUser]:
         with self._lock:
             rows = self._connection.execute(
-                "SELECT id,username,enabled,must_change_password,created_at FROM market_users ORDER BY id"
+                "SELECT id,username,enabled,must_change_password,role,created_at,email FROM market_users ORDER BY id"
             ).fetchall()
         return [self._user(row) for row in rows]
 
@@ -316,6 +419,207 @@ class SQLiteMarketAccountStore:
                 raise LookupError("market user not found")
         return self.get_user(user_id)
 
+    # ---- self-service registration, password reset, and site settings ----
+
+    CODE_TTL = timedelta(minutes=10)
+    TICKET_TTL = timedelta(minutes=15)
+    CODE_RESEND_SECONDS = 60
+    CODE_MAX_ATTEMPTS = 5
+    CODE_DAILY_LIMIT = 10
+
+    @staticmethod
+    def normalize_email(value: str) -> str:
+        normalized = value.strip().lower()
+        if len(normalized) > 254 or not EMAIL_PATTERN.fullmatch(normalized):
+            raise ValueError("邮箱格式不正确")
+        return normalized
+
+    @staticmethod
+    def check_new_password(value: str) -> str:
+        if len(value) < 8 or len(value) > 256:
+            raise ValueError("密码长度需为 8-256 个字符")
+        return value
+
+    def get_setting(self, key: str) -> str | None:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT value FROM app_settings WHERE key=?", (key,)
+            ).fetchone()
+        return str(row["value"]) if row is not None else None
+
+    def set_setting(self, key: str, value: str) -> None:
+        with self._lock, self._connection:
+            self._connection.execute(
+                "INSERT INTO app_settings(key,value) VALUES(?,?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (key, value),
+            )
+
+    def find_user_by_email(self, email: str) -> MarketUser | None:
+        normalized = self.normalize_email(email)
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT id,username,enabled,must_change_password,role,created_at,email "
+                "FROM market_users WHERE email=? COLLATE NOCASE",
+                (normalized,),
+            ).fetchone()
+        return self._user(row) if row is not None else None
+
+    def username_taken(self, username: str) -> bool:
+        normalized = self._username(username)
+        with self._lock:
+            return (
+                self._connection.execute(
+                    "SELECT 1 FROM market_users WHERE username=?", (normalized,)
+                ).fetchone()
+                is not None
+            )
+
+    def create_registered_user(self, username: str, email: str, password: str) -> MarketUser:
+        normalized = self._username(username)
+        address = self.normalize_email(email)
+        password_hash = self._hasher.hash(self.check_new_password(password))
+        try:
+            with self._lock, self._connection:
+                cursor = self._connection.execute(
+                    "INSERT INTO market_users(username,password_hash,created_at,role,email,must_change_password) "
+                    "VALUES(?,?,?,?,?,0)",
+                    (normalized, password_hash, _utc_now().isoformat(), "user", address),
+                )
+                user_id = int(cursor.lastrowid)
+                self._connection.execute(
+                    "INSERT INTO watchlist_groups(user_id,name,sort_order,is_primary) VALUES(?,?,0,1)",
+                    (user_id, "自选"),
+                )
+        except sqlite3.IntegrityError as error:
+            raise DuplicateUserError(normalized) from error
+        return self.get_user(user_id)
+
+    def set_password(self, user_id: int, new_password: str) -> MarketUser:
+        password_hash = self._hasher.hash(self.check_new_password(new_password))
+        with self._lock, self._connection:
+            cursor = self._connection.execute(
+                "UPDATE market_users SET password_hash=?,must_change_password=0 WHERE id=?",
+                (password_hash, user_id),
+            )
+            if cursor.rowcount != 1:
+                raise LookupError("market user not found")
+        return self.get_user(user_id)
+
+    @staticmethod
+    def _code_hash(salt: str, code: str) -> str:
+        return hashlib.sha256(f"{salt}:{code}".encode()).hexdigest()
+
+    def issue_email_code(
+        self, purpose: str, email: str, username: str | None = None
+    ) -> str:
+        """Create a six-digit code, invalidating older ones for the same target."""
+        address = self.normalize_email(email)
+        now = _utc_now()
+        with self._lock, self._connection:
+            last = self._connection.execute(
+                "SELECT created_at FROM email_codes WHERE purpose=? AND email=? ORDER BY id DESC LIMIT 1",
+                (purpose, address),
+            ).fetchone()
+            if last is not None:
+                elapsed = (now - datetime.fromisoformat(str(last["created_at"]))).total_seconds()
+                if elapsed < self.CODE_RESEND_SECONDS:
+                    raise EmailCodeRateLimited(int(self.CODE_RESEND_SECONDS - elapsed) + 1)
+            today = self._connection.execute(
+                "SELECT COUNT(*) FROM email_codes WHERE email=? AND created_at>?",
+                (address, (now - timedelta(days=1)).isoformat()),
+            ).fetchone()[0]
+            if today >= self.CODE_DAILY_LIMIT:
+                raise EmailCodeRateLimited(3600)
+            self._connection.execute(
+                "UPDATE email_codes SET used=1 WHERE purpose=? AND email=?",
+                (purpose, address),
+            )
+            code = f"{secrets.randbelow(1_000_000):06d}"
+            salt = secrets.token_hex(8)
+            self._connection.execute(
+                "INSERT INTO email_codes(purpose,email,username,salt,code_hash,created_at,expires_at) "
+                "VALUES(?,?,?,?,?,?,?)",
+                (
+                    purpose,
+                    address,
+                    username,
+                    salt,
+                    self._code_hash(salt, code),
+                    now.isoformat(),
+                    (now + self.CODE_TTL).isoformat(),
+                ),
+            )
+            self._connection.execute(
+                "DELETE FROM email_codes WHERE expires_at<?",
+                ((now - timedelta(days=2)).isoformat(),),
+            )
+        return code
+
+    def discard_email_codes(self, purpose: str, email: str) -> None:
+        with self._lock, self._connection:
+            self._connection.execute(
+                "DELETE FROM email_codes WHERE id=(SELECT MAX(id) FROM email_codes WHERE purpose=? AND email=?)",
+                (purpose, self.normalize_email(email)),
+            )
+
+    def verify_email_code(self, purpose: str, email: str, code: str) -> str | None:
+        """Return a one-time ticket for a correct code; None for any failure."""
+        address = self.normalize_email(email)
+        now = _utc_now()
+        with self._lock, self._connection:
+            row = self._connection.execute(
+                "SELECT * FROM email_codes WHERE purpose=? AND email=? AND used=0 ORDER BY id DESC LIMIT 1",
+                (purpose, address),
+            ).fetchone()
+            if row is None or datetime.fromisoformat(str(row["expires_at"])) <= now:
+                return None
+            if int(row["attempts"]) >= self.CODE_MAX_ATTEMPTS:
+                return None
+            self._connection.execute(
+                "UPDATE email_codes SET attempts=attempts+1 WHERE id=?", (row["id"],)
+            )
+            expected = str(row["code_hash"])
+            candidate = self._code_hash(str(row["salt"]), code.strip())
+            if not hmac.compare_digest(expected, candidate):
+                return None
+            self._connection.execute("UPDATE email_codes SET used=1 WHERE id=?", (row["id"],))
+            token = secrets.token_urlsafe(32)
+            self._connection.execute(
+                "INSERT INTO email_tickets(token_hash,purpose,email,username,expires_at) VALUES(?,?,?,?,?)",
+                (
+                    hashlib.sha256(token.encode()).hexdigest(),
+                    purpose,
+                    address,
+                    row["username"],
+                    (now + self.TICKET_TTL).isoformat(),
+                ),
+            )
+        return token
+
+    def consume_ticket(self, purpose: str, ticket: str) -> tuple[str, str | None] | None:
+        """Spend a ticket exactly once; returns (email, username) or None."""
+        token_hash = hashlib.sha256(ticket.encode()).hexdigest()
+        with self._lock, self._connection:
+            row = self._connection.execute(
+                "SELECT * FROM email_tickets WHERE token_hash=? AND purpose=?",
+                (token_hash, purpose),
+            ).fetchone()
+            if row is None:
+                return None
+            self._connection.execute("DELETE FROM email_tickets WHERE token_hash=?", (token_hash,))
+            if datetime.fromisoformat(str(row["expires_at"])) <= _utc_now():
+                return None
+            return str(row["email"]), (str(row["username"]) if row["username"] else None)
+
+    def peek_ticket(self, purpose: str, ticket: str) -> bool:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT expires_at FROM email_tickets WHERE token_hash=? AND purpose=?",
+                (hashlib.sha256(ticket.encode()).hexdigest(), purpose),
+            ).fetchone()
+        return row is not None and datetime.fromisoformat(str(row["expires_at"])) > _utc_now()
+
     def set_user_enabled(self, user_id: int, enabled: bool) -> MarketUser:
         with self._lock, self._connection:
             cursor = self._connection.execute(
@@ -368,6 +672,82 @@ class SQLiteMarketAccountStore:
             )
             for group_id, value in groups.items()
         ]
+
+    def vibe_watchlist_synced(self, user_id: int) -> bool:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT vibe_watchlist_synced FROM market_users WHERE id=?",
+                (user_id,),
+            ).fetchone()
+        if row is None:
+            raise LookupError("market user not found")
+        return bool(row["vibe_watchlist_synced"])
+
+    def mark_vibe_watchlist_synced(self, user_id: int) -> None:
+        with self._lock, self._connection:
+            cursor = self._connection.execute(
+                "UPDATE market_users SET vibe_watchlist_synced=1 WHERE id=?",
+                (user_id,),
+            )
+            if cursor.rowcount != 1:
+                raise LookupError("market user not found")
+
+    def merge_primary_symbols(self, user_id: int, symbols: list[SymbolLookup]) -> None:
+        """Import legacy Vibe favorites into this user's primary Market list."""
+        with self._lock, self._connection:
+            user = self._connection.execute(
+                "SELECT id FROM market_users WHERE id=?", (user_id,)
+            ).fetchone()
+            if user is None:
+                raise LookupError("market user not found")
+            primary = self._connection.execute(
+                "SELECT id FROM watchlist_groups WHERE user_id=? AND is_primary=1 LIMIT 1",
+                (user_id,),
+            ).fetchone()
+            if primary is None:
+                raise LookupError("primary watchlist group not found")
+            group_id = int(primary["id"])
+            rows = self._connection.execute(
+                """SELECT DISTINCT i.symbol FROM watchlist_items i
+                   JOIN watchlist_groups g ON g.id=i.group_id WHERE g.user_id=?""",
+                (user_id,),
+            ).fetchall()
+            existing = {str(row["symbol"]) for row in rows}
+            count = len(existing)
+            for symbol in symbols:
+                if symbol.symbol in existing:
+                    continue
+                if count >= self.max_symbols_per_user:
+                    raise ValueError("watchlist symbol limit reached during Vibe sync")
+                if (
+                    not self._symbol_tracked_by_anyone(symbol.symbol)
+                    and self.total_symbol_count() >= self.max_total_symbols
+                ):
+                    raise MonitorLimitError(MONITOR_LIMIT_MESSAGE)
+                self._connection.execute(
+                    """INSERT INTO watchlist_items(
+                           group_id,symbol,name,market,sort_order,monitoring_enabled_at
+                       ) VALUES(?,?,?,?,COALESCE((SELECT MAX(sort_order)+1 FROM watchlist_items WHERE group_id=?),0),?)""",
+                    (
+                        group_id,
+                        symbol.symbol,
+                        symbol.name,
+                        symbol.market,
+                        group_id,
+                        _utc_now().isoformat(),
+                    ),
+                )
+                existing.add(symbol.symbol)
+                count += 1
+
+    def has_watchlist_symbol(self, user_id: int, symbol: str) -> bool:
+        with self._lock:
+            row = self._connection.execute(
+                """SELECT 1 FROM watchlist_items i JOIN watchlist_groups g ON g.id=i.group_id
+                   WHERE g.user_id=? AND i.symbol=? LIMIT 1""",
+                (user_id, symbol),
+            ).fetchone()
+        return row is not None
 
     def _owned_group(self, user_id: int, group_id: int) -> sqlite3.Row:
         row = self._connection.execute(
@@ -441,6 +821,16 @@ class SQLiteMarketAccountStore:
             if primary_group is None:
                 raise LookupError("watchlist group not found")
             primary_group_id = int(primary_group["id"])
+            existing_in_group = self._connection.execute(
+                "SELECT symbol,name,market FROM watchlist_items WHERE group_id=? AND symbol=?",
+                (group_id, symbol.symbol),
+            ).fetchone()
+            if existing_in_group is not None:
+                return WatchlistItem(
+                    symbol=str(existing_in_group["symbol"]),
+                    name=str(existing_in_group["name"]),
+                    market=str(existing_in_group["market"]),
+                )
             known = self._connection.execute(
                 """SELECT COUNT(DISTINCT i.symbol) FROM watchlist_items i
                    JOIN watchlist_groups g ON g.id=i.group_id WHERE g.user_id=?""",
@@ -453,6 +843,11 @@ class SQLiteMarketAccountStore:
             ).fetchone()
             if known >= self.max_symbols_per_user and already_known is None:
                 raise ValueError("watchlist symbol limit reached")
+            if (
+                not self._symbol_tracked_by_anyone(symbol.symbol)
+                and self.total_symbol_count() >= self.max_total_symbols
+            ):
+                raise MonitorLimitError(MONITOR_LIMIT_MESSAGE)
             try:
                 monitoring_enabled_at = _utc_now().isoformat()
                 self._connection.execute(

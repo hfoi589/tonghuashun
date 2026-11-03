@@ -110,6 +110,9 @@ class DeploymentSettings:
     device_lifecycle_timeout_seconds: float
     ths_session_encryption_key: str | None = field(repr=False)
     ths_session_root: Path
+    fund_flow_three_day_interval_seconds: float = 120.0
+    fund_flow_five_day_interval_seconds: float = 300.0
+    fund_flow_max_requests_per_second: float = 5.0
 
     @classmethod
     def from_environ(cls, environ: Mapping[str, str] | None = None) -> "DeploymentSettings":
@@ -242,6 +245,9 @@ class DeploymentSettings:
             ("PUBLIC_MARKET_TIMEOUT_SECONDS", "8"),
             ("MARKET_DIRECT_ENRICHMENT_TTL_SECONDS", "5"),
             ("CORE_WARM_CONNECTION_MAX_IDLE_SECONDS", "25"),
+            ("FUND_FLOW_THREE_DAY_INTERVAL_SECONDS", "120"),
+            ("FUND_FLOW_FIVE_DAY_INTERVAL_SECONDS", "300"),
+            ("FUND_FLOW_MAX_REQUESTS_PER_SECOND", "5"),
         ):
             try:
                 parsed = float(values.get(name, default))
@@ -369,6 +375,15 @@ class DeploymentSettings:
             device_lifecycle_url=lifecycle_url,
             device_lifecycle_token=lifecycle_token,
             device_lifecycle_timeout_seconds=lifecycle_timeout,
+            fund_flow_three_day_interval_seconds=positive_values[
+                "FUND_FLOW_THREE_DAY_INTERVAL_SECONDS"
+            ],
+            fund_flow_five_day_interval_seconds=positive_values[
+                "FUND_FLOW_FIVE_DAY_INTERVAL_SECONDS"
+            ],
+            fund_flow_max_requests_per_second=positive_values[
+                "FUND_FLOW_MAX_REQUESTS_PER_SECOND"
+            ],
             ths_session_encryption_key=session_encryption_key or None,
             ths_session_root=session_root,
         )
@@ -625,6 +640,9 @@ def create_production_app(
             direct_fund_source = FundFlowHttpClient(
                 account_session_provider,
                 minimum_interval_seconds=config.market_direct_enrichment_ttl_seconds,
+                three_day_interval_seconds=config.fund_flow_three_day_interval_seconds,
+                five_day_interval_seconds=config.fund_flow_five_day_interval_seconds,
+                max_requests_per_second=config.fund_flow_max_requests_per_second,
             )
             fund_source = (
                 direct_fund_source

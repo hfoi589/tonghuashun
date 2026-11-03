@@ -7,10 +7,10 @@ export type { FundFlowHistoryPeriod } from './market-api'
 export type FundFlowSeriesKey = 'retail_inflow' | 'main_visible_inflow' | 'main_hidden_inflow' | 'main_net_inflow'
 
 export const fundFlowSeriesConfig: Array<{ key: FundFlowSeriesKey, label: string, className: string, color: string }> = [
-  { key: 'retail_inflow', label: '散户流入', className: 'retail', color: '#16803c' },
-  { key: 'main_visible_inflow', label: '主力明盘', className: 'visible', color: '#d92d20' },
-  { key: 'main_hidden_inflow', label: '主力暗盘', className: 'hidden', color: '#7f1d1d' },
-  { key: 'main_net_inflow', label: '主力净流入', className: 'net', color: '#b7791f' },
+  { key: 'retail_inflow', label: '散户流入', className: 'retail', color: '#34d399' },
+  { key: 'main_visible_inflow', label: '主力明盘', className: 'visible', color: '#ff5a5f' },
+  { key: 'main_hidden_inflow', label: '主力暗盘', className: 'hidden', color: '#e879f9' },
+  { key: 'main_net_inflow', label: '主力净流入', className: 'net', color: '#fbbf24' },
 ]
 
 const fundFlowTimeTicks = [

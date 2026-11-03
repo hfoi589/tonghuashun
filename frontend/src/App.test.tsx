@@ -117,6 +117,22 @@ describe('Level2 web UI', () => {
     expect(screen.getByRole('link', { name: '管理台' })).toHaveAttribute('href', '/#admin')
   })
 
+  it('closes the more menu on Escape and on outside clicks', async () => {
+    const user = userEvent.setup()
+    render(<App />)
+    const trigger = screen.getByRole('button', { name: '更多' })
+
+    await user.click(trigger)
+    expect(screen.getByRole('link', { name: '管理台' })).toBeInTheDocument()
+    await user.keyboard('{Escape}')
+    expect(screen.queryByRole('link', { name: '管理台' })).not.toBeInTheDocument()
+    expect(trigger).toHaveFocus()
+
+    await user.click(trigger)
+    await user.click(document.body)
+    expect(screen.queryByRole('link', { name: '管理台' })).not.toBeInTheDocument()
+  })
+
   it('hides the long-capture option and always submits a data-only task', async () => {
     const dataOnlyTask: Job = { ...task, include_long_capture: false }
     vi.mocked(fetch)

@@ -15,9 +15,44 @@ explicit long captures. OCR is limited to structural validation of an optional
 long screenshot and never fills task metrics. Data-only tasks do not navigate
 the App, scroll, capture, stitch, or run OCR.
 
+## Vibe-Research workbench
+
+The complete Vibe-Research workbench is served at `/market/*`. Its left navigation
+contains **资金暗盘**, which opens the existing multi-user MarketApp at
+`/market/dark-pool`. The original eight-metric task page remains at `/`.
+Every Vibe route requires a ready market-user session. Vibe records, reports,
+threads, uploads, and research runs are stored under
+`vibe_research/.local/workspaces/<market-user-id>`; shared AI settings live in the
+same private data root and are managed from `/#admin`.
+
+The administrator selects one shared API or host CLI runtime. API credentials are
+encrypted at rest with `VRA_SETTINGS_ENCRYPTION_KEY`; the browser receives only
+the provider, model, endpoint, and configured status. If a CLI runtime is selected,
+all market users share the current host CLI login and its usage quota.
+
+On this Mac, prepare the private Vibe data root, Python 3.12 environment, host API
+token, and encryption key with:
+
+```sh
+scripts/setup-vibe-api-host.sh
+```
+
+After the standard OrbStack Compose deployment, install the host-side API
+LaunchAgent. It binds to the address resolved for `host.docker.internal` inside
+the API container; Compose does not publish port 8765 to clients.
+
+```sh
+python3 scripts/install-vibe-api-launch-agent.py
+```
+
+The Vibe public-data and research APIs stay under `/api/vibe/*`. They do not feed
+values into `/api/v1/jobs`; task metrics remain owned by the selected verified
+Tonghuashun App-internal interface.
+
 ## Market monitoring and replay
 
-The `/market` application includes an optional monitoring/replay workspace.
+The **资金暗盘** page (`/market/dark-pool`) includes the existing optional
+monitoring/replay workspace.
 Market users can enable or pause collection for symbols in their grouped
 watchlists, trigger a current-day backfill, inspect replayable minute history,
 select administrator-managed rules, and calculate OPM-compatible B/S replay
@@ -34,7 +69,7 @@ market category. At 09:30 the existing Tencent/Sina public quote chain resumes.
 Auction failures keep only a same-day Redis last-valid value and never fall
 back to a public quote during the auction window.
 
-The administrator console exposes monitoring status, dynamic MACD settings,
+The administrator console at `/#admin` exposes Vibe AI settings, monitoring status, dynamic MACD settings,
 server-side Bark/Server酱³/企业微信 configuration, rule JSON, and QDII/LOF
 premium refresh/push controls. Browser responses mask secrets. OPM-compatible
 legacy routes are FastAPI adapters and do not start the old OPM server or use

@@ -1000,13 +1000,29 @@ class FundFlowHttpClient:
         requester: HttpRequester = _urllib_request,
         timeout_seconds: float = 10.0,
         minimum_interval_seconds: float = 15.0,
+        three_day_interval_seconds: float = 120.0,
+        five_day_interval_seconds: float = 300.0,
+        max_requests_per_second: float = 5.0,
+        breaker_threshold: int = 3,
+        breaker_cooldown_seconds: float = 300.0,
+        breaker_max_cooldown_seconds: float = 1800.0,
         max_cache_entries: int = 512,
         clock: Callable[[], float] = time.monotonic,
+        limiter_clock: Callable[[], float] = time.monotonic,
+        sleeper: Callable[[float], None] = time.sleep,
     ) -> None:
         if timeout_seconds <= 0:
             raise ValueError("timeout_seconds must be positive")
         if minimum_interval_seconds < 0:
             raise ValueError("minimum_interval_seconds must not be negative")
+        if three_day_interval_seconds < 0 or five_day_interval_seconds < 0:
+            raise ValueError("period intervals must not be negative")
+        if max_requests_per_second < 0:
+            raise ValueError("max_requests_per_second must not be negative")
+        if not isinstance(breaker_threshold, int) or breaker_threshold <= 0:
+            raise ValueError("breaker_threshold must be positive")
+        if breaker_cooldown_seconds <= 0 or breaker_max_cooldown_seconds < breaker_cooldown_seconds:
+            raise ValueError("breaker cooldowns are invalid")
         if not isinstance(max_cache_entries, int) or max_cache_entries <= 0:
             raise ValueError("max_cache_entries must be positive")
         self.session_provider = session_provider
@@ -1015,8 +1031,70 @@ class FundFlowHttpClient:
         self.minimum_interval_seconds = minimum_interval_seconds
         self.max_cache_entries = max_cache_entries
         self.clock = clock
-        self._cache: dict[str, tuple[DirectReadOutcome, float]] = {}
+        self.limiter_clock = limiter_clock
+        self.sleeper = sleeper
+        # today / three_day / five_day refresh independently: the longer
+        # windows change slowly, so they are re-requested far less often.
+        self.period_intervals = {
+            "today": minimum_interval_seconds,
+            "three_day": three_day_interval_seconds,
+            "five_day": five_day_interval_seconds,
+        }
+        # 0 disables the global limiter; otherwise requests are spaced evenly.
+        self.request_spacing_seconds = (
+            1.0 / max_requests_per_second if max_requests_per_second > 0 else 0.0
+        )
+        self.breaker_threshold = breaker_threshold
+        self.breaker_cooldown_seconds = breaker_cooldown_seconds
+        self.breaker_max_cooldown_seconds = breaker_max_cooldown_seconds
+        self._cache: dict[str, dict[str, tuple[dict[MetricKind, str | None], float]]] = {}
+        self._symbol_locks: dict[str, Lock] = {}
         self._lock = RLock()
+        self._limiter_lock = Lock()
+        self._next_request_at = 0.0
+        self._breaker_lock = Lock()
+        self._breaker_failures = 0
+        self._breaker_trips = 0
+        self._breaker_open_until = 0.0
+        self._breaker_error = "DIRECT_HTTP_FORBIDDEN"
+
+    def _wait_for_request_slot(self) -> None:
+        """Reserve the next global request slot and sleep until it arrives."""
+        if self.request_spacing_seconds <= 0:
+            return
+        with self._limiter_lock:
+            now = self.limiter_clock()
+            slot = max(now, self._next_request_at)
+            self._next_request_at = slot + self.request_spacing_seconds
+        delay = slot - now
+        if delay > 0:
+            self.sleeper(delay)
+
+    def _check_breaker(self) -> None:
+        with self._breaker_lock:
+            if self.limiter_clock() < self._breaker_open_until:
+                raise DirectRequestError(self._breaker_error)
+
+    def _record_breaker_success(self) -> None:
+        with self._breaker_lock:
+            self._breaker_failures = 0
+            self._breaker_trips = 0
+
+    def _record_breaker_failure(self, error_code: str, *, immediate: bool) -> None:
+        with self._breaker_lock:
+            self._breaker_failures += 1
+            self._breaker_error = error_code
+            if immediate or self._breaker_failures >= self.breaker_threshold:
+                cooldown = min(
+                    self.breaker_cooldown_seconds * (2**self._breaker_trips),
+                    self.breaker_max_cooldown_seconds,
+                )
+                self._breaker_trips += 1
+                self._breaker_failures = 0
+                self._breaker_open_until = self.limiter_clock() + cooldown
+                logger.warning(
+                    "fund flow circuit opened for %.0fs after %s", cooldown, error_code
+                )
 
     @staticmethod
     def _request_body(symbol: str, market: str, window: int) -> bytes:
@@ -1099,65 +1177,94 @@ class FundFlowHttpClient:
                 "DIRECT_FUND_FLOW_RESPONSE_INVALID"
             ) from None
 
-    def _read_uncached(self, symbol: str, market: str) -> DirectReadOutcome:
-        session = self.session_provider.get("main_fund_flow")
-        if session is None:
-            raise DirectRequestError("DIRECT_SESSION_UNAVAILABLE")
-        headers = {
-            "Cookie": session.cookie,
-            "Platform": session.platform,
-            "Source-Id": FUND_FLOW_SOURCE_ID,
-            "User-Agent": session.user_agent,
-            "Content-Type": "application/json",
-            "Accept-Encoding": "gzip",
-        }
-        values = empty_metric_values()
-        unit_kinds = {period: unit for period, _label, unit in FUND_FLOW_PERIODS}
-        for period, window in (("today", 1), ("three_day", 3), ("five_day", 5)):
-            response = self.requester(
-                FUND_FLOW_URL,
-                headers,
-                self._request_body(symbol, market, window),
-                self.timeout_seconds,
+    def _fetch_period(
+        self,
+        headers: dict[str, str],
+        symbol: str,
+        market: str,
+        period: str,
+        window: int,
+    ) -> dict[MetricKind, str | None]:
+        self._check_breaker()
+        self._wait_for_request_slot()
+        response = self.requester(
+            FUND_FLOW_URL,
+            headers,
+            self._request_body(symbol, market, window),
+            self.timeout_seconds,
+        )
+        if response.status_code in {401, 403}:
+            self.session_provider.mark_error(
+                "main_fund_flow",
+                "DIRECT_SESSION_EXPIRED",
             )
-            if response.status_code in {401, 403}:
-                self.session_provider.mark_error(
-                    "main_fund_flow",
-                    "DIRECT_SESSION_EXPIRED",
-                )
-                raise DirectRequestError("DIRECT_SESSION_EXPIRED")
-            if 400 <= response.status_code < 500:
-                raise DirectRequestError("DIRECT_HTTP_FORBIDDEN")
-            if response.status_code < 200 or response.status_code >= 300:
-                raise DirectRequestError("DIRECT_FUND_FLOW_REQUEST_FAILED")
-            raw = self._response_values(response, symbol, market)
-            present = [
-                number.copy_abs() for number in raw.values() if number is not None
-            ]
-            divisor = (
-                Decimal(100000000)
-                if any(number >= Decimal(100000000) for number in present)
-                else Decimal(10000)
+            self._record_breaker_failure("DIRECT_SESSION_EXPIRED", immediate=True)
+            raise DirectRequestError("DIRECT_SESSION_EXPIRED")
+        if 400 <= response.status_code < 500:
+            self._record_breaker_failure(
+                "DIRECT_HTTP_FORBIDDEN", immediate=response.status_code == 429
             )
-            values[unit_kinds[period]] = (
-                "亿元" if divisor == Decimal(100000000) else "万元"
-            )
-            metrics = FUND_FLOW_METRICS[period]
-            main = raw["charge_main_capital"]
-            listed = raw["charge_main_listed_capital"]
-            grey = raw["charge_main_grey_capital"]
-            values[metrics["main_net_inflow"]] = _formatted(
+            raise DirectRequestError("DIRECT_HTTP_FORBIDDEN")
+        if response.status_code < 200 or response.status_code >= 300:
+            raise DirectRequestError("DIRECT_FUND_FLOW_REQUEST_FAILED")
+        raw = self._response_values(response, symbol, market)
+        self._record_breaker_success()
+        present = [number.copy_abs() for number in raw.values() if number is not None]
+        divisor = (
+            Decimal(100000000)
+            if any(number >= Decimal(100000000) for number in present)
+            else Decimal(10000)
+        )
+        unit_kind = {name: unit for name, _label, unit in FUND_FLOW_PERIODS}[period]
+        metrics = FUND_FLOW_METRICS[period]
+        main = raw["charge_main_capital"]
+        listed = raw["charge_main_listed_capital"]
+        grey = raw["charge_main_grey_capital"]
+        return {
+            unit_kind: "亿元" if divisor == Decimal(100000000) else "万元",
+            metrics["main_net_inflow"]: _formatted(
                 main / divisor if main is not None else None
-            )
-            values[metrics["main_visible_inflow"]] = _formatted(
+            ),
+            metrics["main_visible_inflow"]: _formatted(
                 listed / divisor if listed is not None else None
-            )
-            values[metrics["main_hidden_inflow"]] = _formatted(
+            ),
+            metrics["main_hidden_inflow"]: _formatted(
                 grey / divisor if grey is not None else None
-            )
-            values[metrics["retail_inflow"]] = _formatted(
+            ),
+            metrics["retail_inflow"]: _formatted(
                 -main / divisor if main is not None else None
-            )
+            ),
+        }
+
+    def _read_symbol(self, symbol: str, market: str, now: float) -> DirectReadOutcome:
+        with self._lock:
+            periods = self._cache.setdefault(symbol, {})
+            due = [
+                (period, window)
+                for period, window in (("today", 1), ("three_day", 3), ("five_day", 5))
+                if period not in periods
+                or now - periods[period][1] >= self.period_intervals[period]
+            ]
+        if due:
+            session = self.session_provider.get("main_fund_flow")
+            if session is None:
+                raise DirectRequestError("DIRECT_SESSION_UNAVAILABLE")
+            headers = {
+                "Cookie": session.cookie,
+                "Platform": session.platform,
+                "Source-Id": FUND_FLOW_SOURCE_ID,
+                "User-Agent": session.user_agent,
+                "Content-Type": "application/json",
+                "Accept-Encoding": "gzip",
+            }
+            for period, window in due:
+                fetched = self._fetch_period(headers, symbol, market, period, window)
+                with self._lock:
+                    periods[period] = (fetched, now)
+        values = empty_metric_values()
+        with self._lock:
+            for period_values, _timestamp in periods.values():
+                values.update(period_values)
         return DirectReadOutcome(
             values=values,
             source_errors={"core_metrics": None, "main_fund_flow": None},
@@ -1166,14 +1273,17 @@ class FundFlowHttpClient:
     def read_direct(self, symbol: str) -> DirectReadOutcome:
         market = market_code_for_symbol(symbol)
         with self._lock:
+            symbol_lock = self._symbol_locks.setdefault(symbol, Lock())
+        # Per-symbol locking: different symbols proceed concurrently and are
+        # paced by the global request limiter instead of one big lock.
+        with symbol_lock:
             now = self.clock()
-            cached = self._cache.get(symbol)
-            if cached is not None and now - cached[1] < self.minimum_interval_seconds:
-                return cached[0]
-            outcome = self._read_uncached(symbol, market)
-            self._cache[symbol] = (outcome, now)
-            while len(self._cache) > self.max_cache_entries:
-                self._cache.pop(next(iter(self._cache)))
+            outcome = self._read_symbol(symbol, market, now)
+            with self._lock:
+                while len(self._cache) > self.max_cache_entries:
+                    evicted = next(iter(self._cache))
+                    self._cache.pop(evicted)
+                    self._symbol_locks.pop(evicted, None)
             return outcome
 
     def read(self, symbol: str) -> dict[MetricKind, str | None]:

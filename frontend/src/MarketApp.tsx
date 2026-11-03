@@ -1,4 +1,4 @@
-import { FormEvent, KeyboardEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { FormEvent, KeyboardEvent, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react'
 import { ApiError, type MainFundFlowPeriod, type SymbolSuggestion } from './api'
 import { DailyKChart, type DailyKSelection } from './DailyKChart'
 import { FundFlowHistoryPanel } from './FundFlowHistoryPanel'
@@ -9,6 +9,7 @@ import {
   marketAuthExpiredEvent,
   marketApi,
   marketStreamUrl,
+  subscribeMarketWatchlistChanges,
   type FundFlowDailyPoint,
   type FundFlowHistoryResponse,
   type KlineBar,
@@ -25,6 +26,7 @@ import {
   type WatchlistGroup,
   type WatchlistItem,
 } from './market-api'
+import { MarketSessionContext } from './market-session'
 import './market.css'
 
 type AuthState = 'loading' | 'anonymous' | 'authenticated'
@@ -123,11 +125,12 @@ export function nextIntradaySelectedTime(
     : current
 }
 
-function LineChart({ name, points, pricePrecision, selectedTime, onSelectionChange }: {
+function LineChart({ name, points, pricePrecision, selectedTime, error, onSelectionChange }: {
   name: string,
   points: TimesharePoint[],
   pricePrecision: number,
   selectedTime?: string,
+  error?: string | null,
   onSelectionChange: (time: string) => void,
 }) {
   const priceValues = points.map((point) => {
@@ -136,7 +139,9 @@ function LineChart({ name, points, pricePrecision, selectedTime, onSelectionChan
     return Number.isFinite(value) ? value : null
   })
   const data = priceValues.flatMap((value, index) => value === null ? [] : [{ index, value }])
-  if (data.length === 0) return <div className="market-empty-chart">暂无公开分时数据</div>
+  if (data.length === 0) return error
+    ? <div className="market-capability-gap"><strong>腾讯公开分时暂不可用</strong><span>{error}</span></div>
+    : <div className="market-empty-chart">暂无公开分时数据</div>
   const width = 900
   const height = 360
   const pad = { top: 22, right: 18, bottom: 38, left: 58 }
@@ -307,7 +312,7 @@ function DailyKPanel({ name, page, pricePrecision, loading, error, onSelectionCh
   </div>
 }
 
-function PasswordChange({ user, onDone }: { user: MarketUser, onDone: (user: MarketUser) => void }) {
+export function PasswordChange({ user, onDone }: { user: MarketUser, onDone: (user: MarketUser) => void }) {
   const [current, setCurrent] = useState('')
   const [next, setNext] = useState('')
   const [confirmation, setConfirmation] = useState('')
@@ -342,32 +347,114 @@ function PasswordChange({ user, onDone }: { user: MarketUser, onDone: (user: Mar
   </main>
 }
 
-function Login({ onLogin }: { onLogin: (user: MarketUser) => void }) {
+type AuthMode = 'login' | 'register' | 'reset'
+type AuthStep = 'identity' | 'code' | 'password'
+
+export function Login({ onLogin }: { onLogin: (user: MarketUser) => void }) {
+  const [mode, setMode] = useState<AuthMode>('login')
+  const [step, setStep] = useState<AuthStep>('identity')
   const [username, setUsername] = useState('')
   const [password, setPassword] = useState('')
+  const [email, setEmail] = useState('')
+  const [code, setCode] = useState('')
+  const [ticket, setTicket] = useState('')
+  const [confirmation, setConfirmation] = useState('')
   const [message, setMessage] = useState('')
+  const [notice, setNotice] = useState('')
   const [busy, setBusy] = useState(false)
-  async function submit(event: FormEvent) {
-    event.preventDefault()
+  const [features, setFeatures] = useState({ registration_enabled: false, password_reset_enabled: false })
+  useEffect(() => {
+    marketApi.registrationStatus().then(setFeatures).catch(() => undefined)
+  }, [])
+  function switchMode(next: AuthMode) {
+    setMode(next); setStep('identity'); setMessage(''); setNotice(''); setCode(''); setTicket(''); setPassword(''); setConfirmation('')
+  }
+  async function run(task: () => Promise<void>, fallback: string) {
     setBusy(true)
     setMessage('')
-    try { onLogin(await marketApi.login(username, password)) }
-    catch (reason) { setMessage(reason instanceof Error ? reason.message : '登录失败') }
+    try { await task() }
+    catch (reason) { setMessage(reason instanceof Error ? reason.message : fallback) }
     finally { setBusy(false) }
   }
+  function submitLogin(event: FormEvent) {
+    event.preventDefault()
+    void run(async () => { onLogin(await marketApi.login(username, password)) }, '登录失败')
+  }
+  function sendCode(event?: FormEvent) {
+    event?.preventDefault()
+    void run(async () => {
+      if (mode === 'register') await marketApi.requestRegisterCode(username, email)
+      else await marketApi.requestResetCode(email)
+      setStep('code')
+      setCode('')
+      setNotice(mode === 'register' ? `验证码已发送至 ${email}，10 分钟内有效。` : '如果该邮箱已注册，验证码已发送，10 分钟内有效。')
+    }, '验证码发送失败')
+  }
+  function verifyCode(event: FormEvent) {
+    event.preventDefault()
+    void run(async () => {
+      const result = mode === 'register' ? await marketApi.verifyRegisterCode(email, code) : await marketApi.verifyResetCode(email, code)
+      setTicket(result.ticket)
+      setStep('password')
+      setNotice('验证通过，请设置密码。')
+    }, '验证码错误')
+  }
+  function submitPassword(event: FormEvent) {
+    event.preventDefault()
+    void run(async () => {
+      if (mode === 'register') {
+        onLogin(await marketApi.completeRegistration(ticket, password, confirmation))
+        return
+      }
+      await marketApi.confirmPasswordReset(ticket, password, confirmation)
+      switchMode('login')
+      setNotice('密码已重置，请使用新密码登录。')
+    }, '密码设置失败')
+  }
+  const heading = mode === 'login' ? '登录好运器行情中心' : mode === 'register' ? '注册账号' : '找回密码'
   return <main className="market-auth-shell">
     <section className="market-auth-card">
-      <div className="market-brand-mark" aria-hidden="true">顺</div>
+      <img className="market-auth-logo" src="/haoyunqi-mascot.png?v=2" alt="好运器" />
       <p className="market-kicker">THS MARKET</p>
-      <h1>登录行情中心</h1>
-      <p>访问你的分组自选、公开实时行情和可选直连增强。</p>
-      <form onSubmit={submit}>
-        <label htmlFor="market-username">用户名</label>
-        <input id="market-username" autoComplete="username" value={username} onChange={(event) => setUsername(event.target.value)} required />
-        <label htmlFor="market-password">密码</label>
-        <input id="market-password" type="password" autoComplete="current-password" value={password} onChange={(event) => setPassword(event.target.value)} required />
-        <button type="submit" disabled={busy}>{busy ? '正在登录…' : '登录'}</button>
-      </form>
+      <h1>{heading}</h1>
+      {mode === 'login' && <>
+        <p>访问你的分组自选和公开实时行情。</p>
+        <form onSubmit={submitLogin}>
+          <label htmlFor="market-username">用户名</label>
+          <input id="market-username" autoComplete="username" value={username} onChange={(event) => setUsername(event.target.value)} required />
+          <label htmlFor="market-password">密码</label>
+          <input id="market-password" type="password" autoComplete="current-password" value={password} onChange={(event) => setPassword(event.target.value)} required />
+          <button type="submit" disabled={busy}>{busy ? '正在登录…' : '登录'}</button>
+        </form>
+        <div className="market-auth-links">
+          {features.registration_enabled && <button type="button" className="market-secondary-button" onClick={() => switchMode('register')}>注册账号</button>}
+          {features.password_reset_enabled && <button type="button" className="market-secondary-button" onClick={() => switchMode('reset')}>忘记密码</button>}
+        </div>
+      </>}
+      {mode !== 'login' && step === 'identity' && <form onSubmit={sendCode}>
+        {mode === 'register' && <>
+          <label htmlFor="market-register-username">用户名</label>
+          <input id="market-register-username" autoComplete="username" value={username} onChange={(event) => setUsername(event.target.value)} placeholder="3-32 位字母、数字、点、下划线或连字符" required />
+        </>}
+        <label htmlFor="market-email">邮箱地址</label>
+        <input id="market-email" type="email" autoComplete="email" value={email} onChange={(event) => setEmail(event.target.value)} required />
+        <button type="submit" disabled={busy}>{busy ? '正在发送…' : '发送验证码'}</button>
+      </form>}
+      {mode !== 'login' && step === 'code' && <form onSubmit={verifyCode}>
+        <label htmlFor="market-code">邮箱验证码</label>
+        <input id="market-code" inputMode="numeric" autoComplete="one-time-code" maxLength={6} pattern="[0-9]{6}" value={code} onChange={(event) => setCode(event.target.value.replace(/\D/g, ''))} placeholder="6 位数字" required />
+        <button type="submit" disabled={busy || code.length !== 6}>{busy ? '正在验证…' : '验证'}</button>
+        <button type="button" className="market-secondary-button" onClick={() => sendCode()} disabled={busy}>重新发送验证码</button>
+      </form>}
+      {mode !== 'login' && step === 'password' && <form onSubmit={submitPassword}>
+        <label htmlFor="market-set-password">{mode === 'register' ? '设置密码' : '新密码'}</label>
+        <input id="market-set-password" type="password" autoComplete="new-password" minLength={8} value={password} onChange={(event) => setPassword(event.target.value)} placeholder="至少 8 位" required />
+        <label htmlFor="market-set-confirmation">确认密码</label>
+        <input id="market-set-confirmation" type="password" autoComplete="new-password" minLength={8} value={confirmation} onChange={(event) => setConfirmation(event.target.value)} required />
+        <button type="submit" disabled={busy}>{busy ? '正在提交…' : mode === 'register' ? '完成注册并登录' : '重置密码'}</button>
+      </form>}
+      {mode !== 'login' && <div className="market-auth-links"><button type="button" className="market-secondary-button" onClick={() => switchMode('login')}>返回登录</button></div>}
+      {notice && <p className="market-form-notice" role="status">{notice}</p>}
       {message && <p className="market-form-error" role="alert">{message}</p>}
     </section>
   </main>
@@ -733,7 +820,7 @@ function Detail({ item, snapshot, period, setPeriod, series, dailyLoading, daily
         ? null
         : period === 'timeshare'
         ? <>
-          <LineChart name={snapshot?.name ?? item.name} points={snapshot?.timeshare ?? []} pricePrecision={pricePrecision} selectedTime={intradaySelectedTime} onSelectionChange={setIntradaySelectedTime} />
+          <LineChart name={snapshot?.name ?? item.name} points={snapshot?.timeshare ?? []} pricePrecision={pricePrecision} selectedTime={intradaySelectedTime} error={snapshot?.source_errors?.tencent_intraday ?? snapshot?.capabilities.timeshare?.reason} onSelectionChange={setIntradaySelectedTime} />
           {l2Available && <MarketIntradayCharts symbol={snapshot?.symbol ?? item.symbol} series={snapshot?.intraday_series ?? {}} selectedTime={intradaySelectedTime} />}
         </>
         : period === 'day'
@@ -753,9 +840,12 @@ function Detail({ item, snapshot, period, setPeriod, series, dailyLoading, daily
   </section>
 }
 
-export function MarketApp() {
-  const [auth, setAuth] = useState<AuthState>('loading')
-  const [user, setUser] = useState<MarketUser | null>(null)
+export function MarketApp({ embedded = false }: { embedded?: boolean } = {}) {
+  // 内嵌在工作台里时，登录态已由外层确认，不再重复请求并闪出第二个“正在连接”页面
+  const hostSession = useContext(MarketSessionContext)
+  const inheritedUser = embedded ? hostSession?.user ?? null : null
+  const [auth, setAuth] = useState<AuthState>(inheritedUser ? 'authenticated' : 'loading')
+  const [user, setUser] = useState<MarketUser | null>(inheritedUser)
   const [groups, setGroups] = useState<WatchlistGroup[]>([])
   const [groupId, setGroupId] = useState<number | null>(null)
   const [selected, setSelected] = useState<string | null>(null)
@@ -868,7 +958,17 @@ export function MarketApp() {
       : availableItems[0]?.symbol ?? null)
   }
 
+  useEffect(() => subscribeMarketWatchlistChanges(() => {
+    if (auth === 'authenticated' && !user?.must_change_password) {
+      void loadWatchlists().catch((reason) => setMessage(reason instanceof Error ? reason.message : '自选同步失败'))
+    }
+  }), [auth, user?.must_change_password])
+
   useEffect(() => {
+    if (inheritedUser) {
+      if (!inheritedUser.must_change_password) void loadWatchlists().catch((reason) => setMessage(reason instanceof Error ? reason.message : '自选加载失败'))
+      return
+    }
     let active = true
     void marketApi.session().then((current) => {
       if (!active) return
@@ -1131,7 +1231,7 @@ export function MarketApp() {
   if (auth === 'anonymous') return <Login onLogin={(current) => { setUser(current); setAuth('authenticated'); if (!current.must_change_password) void loadWatchlists() }} />
   if (user?.must_change_password) return <PasswordChange user={user} onDone={(current) => { setUser(current); void loadWatchlists() }} />
 
-  return <main className="market-app-shell">
+  return <main className={`market-app-shell${embedded ? ' market-app-embedded' : ''}`}>
     <header className="market-topbar">
       <a href="/market" className="market-wordmark"><span>顺</span><strong>行情中心</strong></a>
       <div className="market-search" ref={symbolSearchRef}>
@@ -1186,7 +1286,7 @@ export function MarketApp() {
           {symbolSuggestionState === 'loading' ? '正在搜索股票' : symbolSuggestionState === 'empty' ? '没有匹配的股票' : ''}
         </span>
       </div>
-      <div className="market-account"><span><i className={connection} />{connection === 'live' ? '实时连接' : connection === 'reconnecting' ? '正在重连' : '轮询模式'}</span><button type="button" onClick={logout}>{user?.username} · 退出</button></div>
+      <div className="market-account"><span><i className={connection} />{connection === 'live' ? '实时连接' : connection === 'reconnecting' ? '正在重连' : '轮询模式'}</span>{!embedded && <button type="button" onClick={logout}>{user?.username} · 退出</button>}</div>
     </header>
     <div className="market-workspace">
       <aside className="market-watchlist">

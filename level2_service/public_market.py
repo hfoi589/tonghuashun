@@ -213,7 +213,10 @@ def _quote_snapshot(
 
 class TencentPublicMarketProvider:
     quote_url = "https://qt.gtimg.cn/q={provider_id}"
-    minute_url = "https://web.ifzq.gtimg.cn/appstock/app/minute/query?code={provider_id}"
+    # Tencent's minute endpoint is served by the non-web alias. The web alias
+    # began returning its 501 WAF page for server requests while quote and K-line
+    # requests on the same backend remained available.
+    minute_url = "https://ifzq.gtimg.cn/appstock/app/minute/query?code={provider_id}"
     kline_url = (
         "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?"
         "param={provider_id},{period},,,{limit},qfq"

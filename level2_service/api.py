@@ -34,6 +34,7 @@ from .device_lifecycle import (
     DeviceLifecycleState,
 )
 from .models import CaptureKind, CaptureStatus, TaskRecord, TaskStatus, ValueSource, utc_now
+from .goodluck_bridge import install_goodluck_routes
 from .market_api import install_market_routes
 from .vibe_api import install_vibe_routes
 from .market_data import is_china_market_open
@@ -441,6 +442,7 @@ def create_app(
     device_lifecycle: DeviceLifecycleClient | None = None,
     request_log_store: RequestLogStore | None = None,
     workday_calendar: ChinaLegalWorkdayCalendar | None = None,
+    goodluck_internal_token: str | None = None,
 ) -> FastAPI:
     """Build an isolated application instance for one service process."""
     if cleanup_interval_seconds <= 0:
@@ -645,6 +647,12 @@ def create_app(
                 await app.state.premium_task
             if app.state.symbol_catalog_task is not None:
                 await app.state.symbol_catalog_task
+            warmup_tasks = list(getattr(app.state, "goodluck_warmup_tasks", ()))
+            for task in warmup_tasks:
+                if not task.done():
+                    task.cancel()
+            if warmup_tasks:
+                await gather(*warmup_tasks, return_exceptions=True)
             for resource in reversed(app.state.managed_resources):
                 close = getattr(resource, "close", None)
                 if callable(close):
@@ -784,6 +792,8 @@ def create_app(
     app.state.account_session_provider = account_session_provider
     app.state.workday_calendar = workday_calendar or default_china_workday_calendar()
     app.state.account_session_refreshers = dict(account_session_refreshers or {})
+    app.state.goodluck_internal_token = (goodluck_internal_token or "").strip() or None
+    app.state.goodluck_warmup_tasks = set()
     set_capture_root = getattr(app.state.store, "set_capture_root", None)
     if callable(set_capture_root):
         set_capture_root(app.state.capture_root)
@@ -1664,6 +1674,12 @@ def create_app(
         require_admin_csrf=require_csrf,
         resolve_symbol=resolve_symbol,
         secure_cookies=secure_admin_cookies,
+        previous_trading_date=previous_trading_date,
+    )
+
+    install_goodluck_routes(
+        app,
+        resolve_symbol=resolve_symbol,
         previous_trading_date=previous_trading_date,
     )
 

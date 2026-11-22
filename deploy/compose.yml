@@ -58,6 +58,7 @@ services:
       THS_SESSION_ROOT: /data/admin/ths-sessions
       VRA_API_TOKEN: ${VRA_API_TOKEN:-}
       VRA_BACKEND_URL: ${VRA_BACKEND_URL:-http://host.docker.internal:8765}
+      GOODLUCK_INTERNAL_TOKEN: ${GOODLUCK_INTERNAL_TOKEN:-}
     depends_on:
       redis:
         condition: service_healthy

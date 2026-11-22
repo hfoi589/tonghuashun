@@ -190,6 +190,14 @@ class SQLiteMarketAccountStore:
                 self._connection.execute(
                     "ALTER TABLE market_users ADD COLUMN vibe_watchlist_synced INTEGER NOT NULL DEFAULT 0"
                 )
+            if "external_identity" not in user_columns:
+                self._connection.execute(
+                    "ALTER TABLE market_users ADD COLUMN external_identity TEXT"
+                )
+            self._connection.execute(
+                """CREATE UNIQUE INDEX IF NOT EXISTS market_users_external_identity
+                   ON market_users(external_identity) WHERE external_identity IS NOT NULL"""
+            )
             # Wilson is the single default administrator for the integrated workspace.
             # User creation never accepts a role from the request and always uses the
             # database default (ordinary user).
@@ -319,6 +327,63 @@ class SQLiteMarketAccountStore:
                     "SELECT COUNT(DISTINCT symbol) FROM watchlist_items"
                 ).fetchone()[0]
             )
+
+    def user_symbol_count(self, user_id: int) -> int:
+        """Distinct symbols held across one user's watchlist groups."""
+        with self._lock:
+            return int(
+                self._connection.execute(
+                    """SELECT COUNT(DISTINCT i.symbol) FROM watchlist_items i
+                       JOIN watchlist_groups g ON g.id=i.group_id
+                       WHERE g.user_id=?""",
+                    (user_id,),
+                ).fetchone()[0]
+            )
+
+    def get_or_create_external_user(self, provider: str, subject: str) -> MarketUser:
+        """Resolve or provision an isolated market user for an external identity."""
+        normalized_provider = provider.strip().lower()
+        if not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,31}", normalized_provider):
+            raise ValueError("invalid external identity provider")
+        normalized_subject = subject.strip()
+        if not 1 <= len(normalized_subject) <= 128:
+            raise ValueError("external identity subject must contain 1-128 characters")
+        external_key = f"{normalized_provider}:{normalized_subject}"
+        with self._lock:
+            row = self._connection.execute(
+                """SELECT id,username,enabled,must_change_password,role,created_at,email
+                   FROM market_users WHERE external_identity=?""",
+                (external_key,),
+            ).fetchone()
+            if row is not None:
+                return self._user(row)
+            digest = hashlib.sha256(external_key.encode("utf-8")).hexdigest()
+            username = f"gl_{digest[:16]}"
+            password_hash = self._hasher.hash(secrets.token_urlsafe(32))
+            created_at = _utc_now().isoformat()
+            try:
+                with self._connection:
+                    cursor = self._connection.execute(
+                        """INSERT INTO market_users(
+                               username,password_hash,created_at,role,must_change_password,external_identity
+                           ) VALUES(?,?,?,?,0,?)""",
+                        (username, password_hash, created_at, "user", external_key),
+                    )
+                    user_id = int(cursor.lastrowid)
+                    self._connection.execute(
+                        "INSERT INTO watchlist_groups(user_id,name,sort_order,is_primary) VALUES(?,?,0,1)",
+                        (user_id, "自选"),
+                    )
+                return self.get_user(user_id)
+            except sqlite3.IntegrityError:
+                row = self._connection.execute(
+                    """SELECT id,username,enabled,must_change_password,role,created_at,email
+                       FROM market_users WHERE external_identity=?""",
+                    (external_key,),
+                ).fetchone()
+                if row is not None:
+                    return self._user(row)
+                raise
 
     def _symbol_tracked_by_anyone(self, symbol: str) -> bool:
         return (

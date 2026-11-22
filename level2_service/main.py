@@ -113,6 +113,7 @@ class DeploymentSettings:
     fund_flow_three_day_interval_seconds: float = 120.0
     fund_flow_five_day_interval_seconds: float = 300.0
     fund_flow_max_requests_per_second: float = 5.0
+    goodluck_internal_token: str | None = field(default=None, repr=False)
 
     @classmethod
     def from_environ(cls, environ: Mapping[str, str] | None = None) -> "DeploymentSettings":
@@ -386,6 +387,7 @@ class DeploymentSettings:
             ],
             ths_session_encryption_key=session_encryption_key or None,
             ths_session_root=session_root,
+            goodluck_internal_token=values.get("GOODLUCK_INTERNAL_TOKEN", "").strip() or None,
         )
 
 
@@ -865,6 +867,7 @@ def create_production_app(
         account_session_refreshers=account_session_refreshers,
         device_lifecycle=device_lifecycle,
         request_log_store=RequestLogStore(config.research_database_path),
+        goodluck_internal_token=config.goodluck_internal_token,
     )
     app.state.deployment_settings = config
     app.state.runner = runner

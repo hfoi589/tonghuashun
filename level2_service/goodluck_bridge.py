@@ -1,13 +1,15 @@
-"""Internal bridge endpoints for Guohang Goodluck dark-pool & watchlist integration."""
+"""Internal bridge endpoints for Guohang Goodluck dark-pool, intraday & premium integration."""
 
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime
 import hashlib
 import hmac
 import re
 from typing import Any, Callable
 from urllib.parse import unquote
+from zoneinfo import ZoneInfo
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from pydantic import BaseModel, Field
@@ -15,10 +17,17 @@ from pydantic import BaseModel, Field
 from .market_accounts import MarketUser
 from .market_data import fixed_market_error_code
 from .parsed_values import DirectRequestError, SymbolLookup
+from .research_premium import format_premium_body
+from .research_replay import (
+    build_replay_markers,
+    calculate_replay_performance,
+    evaluate_rule_detail,
+)
 
 
 _SYMBOL_RE = re.compile(r"^[0-9]{6}\Z")
 _DATE_RE = re.compile(r"^[0-9]{8}\Z")
+_SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
 
 
 class BridgeGroupRequest(BaseModel):
@@ -48,6 +57,33 @@ class BridgeMonitoringUpdateRequest(BaseModel):
     enabled: bool
 
 
+class BridgeMacdSettingsRequest(BaseModel):
+    short: int = Field(ge=2, le=200)
+    long: int = Field(ge=3, le=200)
+    signal: int = Field(ge=1, le=100)
+    marker_threshold: float = Field(default=0.005, ge=0, le=1)
+
+
+class BridgeReplayRequest(BaseModel):
+    symbol: str
+    trade_date: str | None = None
+    rule_ids: list[str] = Field(default_factory=list)
+    rules: list[dict[str, Any]] | None = None
+
+
+class BridgePushTestRequest(BaseModel):
+    channel: str | None = None
+    config: dict[str, Any] | None = None
+
+
+class BridgePushRuleTestRequest(BaseModel):
+    symbol: str
+    trade_date: str | None = None
+    rule: dict[str, Any]
+    send_push: bool = False
+    config: dict[str, Any] | None = None
+
+
 def _token_matches(provided: str | None, expected: str | None) -> bool:
     if not provided or not expected:
         return False
@@ -61,6 +97,17 @@ def _validate_symbol(symbol: str) -> str:
     if not _SYMBOL_RE.fullmatch(normalized):
         raise HTTPException(status_code=422, detail="symbol must be a six-digit stock code")
     return normalized
+
+
+def _validate_optional_date(trade_date: str | None) -> str | None:
+    if trade_date is None:
+        return None
+    cleaned = trade_date.strip().replace("-", "")
+    if not cleaned:
+        return None
+    if not _DATE_RE.fullmatch(cleaned):
+        raise HTTPException(status_code=422, detail="trade_date must be YYYYMMDD")
+    return cleaned
 
 
 def _extract_today_fund_flow(store: object, symbol: str) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
@@ -81,6 +128,68 @@ def _extract_today_fund_flow(store: object, symbol: str) -> tuple[dict[str, Any]
         "trade_date": history.get("trade_date"),
         "minute": latest.get("time"),
     }, latest
+
+
+def _merge_push_config_for_test(current: dict[str, Any], incoming: dict[str, Any] | None) -> dict[str, Any]:
+    if not incoming or not isinstance(incoming, dict):
+        return current
+    current_groups = {
+        str(g.get("id")): g for g in (current.get("bark_groups") or []) if isinstance(g, dict) and g.get("id")
+    }
+    groups = []
+    raw_groups = incoming.get("bark_groups", current.get("bark_groups", []))
+    for idx, raw_group in enumerate(raw_groups if isinstance(raw_groups, list) else []):
+        if not isinstance(raw_group, dict):
+            continue
+        gid = str(raw_group.get("id") or f"bark-{idx + 1}")
+        prev = current_groups.get(gid, {})
+        secret = str(raw_group.get("device_key") or prev.get("device_key") or "")
+        groups.append(
+            {
+                "id": gid,
+                "name": str(raw_group.get("name") or gid),
+                "base_url": str(raw_group.get("base_url") or prev.get("base_url") or "https://api.day.app").rstrip("/"),
+                "device_key": secret,
+            }
+        )
+    cur_sc3 = current.get("sc3_bot") or {}
+    in_sc3 = incoming.get("sc3_bot") if isinstance(incoming.get("sc3_bot"), dict) else {}
+    merged_sc3 = {**cur_sc3, **in_sc3}
+    if not str(in_sc3.get("token") or "").strip():
+        merged_sc3["token"] = cur_sc3.get("token", "")
+
+    cur_wecom = current.get("wecom") or {}
+    in_wecom = incoming.get("wecom") if isinstance(incoming.get("wecom"), dict) else {}
+    merged_wecom = {**cur_wecom, **in_wecom}
+    if not str(in_wecom.get("corp_secret") or "").strip():
+        merged_wecom["corp_secret"] = cur_wecom.get("corp_secret", "")
+
+    return {
+        **current,
+        "enabled": bool(incoming.get("enabled", current.get("enabled", False))),
+        "premium_push_enabled": bool(incoming.get("premium_push_enabled", current.get("premium_push_enabled", True))),
+        "bark_groups": groups,
+        "sc3_bot": merged_sc3,
+        "wecom": merged_wecom,
+        "rules": incoming.get("rules", current.get("rules", [])),
+    }
+
+
+def _build_macd_cross_dots(points: list[dict[str, Any]], threshold: float) -> list[dict[str, Any]]:
+    dots: list[dict[str, Any]] = []
+    for idx in range(1, len(points)):
+        prev = points[idx - 1]
+        curr = points[idx]
+        prev_delta = float(prev.get("diff") or 0.0) - float(prev.get("dea") or 0.0)
+        curr_delta = float(curr.get("diff") or 0.0) - float(curr.get("dea") or 0.0)
+        macd_val = float(curr.get("macd") or 0.0)
+        if abs(macd_val) < threshold:
+            continue
+        if prev_delta <= 0 < curr_delta:
+            dots.append({"index": idx, "time": curr.get("time"), "kind": "red", "diff": curr.get("diff"), "macd": macd_val})
+        elif prev_delta >= 0 > curr_delta:
+            dots.append({"index": idx, "time": curr.get("time"), "kind": "green", "diff": curr.get("diff"), "macd": macd_val})
+    return dots
 
 
 def install_goodluck_routes(
@@ -119,6 +228,12 @@ def install_goodluck_routes(
         if not user.enabled:
             raise HTTPException(status_code=403, detail="market user is disabled")
         return user, is_admin
+
+    def require_goodluck_admin(identity: tuple[MarketUser, bool] = Depends(require_goodluck_identity)) -> MarketUser:
+        user, is_admin = identity
+        if not is_admin:
+            raise HTTPException(status_code=403, detail="admin access required")
+        return user
 
     def _user_watchlist_items(accounts: Any, user_id: int) -> dict[str, Any]:
         items: dict[str, Any] = {}
@@ -159,6 +274,32 @@ def install_goodluck_routes(
         task = asyncio.create_task(_run())
         tasks.add(task)
         task.add_done_callback(tasks.discard)
+
+    def _enrich_intraday_points(store: Any, symbol: str, trade_date: str, points: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        ff_by_time: dict[str, dict[str, Any]] = {}
+        try:
+            ff_history = store.read_fund_flow_history(symbol, trade_date)
+            today_pts = ((ff_history.get("periods") or {}).get("today") or {}).get("points") or []
+            for item in today_pts:
+                if isinstance(item, dict) and item.get("time"):
+                    ff_by_time[str(item["time"])] = item
+        except Exception:
+            ff_by_time = {}
+
+        enriched: list[dict[str, Any]] = []
+        for point in points:
+            ff = ff_by_time.get(str(point.get("time") or ""), {})
+            enriched.append(
+                {
+                    **point,
+                    "main_net_inflow": ff.get("main_net_inflow"),
+                    "main_visible_inflow": ff.get("main_visible_inflow"),
+                    "main_hidden_inflow": ff.get("main_hidden_inflow"),
+                    "retail_inflow": ff.get("retail_inflow"),
+                    "fund_unit": ff.get("unit"),
+                }
+            )
+        return enriched
 
     @app.get(f"{prefix}/symbols")
     def bridge_search_symbols(
@@ -655,6 +796,355 @@ def install_goodluck_routes(
             "name": _resolve_item_name(normalized, watchlist_item.name),
         }
 
+    # ---- Oil & Gas QDII/LOF Premium Panel ----
+
+    @app.get(f"{prefix}/premium")
+    async def bridge_get_premium(_identity=Depends(require_goodluck_identity)) -> dict[str, Any]:
+        store = getattr(app.state, "research_store", None)
+        monitor = getattr(app.state, "premium_monitor", None)
+        snapshot = await asyncio.to_thread(store.premium_snapshot) if store is not None else None
+        if snapshot is None and monitor is not None:
+            try:
+                snapshot = await monitor.poll_once(force=True)
+            except Exception:
+                snapshot = None
+        push_enabled = False
+        if store is not None:
+            try:
+                push_cfg = await asyncio.to_thread(store.push_config, public=True)
+                push_enabled = bool(push_cfg.get("premium_push_enabled"))
+            except Exception:
+                push_enabled = False
+        base = snapshot or {"as_of": None, "rows": [], "valid_count": 0, "errors": {}}
+        return {**base, "push_enabled": push_enabled}
+
+    @app.post(f"{prefix}/premium/refresh")
+    async def bridge_refresh_premium(_admin=Depends(require_goodluck_admin)) -> dict[str, Any]:
+        monitor = getattr(app.state, "premium_monitor", None)
+        store = getattr(app.state, "research_store", None)
+        if monitor is None:
+            raise HTTPException(status_code=503, detail="premium monitor is not configured")
+        snapshot = await monitor.poll_once(force=True)
+        push_enabled = False
+        if store is not None:
+            push_cfg = await asyncio.to_thread(store.push_config, public=True)
+            push_enabled = bool(push_cfg.get("premium_push_enabled"))
+        return {**snapshot, "push_enabled": push_enabled}
+
+    @app.post(f"{prefix}/premium/push")
+    async def bridge_push_premium(_admin=Depends(require_goodluck_admin)) -> dict[str, Any]:
+        store = getattr(app.state, "research_store", None)
+        dispatcher = getattr(app.state, "push_dispatcher", None)
+        if store is None or dispatcher is None:
+            raise HTTPException(status_code=503, detail="push dispatcher is not configured")
+        snapshot = await asyncio.to_thread(store.premium_snapshot)
+        if not snapshot or not snapshot.get("valid_count"):
+            raise HTTPException(status_code=409, detail="暂无有效的油气溢价估值快照，请先刷新")
+        config = await asyncio.to_thread(store.push_config, public=False)
+        try:
+            return await asyncio.to_thread(
+                dispatcher.send,
+                config,
+                "[手动] QDII/LOF 溢价估算",
+                format_premium_body(snapshot),
+            )
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from None
+
+    # ---- Admin-only Intraday Monitoring, Replay & Push Rules ----
+
+    @app.get(f"{prefix}/intraday/series")
+    async def bridge_intraday_series(
+        symbol: str,
+        trade_date: str | None = None,
+        refresh: bool = False,
+        rule_ids: str | None = None,
+        admin_user: MarketUser = Depends(require_goodluck_admin),
+    ) -> dict[str, Any]:
+        normalized = _validate_symbol(symbol)
+        selected_date = _validate_optional_date(trade_date)
+        store = getattr(app.state, "research_store", None)
+        broker = getattr(app.state, "market_data_broker", None)
+        monitor = getattr(app.state, "research_monitor", None)
+        accounts = account_store()
+        if store is None:
+            raise HTTPException(status_code=503, detail="research monitoring is not configured")
+
+        now_sh = datetime.now(_SHANGHAI_TZ)
+        today_str = now_sh.strftime("%Y%m%d")
+        synced_at = now_sh.isoformat(timespec="seconds")
+        market_open = bool(broker.is_market_open()) if broker is not None else False
+        refresh_error: str | None = None
+
+        if refresh and (selected_date is None or selected_date == today_str) and broker is not None and market_open:
+            try:
+                live_snap = await broker.refresh(normalized, detail=True, max_age_seconds=0)
+                changed = await asyncio.to_thread(store.record_snapshot, live_snap)
+                if changed and monitor is not None and getattr(monitor, "dispatcher", None) is not None:
+                    try:
+                        await monitor._push_changed(normalized, changed)
+                    except Exception:
+                        pass
+            except Exception as error:
+                refresh_error = fixed_market_error_code(error, "MARKET_QUOTE_UNAVAILABLE")
+                try:
+                    await asyncio.to_thread(store.record_error, normalized, refresh_error)
+                except Exception:
+                    pass
+
+        try:
+            series = await asyncio.to_thread(store.read_series, normalized, selected_date)
+        except LookupError:
+            if selected_date is None and broker is not None:
+                try:
+                    live_snap = await broker.refresh(normalized, detail=True, max_age_seconds=0)
+                    await asyncio.to_thread(store.record_snapshot, live_snap)
+                    series = await asyncio.to_thread(store.read_series, normalized, None)
+                except Exception as error:
+                    code = fixed_market_error_code(error, "MARKET_QUOTE_UNAVAILABLE")
+                    raise HTTPException(status_code=404, detail=code) from None
+            else:
+                raise HTTPException(status_code=404, detail="本地尚无该交易日分时数据，请先执行补采") from None
+
+        user_items = _user_watchlist_items(accounts, admin_user.id)
+        fallback_name = user_items[normalized].name if normalized in user_items else normalized
+        stock_name = series.get("name") or _resolve_item_name(normalized, fallback_name)
+        enriched_points = await asyncio.to_thread(
+            _enrich_intraday_points,
+            store,
+            normalized,
+            series["trade_date"],
+            series["points"],
+        )
+        macd_settings = series["macd_settings"]
+        threshold = float(macd_settings.get("marker_threshold", 0))
+        macd_dots = _build_macd_cross_dots(enriched_points, threshold)
+
+        replay_payload: dict[str, Any] | None = None
+        if rule_ids is not None and rule_ids.strip():
+            push_cfg = await asyncio.to_thread(store.push_config, public=True)
+            all_rules = push_cfg.get("rules") or []
+            wanted_ids = {rid.strip() for rid in rule_ids.split(",") if rid.strip()}
+            selected_rules = [
+                {**r, "enabled": True}
+                for r in all_rules
+                if isinstance(r, dict) and ("*" in wanted_ids or str(r.get("id") or "") in wanted_ids)
+            ]
+            markers = build_replay_markers(normalized, enriched_points, selected_rules, marker_threshold=threshold)
+            performance = calculate_replay_performance(markers, enriched_points)
+            replay_payload = {"markers": markers, "performance": performance}
+
+        latest_pt = enriched_points[-1] if enriched_points else {}
+        return {
+            "symbol": normalized,
+            "name": stock_name,
+            "market": series["market"],
+            "trade_date": series["trade_date"],
+            "requested_date": selected_date or series["trade_date"],
+            "source": series["source"],
+            "collected_at": series["collected_at"],
+            "synced_at": synced_at,
+            "market_open": market_open,
+            "refresh_error": refresh_error,
+            "pre_close": series["pre_close"],
+            "available_dates": series["available_dates"],
+            "macd_settings": macd_settings,
+            "macd_dots": macd_dots,
+            "latest": latest_pt,
+            "points": enriched_points,
+            "replay": replay_payload,
+        }
+
+    @app.post(f"{prefix}/intraday/replay")
+    async def bridge_intraday_replay(
+        payload: BridgeReplayRequest,
+        _admin: MarketUser = Depends(require_goodluck_admin),
+    ) -> dict[str, Any]:
+        normalized = _validate_symbol(payload.symbol)
+        selected_date = _validate_optional_date(payload.trade_date)
+        store = getattr(app.state, "research_store", None)
+        if store is None:
+            raise HTTPException(status_code=503, detail="research monitoring is not configured")
+        try:
+            series = await asyncio.to_thread(store.read_series, normalized, selected_date)
+        except LookupError:
+            raise HTTPException(status_code=404, detail="research history not found") from None
+        points = await asyncio.to_thread(
+            _enrich_intraday_points,
+            store,
+            normalized,
+            series["trade_date"],
+            series["points"],
+        )
+        threshold = float(series["macd_settings"].get("marker_threshold", 0))
+        if payload.rules is not None:
+            active_rules = [{**r, "enabled": True} for r in payload.rules if isinstance(r, dict)]
+        else:
+            push_cfg = await asyncio.to_thread(store.push_config, public=True)
+            wanted = set(payload.rule_ids)
+            active_rules = [
+                {**r, "enabled": True}
+                for r in (push_cfg.get("rules") or [])
+                if isinstance(r, dict) and (not wanted or str(r.get("id") or "") in wanted)
+            ]
+        markers = build_replay_markers(normalized, points, active_rules, marker_threshold=threshold)
+        performance = calculate_replay_performance(markers, points)
+        return {
+            "symbol": normalized,
+            "trade_date": series["trade_date"],
+            "markers": markers,
+            "performance": performance,
+        }
+
+    @app.post(f"{prefix}/intraday/backfill-all")
+    async def bridge_intraday_backfill_all(
+        admin_user: MarketUser = Depends(require_goodluck_admin),
+    ) -> dict[str, Any]:
+        accounts = account_store()
+        broker = getattr(app.state, "market_data_broker", None)
+        store = getattr(app.state, "research_store", None)
+        if broker is None or store is None:
+            raise HTTPException(status_code=503, detail="research monitoring is not configured")
+        user_symbols = list(_user_watchlist_items(accounts, admin_user.id).keys())
+        target_symbols = user_symbols or accounts.list_monitored_symbols()
+        semaphore = asyncio.Semaphore(4)
+
+        async def _backfill_one(code: str) -> dict[str, Any]:
+            async with semaphore:
+                try:
+                    snap = await broker.refresh(code, detail=True, max_age_seconds=0)
+                    changed = await asyncio.to_thread(store.record_snapshot, snap)
+                    return {"symbol": code, "ok": True, "changed_count": len(changed)}
+                except Exception as error:
+                    err_code = fixed_market_error_code(error, "MARKET_QUOTE_UNAVAILABLE")
+                    await asyncio.to_thread(store.record_error, code, err_code)
+                    return {"symbol": code, "ok": False, "error": err_code}
+
+        results = await asyncio.gather(*(_backfill_one(s) for s in target_symbols[:50]))
+        return {
+            "count": len(results),
+            "results": list(results),
+            "synced_at": datetime.now(_SHANGHAI_TZ).isoformat(timespec="seconds"),
+        }
+
+    @app.get(f"{prefix}/intraday/macd-settings")
+    async def bridge_get_macd_settings(_admin=Depends(require_goodluck_admin)) -> dict[str, Any]:
+        store = getattr(app.state, "research_store", None)
+        if store is None:
+            raise HTTPException(status_code=503, detail="research monitoring is not configured")
+        return await asyncio.to_thread(store.macd_settings)
+
+    @app.put(f"{prefix}/intraday/macd-settings")
+    async def bridge_update_macd_settings(
+        payload: BridgeMacdSettingsRequest,
+        _admin=Depends(require_goodluck_admin),
+    ) -> dict[str, Any]:
+        store = getattr(app.state, "research_store", None)
+        if store is None:
+            raise HTTPException(status_code=503, detail="research monitoring is not configured")
+        try:
+            return await asyncio.to_thread(store.save_macd_settings, payload.model_dump())
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from None
+
+    @app.get(f"{prefix}/intraday/push-config")
+    async def bridge_get_push_config(_admin=Depends(require_goodluck_admin)) -> dict[str, Any]:
+        store = getattr(app.state, "research_store", None)
+        if store is None:
+            raise HTTPException(status_code=503, detail="research monitoring is not configured")
+        return await asyncio.to_thread(store.push_config, public=True)
+
+    @app.put(f"{prefix}/intraday/push-config")
+    async def bridge_save_push_config(
+        payload: dict[str, Any],
+        _admin=Depends(require_goodluck_admin),
+    ) -> dict[str, Any]:
+        store = getattr(app.state, "research_store", None)
+        if store is None:
+            raise HTTPException(status_code=503, detail="research monitoring is not configured")
+        try:
+            return await asyncio.to_thread(store.save_push_config, payload)
+        except (TypeError, ValueError) as error:
+            raise HTTPException(status_code=422, detail=str(error)) from None
+
+    @app.post(f"{prefix}/intraday/push-test")
+    async def bridge_test_push(
+        payload: BridgePushTestRequest,
+        _admin=Depends(require_goodluck_admin),
+    ) -> dict[str, Any]:
+        store = getattr(app.state, "research_store", None)
+        dispatcher = getattr(app.state, "push_dispatcher", None)
+        if store is None or dispatcher is None:
+            raise HTTPException(status_code=503, detail="push dispatcher is not configured")
+        saved = await asyncio.to_thread(store.push_config, public=False)
+        merged = _merge_push_config_for_test(saved, payload.config)
+        try:
+            return await asyncio.to_thread(
+                dispatcher.send,
+                merged,
+                "国行好运器 · 分时监控推送测试",
+                "推送通道已连通",
+                only_channel=payload.channel,
+            )
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from None
+
+    @app.post(f"{prefix}/intraday/push-rule-test")
+    async def bridge_test_push_rule(
+        payload: BridgePushRuleTestRequest,
+        _admin=Depends(require_goodluck_admin),
+    ) -> dict[str, Any]:
+        normalized = _validate_symbol(payload.symbol)
+        selected_date = _validate_optional_date(payload.trade_date)
+        store = getattr(app.state, "research_store", None)
+        dispatcher = getattr(app.state, "push_dispatcher", None)
+        if store is None:
+            raise HTTPException(status_code=503, detail="research monitoring is not configured")
+        try:
+            series = await asyncio.to_thread(store.read_series, normalized, selected_date)
+        except LookupError:
+            raise HTTPException(status_code=404, detail="本地尚无该标的分时数据") from None
+        points = await asyncio.to_thread(
+            _enrich_intraday_points,
+            store,
+            normalized,
+            series["trade_date"],
+            series["points"],
+        )
+        threshold = float(series["macd_settings"].get("marker_threshold", 0))
+        evaluation = evaluate_rule_detail(
+            normalized,
+            points,
+            payload.rule,
+            marker_threshold=threshold,
+        )
+        markers = build_replay_markers(
+            normalized,
+            points,
+            [{**payload.rule, "enabled": True}],
+            marker_threshold=threshold,
+        )
+        push_result = None
+        if payload.send_push and dispatcher is not None:
+            saved = await asyncio.to_thread(store.push_config, public=False)
+            merged = _merge_push_config_for_test(saved, payload.config)
+            side_label = "卖点" if payload.rule.get("side") == "sell" else "买点"
+            title = f"[测试] {side_label} · {payload.rule.get('title') or '分时提醒'}"
+            body = f"{series.get('name') or normalized}({normalized}) {evaluation.get('time') or ''} {evaluation['summary']}"
+            try:
+                push_result = await asyncio.to_thread(dispatcher.send, merged, title, body)
+            except ValueError as error:
+                raise HTTPException(status_code=422, detail=str(error)) from None
+        return {
+            "symbol": normalized,
+            "name": series.get("name") or normalized,
+            "trade_date": series["trade_date"],
+            "evaluation": evaluation,
+            "day_hit_count": len(markers),
+            "day_hits": markers[-10:],
+            "push_result": push_result,
+        }
+
     @app.get(f"{prefix}/admin/status")
     def bridge_admin_status(identity=Depends(require_goodluck_identity)) -> dict[str, Any]:
         _user, is_admin = identity
@@ -675,11 +1165,21 @@ def install_goodluck_routes(
                 "stale": current.stale,
                 "checksum": current.checksum,
             }
+        premium_info = None
+        if store is not None:
+            snap = store.premium_snapshot()
+            if snap:
+                premium_info = {
+                    "as_of": snap.get("as_of"),
+                    "valid_count": snap.get("valid_count", 0),
+                    "error_count": len(snap.get("errors") or {}),
+                }
         return {
             "global_count": accounts.total_symbol_count(),
             "global_max": accounts.max_total_symbols,
             "monitored_count": len(monitored_symbols),
             "market_open": bool(broker.is_market_open()) if broker is not None else False,
             "symbol_catalog": catalog_info,
+            "premium": premium_info,
             "monitoring": store.monitoring_status(monitored_symbols) if store is not None else [],
         }

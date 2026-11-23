@@ -808,6 +808,7 @@ def create_production_app(
         PublicPremiumProvider(timeout_seconds=config.public_market_timeout_seconds),
         research_store,
         push_dispatcher,
+        is_trading_day=trading_calendar.is_trading_day,
     )
     device_lifecycle = (
         DeviceLifecycleClient(

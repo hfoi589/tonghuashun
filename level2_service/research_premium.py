@@ -215,14 +215,23 @@ class PublicPremiumProvider:
                 self._get("https://fund.eastmoney.com", f"/{code}.html"),
                 dt.datetime.now(SH_TZ).date(),
             )
-        result["xop"] = parse_yahoo_chart(
-            self._get("https://query1.finance.yahoo.com", "/v8/finance/chart/XOP?range=5d&interval=1d")
-        )
-        result["fx"] = parse_yahoo_chart(
-            self._get("https://query1.finance.yahoo.com", f"/v8/finance/chart/{quote('CNY=X', safe='=')}?range=5d&interval=1d")
-        )
+        result["xop"] = self._yahoo_closes("XOP")
+        result["fx"] = self._yahoo_closes(quote("CNY=X", safe="="))
         self._reference_cache = (now, result)
         return result
+
+    def _yahoo_closes(self, encoded_symbol: str) -> list[dict[str, Any]]:
+        last_error: Exception | None = None
+        for host in ("https://query1.finance.yahoo.com", "https://query2.finance.yahoo.com"):
+            try:
+                return parse_yahoo_chart(
+                    self._get(host, f"/v8/finance/chart/{encoded_symbol}?range=5d&interval=1d")
+                )
+            except Exception as error:
+                last_error = error
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError("PREMIUM_SOURCE_HTTP_FAILED")
 
     def _proxy_quote(self, code: str, references: dict[str, Any]) -> dict[str, Any]:
         secid = self._SECIDS[code]

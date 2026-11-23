@@ -940,15 +940,28 @@ class SQLiteResearchStore:
             raise LookupError("research history not found")
         settings = self.macd_settings()
         prices = [float(row["price"]) if row["price"] is not None else 0.0 for row in rows]
+        pre_close_val = 0.0
+        try:
+            if day["pre_close"] is not None and str(day["pre_close"]).strip() != "":
+                pre_close_val = float(day["pre_close"])
+        except (TypeError, ValueError):
+            pre_close_val = 0.0
         macd = calculate_macd(prices, settings)
         points = []
         for index, row in enumerate(rows):
+            price_num = prices[index]
+            change_pct = (
+                round((price_num - pre_close_val) / pre_close_val * 100, 4)
+                if pre_close_val > 0 and row["price"] is not None
+                else None
+            )
             points.append(
                 {
                     "time": row["minute"],
                     "price": row["price"],
                     "average_price": row["average_price"],
                     "volume": row["volume"],
+                    "change_pct": change_pct,
                     "large_order_net": row["large_order_net"],
                     "large_order_amount": row["large_order_amount"],
                     "retail_count": row["retail_count"],

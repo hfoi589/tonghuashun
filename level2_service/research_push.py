@@ -3,11 +3,24 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Any, Callable
 from urllib.parse import quote, urlencode
 from urllib.request import Request
 
 from .safe_http import SafeHttpTransport
+
+
+def _resolve_sc3_chat_id(raw_chat_id: object, token: str) -> str | int:
+    text = str(raw_chat_id or "").strip()
+    if text:
+        try:
+            numeric = int(float(text))
+            return numeric if numeric > 0 else text
+        except (TypeError, ValueError):
+            return text
+    match = re.match(r"^sctp(\d+)t", token.strip())
+    return int(match.group(1)) if match else ""
 
 
 class PushDispatcher:
@@ -47,7 +60,7 @@ class PushDispatcher:
 
     def _sc3(self, config: dict[str, Any], title: str, body: str) -> None:
         token = str(config.get("token") or "").strip()
-        chat_id = str(config.get("chat_id") or "").strip()
+        chat_id = _resolve_sc3_chat_id(config.get("chat_id"), token)
         if not token or not chat_id:
             raise RuntimeError("SC3_NOT_CONFIGURED")
         base = str(config.get("base_url") or "https://bot-go.apijia.cn").rstrip("/")
@@ -86,17 +99,25 @@ class PushDispatcher:
         token_payload = self._response_json(token_response)
         if int(token_payload.get("errcode", -1)) != 0 or not token_payload.get("access_token"):
             raise RuntimeError("WECOM_TOKEN_FAILED")
-        message = {
+        content = f"{title}\n{body}" if body else title
+        news_base = str(config.get("news_base_url") or "").strip().rstrip("/")
+        if news_base and news_base not in content:
+            content = f"{content}\n查看图片：{news_base}/news-images"
+        message: dict[str, Any] = {
             "touser": str(config.get("to_user") or "@all"),
-            "toparty": str(config.get("to_party") or ""),
-            "totag": str(config.get("to_tag") or ""),
             "msgtype": "text",
             "agentid": int(config.get("agent_id") or 0),
-            "text": {"content": f"{title}\n{body}" if body else title},
+            "text": {"content": content},
             "safe": 0,
             "enable_duplicate_check": 1,
             "duplicate_check_interval": 1800,
         }
+        to_party = str(config.get("to_party") or "").strip()
+        to_tag = str(config.get("to_tag") or "").strip()
+        if to_party:
+            message["toparty"] = to_party
+        if to_tag:
+            message["totag"] = to_tag
         response = transport.request(
             Request(
                 f"{base}/cgi-bin/message/send?{urlencode({'access_token': token_payload['access_token']})}",
@@ -110,11 +131,25 @@ class PushDispatcher:
         if int(payload.get("errcode", -1)) != 0:
             raise RuntimeError("WECOM_SEND_FAILED")
 
-    def send(self, config: dict[str, Any], title: str, body: str) -> dict[str, Any]:
+    def send(
+        self,
+        config: dict[str, Any],
+        title: str,
+        body: str,
+        *,
+        only_channel: str | None = None,
+    ) -> dict[str, Any]:
         channels: dict[str, dict[str, Any]] = {}
         errors: dict[str, str] = {}
-        if config.get("enabled"):
-            groups = list(config.get("bark_groups") or [])
+        target = (only_channel or "").strip().lower() or None
+
+        if target in {None, "bark"} and (target == "bark" or config.get("enabled")):
+            groups = [
+                g for g in (config.get("bark_groups") or [])
+                if isinstance(g, dict) and (target == "bark" or str(g.get("device_key") or "").strip())
+            ]
+            if not groups and target == "bark":
+                groups = list(config.get("bark_groups") or [])
             if groups:
                 sent = 0
                 for group in groups:
@@ -125,20 +160,23 @@ class PushDispatcher:
                     except Exception:
                         errors[f"bark:{group_id}"] = "BARK_SEND_FAILED"
                 channels["bark"] = {"sent": sent, "total": len(groups)}
+
         sc3 = config.get("sc3_bot") or {}
-        if sc3.get("enabled"):
+        if target in {None, "sc3_bot"} and (target == "sc3_bot" or sc3.get("enabled")):
             try:
                 self._sc3(sc3, title, body)
                 channels["sc3_bot"] = {"sent": 1}
             except Exception:
                 errors["sc3_bot"] = "SC3_SEND_FAILED"
+
         wecom = config.get("wecom") or {}
-        if wecom.get("enabled"):
+        if target in {None, "wecom"} and (target == "wecom" or wecom.get("enabled")):
             try:
                 self._wecom(wecom, title, body)
                 channels["wecom"] = {"sent": 1}
             except Exception:
                 errors["wecom"] = "WECOM_SEND_FAILED"
+
         if not channels and not errors:
             raise ValueError("no push channel is enabled")
         return {"ok": not errors, "channels": channels, "errors": errors}

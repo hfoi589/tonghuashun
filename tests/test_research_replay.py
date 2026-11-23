@@ -75,3 +75,56 @@ def test_build_replay_markers_applies_code_macd_and_flow_conditions():
         "rule_id": "buy",
         "rule_title": "大单金叉",
     }]
+
+
+def test_swing_reversal_condition_generates_buy_and_sell_markers():
+    prices = [10.00, 9.96, 9.90, 9.97, 10.02, 10.05, 9.98]
+    points = [
+        {"time": f"09:{30 + idx:02d}", "price": str(price), "diff": 0.01, "dea": 0.0, "macd": 0.02, "volume": "10000"}
+        for idx, price in enumerate(prices)
+    ]
+    rules = [
+        {
+            "id": "t0-buy",
+            "enabled": True,
+            "side": "buy",
+            "title": "T0波段买点",
+            "joiner": "and",
+            "conditions": [
+                {
+                    "type": "swing_reversal",
+                    "side": "buy",
+                    "drawdownPct": 0.5,
+                    "bouncePct": 0.5,
+                    "takeProfitPct": 0.6,
+                    "pullbackPct": 0.5,
+                    "gapMinutes": 1,
+                    "startIndex": 1,
+                }
+            ],
+        },
+        {
+            "id": "t0-sell",
+            "enabled": True,
+            "side": "sell",
+            "title": "T0波段卖点",
+            "joiner": "and",
+            "conditions": [
+                {
+                    "type": "swing_reversal",
+                    "side": "sell",
+                    "drawdownPct": 0.5,
+                    "bouncePct": 0.5,
+                    "pullbackPct": 0.5,
+                    "gapMinutes": 1,
+                    "startIndex": 1,
+                }
+            ],
+        },
+    ]
+
+    markers = build_replay_markers("160723", points, rules)
+    sides = [m["side"] for m in markers]
+    assert "buy" in sides
+    perf = calculate_replay_performance(markers, points)
+    assert perf["buy_count"] >= 1

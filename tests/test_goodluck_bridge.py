@@ -443,3 +443,119 @@ def test_deployment_settings_reads_and_hides_goodluck_internal_token() -> None:
 
     assert settings.goodluck_internal_token == secret
     assert secret not in repr(settings)
+
+
+def test_bridge_admin_only_intraday_replay_and_premium(tmp_path) -> None:
+    from level2_service.market_data import TimesharePoint
+
+    snap = _make_snapshot("601872")
+    snap = MarketSnapshot(
+        symbol="601872",
+        name="招商轮船",
+        market="17",
+        sequence=2,
+        source_time="20261123 09:35:00",
+        collected_at=datetime(2026, 11, 23, 1, 35, tzinfo=timezone.utc),
+        quote={**snap.quote, "previous_close": "7.00"},
+        source="TENCENT_PUBLIC",
+        market_phase=MarketPhase.CONTINUOUS,
+        price_precision=2,
+        timeshare=(
+            TimesharePoint(time="09:30", price="7.02", average_price="7.01", volume="10000"),
+            TimesharePoint(time="09:31", price="7.08", average_price="7.04", volume="15000"),
+            TimesharePoint(time="09:32", price="7.12", average_price="7.07", volume="18000"),
+        ),
+        main_fund_flow=snap.main_fund_flow,
+    )
+    broker = FakeMarketBroker({"601872": snap}, market_open=True)
+    app, _accounts, store = _build_app(tmp_path, broker=broker)
+    store.save_premium_snapshot(
+        {
+            "as_of": "2026-11-23T09:35:00+08:00",
+            "valid_count": 1,
+            "rows": [
+                {
+                    "code": "160723",
+                    "name": "嘉实原油",
+                    "current_price": 1.452,
+                    "estimated_price": 1.4102,
+                    "premium_rate": 0.0296,
+                    "estimate_source": "实时估值",
+                    "estimate_date": "2026-11-23 09:35",
+                    "stale": False,
+                    "error": None,
+                }
+            ],
+            "errors": {},
+        }
+    )
+
+    with TestClient(app) as client:
+        # 普通用户可读油气溢价，但禁止访问分时监控与管理刷新
+        prem_user = client.get("/api/internal/goodluck/premium", headers=_headers("uid:alice", "user"))
+        assert prem_user.status_code == 200
+        assert prem_user.json()["valid_count"] == 1
+        assert client.post("/api/internal/goodluck/premium/refresh", headers=_headers("uid:alice", "user")).status_code == 403
+        assert client.get("/api/internal/goodluck/intraday/series?symbol=601872", headers=_headers("uid:alice", "user")).status_code == 403
+        assert client.get("/api/internal/goodluck/intraday/macd-settings", headers=_headers("uid:alice", "user")).status_code == 403
+        assert client.get("/api/internal/goodluck/intraday/push-config", headers=_headers("uid:alice", "user")).status_code == 403
+
+        # 管理员可调 MACD 参数、保存规则、实时拉取分时与执行复盘测算
+        macd_res = client.put(
+            "/api/internal/goodluck/intraday/macd-settings",
+            headers=_headers("uid:admin", "admin"),
+            json={"short": 10, "long": 20, "signal": 5, "marker_threshold": 0.001},
+        )
+        assert macd_res.status_code == 200
+        assert macd_res.json()["short"] == 10
+
+        push_save = client.put(
+            "/api/internal/goodluck/intraday/push-config",
+            headers=_headers("uid:admin", "admin"),
+            json={
+                "enabled": True,
+                "premium_push_enabled": True,
+                "bark_groups": [{"id": "b1", "name": "iPhone", "base_url": "https://api.day.app", "device_key": "sec123"}],
+                "rules": [
+                    {
+                        "id": "r-up",
+                        "enabled": False,
+                        "side": "buy",
+                        "title": "涨幅突破1%",
+                        "joiner": "and",
+                        "conditions": [{"type": "change_pct", "direction": "gte", "value": 1.0}],
+                    }
+                ],
+            },
+        )
+        assert push_save.status_code == 200
+        assert push_save.json()["bark_groups"][0]["device_key"] == ""
+        assert push_save.json()["bark_groups"][0]["device_key_configured"] is True
+
+        series_res = client.get(
+            "/api/internal/goodluck/intraday/series?symbol=601872&refresh=1&rule_ids=r-up",
+            headers=_headers("uid:admin", "admin"),
+        )
+        assert series_res.status_code == 200
+        s_body = series_res.json()
+        assert s_body["symbol"] == "601872"
+        assert len(s_body["points"]) == 3
+        assert s_body["points"][1]["change_pct"] is not None
+        assert s_body["replay"]["performance"]["buy_count"] >= 1
+
+        rule_test = client.post(
+            "/api/internal/goodluck/intraday/push-rule-test",
+            headers=_headers("uid:admin", "admin"),
+            json={
+                "symbol": "601872",
+                "rule": {
+                    "id": "r-up",
+                    "side": "buy",
+                    "title": "涨幅突破1%",
+                    "joiner": "and",
+                    "conditions": [{"type": "change_pct", "direction": "gte", "value": 1.0}],
+                },
+            },
+        )
+        assert rule_test.status_code == 200
+        assert rule_test.json()["evaluation"]["matched"] is True

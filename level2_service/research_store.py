@@ -943,9 +943,20 @@ class SQLiteResearchStore:
         pre_close_val = 0.0
         try:
             if day["pre_close"] is not None and str(day["pre_close"]).strip() != "":
-                pre_close_val = float(day["pre_close"])
+                pre_close_val = float(str(day["pre_close"]).replace(",", "").strip())
         except (TypeError, ValueError):
             pre_close_val = 0.0
+        if pre_close_val <= 0:
+            try:
+                raw_q_price = str(day["quote_price"] or "").replace(",", "").strip()
+                raw_q_pct = str(day["quote_change_percent"] or "").replace(",", "").replace("%", "").strip()
+                if raw_q_price and raw_q_pct:
+                    q_price = float(raw_q_price)
+                    q_pct = float(raw_q_pct)
+                    if q_price > 0 and (100.0 + q_pct) > 0:
+                        pre_close_val = q_price / (1.0 + q_pct / 100.0)
+            except (TypeError, ValueError):
+                pre_close_val = 0.0
         macd = calculate_macd(prices, settings)
         points = []
         for index, row in enumerate(rows):

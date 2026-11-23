@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
 from .market_data import fixed_market_error_code
 from .research_premium import PREMIUM_NAMES
@@ -47,6 +47,56 @@ def format_push_price(symbol: str, price: float) -> str:
     """Format push price with 3 decimals for on-exchange funds and 2 decimals for equities."""
     precision = 3 if str(symbol).startswith(_FUND_PREFIXES) else 2
     return f"{float(price):.{precision}f}"
+
+
+def resolve_push_change_pct(
+    price: float,
+    point: Mapping[str, Any] | None = None,
+    pre_close: object = None,
+) -> float | None:
+    """Resolve signed percentage change from minute point or previous close."""
+    if point is not None:
+        raw_pct = point.get("change_pct")
+        if raw_pct is not None and str(raw_pct).strip() != "":
+            try:
+                return float(str(raw_pct).replace(",", "").replace("%", "").strip())
+            except (TypeError, ValueError):
+                pass
+    if pre_close is not None and str(pre_close).strip() != "":
+        try:
+            pre_val = float(str(pre_close).replace(",", "").strip())
+            if pre_val > 0:
+                return (float(price) - pre_val) / pre_val * 100.0
+        except (TypeError, ValueError):
+            pass
+    return None
+
+
+def format_push_change_pct(change_pct: object) -> str:
+    """Format signed percentage change (+X.XX% / -X.XX% / 0.00%)."""
+    if change_pct is None or str(change_pct).strip() == "":
+        return ""
+    try:
+        rounded = round(float(str(change_pct).replace(",", "").replace("%", "").strip()), 2)
+    except (TypeError, ValueError):
+        return ""
+    if rounded == 0:
+        return "0.00%"
+    return f"{rounded:+.2f}%"
+
+
+def format_push_price_and_change(
+    symbol: str,
+    price: float,
+    point: Mapping[str, Any] | None = None,
+    pre_close: object = None,
+) -> str:
+    """Format push price together with signed change percentage when available."""
+    price_part = f"价格 {format_push_price(symbol, float(price))}"
+    pct_text = format_push_change_pct(
+        resolve_push_change_pct(float(price), point, pre_close)
+    )
+    return f"{price_part} 涨跌幅 {pct_text}" if pct_text else price_part
 
 
 def _enrich_points_with_fund_flow(
@@ -173,10 +223,17 @@ class ResearchMonitor:
             )
             if not claimed:
                 continue
-            price_text = format_push_price(symbol, float(marker["price"]))
+            idx = int(marker.get("index", -1))
+            matched_point = points[idx] if 0 <= idx < len(points) else None
+            price_and_change = format_push_price_and_change(
+                symbol,
+                float(marker["price"]),
+                matched_point,
+                series.get("pre_close"),
+            )
             await asyncio.to_thread(
                 self.dispatcher.send,
                 config,
                 marker["rule_title"],
-                f"{display_symbol} {marker['time']} 价格 {price_text}",
+                f"{display_symbol} {marker['time']} {price_and_change}",
             )

@@ -17,7 +17,11 @@ from pydantic import BaseModel, Field
 from .market_accounts import MarketUser
 from .market_data import fixed_market_error_code
 from .parsed_values import DirectRequestError, SymbolLookup
-from .research_monitor import format_push_symbol, resolve_push_symbol_name
+from .research_monitor import (
+    format_push_price_and_change,
+    format_push_symbol,
+    resolve_push_symbol_name,
+)
 from .research_premium import format_premium_body
 from .research_replay import (
     build_replay_markers,
@@ -1126,6 +1130,7 @@ def install_goodluck_routes(
             marker_threshold=threshold,
         )
         stock_name = resolve_push_symbol_name(normalized, series.get("name"), resolve_symbol)
+        latest_point = points[-1] if points else None
         push_result = None
         if payload.send_push and dispatcher is not None:
             saved = await asyncio.to_thread(store.push_config, public=False)
@@ -1133,11 +1138,20 @@ def install_goodluck_routes(
             side_label = "卖点" if payload.rule.get("side") == "sell" else "买点"
             title = f"[测试] {side_label} · {payload.rule.get('title') or '分时提醒'}"
             display_symbol = format_push_symbol(normalized, stock_name)
-            body = " ".join(
-                part
-                for part in (display_symbol, evaluation.get("time") or "", evaluation["summary"])
-                if part
+            eval_time = str(evaluation.get("time") or "").strip()
+            eval_price = evaluation.get("price")
+            price_part = (
+                format_push_price_and_change(
+                    normalized,
+                    float(eval_price),
+                    latest_point,
+                    series.get("pre_close"),
+                )
+                if eval_price is not None
+                else ""
             )
+            head = " ".join(part for part in (display_symbol, eval_time, price_part) if part)
+            body = f"{head} · {evaluation['summary']}" if head else str(evaluation["summary"])
             try:
                 push_result = await asyncio.to_thread(dispatcher.send, merged, title, body)
             except ValueError as error:

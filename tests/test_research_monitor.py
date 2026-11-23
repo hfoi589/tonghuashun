@@ -4,7 +4,7 @@ import asyncio
 from datetime import datetime, timezone
 
 from level2_service.market_data import MarketSnapshot, TimesharePoint
-from level2_service.research_monitor import ResearchMonitor
+from level2_service.research_monitor import ResearchMonitor, format_push_change_pct
 
 
 class Accounts:
@@ -64,6 +64,7 @@ class PushStore(Store):
         return {
             "symbol": symbol,
             "name": "招商轮船",
+            "pre_close": "9.80",
             "trade_date": "20260831",
             "macd_settings": {"marker_threshold": 0},
             "points": [{"time": "09:30", "price": "10.00", "diff": 0, "dea": 0, "macd": 0}],
@@ -103,7 +104,7 @@ def test_monitor_pushes_only_changed_minutes_and_deduplicates_events():
     asyncio.run(monitor.poll_once())
     asyncio.run(monitor.poll_once())
 
-    assert dispatcher.sent == [("买入", "招商轮船 (601872) 09:30 价格 10.00")]
+    assert dispatcher.sent == [("买入", "招商轮船 (601872) 09:30 价格 10.00 涨跌幅 +2.04%")]
 
 
 class FundAccounts:
@@ -131,6 +132,7 @@ class EmptyNameFundStore(PushStore):
         return {
             "symbol": symbol,
             "name": "",
+            "pre_close": "1.550",
             "trade_date": "20260831",
             "macd_settings": {"marker_threshold": 0},
             "points": [{"time": "09:30", "price": "1.523", "diff": 0, "dea": 0, "macd": 0}],
@@ -154,4 +156,11 @@ def test_monitor_resolves_fallback_name_and_three_decimal_price_for_fund():
 
     asyncio.run(monitor.poll_once())
 
-    assert dispatcher.sent == [("买入", "嘉实原油 (160723) 09:30 价格 1.523")]
+    assert dispatcher.sent == [("买入", "嘉实原油 (160723) 09:30 价格 1.523 涨跌幅 -1.74%")]
+
+
+def test_format_push_change_pct_handles_positive_negative_and_negative_zero():
+    assert format_push_change_pct(2.345) == "+2.35%"
+    assert format_push_change_pct(-1.2) == "-1.20%"
+    assert format_push_change_pct(-0.001) == "0.00%"
+    assert format_push_change_pct(None) == ""

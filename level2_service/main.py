@@ -793,6 +793,7 @@ def create_production_app(
         market_broker,
         research_store,
         dispatcher=push_dispatcher,
+        symbol_lookup=symbol_catalog.lookup,
     )
     fund_flow_monitor = (
         FundFlowHistoryMonitor(

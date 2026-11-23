@@ -442,7 +442,7 @@ class SQLiteResearchStore:
             "wecom": {
                 "enabled": bool(raw_wecom.get("enabled", False)),
                 "api_base_url": str(raw_wecom.get("api_base_url") or "https://qyapi.weixin.qq.com").rstrip("/"),
-                "news_base_url": str(raw_wecom.get("news_base_url") or "").rstrip("/"),
+                "news_base_url": "",
                 "corp_id": str(raw_wecom.get("corp_id") or ""),
                 "corp_secret": str(raw_wecom.get("corp_secret") or ""),
                 "agent_id": int(raw_wecom.get("agent_id") or 0),

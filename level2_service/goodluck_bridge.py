@@ -17,6 +17,7 @@ from pydantic import BaseModel, Field
 from .market_accounts import MarketUser
 from .market_data import fixed_market_error_code
 from .parsed_values import DirectRequestError, SymbolLookup
+from .research_monitor import format_push_symbol, resolve_push_symbol_name
 from .research_premium import format_premium_body
 from .research_replay import (
     build_replay_markers,
@@ -1124,20 +1125,26 @@ def install_goodluck_routes(
             [{**payload.rule, "enabled": True}],
             marker_threshold=threshold,
         )
+        stock_name = resolve_push_symbol_name(normalized, series.get("name"), resolve_symbol)
         push_result = None
         if payload.send_push and dispatcher is not None:
             saved = await asyncio.to_thread(store.push_config, public=False)
             merged = _merge_push_config_for_test(saved, payload.config)
             side_label = "卖点" if payload.rule.get("side") == "sell" else "买点"
             title = f"[测试] {side_label} · {payload.rule.get('title') or '分时提醒'}"
-            body = f"{series.get('name') or normalized}({normalized}) {evaluation.get('time') or ''} {evaluation['summary']}"
+            display_symbol = format_push_symbol(normalized, stock_name)
+            body = " ".join(
+                part
+                for part in (display_symbol, evaluation.get("time") or "", evaluation["summary"])
+                if part
+            )
             try:
                 push_result = await asyncio.to_thread(dispatcher.send, merged, title, body)
             except ValueError as error:
                 raise HTTPException(status_code=422, detail=str(error)) from None
         return {
             "symbol": normalized,
-            "name": series.get("name") or normalized,
+            "name": stock_name or normalized,
             "trade_date": series["trade_date"],
             "evaluation": evaluation,
             "day_hit_count": len(markers),

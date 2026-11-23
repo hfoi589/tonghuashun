@@ -100,9 +100,6 @@ class PushDispatcher:
         if int(token_payload.get("errcode", -1)) != 0 or not token_payload.get("access_token"):
             raise RuntimeError("WECOM_TOKEN_FAILED")
         content = f"{title}\n{body}" if body else title
-        news_base = str(config.get("news_base_url") or "").strip().rstrip("/")
-        if news_base and news_base not in content:
-            content = f"{content}\n查看图片：{news_base}/news-images"
         message: dict[str, Any] = {
             "touser": str(config.get("to_user") or "@all"),
             "msgtype": "text",

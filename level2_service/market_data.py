@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import re
 import time
@@ -10,7 +11,7 @@ from dataclasses import asdict, dataclass, field, replace
 from datetime import date, datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Any, Callable, Protocol
+from typing import Any, Callable, Iterable, Protocol
 from zoneinfo import ZoneInfo
 
 from .workday_calendar import ChinaLegalWorkdayCalendar
@@ -487,18 +488,20 @@ class MarketDataBroker:
         *,
         detail: bool,
         max_age_seconds: float = 0,
+        force: bool = False,
     ) -> MarketSnapshot:
         lock = self._refresh_locks.setdefault(symbol, asyncio.Lock())
         async with lock:
             cached = self._cache.get(symbol)
             if (
-                not self.is_market_open()
+                not force
+                and not self.is_market_open()
                 and cached is not None
                 and cached.market_phase in {MarketPhase.CLOSED, MarketPhase.BREAK}
                 and (not detail or self._cache_detail.get(symbol, False))
             ):
                 return cached
-            if max_age_seconds > 0:
+            if not force and max_age_seconds > 0:
                 last = self._last_polled.get(symbol)
                 if (
                     cached is not None
@@ -525,6 +528,88 @@ class MarketDataBroker:
             self._retry_after.pop(symbol, None)
             self._publish(symbol, {"type": "snapshot", "data": current.as_public()})
             return current
+
+    @staticmethod
+    def _supports_force_kwarg(fn: object) -> bool:
+        try:
+            sig = inspect.signature(fn)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return False
+        param = sig.parameters.get("force")
+        if param is not None:
+            return True
+        return any(p.kind is inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
+
+    async def refresh_quotes_batch(
+        self,
+        symbols: Iterable[str],
+        *,
+        max_age_seconds: float = 10.0,
+    ) -> dict[str, MarketSnapshot]:
+        targets = list(dict.fromkeys(symbols))
+        if not targets:
+            return {}
+        market_open = self.is_market_open()
+        now = self.clock()
+        out: dict[str, MarketSnapshot] = {}
+        missing: list[str] = []
+        for sym in targets:
+            cached = self._cache.get(sym)
+            if not market_open:
+                if cached is not None and cached.market_phase in {MarketPhase.CLOSED, MarketPhase.BREAK}:
+                    out[sym] = cached
+                else:
+                    missing.append(sym)
+            else:
+                last = self._last_polled.get(sym)
+                if cached is not None and last is not None and now - last < max_age_seconds:
+                    out[sym] = cached
+                else:
+                    missing.append(sym)
+        if not missing:
+            return out
+        batch_reader = getattr(self.source, "read_quotes_batch", None)
+        if callable(batch_reader):
+            try:
+                fetched = await asyncio.wait_for(
+                    asyncio.to_thread(batch_reader, missing),
+                    timeout=self.refresh_timeout_seconds,
+                )
+            except Exception:
+                fetched = {}
+            now_after = self.clock()
+            for sym in missing:
+                snap = fetched.get(sym) if isinstance(fetched, dict) else None
+                if isinstance(snap, MarketSnapshot):
+                    sequence = self._sequence.get(sym, 0) + 1
+                    current = replace(snap, sequence=sequence)
+                    self._sequence[sym] = sequence
+                    self._cache[sym] = current
+                    self._cache_detail[sym] = False
+                    self._last_polled[sym] = now_after
+                    self._failure_counts.pop(sym, None)
+                    self._retry_after.pop(sym, None)
+                    out[sym] = current
+                elif sym in self._cache:
+                    out[sym] = self._cache[sym]
+            still_missing = [sym for sym in missing if sym not in out]
+            if not still_missing:
+                return out
+            missing = still_missing
+        sem = asyncio.Semaphore(8)
+
+        async def _one(sym: str) -> None:
+            async with sem:
+                try:
+                    snap = await self.refresh(sym, detail=False, max_age_seconds=max_age_seconds)
+                    out[sym] = snap
+                except Exception:
+                    cached = self._cache.get(sym)
+                    if cached is not None:
+                        out[sym] = cached
+
+        await asyncio.gather(*(_one(sym) for sym in missing))
+        return out
 
     async def poll_due(self) -> None:
         now = self.clock()

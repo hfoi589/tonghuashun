@@ -290,3 +290,44 @@ def test_read_fund_flow_daily_migrates_null_rows_and_uses_latest_valid_minute(tm
     assert daily["points"][1]["main_net_inflow"] == "1.20"
     history = reopened.read_fund_flow_history("601872", "20261120")
     assert [pt["time"] for pt in history["periods"]["today"]["points"]] == ["14:58"]
+
+
+def test_record_fund_flow_batch_today_map_and_expected_trade_date(tmp_path):
+    from zoneinfo import ZoneInfo
+    from level2_service.parsed_values import DirectReadOutcome
+
+    store = SQLiteResearchStore(tmp_path / "research.db")
+    captured = datetime(2026, 11, 24, 15, 2, tzinfo=ZoneInfo("Asia/Shanghai"))
+    records = {
+        sym: {
+            period: {
+                "unit": "亿元",
+                "main_net_inflow": val,
+                "main_visible_inflow": "1.00",
+                "main_hidden_inflow": "0.50",
+                "retail_inflow": f"-{val}",
+            }
+            for period in ("today", "three_day", "five_day")
+        }
+        for sym, val in (("601318", "5.68"), ("000001", "1.45"))
+    }
+    changed = store.record_fund_flow_batch(
+        records,
+        trade_date="20261124",
+        minute="15:00",
+        captured_at=captured,
+    )
+    assert changed == {"601318": True, "000001": True}
+
+    today_map = store.latest_today_fund_flow_map(["601318", "000001", "300059"])
+    assert set(today_map) == {"601318", "000001"}
+    assert today_map["601318"]["main_net_inflow"] == "5.68"
+    assert today_map["000001"]["minute"] == "15:00"
+
+    # Prior L2 point from 20260831 must not leak when expected_trade_date="20261124".
+    store.record_snapshot(snapshot())
+    isolated = store.latest_market_enrichment("601872", expected_trade_date="20261124")
+    assert isolated is None
+    unscoped = store.latest_market_enrichment("601872")
+    assert isinstance(unscoped, DirectReadOutcome)
+    assert unscoped.stored_trade_dates["core_metrics"] == "20260831"

@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from threading import Lock, RLock
-from typing import Any, Callable
+from typing import Any, Callable, Iterable, Sequence
 from urllib.request import Request, urlopen
 
 from .market_data import KlineBar, MarketSeriesPage, MarketSnapshot, TimesharePoint
@@ -326,6 +326,55 @@ class TencentPublicMarketProvider:
             timeshare=tuple(points),
         )
 
+    batch_quote_url = "https://qt.gtimg.cn/q={provider_ids}"
+
+    def read_quotes_batch(
+        self,
+        identities: Sequence[SymbolLookup],
+        *,
+        chunk_size: int = 60,
+    ) -> dict[str, MarketSnapshot]:
+        if not identities:
+            return {}
+        results: dict[str, MarketSnapshot] = {}
+        size = max(1, int(chunk_size))
+        for start in range(0, len(identities), size):
+            chunk = list(identities[start : start + size])
+            by_pid: dict[str, SymbolLookup] = {}
+            for identity in chunk:
+                try:
+                    by_pid[_provider_id(identity)] = identity
+                except PublicMarketError:
+                    continue
+            if not by_pid:
+                continue
+            raw_bytes = self._request(
+                self.batch_quote_url.format(provider_ids=",".join(by_pid))
+            )
+            try:
+                text = raw_bytes.decode("gb18030")
+            except UnicodeDecodeError:
+                raise PublicMarketError("PUBLIC_MARKET_RESPONSE_INVALID") from None
+            for line in text.split(";"):
+                snippet = line.strip()
+                if not snippet.startswith("v_") or '="' not in snippet:
+                    continue
+                head, rest = snippet.split('="', 1)
+                pid = head[2:].strip()
+                identity = by_pid.get(pid)
+                if identity is None:
+                    continue
+                body = rest.rsplit('"', 1)[0]
+                try:
+                    results[identity.symbol] = _quote_snapshot(
+                        identity,
+                        body.split("~"),
+                        source="TENCENT_PUBLIC",
+                    )
+                except PublicMarketError:
+                    continue
+        return results
+
     def read_series(
         self,
         identity: SymbolLookup,
@@ -554,6 +603,36 @@ class PublicMarketDataSource:
             limit,
         )
 
+    def read_quotes_batch(
+        self,
+        symbols: Sequence[str],
+    ) -> dict[str, MarketSnapshot]:
+        ordered_symbols = list(dict.fromkeys(str(symbol) for symbol in symbols if symbol))
+        if not ordered_symbols:
+            return {}
+        identities: list[SymbolLookup] = []
+        valid_symbols: list[str] = []
+        for symbol in ordered_symbols:
+            try:
+                identities.append(self._identity(symbol))
+                valid_symbols.append(symbol)
+            except PublicMarketError:
+                continue
+        results: dict[str, MarketSnapshot] = {}
+        if identities:
+            try:
+                results.update(self.tencent.read_quotes_batch(identities))
+            except PublicMarketError:
+                pass
+        for symbol in valid_symbols:
+            if symbol in results:
+                continue
+            try:
+                results[symbol] = self.read_market_snapshot(symbol, detail=False)
+            except PublicMarketError:
+                continue
+        return results
+
 
 @dataclass(frozen=True)
 class _EnrichmentEntry:
@@ -579,7 +658,7 @@ class DirectEnrichedMarketDataSource:
         *,
         ttl_seconds: float = 5.0,
         stale_ttl_seconds: float = 120.0,
-        max_cache_entries: int = 512,
+        max_cache_entries: int = 2048,
         clock: Callable[[], float] = time.monotonic,
         is_market_open: Callable[[], bool] = lambda: True,
         is_watchlist_symbol: Callable[[str], bool] = lambda _symbol: True,
@@ -773,6 +852,24 @@ class DirectEnrichedMarketDataSource:
             stored_trade_dates=dict(outcome.stored_trade_dates),
         )
 
+    def read_quotes_batch(
+        self,
+        symbols: Sequence[str],
+    ) -> dict[str, MarketSnapshot]:
+        batch_reader = getattr(self.base_source, "read_quotes_batch", None)
+        if callable(batch_reader):
+            return batch_reader(symbols)
+        read_snapshot = getattr(self.base_source, "read_market_snapshot", None)
+        if not callable(read_snapshot):
+            return {}
+        out: dict[str, MarketSnapshot] = {}
+        for symbol in symbols:
+            try:
+                out[symbol] = read_snapshot(symbol, detail=False)
+            except Exception:
+                continue
+        return out
+
     def read_market_snapshot(
         self,
         symbol: str,
@@ -789,6 +886,21 @@ class DirectEnrichedMarketDataSource:
         snapshot = read_snapshot(symbol, detail=detail)
         if not detail:
             return snapshot
+        if is_exchange_fund_symbol(symbol, snapshot.market):
+            capabilities = dict(snapshot.capabilities)
+            capabilities["l2"] = {
+                "available": False,
+                "reason": "FUND_L2_UNSUPPORTED",
+            }
+            return replace(
+                snapshot,
+                capabilities=capabilities,
+                source_errors={
+                    **snapshot.source_errors,
+                    "core_metrics": None,
+                    "main_fund_flow": None,
+                },
+            )
         if not self.is_market_open():
             if self.is_watchlist_symbol(symbol) and self.closed_enrichment is not None:
                 try:

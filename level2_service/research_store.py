@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 import sqlite3
+import time
 from datetime import date, datetime
 from pathlib import Path
 from threading import RLock
-from typing import Any, Callable, Iterable
+from typing import Any, Callable, Iterable, Mapping
 from zoneinfo import ZoneInfo
 
 from .fund_flow_history import has_fund_flow_values
@@ -68,6 +70,13 @@ class SQLiteResearchStore:
         self._connection = sqlite3.connect(self.path, check_same_thread=False)
         self._connection.row_factory = sqlite3.Row
         self._connection.execute("PRAGMA journal_mode = WAL")
+        self._connection.execute("PRAGMA synchronous = NORMAL")
+        self._connection.execute("PRAGMA busy_timeout = 5000")
+        self._read_cache_lock = RLock()
+        self._history_cache: dict[tuple[str, str | None], tuple[float, dict[str, Any]]] = {}
+        self._daily_cache: dict[tuple[str, int], tuple[float, dict[str, Any]]] = {}
+        self._today_ff_map_cache: dict[str, tuple[float, dict[str, Any]]] = {}
+        self._today_ff_map_cached_at: float = 0.0
         self._migrate()
         try:
             os.chmod(self.path, 0o600)
@@ -525,6 +534,103 @@ class SQLiteResearchStore:
             "retail_inflow",
         )
 
+    def _invalidate_fund_flow_caches(self, symbols: Iterable[str] | None = None) -> None:
+        symbol_set = None if symbols is None else {str(s) for s in symbols}
+        with self._read_cache_lock:
+            if symbol_set is None:
+                self._history_cache.clear()
+                self._daily_cache.clear()
+                self._today_ff_map_cache.clear()
+                self._today_ff_map_cached_at = 0.0
+                return
+            for key in [k for k in self._history_cache if k[0] in symbol_set]:
+                self._history_cache.pop(key, None)
+            for key in [k for k in self._daily_cache if k[0] in symbol_set]:
+                self._daily_cache.pop(key, None)
+            self._today_ff_map_cached_at = 0.0
+            for sym in symbol_set:
+                self._today_ff_map_cache.pop(sym, None)
+
+    def _upsert_fund_flow_locked(
+        self,
+        symbol: str,
+        *,
+        trade_date: str,
+        minute: str,
+        periods: Mapping[str, Mapping[str, str | None]],
+        captured: str,
+    ) -> bool:
+        fields = self._fund_flow_fields()
+        compact_minute = minute.replace(":", "")
+        changed = False
+        recorded = False
+        for period, raw_values in periods.items():
+            if period not in {"today", "three_day", "five_day"}:
+                continue
+            if period == "today" and compact_minute < "0929":
+                continue
+            incoming = {
+                field: (
+                    None
+                    if raw_values.get(field) is None
+                    else str(raw_values.get(field))
+                )
+                for field in fields
+            }
+            if not has_fund_flow_values(incoming):
+                continue
+            recorded = True
+            existing = self._connection.execute(
+                """SELECT unit,main_net_inflow,main_visible_inflow,
+                          main_hidden_inflow,retail_inflow
+                   FROM fund_flow_history_points
+                   WHERE symbol=? AND trade_date=? AND minute=? AND period=?""",
+                (symbol, trade_date, minute, period),
+            ).fetchone()
+            merged = {
+                field: incoming[field]
+                if incoming[field] is not None
+                else (existing[field] if existing is not None else None)
+                for field in fields
+            }
+            if existing is None or any(existing[field] != merged[field] for field in fields):
+                changed = True
+            self._connection.execute(
+                """INSERT INTO fund_flow_history_points(
+                       symbol,trade_date,minute,period,unit,
+                       main_net_inflow,main_visible_inflow,main_hidden_inflow,
+                       retail_inflow,captured_at
+                   ) VALUES(?,?,?,?,?,?,?,?,?,?)
+                   ON CONFLICT(symbol,trade_date,minute,period) DO UPDATE SET
+                       unit=excluded.unit,
+                       main_net_inflow=excluded.main_net_inflow,
+                       main_visible_inflow=excluded.main_visible_inflow,
+                       main_hidden_inflow=excluded.main_hidden_inflow,
+                       retail_inflow=excluded.retail_inflow,
+                       captured_at=excluded.captured_at""",
+                (
+                    symbol,
+                    trade_date,
+                    minute,
+                    period,
+                    *(merged[field] for field in fields),
+                    captured,
+                ),
+            )
+        if recorded:
+            self._connection.execute(
+                """INSERT INTO fund_flow_history_status(
+                       symbol,latest_trade_date,latest_time,last_sync_at,last_error
+                   ) VALUES(?,?,?,?,NULL)
+                   ON CONFLICT(symbol) DO UPDATE SET
+                       latest_trade_date=excluded.latest_trade_date,
+                       latest_time=excluded.latest_time,
+                       last_sync_at=excluded.last_sync_at,
+                       last_error=NULL""",
+                (symbol, trade_date, minute, captured),
+            )
+        return changed
+
     def record_fund_flow(
         self,
         symbol: str,
@@ -535,44 +641,98 @@ class SQLiteResearchStore:
         captured_at: datetime,
     ) -> bool:
         """Upsert one shared fund-flow sample and preserve prior non-null values."""
+        captured = captured_at.isoformat()
+        with self._lock, self._connection:
+            changed = self._upsert_fund_flow_locked(
+                symbol,
+                trade_date=trade_date,
+                minute=minute,
+                periods=periods,
+                captured=captured,
+            )
+        self._invalidate_fund_flow_caches((symbol,))
+        return changed
+
+    def record_fund_flow_batch(
+        self,
+        records: Mapping[str, Mapping[str, Mapping[str, str | None]]],
+        *,
+        trade_date: str,
+        minute: str,
+        captured_at: datetime,
+    ) -> dict[str, bool]:
+        """Upsert a batch of fund-flow samples in a single SQLite transaction."""
+        target_symbols = [str(symbol) for symbol in records]
+        if not target_symbols:
+            return {}
         fields = self._fund_flow_fields()
         captured = captured_at.isoformat()
         compact_minute = minute.replace(":", "")
-        changed = False
-        recorded = False
+        out: dict[str, bool] = {}
+        point_rows: list[tuple[Any, ...]] = []
+        status_rows: list[tuple[Any, ...]] = []
         with self._lock, self._connection:
-            for period, raw_values in periods.items():
-                if period not in {"today", "three_day", "five_day"}:
-                    continue
-                if period == "today" and compact_minute < "0929":
-                    continue
-                incoming = {
-                    field: (
-                        None
-                        if raw_values.get(field) is None
-                        else str(raw_values.get(field))
+            existing_map: dict[tuple[str, str], dict[str, str | None]] = {}
+            for start in range(0, len(target_symbols), 200):
+                chunk = target_symbols[start : start + 200]
+                placeholders = ",".join("?" for _ in chunk)
+                rows = self._connection.execute(
+                    f"""SELECT symbol,period,unit,main_net_inflow,main_visible_inflow,
+                               main_hidden_inflow,retail_inflow
+                        FROM fund_flow_history_points
+                        WHERE trade_date=? AND minute=? AND symbol IN ({placeholders})""",
+                    (trade_date, minute, *chunk),
+                ).fetchall()
+                for row in rows:
+                    existing_map[(str(row["symbol"]), str(row["period"]))] = {
+                        field: row[field] for field in fields
+                    }
+            for symbol in target_symbols:
+                raw_periods = records[symbol]
+                changed = False
+                recorded = False
+                for period, raw_values in raw_periods.items():
+                    if period not in {"today", "three_day", "five_day"}:
+                        continue
+                    if period == "today" and compact_minute < "0929":
+                        continue
+                    incoming = {
+                        field: (
+                            None
+                            if raw_values.get(field) is None
+                            else str(raw_values.get(field))
+                        )
+                        for field in fields
+                    }
+                    if not has_fund_flow_values(incoming):
+                        continue
+                    recorded = True
+                    existing = existing_map.get((symbol, period))
+                    merged = {
+                        field: incoming[field]
+                        if incoming[field] is not None
+                        else (existing[field] if existing is not None else None)
+                        for field in fields
+                    }
+                    if existing is None or any(
+                        existing[field] != merged[field] for field in fields
+                    ):
+                        changed = True
+                    point_rows.append(
+                        (
+                            symbol,
+                            trade_date,
+                            minute,
+                            period,
+                            *(merged[field] for field in fields),
+                            captured,
+                        )
                     )
-                    for field in fields
-                }
-                if not has_fund_flow_values(incoming):
-                    continue
-                recorded = True
-                existing = self._connection.execute(
-                    """SELECT unit,main_net_inflow,main_visible_inflow,
-                              main_hidden_inflow,retail_inflow
-                       FROM fund_flow_history_points
-                       WHERE symbol=? AND trade_date=? AND minute=? AND period=?""",
-                    (symbol, trade_date, minute, period),
-                ).fetchone()
-                merged = {
-                    field: incoming[field]
-                    if incoming[field] is not None
-                    else (existing[field] if existing is not None else None)
-                    for field in fields
-                }
-                if existing is None or any(existing[field] != merged[field] for field in fields):
-                    changed = True
-                self._connection.execute(
+                out[symbol] = changed
+                if recorded:
+                    status_rows.append((symbol, trade_date, minute, captured))
+            if point_rows:
+                self._connection.executemany(
                     """INSERT INTO fund_flow_history_points(
                            symbol,trade_date,minute,period,unit,
                            main_net_inflow,main_visible_inflow,main_hidden_inflow,
@@ -585,17 +745,10 @@ class SQLiteResearchStore:
                            main_hidden_inflow=excluded.main_hidden_inflow,
                            retail_inflow=excluded.retail_inflow,
                            captured_at=excluded.captured_at""",
-                    (
-                        symbol,
-                        trade_date,
-                        minute,
-                        period,
-                        *(merged[field] for field in fields),
-                        captured,
-                    ),
+                    point_rows,
                 )
-            if recorded:
-                self._connection.execute(
+            if status_rows:
+                self._connection.executemany(
                     """INSERT INTO fund_flow_history_status(
                            symbol,latest_trade_date,latest_time,last_sync_at,last_error
                        ) VALUES(?,?,?,?,NULL)
@@ -604,9 +757,10 @@ class SQLiteResearchStore:
                            latest_time=excluded.latest_time,
                            last_sync_at=excluded.last_sync_at,
                            last_error=NULL""",
-                    (symbol, trade_date, minute, captured),
+                    status_rows,
                 )
-        return changed
+        self._invalidate_fund_flow_caches(target_symbols)
+        return out
 
     def record_fund_flow_error(self, symbol: str, error_code: str) -> None:
         now = datetime.now().astimezone().isoformat()
@@ -617,6 +771,7 @@ class SQLiteResearchStore:
                    last_sync_at=excluded.last_sync_at,last_error=excluded.last_error""",
                 (symbol, now, error_code),
             )
+        self._invalidate_fund_flow_caches((symbol,))
 
     def latest_fund_flow_snapshot(
         self,
@@ -680,16 +835,29 @@ class SQLiteResearchStore:
             }
         return None
 
-    def latest_market_enrichment(self, symbol: str) -> DirectReadOutcome | None:
+    def latest_market_enrichment(
+        self,
+        symbol: str,
+        *,
+        expected_trade_date: str | None = None,
+    ) -> DirectReadOutcome | None:
         """Reconstruct the last stored L2/fund values for a closed Market view."""
-        fund = self.latest_fund_flow_snapshot(symbol)
+        fund = self.latest_fund_flow_snapshot(symbol, trade_date=expected_trade_date)
         with self._lock:
-            row = self._connection.execute(
-                """SELECT * FROM research_points
-                   WHERE symbol=? ORDER BY trade_date DESC,REPLACE(minute,':','') DESC
-                   LIMIT 1""",
-                (symbol,),
-            ).fetchone()
+            if expected_trade_date is not None:
+                row = self._connection.execute(
+                    """SELECT * FROM research_points
+                       WHERE symbol=? AND trade_date=?
+                       ORDER BY REPLACE(minute,':','') DESC LIMIT 1""",
+                    (symbol, expected_trade_date),
+                ).fetchone()
+            else:
+                row = self._connection.execute(
+                    """SELECT * FROM research_points
+                       WHERE symbol=? ORDER BY trade_date DESC,REPLACE(minute,':','') DESC
+                       LIMIT 1""",
+                    (symbol,),
+                ).fetchone()
         if row is None and fund is None:
             return None
         values = empty_metric_values()
@@ -793,11 +961,107 @@ class SQLiteResearchStore:
             ).fetchall()
         return [str(row["trade_date"]) for row in rows]
 
+    def latest_today_fund_flow_map(
+        self,
+        symbols: Iterable[str],
+        *,
+        now: datetime | None = None,
+        trade_date: str | None = None,
+    ) -> dict[str, dict[str, Any]]:
+        """Batch-read the newest today-period fund-flow sample for many symbols."""
+        target_symbols = list(dict.fromkeys(str(symbol) for symbol in symbols if symbol))
+        if not target_symbols:
+            return {}
+        use_cache = now is None and trade_date is None
+        now_mono = time.monotonic()
+        if use_cache:
+            with self._read_cache_lock:
+                if (
+                    now_mono - self._today_ff_map_cached_at < 1.0
+                    and all(symbol in self._today_ff_map_cache for symbol in target_symbols)
+                ):
+                    return {
+                        symbol: dict(payload)
+                        for symbol in target_symbols
+                        if (payload := self._today_ff_map_cache[symbol][1])
+                    }
+        where_clauses = [
+            "period='today'",
+            "REPLACE(minute,':','') >= '0929'",
+            "(main_net_inflow IS NOT NULL OR main_visible_inflow IS NOT NULL"
+            " OR main_hidden_inflow IS NOT NULL OR retail_inflow IS NOT NULL)",
+        ]
+        extra_params: list[Any] = []
+        if trade_date is not None:
+            where_clauses.append("trade_date=?")
+            extra_params.append(trade_date)
+        if now is not None:
+            local_now = now.astimezone(ZoneInfo("Asia/Shanghai"))
+            today_str = local_now.strftime("%Y%m%d")
+            local_hhmm = local_now.strftime("%H%M")
+            if local_hhmm < "0929":
+                where_clauses.append("trade_date < ?")
+                extra_params.append(today_str)
+            else:
+                where_clauses.append(
+                    "(trade_date < ? OR (trade_date = ? AND REPLACE(minute,':','') <= ?))"
+                )
+                extra_params.extend([today_str, today_str, local_hhmm])
+        where_sql = " AND ".join(where_clauses)
+        out: dict[str, dict[str, Any]] = {}
+        with self._lock:
+            for start in range(0, len(target_symbols), 200):
+                chunk = target_symbols[start : start + 200]
+                placeholders = ",".join("?" for _ in chunk)
+                rows = self._connection.execute(
+                    f"""WITH ranked AS (
+                            SELECT symbol,trade_date,minute,unit,
+                                   main_net_inflow,main_visible_inflow,
+                                   main_hidden_inflow,retail_inflow,captured_at,
+                                   ROW_NUMBER() OVER (
+                                       PARTITION BY symbol
+                                       ORDER BY trade_date DESC, REPLACE(minute,':','') DESC
+                                   ) AS rn
+                            FROM fund_flow_history_points
+                            WHERE symbol IN ({placeholders}) AND {where_sql}
+                        )
+                        SELECT symbol,trade_date,minute,unit,
+                               main_net_inflow,main_visible_inflow,
+                               main_hidden_inflow,retail_inflow,captured_at
+                        FROM ranked WHERE rn = 1""",
+                    (*chunk, *extra_params),
+                ).fetchall()
+                for row in rows:
+                    out[str(row["symbol"])] = {
+                        "trade_date": str(row["trade_date"]),
+                        "minute": str(row["minute"]),
+                        "captured_at": str(row["captured_at"]),
+                        "unit": row["unit"],
+                        "main_net_inflow": row["main_net_inflow"],
+                        "main_visible_inflow": row["main_visible_inflow"],
+                        "main_hidden_inflow": row["main_hidden_inflow"],
+                        "retail_inflow": row["retail_inflow"],
+                    }
+        if use_cache:
+            with self._read_cache_lock:
+                self._today_ff_map_cached_at = time.monotonic()
+                for symbol in target_symbols:
+                    self._today_ff_map_cache[symbol] = (
+                        self._today_ff_map_cached_at,
+                        dict(out[symbol]) if symbol in out else {},
+                    )
+        return out
+
     def read_fund_flow_history(
         self,
         symbol: str,
         trade_date: str | None = None,
     ) -> dict[str, Any]:
+        cache_key = (symbol, trade_date)
+        with self._read_cache_lock:
+            cached = self._history_cache.get(cache_key)
+            if cached is not None and time.monotonic() - cached[0] < 2.0:
+                return copy.deepcopy(cached[1])
         available_dates = self.available_fund_flow_dates(symbol)
         with self._lock:
             status_row = self._connection.execute(
@@ -806,7 +1070,7 @@ class SQLiteResearchStore:
             ).fetchone()
         selected_date = trade_date or (available_dates[0] if available_dates else None)
         if selected_date is None:
-            return {
+            result = {
                 "symbol": symbol,
                 "trade_date": None,
                 "available_dates": [],
@@ -818,6 +1082,9 @@ class SQLiteResearchStore:
                     "five_day": {"points": []},
                 },
             }
+            with self._read_cache_lock:
+                self._history_cache[cache_key] = (time.monotonic(), copy.deepcopy(result))
+            return result
         with self._lock:
             rows = self._connection.execute(
                 """SELECT * FROM fund_flow_history_points
@@ -833,7 +1100,7 @@ class SQLiteResearchStore:
             raise LookupError("fund flow history not found")
         periods = {"today": {"points": []}, "three_day": {"points": []}, "five_day": {"points": []}}
         for row in rows:
-            periods[str(row["period"])] ["points"].append(
+            periods[str(row["period"])]["points"].append(
                 {
                     "time": str(row["minute"]),
                     "unit": row["unit"],
@@ -843,7 +1110,7 @@ class SQLiteResearchStore:
                     "retail_inflow": row["retail_inflow"],
                 }
             )
-        return {
+        result = {
             "symbol": symbol,
             "trade_date": selected_date,
             "available_dates": available_dates,
@@ -851,6 +1118,9 @@ class SQLiteResearchStore:
             "last_error": status["last_error"] if status else None,
             "periods": periods,
         }
+        with self._read_cache_lock:
+            self._history_cache[cache_key] = (time.monotonic(), copy.deepcopy(result))
+        return result
 
     def read_fund_flow_daily(
         self,
@@ -861,81 +1131,98 @@ class SQLiteResearchStore:
         """Return one closing `today` fund-flow point per recent trade date."""
         if not 1 <= limit <= 60:
             raise ValueError("fund flow daily limit must be between 1 and 60")
-        non_null_metrics = (
-            "(main_net_inflow IS NOT NULL"
-            " OR main_visible_inflow IS NOT NULL"
-            " OR main_hidden_inflow IS NOT NULL"
-            " OR retail_inflow IS NOT NULL)"
-        )
-        with self._lock:
-            date_rows = self._connection.execute(
-                f"""SELECT DISTINCT trade_date FROM fund_flow_history_points
-                   WHERE symbol=? AND period='today' AND {non_null_metrics}
-                   ORDER BY trade_date DESC LIMIT ?""",
-                (symbol, limit),
-            ).fetchall()
-            dates = [str(row["trade_date"]) for row in date_rows]
-            if not dates:
-                return {"symbol": symbol, "limit": limit, "baseline_trade_date": None, "points": []}
-            placeholders = ",".join("?" for _ in dates)
-            rows = self._connection.execute(
-                f"""WITH ranked AS (
+        cache_key = (symbol, limit)
+        points: list[dict[str, Any]] | None = None
+        with self._read_cache_lock:
+            cached = self._daily_cache.get(cache_key)
+            if cached is not None and time.monotonic() - cached[0] < 2.0:
+                points = copy.deepcopy(cached[1]["points"])
+        if points is None:
+            non_null_metrics = (
+                "(main_net_inflow IS NOT NULL"
+                " OR main_visible_inflow IS NOT NULL"
+                " OR main_hidden_inflow IS NOT NULL"
+                " OR retail_inflow IS NOT NULL)"
+            )
+            with self._lock:
+                date_rows = self._connection.execute(
+                    f"""SELECT DISTINCT trade_date FROM fund_flow_history_points
+                       WHERE symbol=? AND period='today' AND {non_null_metrics}
+                       ORDER BY trade_date DESC LIMIT ?""",
+                    (symbol, limit),
+                ).fetchall()
+                dates = [str(row["trade_date"]) for row in date_rows]
+                if not dates:
+                    with self._read_cache_lock:
+                        self._daily_cache[cache_key] = (
+                            time.monotonic(),
+                            {"points": []},
+                        )
+                    return {"symbol": symbol, "limit": limit, "baseline_trade_date": None, "points": []}
+                placeholders = ",".join("?" for _ in dates)
+                rows = self._connection.execute(
+                    f"""WITH ranked AS (
+                            SELECT trade_date,minute,period,unit,
+                                   main_net_inflow,main_visible_inflow,
+                                   main_hidden_inflow,retail_inflow,
+                                   ROW_NUMBER() OVER (
+                                       PARTITION BY trade_date, period
+                                       ORDER BY REPLACE(minute,':','') DESC
+                                   ) AS rn
+                            FROM fund_flow_history_points
+                            WHERE symbol=? AND trade_date IN ({placeholders})
+                              AND {non_null_metrics}
+                        )
                         SELECT trade_date,minute,period,unit,
                                main_net_inflow,main_visible_inflow,
-                               main_hidden_inflow,retail_inflow,
-                               ROW_NUMBER() OVER (
-                                   PARTITION BY trade_date, period
-                                   ORDER BY REPLACE(minute,':','') DESC
-                               ) AS rn
-                        FROM fund_flow_history_points
-                        WHERE symbol=? AND trade_date IN ({placeholders})
-                          AND {non_null_metrics}
-                    )
-                    SELECT trade_date,minute,period,unit,
-                           main_net_inflow,main_visible_inflow,
-                           main_hidden_inflow,retail_inflow
-                    FROM ranked
-                    WHERE rn = 1
-                    ORDER BY trade_date ASC""",
-                (symbol, *dates),
-            ).fetchall()
-        latest_by_date: dict[str, dict[str, sqlite3.Row]] = {}
-        for row in rows:
-            latest_by_date.setdefault(str(row["trade_date"]), {})[str(row["period"])] = row
+                               main_hidden_inflow,retail_inflow
+                        FROM ranked
+                        WHERE rn = 1
+                        ORDER BY trade_date ASC""",
+                    (symbol, *dates),
+                ).fetchall()
+            latest_by_date: dict[str, dict[str, sqlite3.Row]] = {}
+            for row in rows:
+                latest_by_date.setdefault(str(row["trade_date"]), {})[str(row["period"])] = row
 
-        def period_values(row: sqlite3.Row | None) -> dict[str, str | None] | None:
-            if row is None:
-                return None
-            return {
-                "unit": row["unit"],
-                "main_net_inflow": row["main_net_inflow"],
-                "main_visible_inflow": row["main_visible_inflow"],
-                "main_hidden_inflow": row["main_hidden_inflow"],
-                "retail_inflow": row["retail_inflow"],
-            }
-
-        points = []
-        for trade_date in sorted(latest_by_date):
-            rows_by_period = latest_by_date[trade_date]
-            row = rows_by_period.get("today")
-            if row is None:
-                continue
-            points.append(
-                {
-                    "trade_date": trade_date,
-                    "time": str(row["minute"]),
+            def period_values(row: sqlite3.Row | None) -> dict[str, str | None] | None:
+                if row is None:
+                    return None
+                return {
                     "unit": row["unit"],
                     "main_net_inflow": row["main_net_inflow"],
                     "main_visible_inflow": row["main_visible_inflow"],
                     "main_hidden_inflow": row["main_hidden_inflow"],
                     "retail_inflow": row["retail_inflow"],
-                    "periods": {
-                        "today": period_values(rows_by_period.get("today")),
-                        "three_day": period_values(rows_by_period.get("three_day")),
-                        "five_day": period_values(rows_by_period.get("five_day")),
-                    },
                 }
-            )
+
+            points = []
+            for item_trade_date in sorted(latest_by_date):
+                rows_by_period = latest_by_date[item_trade_date]
+                row = rows_by_period.get("today")
+                if row is None:
+                    continue
+                points.append(
+                    {
+                        "trade_date": item_trade_date,
+                        "time": str(row["minute"]),
+                        "unit": row["unit"],
+                        "main_net_inflow": row["main_net_inflow"],
+                        "main_visible_inflow": row["main_visible_inflow"],
+                        "main_hidden_inflow": row["main_hidden_inflow"],
+                        "retail_inflow": row["retail_inflow"],
+                        "periods": {
+                            "today": period_values(rows_by_period.get("today")),
+                            "three_day": period_values(rows_by_period.get("three_day")),
+                            "five_day": period_values(rows_by_period.get("five_day")),
+                        },
+                    }
+                )
+            with self._read_cache_lock:
+                self._daily_cache[cache_key] = (
+                    time.monotonic(),
+                    {"points": copy.deepcopy(points)},
+                )
         baseline_date = None
         if points:
             baseline_date = (
@@ -965,6 +1252,7 @@ class SQLiteResearchStore:
                 """DELETE FROM fund_flow_history_status
                    WHERE symbol NOT IN (SELECT DISTINCT symbol FROM fund_flow_history_points)"""
             )
+        self._invalidate_fund_flow_caches()
         return int(cursor.rowcount)
 
     def read_series(self, symbol: str, trade_date: str | None = None) -> dict[str, Any]:

@@ -2523,3 +2523,53 @@ def test_core_curve_decoder_rejects_a_compressed_length_that_is_not_exact() -> N
     with pytest.raises(DirectRequestError) as caught:
         Core9528CurveDecoder()([bytes(malformed)], "601872", "17")
     assert caught.value.error_code == "DIRECT_PROTOCOL_RESPONSE_INVALID"
+
+
+def test_fund_client_read_direct_batch_chunks_200_and_isolates_periods() -> None:
+    calls: list[tuple[int, int]] = []
+
+    def request(_url, _headers, body, _timeout):
+        payload = json.loads(body)
+        win_size = int(payload["indexes"][0]["attribute"]["win_size"])
+        codes = list(payload["code_selectors"]["include"][0]["values"])
+        calls.append((win_size, len(codes)))
+        template = json.loads(response_for(win_size).body)
+        sample_row = template["data"]["data"][0]
+        template["data"]["data"] = [
+            {
+                "code": code,
+                "values": list(sample_row["values"]),
+            }
+            for code in codes
+        ]
+        template["data"]["total"] = len(codes)
+        return HttpResponse(200, {}, json.dumps(template).encode())
+
+    now = [100.0]
+    client = FundFlowHttpClient(
+        StaticSessionProvider(session()),
+        requester=request,
+        clock=lambda: now[0],
+        max_requests_per_second=0,
+        batch_size=200,
+    )
+    symbols = [f"60{idx:04d}" for idx in range(205)]
+    first = client.read_direct_batch(symbols)
+    assert len(first) == 205
+    # 205 symbols across 2 chunks (200 + 5) * 3 isolated win_size requests = 6 HTTP calls.
+    assert calls == [
+        (1, 200),
+        (1, 5),
+        (3, 200),
+        (3, 5),
+        (5, 200),
+        (5, 5),
+    ]
+    assert first["600000"].values[MetricKind.MAIN_FLOW_TODAY_NET] is not None
+    assert first["600204"].values[MetricKind.MAIN_FLOW_FIVE_DAY_NET] is not None
+
+    calls.clear()
+    now[0] = 102.0
+    forced = client.read_direct_batch(symbols[:2], force_all_periods=True)
+    assert len(forced) == 2
+    assert calls == [(1, 2), (3, 2), (5, 2)]

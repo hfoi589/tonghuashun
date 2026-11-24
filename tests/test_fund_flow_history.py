@@ -199,3 +199,44 @@ def test_fund_flow_monitor_drops_unit_only_today_when_other_periods_have_values(
     history = store.read_fund_flow_history("601872", "20260909")
     assert history["periods"]["today"]["points"] == []
     assert history["periods"]["three_day"]["points"][0]["main_net_inflow"] == "2.50"
+
+
+def test_fund_flow_monitor_post_close_150130_sweeps_1500_and_fires_callback_once(tmp_path):
+    store = SQLiteResearchStore(tmp_path / "research.db")
+
+    class TwoAccounts:
+        @staticmethod
+        def list_watchlist_symbols():
+            return ["601872", "000001", "160723"]
+
+    class BatchSource:
+        def __init__(self) -> None:
+            self.calls: list[tuple[list[str], bool]] = []
+
+        def read_direct(self, _symbol: str):
+            return _outcome("9.99")
+
+        def read_direct_batch(self, symbols: list[str], *, force_all_periods: bool = False):
+            self.calls.append((list(symbols), force_all_periods))
+            return {sym: _outcome("3.21") for sym in symbols}
+
+    finalized: list[list[str]] = []
+    source = BatchSource()
+    monitor = FundFlowHistoryMonitor(
+        TwoAccounts(),
+        source,
+        store,
+        is_market_open=lambda: False,
+        is_post_close_window=lambda _dt: True,
+        on_post_close_finalized=lambda syms: finalized.append(list(syms)),
+        clock=lambda: datetime(2026, 11, 24, 15, 1, 45, tzinfo=ZoneInfo("Asia/Shanghai")),
+    )
+
+    first = asyncio.run(monitor.poll_once())
+    second = asyncio.run(monitor.poll_once())
+
+    assert source.calls == [(["000001", "601872"], True)]
+    assert first == {"000001": True, "601872": True}
+    assert second == {}
+    assert finalized == [["000001", "601872"]]
+    assert [pt["time"] for pt in store.read_fund_flow_history("601872", "20261124")["periods"]["today"]["points"]] == ["15:00"]

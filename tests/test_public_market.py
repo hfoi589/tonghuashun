@@ -1206,3 +1206,65 @@ def test_busy_direct_enrichment_reuses_last_good_and_today_core_fallback_and_ski
     fund_snap = fund_source.read_market_snapshot("160723", detail=True)
     assert fund_snap.main_fund_flow == {}
     assert fund_fallback_calls == []
+
+
+def test_tencent_read_quotes_batch_and_exchange_fund_l2_short_circuit() -> None:
+    from level2_service.public_market import (
+        DirectEnrichedMarketDataSource,
+        TencentPublicMarketProvider,
+    )
+
+    f1 = "~".join(_tencent_quote_fields(
+        "601872", "招商轮船", price="10.20", previous_close="10.00",
+        open_price="10.05", high="10.30", low="10.00", volume_lots="1200",
+        amount_wan="1234.5", turnover="1.20", change_percent="2.00",
+    ))
+    f2 = "~".join(_tencent_quote_fields(
+        "000001", "平安银行", price="11.50", previous_close="11.40",
+        open_price="11.42", high="11.60", low="11.35", volume_lots="2400",
+        amount_wan="2345.6", turnover="0.80", change_percent="0.88",
+    ))
+    f3 = "~".join(_tencent_quote_fields(
+        "160723", "嘉实原油", price="1.23", previous_close="1.21",
+        open_price="1.22", high="1.25", low="1.21", volume_lots="500",
+        amount_wan="61.5", turnover="2.10", change_percent="1.65",
+    ))
+    seen_urls: list[str] = []
+
+    def fake_request(url: str, _timeout: float) -> bytes:
+        seen_urls.append(url)
+        if "sh601872,sz000001" in url:
+            return f'v_sh601872="{f1}";v_sz000001="{f2}";'.encode("gb18030")
+        return f'v_sz160723="{f3}";'.encode("gb18030")
+
+    provider = TencentPublicMarketProvider(fetch=fake_request)
+    batch = provider.read_quotes_batch(
+        [
+            SymbolLookup(symbol="601872", name="招商轮船", market="17"),
+            SymbolLookup(symbol="000001", name="平安银行", market="33"),
+            SymbolLookup(symbol="160723", name="嘉实原油", market="36"),
+        ],
+        chunk_size=2,
+    )
+    assert len(seen_urls) == 2
+    assert set(batch) == {"601872", "000001", "160723"}
+    assert batch["601872"].quote["price"] == "10.20"
+    assert batch["160723"].quote["open"] == "1.220"
+
+    direct_calls: list[str] = []
+
+    class Base:
+        @staticmethod
+        def read_market_snapshot(symbol: str, *, detail: bool):
+            del detail
+            return batch[symbol]
+
+    enriched = DirectEnrichedMarketDataSource(
+        Base(),
+        type("NoFundDirect", (), {"read_direct": staticmethod(lambda sym: direct_calls.append(sym))})(),
+        is_watchlist_symbol=lambda _s: True,
+    )
+    fund_snap = enriched.read_market_snapshot("160723", detail=True)
+    assert fund_snap.capabilities["l2"] == {"available": False, "reason": "FUND_L2_UNSUPPORTED"}
+    assert fund_snap.source_errors["core_metrics"] is None
+    assert direct_calls == []

@@ -11,7 +11,7 @@ import urllib.request
 from dataclasses import dataclass, replace
 from datetime import date
 from decimal import Decimal, InvalidOperation
-from typing import Any, Callable
+from typing import Any, Callable, Iterable
 
 from .market_data import (
     KlineBar,
@@ -394,6 +394,18 @@ class DailyKlineMarketDataSource:
         capabilities = dict(snapshot.capabilities)
         capabilities["daily_kline"] = {"available": True, "adjustment": "qfq"}
         return replace(snapshot, capabilities=capabilities)
+
+    def read_quotes_batch(self, symbols: Iterable[str]) -> dict[str, MarketSnapshot]:
+        batch_reader = getattr(self.base_source, "read_quotes_batch", None)
+        if callable(batch_reader):
+            raw = batch_reader(symbols)
+            out: dict[str, MarketSnapshot] = {}
+            for sym, snap in raw.items():
+                capabilities = dict(snap.capabilities)
+                capabilities["daily_kline"] = {"available": True, "adjustment": "qfq"}
+                out[sym] = replace(snap, capabilities=capabilities)
+            return out
+        return {sym: self.read_market_snapshot(sym, detail=False) for sym in symbols}
 
     @staticmethod
     def _error_code(error: Exception) -> str:

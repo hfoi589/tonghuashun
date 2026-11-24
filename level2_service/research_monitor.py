@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 from datetime import datetime, timezone
 from typing import Any, Callable, Mapping
 from zoneinfo import ZoneInfo
@@ -164,6 +165,41 @@ class ResearchMonitor:
         self.now = now
         self._finalized_close_date: str | None = None
 
+    @staticmethod
+    def _supports_force_kwarg(fn: object) -> bool:
+        try:
+            sig = inspect.signature(fn)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return False
+        if "force" in sig.parameters:
+            return True
+        return any(p.kind is inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
+
+    def _prioritized_symbols(self, symbols: list[str]) -> list[str]:
+        unique = list(dict.fromkeys(symbols))
+        if len(unique) <= 40:
+            return unique
+        priority: list[str] = []
+        get_push_cfg = getattr(self.store, "push_config", None)
+        if callable(get_push_cfg):
+            try:
+                cfg = get_push_cfg(public=False)
+                for rule in cfg.get("rules") or []:
+                    if not isinstance(rule, Mapping) or not rule.get("enabled", True):
+                        continue
+                    for cond in rule.get("conditions") or []:
+                        if isinstance(cond, Mapping) and cond.get("type") == "code_filter":
+                            for code in cond.get("codes") or []:
+                                code_str = str(code).strip()
+                                if code_str and code_str not in priority:
+                                    priority.append(code_str)
+            except Exception:
+                pass
+        if not priority:
+            return unique
+        priority_set = set(priority)
+        return [s for s in unique if s in priority_set] + [s for s in unique if s not in priority_set]
+
     async def poll_once(self, *, force: bool = False) -> dict[str, list[str]]:
         post_close = False
         trade_date: str | None = None
@@ -180,19 +216,33 @@ class ResearchMonitor:
                 return {}
             post_close = True
 
-        symbols = await asyncio.to_thread(self.accounts.list_monitored_symbols)
+        raw_symbols = await asyncio.to_thread(self.accounts.list_monitored_symbols)
+        symbols = self._prioritized_symbols(list(raw_symbols))
         semaphore = asyncio.Semaphore(self.max_concurrent)
         had_error = False
+        accepts_force = self._supports_force_kwarg(self.broker.refresh)
 
         async def collect(symbol: str) -> tuple[str, list[str]]:
             nonlocal had_error
             async with semaphore:
                 try:
-                    snapshot = await self.broker.refresh(
-                        symbol,
-                        detail=True,
-                        max_age_seconds=0,
-                    )
+                    if post_close and accepts_force:
+                        snapshot = await self.broker.refresh(
+                            symbol,
+                            detail=True,
+                            max_age_seconds=0,
+                            force=True,
+                        )
+                    else:
+                        if post_close:
+                            evict = getattr(self.broker, "evict", None)
+                            if callable(evict):
+                                evict(symbol)
+                        snapshot = await self.broker.refresh(
+                            symbol,
+                            detail=True,
+                            max_age_seconds=0,
+                        )
                     changed = await asyncio.to_thread(
                         self.store.record_snapshot,
                         snapshot,
@@ -215,7 +265,7 @@ class ResearchMonitor:
                     return symbol, []
 
         rows = await asyncio.gather(*(collect(symbol) for symbol in symbols))
-        if post_close and trade_date is not None and not had_error and local_hhmm is not None and local_hhmm >= "1501":
+        if post_close and trade_date is not None and not had_error and local_hhmm is not None and local_hhmm >= "1502":
             self._finalized_close_date = trade_date
         return dict(rows)
 

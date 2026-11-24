@@ -6,6 +6,7 @@ import asyncio
 from datetime import datetime
 import hashlib
 import hmac
+import inspect
 import re
 from typing import Any, Callable
 from urllib.parse import unquote
@@ -119,6 +120,16 @@ def _validate_optional_date(trade_date: str | None) -> str | None:
     if not _DATE_RE.fullmatch(cleaned):
         raise HTTPException(status_code=422, detail="trade_date must be YYYYMMDD")
     return cleaned
+
+
+def _supports_force_kwarg(fn: object) -> bool:
+    try:
+        sig = inspect.signature(fn)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return False
+    if "force" in sig.parameters:
+        return True
+    return any(p.kind is inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
 
 
 def _extract_today_fund_flow(store: object, symbol: str) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
@@ -280,8 +291,21 @@ def install_goodluck_routes(
 
         async def _run() -> None:
             try:
-                snapshot = await broker.refresh(symbol, detail=True, max_age_seconds=5)
-                if store is not None:
+                backfill = getattr(app.state, "post_close_backfill", None)
+                snapshot = None
+                if (
+                    not broker.is_market_open()
+                    and callable(backfill)
+                    and _supports_darkpool(symbol)
+                ):
+                    snapshot = await asyncio.to_thread(backfill, symbol)
+                    if snapshot is not None:
+                        seed = getattr(broker, "seed", None)
+                        if callable(seed):
+                            seed(snapshot)
+                if snapshot is None:
+                    snapshot = await broker.refresh(symbol, detail=True, max_age_seconds=5)
+                if store is not None and snapshot is not None:
                     await asyncio.to_thread(store.record_snapshot, snapshot)
             except Exception as error:
                 if store is not None:
@@ -634,7 +658,28 @@ def install_goodluck_routes(
             evict = getattr(broker, "evict", None)
             if callable(evict):
                 evict(normalized)
-            snapshot = await broker.refresh(normalized, detail=True, max_age_seconds=0)
+            backfill = getattr(app.state, "post_close_backfill", None)
+            snapshot = None
+            if (
+                not broker.is_market_open()
+                and callable(backfill)
+                and _supports_darkpool(normalized)
+            ):
+                snapshot = await asyncio.to_thread(backfill, normalized)
+                if snapshot is not None:
+                    seed = getattr(broker, "seed", None)
+                    if callable(seed):
+                        seed(snapshot)
+            if snapshot is None:
+                if _supports_force_kwarg(broker.refresh):
+                    snapshot = await broker.refresh(
+                        normalized,
+                        detail=True,
+                        max_age_seconds=0,
+                        force=True,
+                    )
+                else:
+                    snapshot = await broker.refresh(normalized, detail=True, max_age_seconds=0)
             changed = await asyncio.to_thread(store.record_snapshot, snapshot)
         except HTTPException:
             raise
@@ -652,6 +697,11 @@ def install_goodluck_routes(
         user, _is_admin = identity
         accounts = account_store()
         user_items = _user_watchlist_items(accounts, user.id)
+        quote_limit = max(
+            100,
+            int(getattr(accounts, "max_symbols_per_user", 50)),
+            int(getattr(accounts, "max_total_symbols", 50)),
+        )
         if symbols is not None:
             requested = []
             seen: set[str] = set()
@@ -660,35 +710,85 @@ def install_goodluck_routes(
                 if code in user_items and code not in seen:
                     seen.add(code)
                     requested.append(code)
-                if len(requested) >= 50:
+                if len(requested) >= quote_limit:
                     break
             target_symbols = requested
         else:
-            target_symbols = list(user_items.keys())[:50]
+            target_symbols = list(user_items.keys())[:quote_limit]
 
         broker = getattr(app.state, "market_data_broker", None)
         store = getattr(app.state, "research_store", None)
+        darkpool_codes = [
+            code
+            for code in target_symbols
+            if _supports_darkpool(code, _resolved_market(code, user_items[code].market))
+        ]
+        batch_ff_reader = (
+            getattr(store, "latest_today_fund_flow_map", None)
+            if store is not None
+            else None
+        )
+        ff_map: dict[str, dict[str, Any]] = {}
+        if darkpool_codes and callable(batch_ff_reader):
+            try:
+                ff_map = await asyncio.to_thread(batch_ff_reader, darkpool_codes)
+            except Exception:
+                ff_map = {}
+
+        batch_quotes_fn = (
+            getattr(broker, "refresh_quotes_batch", None)
+            if broker is not None
+            else None
+        )
+        batch_snapshots: dict[str, Any] = {}
+        if callable(batch_quotes_fn) and target_symbols:
+            try:
+                batch_snapshots = await batch_quotes_fn(
+                    target_symbols,
+                    max_age_seconds=10.0,
+                )
+            except Exception:
+                batch_snapshots = {}
+
         semaphore = asyncio.Semaphore(6)
 
         async def fetch_one(code: str) -> tuple[str, dict[str, Any]]:
             item = user_items[code]
             snapshot = None
-            async with semaphore:
-                if broker is not None:
-                    cached = broker.cached_snapshot(code)
-                    if cached is not None and not broker.is_market_open():
-                        snapshot = cached
-                    else:
-                        try:
-                            snapshot = await broker.refresh(code, detail=False, max_age_seconds=10.0)
-                        except Exception:
-                            snapshot = cached
+            if callable(batch_quotes_fn):
+                snapshot = batch_snapshots.get(code)
                 if snapshot is None and store is not None:
                     snapshot = await asyncio.to_thread(store.latest_market_snapshot, code)
+            else:
+                async with semaphore:
+                    if broker is not None:
+                        cached = broker.cached_snapshot(code)
+                        cached_phase = (
+                            getattr(cached.market_phase, "value", cached.market_phase)
+                            if cached is not None
+                            else None
+                        )
+                        if (
+                            cached is not None
+                            and not broker.is_market_open()
+                            and cached_phase in {"CLOSED", "BREAK"}
+                        ):
+                            snapshot = cached
+                        else:
+                            try:
+                                snapshot = await broker.refresh(code, detail=False, max_age_seconds=10.0)
+                            except Exception:
+                                snapshot = cached
+                    if snapshot is None and store is not None:
+                        snapshot = await asyncio.to_thread(store.latest_market_snapshot, code)
             resolved_market = _resolved_market(code, item.market)
             supports_dp = _supports_darkpool(code, resolved_market)
             if supports_dp:
-                ff_meta, today_ff = await asyncio.to_thread(_extract_today_fund_flow, store, code)
+                if callable(batch_ff_reader):
+                    entry = ff_map.get(code)
+                    ff_meta, today_ff = entry, entry
+                else:
+                    ff_meta, today_ff = await asyncio.to_thread(_extract_today_fund_flow, store, code)
             else:
                 ff_meta, today_ff = None, None
             if snapshot is not None:
@@ -781,6 +881,10 @@ def install_goodluck_routes(
                 "current_price": quote.get("price"),
                 "change_percent": quote.get("change_percent"),
                 "turnover_rate": quote.get("turnover_rate"),
+                "open": quote.get("open"),
+                "high": quote.get("high"),
+                "low": quote.get("low"),
+                "amount": quote.get("amount"),
                 "large_order_net": quote.get("large_order_net"),
                 "large_order_amount": quote.get("large_order_amount"),
                 "retail_count": quote.get("retail_count"),
@@ -1085,6 +1189,7 @@ def install_goodluck_routes(
             raise HTTPException(status_code=503, detail="research monitoring is not configured")
         user_symbols = list(_user_watchlist_items(accounts, admin_user.id).keys())
         target_symbols = user_symbols or accounts.list_monitored_symbols()
+        max_batch = max(50, int(getattr(accounts, "max_total_symbols", 50)))
         semaphore = asyncio.Semaphore(4)
 
         async def _backfill_one(code: str) -> dict[str, Any]:
@@ -1093,7 +1198,28 @@ def install_goodluck_routes(
                     evict = getattr(broker, "evict", None)
                     if callable(evict):
                         evict(code)
-                    snap = await broker.refresh(code, detail=True, max_age_seconds=0)
+                    backfill = getattr(app.state, "post_close_backfill", None)
+                    snap = None
+                    if (
+                        not broker.is_market_open()
+                        and callable(backfill)
+                        and _supports_darkpool(code)
+                    ):
+                        snap = await asyncio.to_thread(backfill, code)
+                        if snap is not None:
+                            seed = getattr(broker, "seed", None)
+                            if callable(seed):
+                                seed(snap)
+                    if snap is None:
+                        if _supports_force_kwarg(broker.refresh):
+                            snap = await broker.refresh(
+                                code,
+                                detail=True,
+                                max_age_seconds=0,
+                                force=True,
+                            )
+                        else:
+                            snap = await broker.refresh(code, detail=True, max_age_seconds=0)
                     changed = await asyncio.to_thread(store.record_snapshot, snap)
                     return {"symbol": code, "ok": True, "changed_count": len(changed)}
                 except Exception as error:
@@ -1101,7 +1227,7 @@ def install_goodluck_routes(
                     await asyncio.to_thread(store.record_error, code, err_code)
                     return {"symbol": code, "ok": False, "error": err_code}
 
-        results = await asyncio.gather(*(_backfill_one(s) for s in target_symbols[:50]))
+        results = await asyncio.gather(*(_backfill_one(s) for s in target_symbols[:max_batch]))
         return {
             "count": len(results),
             "results": list(results),

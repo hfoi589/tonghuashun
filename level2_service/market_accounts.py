@@ -8,6 +8,7 @@ import json
 import re
 import secrets
 import sqlite3
+import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -105,6 +106,7 @@ class SQLiteMarketAccountStore:
         self.max_symbols_per_user = max_symbols_per_user
         self.max_total_symbols = max_total_symbols
         self._lock = RLock()
+        self._external_user_cache: dict[str, tuple[float, MarketUser]] = {}
         self._hasher = PasswordHasher(type=Type.ID)
         self._connection = sqlite3.connect(self.path, check_same_thread=False)
         self._connection.row_factory = sqlite3.Row
@@ -375,14 +377,20 @@ class SQLiteMarketAccountStore:
         if not 1 <= len(normalized_subject) <= 128:
             raise ValueError("external identity subject must contain 1-128 characters")
         external_key = f"{normalized_provider}:{normalized_subject}"
+        now_mono = time.monotonic()
         with self._lock:
+            cached = self._external_user_cache.get(external_key)
+            if cached is not None and now_mono - cached[0] < 60.0:
+                return cached[1]
             row = self._connection.execute(
                 """SELECT id,username,enabled,must_change_password,role,created_at,email
                    FROM market_users WHERE external_identity=?""",
                 (external_key,),
             ).fetchone()
             if row is not None:
-                return self._user(row)
+                user = self._user(row)
+                self._external_user_cache[external_key] = (now_mono, user)
+                return user
             digest = hashlib.sha256(external_key.encode("utf-8")).hexdigest()
             username = f"gl_{digest[:16]}"
             password_hash = self._hasher.hash(secrets.token_urlsafe(32))
@@ -400,7 +408,9 @@ class SQLiteMarketAccountStore:
                         "INSERT INTO watchlist_groups(user_id,name,sort_order,is_primary) VALUES(?,?,0,1)",
                         (user_id, "自选"),
                     )
-                return self.get_user(user_id)
+                user = self.get_user(user_id)
+                self._external_user_cache[external_key] = (now_mono, user)
+                return user
             except sqlite3.IntegrityError:
                 row = self._connection.execute(
                     """SELECT id,username,enabled,must_change_password,role,created_at,email
@@ -408,7 +418,9 @@ class SQLiteMarketAccountStore:
                     (external_key,),
                 ).fetchone()
                 if row is not None:
-                    return self._user(row)
+                    user = self._user(row)
+                    self._external_user_cache[external_key] = (now_mono, user)
+                    return user
                 raise
 
     def _symbol_tracked_by_anyone(self, symbol: str) -> bool:
@@ -719,6 +731,7 @@ class SQLiteMarketAccountStore:
             )
             if cursor.rowcount != 1:
                 raise LookupError("market user not found")
+            self._external_user_cache.clear()
         return self.get_user(user_id)
 
     def list_watchlists(self, user_id: int) -> list[WatchlistGroup]:

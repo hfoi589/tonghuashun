@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import gzip
 import hashlib
+import http.client
 import json
 import logging
 import base64
@@ -15,8 +16,9 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from threading import Lock, RLock, Thread
-from typing import Any, Callable, Mapping, Protocol
+from typing import Any, Callable, Iterable, Mapping, Protocol, Sequence
 from urllib.error import HTTPError, URLError
+from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
 
 from .app_sessions import SessionProvider
@@ -961,7 +963,11 @@ def _urllib_request(
         status = error.code
     except (OSError, URLError):
         raise DirectRequestError("DIRECT_FUND_FLOW_REQUEST_FAILED") from None
-    if response_headers.get("Content-Encoding", "").lower() == "gzip":
+    encoding = next(
+        (v for k, v in response_headers.items() if k.lower() == "content-encoding"),
+        "",
+    ).lower()
+    if encoding == "gzip":
         try:
             payload = gzip.decompress(payload)
         except OSError:
@@ -969,6 +975,108 @@ def _urllib_request(
                 "DIRECT_FUND_FLOW_RESPONSE_INVALID"
             ) from None
     return HttpResponse(status_code=status, headers=response_headers, body=payload)
+
+
+class _KeepAliveHttpsPoster:
+    """Thread-safe HTTPS connection pool for keep-alive HTTP/1.1 POST requests."""
+
+    def __init__(self, *, max_idle_per_host: int = 16) -> None:
+        self.max_idle_per_host = max(1, int(max_idle_per_host))
+        self._lock = Lock()
+        self._pools: dict[tuple[str, int], list[http.client.HTTPSConnection]] = {}
+        self._closed = False
+
+    def _acquire(self, key: tuple[str, int], timeout_seconds: float) -> tuple[http.client.HTTPSConnection, bool]:
+        with self._lock:
+            idle = self._pools.get(key)
+            if idle:
+                conn = idle.pop()
+                conn.timeout = timeout_seconds
+                return conn, True
+        return http.client.HTTPSConnection(key[0], key[1], timeout=timeout_seconds), False
+
+    def _release(self, key: tuple[str, int], conn: http.client.HTTPSConnection, close_conn: bool) -> None:
+        if close_conn:
+            try:
+                conn.close()
+            except Exception:
+                pass
+            return
+        with self._lock:
+            if self._closed:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                return
+            idle = self._pools.setdefault(key, [])
+            if len(idle) < self.max_idle_per_host:
+                idle.append(conn)
+                return
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+    def close(self) -> None:
+        with self._lock:
+            self._closed = True
+            conns = [c for pool in self._pools.values() for c in pool]
+            self._pools.clear()
+        for conn in conns:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    def __call__(
+        self,
+        url: str,
+        headers: dict[str, str],
+        body: bytes,
+        timeout_seconds: float,
+    ) -> HttpResponse:
+        parsed = urlsplit(url)
+        if parsed.scheme.lower() != "https" or not parsed.hostname:
+            return _urllib_request(url, headers, body, timeout_seconds)
+        key = (parsed.hostname, parsed.port or 443)
+        target = parsed.path or "/"
+        if parsed.query:
+            target = f"{target}?{parsed.query}"
+        req_headers = dict(headers)
+        req_headers.setdefault("Connection", "keep-alive")
+        for attempt in range(2):
+            conn, reused = self._acquire(key, timeout_seconds)
+            try:
+                conn.request("POST", target, body=body, headers=req_headers)
+                response = conn.getresponse()
+                payload = response.read()
+                response_headers = dict(response.getheaders())
+                status = int(response.status)
+                conn_header = next(
+                    (v for k, v in response_headers.items() if k.lower() == "connection"),
+                    "",
+                ).lower()
+                self._release(key, conn, close_conn=(conn_header == "close"))
+                break
+            except (http.client.HTTPException, OSError, TimeoutError):
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                if reused and attempt == 0:
+                    continue
+                raise DirectRequestError("DIRECT_FUND_FLOW_REQUEST_FAILED") from None
+        encoding = next(
+            (v for k, v in response_headers.items() if k.lower() == "content-encoding"),
+            "",
+        ).lower()
+        if encoding == "gzip":
+            try:
+                payload = gzip.decompress(payload)
+            except OSError:
+                raise DirectRequestError("DIRECT_FUND_FLOW_RESPONSE_INVALID") from None
+        return HttpResponse(status_code=status, headers=response_headers, body=payload)
 
 
 def _decimal(value: object) -> Decimal | None:
@@ -997,7 +1105,7 @@ class FundFlowHttpClient:
         self,
         session_provider: SessionProvider,
         *,
-        requester: HttpRequester = _urllib_request,
+        requester: HttpRequester | None = None,
         timeout_seconds: float = 10.0,
         minimum_interval_seconds: float = 15.0,
         three_day_interval_seconds: float = 120.0,
@@ -1006,7 +1114,8 @@ class FundFlowHttpClient:
         breaker_threshold: int = 3,
         breaker_cooldown_seconds: float = 300.0,
         breaker_max_cooldown_seconds: float = 1800.0,
-        max_cache_entries: int = 512,
+        max_cache_entries: int = 2048,
+        batch_size: int = 200,
         clock: Callable[[], float] = time.monotonic,
         limiter_clock: Callable[[], float] = time.monotonic,
         sleeper: Callable[[float], None] = time.sleep,
@@ -1025,11 +1134,15 @@ class FundFlowHttpClient:
             raise ValueError("breaker cooldowns are invalid")
         if not isinstance(max_cache_entries, int) or max_cache_entries <= 0:
             raise ValueError("max_cache_entries must be positive")
+        if not isinstance(batch_size, int) or batch_size <= 0:
+            raise ValueError("batch_size must be positive")
         self.session_provider = session_provider
-        self.requester = requester
+        self._owned_poster = _KeepAliveHttpsPoster() if requester is None else None
+        self.requester: HttpRequester = self._owned_poster if requester is None else requester
         self.timeout_seconds = timeout_seconds
         self.minimum_interval_seconds = minimum_interval_seconds
         self.max_cache_entries = max_cache_entries
+        self.batch_size = batch_size
         self.clock = clock
         self.limiter_clock = limiter_clock
         self.sleeper = sleeper
@@ -1057,6 +1170,10 @@ class FundFlowHttpClient:
         self._breaker_trips = 0
         self._breaker_open_until = 0.0
         self._breaker_error = "DIRECT_HTTP_FORBIDDEN"
+
+    def close(self) -> None:
+        if self._owned_poster is not None:
+            self._owned_poster.close()
 
     def invalidate(self) -> None:
         with self._lock:
@@ -1105,7 +1222,9 @@ class FundFlowHttpClient:
                 )
 
     @staticmethod
-    def _request_body(symbol: str, market: str, window: int) -> bytes:
+    def _request_body_batch(
+        symbols_with_markets: Sequence[tuple[str, str]], window: int
+    ) -> bytes:
         indexes = [
             {
                 "index_id": index_id,
@@ -1123,7 +1242,7 @@ class FundFlowHttpClient:
                     "include": [
                         {
                             "type": "stock_code",
-                            "values": [f"{market}:{symbol}"],
+                            "values": [f"{market}:{symbol}" for symbol, market in symbols_with_markets],
                         }
                     ]
                 },
@@ -1133,20 +1252,64 @@ class FundFlowHttpClient:
         ).encode("utf-8")
 
     @staticmethod
+    def _request_body(symbol: str, market: str, window: int) -> bytes:
+        return FundFlowHttpClient._request_body_batch([(symbol, market)], window)
+
+    @staticmethod
+    def _parse_response_rows(
+        response: HttpResponse,
+    ) -> tuple[dict[int, str], list[Mapping[str, Any]]]:
+        payload = json.loads(response.body.decode("utf-8"), parse_float=Decimal)
+        if not isinstance(payload, dict) or int(payload.get("status_code")) != 0:
+            raise ValueError("fund flow service returned a failure status")
+        data = payload["data"]
+        indexes = data["indexes"]
+        rows = data["data"]
+        if not isinstance(indexes, list) or not isinstance(rows, list):
+            raise ValueError("fund flow response collections are invalid")
+        index_names: dict[int, str] = {}
+        for position, item in enumerate(indexes):
+            if not isinstance(item, dict):
+                continue
+            index_id = item.get("index_id")
+            if index_id not in FUND_FLOW_INDEXES:
+                continue
+            attribute = item.get("attribute")
+            if isinstance(attribute, Mapping):
+                flag = str(attribute.get("permission_flag") or "").strip().upper()
+                if flag == "NO_AUTH":
+                    raise DirectRequestError("DIRECT_SESSION_EXPIRED")
+            index_names[position] = str(index_id)
+        return index_names, rows
+
+    @staticmethod
+    def _extract_row_values(
+        row: Mapping[str, Any], index_names: Mapping[int, str]
+    ) -> dict[str, Decimal | None]:
+        raw_values = row.get("values")
+        if not isinstance(raw_values, list):
+            raise ValueError("fund flow response values are invalid")
+        result: dict[str, Decimal | None] = {name: None for name in FUND_FLOW_INDEXES}
+        for item in raw_values:
+            if not isinstance(item, dict):
+                continue
+            try:
+                position = int(item.get("idx"))
+            except (TypeError, ValueError):
+                continue
+            name = index_names.get(position)
+            if name is not None:
+                result[name] = _decimal(item.get("value"))
+        return result
+
+    @staticmethod
     def _response_values(
         response: HttpResponse,
         symbol: str,
         market: str,
     ) -> dict[str, Decimal | None]:
         try:
-            payload = json.loads(response.body.decode("utf-8"), parse_float=Decimal)
-            if not isinstance(payload, dict) or int(payload.get("status_code")) != 0:
-                raise ValueError("fund flow service returned a failure status")
-            data = payload["data"]
-            indexes = data["indexes"]
-            rows = data["data"]
-            if not isinstance(indexes, list) or not isinstance(rows, list):
-                raise ValueError("fund flow response collections are invalid")
+            index_names, rows = FundFlowHttpClient._parse_response_rows(response)
             matching = [
                 row
                 for row in rows
@@ -1154,34 +1317,7 @@ class FundFlowHttpClient:
             ]
             if len(matching) != 1:
                 raise ValueError("fund flow response identity does not match")
-            raw_values = matching[0].get("values")
-            if not isinstance(raw_values, list):
-                raise ValueError("fund flow response values are invalid")
-            index_names: dict[int, str] = {}
-            for position, item in enumerate(indexes):
-                if not isinstance(item, dict):
-                    continue
-                index_id = item.get("index_id")
-                if index_id not in FUND_FLOW_INDEXES:
-                    continue
-                attribute = item.get("attribute")
-                if isinstance(attribute, Mapping):
-                    flag = str(attribute.get("permission_flag") or "").strip().upper()
-                    if flag == "NO_AUTH":
-                        raise DirectRequestError("DIRECT_SESSION_EXPIRED")
-                index_names[position] = str(index_id)
-            result = {name: None for name in FUND_FLOW_INDEXES}
-            for item in raw_values:
-                if not isinstance(item, dict):
-                    continue
-                try:
-                    position = int(item.get("idx"))
-                except (TypeError, ValueError):
-                    continue
-                name = index_names.get(position)
-                if name is not None:
-                    result[name] = _decimal(item.get("value"))
-            return result
+            return FundFlowHttpClient._extract_row_values(matching[0], index_names)
         except DirectRequestError:
             raise
         except (
@@ -1195,47 +1331,40 @@ class FundFlowHttpClient:
                 "DIRECT_FUND_FLOW_RESPONSE_INVALID"
             ) from None
 
-    def _fetch_period(
-        self,
-        headers: dict[str, str],
-        symbol: str,
-        market: str,
-        period: str,
-        window: int,
-    ) -> dict[MetricKind, str | None]:
-        self._check_breaker()
-        self._wait_for_request_slot()
-        response = self.requester(
-            FUND_FLOW_URL,
-            headers,
-            self._request_body(symbol, market, window),
-            self.timeout_seconds,
-        )
-        if response.status_code in {401, 403}:
-            self.session_provider.mark_error(
-                "main_fund_flow",
-                "DIRECT_SESSION_EXPIRED",
-            )
-            self._record_breaker_failure("DIRECT_SESSION_EXPIRED", immediate=True)
-            raise DirectRequestError("DIRECT_SESSION_EXPIRED")
-        if 400 <= response.status_code < 500:
-            self._record_breaker_failure(
-                "DIRECT_HTTP_FORBIDDEN", immediate=response.status_code == 429
-            )
-            raise DirectRequestError("DIRECT_HTTP_FORBIDDEN")
-        if response.status_code < 200 or response.status_code >= 300:
-            raise DirectRequestError("DIRECT_FUND_FLOW_REQUEST_FAILED")
+    @staticmethod
+    def _response_values_batch(
+        response: HttpResponse,
+        expected_codes: set[str],
+    ) -> dict[str, dict[str, Decimal | None]]:
         try:
-            raw = self._response_values(response, symbol, market)
-        except DirectRequestError as error:
-            if error.error_code == "DIRECT_SESSION_EXPIRED":
-                self.session_provider.mark_error(
-                    "main_fund_flow",
-                    "DIRECT_SESSION_EXPIRED",
-                )
-                self._record_breaker_failure("DIRECT_SESSION_EXPIRED", immediate=True)
+            index_names, rows = FundFlowHttpClient._parse_response_rows(response)
+            matched: dict[str, dict[str, Decimal | None]] = {}
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                code = str(row.get("code") or "")
+                if code in expected_codes:
+                    matched[code] = FundFlowHttpClient._extract_row_values(row, index_names)
+            if rows and not matched:
+                raise ValueError("fund flow batch response contains no expected symbols")
+            return matched
+        except DirectRequestError:
             raise
-        self._record_breaker_success()
+        except (
+            KeyError,
+            TypeError,
+            ValueError,
+            UnicodeDecodeError,
+            json.JSONDecodeError,
+        ):
+            raise DirectRequestError(
+                "DIRECT_FUND_FLOW_RESPONSE_INVALID"
+            ) from None
+
+    @staticmethod
+    def _scale_period_values(
+        raw: Mapping[str, Decimal | None], period: str
+    ) -> dict[MetricKind, str | None]:
         present = [number.copy_abs() for number in raw.values() if number is not None]
         divisor = (
             Decimal(100000000)
@@ -1244,9 +1373,9 @@ class FundFlowHttpClient:
         )
         unit_kind = {name: unit for name, _label, unit in FUND_FLOW_PERIODS}[period]
         metrics = FUND_FLOW_METRICS[period]
-        main = raw["charge_main_capital"]
-        listed = raw["charge_main_listed_capital"]
-        grey = raw["charge_main_grey_capital"]
+        main = raw.get("charge_main_capital")
+        listed = raw.get("charge_main_listed_capital")
+        grey = raw.get("charge_main_grey_capital")
         return {
             unit_kind: (
                 ("亿元" if divisor == Decimal(100000000) else "万元")
@@ -1267,33 +1396,102 @@ class FundFlowHttpClient:
             ),
         }
 
-    def _read_symbol(self, symbol: str, market: str, now: float) -> DirectReadOutcome:
-        with self._lock:
-            periods = self._cache.setdefault(symbol, {})
-            due = [
-                (period, window)
-                for period, window in (("today", 1), ("three_day", 3), ("five_day", 5))
-                if period not in periods
-                or now - periods[period][1] >= self.period_intervals[period]
-            ]
-        if due:
-            session = self.session_provider.get("main_fund_flow")
-            if session is None:
-                raise DirectRequestError("DIRECT_SESSION_UNAVAILABLE")
-            headers = {
-                "Cookie": session.cookie,
-                "Platform": session.platform,
-                "Source-Id": FUND_FLOW_SOURCE_ID,
-                "User-Agent": session.user_agent,
-                "Content-Type": "application/json",
-                "Accept-Encoding": "gzip",
-            }
-            for period, window in due:
-                fetched = self._fetch_period(headers, symbol, market, period, window)
-                with self._lock:
-                    periods[period] = (fetched, now)
+    def _send_and_handle_http(
+        self, headers: dict[str, str], body: bytes
+    ) -> HttpResponse:
+        self._check_breaker()
+        self._wait_for_request_slot()
+        response = self.requester(
+            FUND_FLOW_URL,
+            headers,
+            body,
+            self.timeout_seconds,
+        )
+        if response.status_code in {401, 403}:
+            self.session_provider.mark_error(
+                "main_fund_flow",
+                "DIRECT_SESSION_EXPIRED",
+            )
+            self._record_breaker_failure("DIRECT_SESSION_EXPIRED", immediate=True)
+            raise DirectRequestError("DIRECT_SESSION_EXPIRED")
+        if 400 <= response.status_code < 500:
+            self._record_breaker_failure(
+                "DIRECT_HTTP_FORBIDDEN", immediate=response.status_code == 429
+            )
+            raise DirectRequestError("DIRECT_HTTP_FORBIDDEN")
+        if response.status_code < 200 or response.status_code >= 300:
+            raise DirectRequestError("DIRECT_FUND_FLOW_REQUEST_FAILED")
+        return response
+
+    def _fetch_period(
+        self,
+        headers: dict[str, str],
+        symbol: str,
+        market: str,
+        period: str,
+        window: int,
+    ) -> dict[MetricKind, str | None]:
+        response = self._send_and_handle_http(
+            headers, self._request_body(symbol, market, window)
+        )
+        try:
+            raw = self._response_values(response, symbol, market)
+        except DirectRequestError as error:
+            if error.error_code == "DIRECT_SESSION_EXPIRED":
+                self.session_provider.mark_error(
+                    "main_fund_flow",
+                    "DIRECT_SESSION_EXPIRED",
+                )
+                self._record_breaker_failure("DIRECT_SESSION_EXPIRED", immediate=True)
+            raise
+        self._record_breaker_success()
+        return self._scale_period_values(raw, period)
+
+    def _fetch_period_batch(
+        self,
+        headers: dict[str, str],
+        items: Sequence[tuple[str, str]],
+        period: str,
+        window: int,
+    ) -> dict[str, dict[MetricKind, str | None]]:
+        code_to_symbol = {f"{market}:{symbol}": symbol for symbol, market in items}
+        response = self._send_and_handle_http(
+            headers, self._request_body_batch(items, window)
+        )
+        try:
+            raw_by_code = self._response_values_batch(response, set(code_to_symbol))
+        except DirectRequestError as error:
+            if error.error_code == "DIRECT_SESSION_EXPIRED":
+                self.session_provider.mark_error(
+                    "main_fund_flow",
+                    "DIRECT_SESSION_EXPIRED",
+                )
+                self._record_breaker_failure("DIRECT_SESSION_EXPIRED", immediate=True)
+            raise
+        self._record_breaker_success()
+        empty_raw = {name: None for name in FUND_FLOW_INDEXES}
+        return {
+            sym: self._scale_period_values(raw_by_code.get(code, empty_raw), period)
+            for code, sym in code_to_symbol.items()
+        }
+
+    def _headers_for_session(self) -> dict[str, str]:
+        session = self.session_provider.get("main_fund_flow")
+        if session is None:
+            raise DirectRequestError("DIRECT_SESSION_UNAVAILABLE")
+        return {
+            "Cookie": session.cookie,
+            "Platform": session.platform,
+            "Source-Id": FUND_FLOW_SOURCE_ID,
+            "User-Agent": session.user_agent,
+            "Content-Type": "application/json",
+            "Accept-Encoding": "gzip",
+        }
+
+    def _outcome_from_cached_periods(self, symbol: str) -> DirectReadOutcome:
         values = empty_metric_values()
         with self._lock:
+            periods = self._cache.get(symbol, {})
             for period_values, _timestamp in periods.values():
                 values.update(period_values)
         return DirectReadOutcome(
@@ -1301,7 +1499,27 @@ class FundFlowHttpClient:
             source_errors={"core_metrics": None, "main_fund_flow": None},
         )
 
-    def read_direct(self, symbol: str) -> DirectReadOutcome:
+    def _read_symbol(
+        self, symbol: str, market: str, now: float, *, force: bool = False
+    ) -> DirectReadOutcome:
+        with self._lock:
+            periods = self._cache.setdefault(symbol, {})
+            due = [
+                (period, window)
+                for period, window in (("today", 1), ("three_day", 3), ("five_day", 5))
+                if force
+                or period not in periods
+                or now - periods[period][1] >= self.period_intervals[period]
+            ]
+        if due:
+            headers = self._headers_for_session()
+            for period, window in due:
+                fetched = self._fetch_period(headers, symbol, market, period, window)
+                with self._lock:
+                    periods[period] = (fetched, now)
+        return self._outcome_from_cached_periods(symbol)
+
+    def read_direct(self, symbol: str, *, force: bool = False) -> DirectReadOutcome:
         market = market_code_for_symbol(symbol)
         if market in {"20", "36"}:
             return DirectReadOutcome(
@@ -1314,13 +1532,92 @@ class FundFlowHttpClient:
         # paced by the global request limiter instead of one big lock.
         with symbol_lock:
             now = self.clock()
-            outcome = self._read_symbol(symbol, market, now)
+            outcome = self._read_symbol(symbol, market, now, force=force)
             with self._lock:
                 while len(self._cache) > self.max_cache_entries:
                     evicted = next(iter(self._cache))
                     self._cache.pop(evicted)
                     self._symbol_locks.pop(evicted, None)
             return outcome
+
+    def read_direct_batch(
+        self,
+        symbols: Iterable[str],
+        *,
+        force_all_periods: bool = False,
+    ) -> dict[str, DirectReadOutcome]:
+        """Batch-query THS fund flow with one win_size per HTTP request."""
+        ordered = list(dict.fromkeys(str(sym).strip() for sym in symbols if str(sym).strip()))
+        outcomes: dict[str, DirectReadOutcome] = {}
+        eligible: list[tuple[str, str]] = []
+        for sym in ordered:
+            try:
+                market = market_code_for_symbol(sym)
+            except Exception:
+                outcomes[sym] = DirectReadOutcome(
+                    values=empty_metric_values(),
+                    source_errors={"core_metrics": None, "main_fund_flow": None},
+                )
+                continue
+            if market in {"20", "36"}:
+                outcomes[sym] = DirectReadOutcome(
+                    values=empty_metric_values(),
+                    source_errors={"core_metrics": None, "main_fund_flow": None},
+                )
+            else:
+                eligible.append((sym, market))
+        if not eligible:
+            return outcomes
+
+        now = self.clock()
+        due_by_period: dict[str, list[tuple[str, str]]] = {
+            "today": [],
+            "three_day": [],
+            "five_day": [],
+        }
+        with self._lock:
+            for sym, market in eligible:
+                periods = self._cache.setdefault(sym, {})
+                for period in ("today", "three_day", "five_day"):
+                    if (
+                        force_all_periods
+                        or period not in periods
+                        or now - periods[period][1] >= self.period_intervals[period]
+                    ):
+                        due_by_period[period].append((sym, market))
+
+        if any(due_by_period.values()):
+            headers = self._headers_for_session()
+            for period, window in (("today", 1), ("three_day", 3), ("five_day", 5)):
+                targets = due_by_period[period]
+                if not targets:
+                    continue
+                for start in range(0, len(targets), self.batch_size):
+                    chunk = targets[start : start + self.batch_size]
+                    fetched_map = self._fetch_period_batch(headers, chunk, period, window)
+                    fetch_now = self.clock()
+                    with self._lock:
+                        for sym, _mkt in chunk:
+                            if sym in fetched_map:
+                                self._cache.setdefault(sym, {})[period] = (
+                                    fetched_map[sym],
+                                    fetch_now,
+                                )
+
+        for sym, _mkt in eligible:
+            outcomes[sym] = self._outcome_from_cached_periods(sym)
+
+        with self._lock:
+            cap = max(self.max_cache_entries, len(eligible) + 64)
+            eligible_set = {sym for sym, _mkt in eligible}
+            while len(self._cache) > cap:
+                evicted = next(
+                    (k for k in self._cache if k not in eligible_set),
+                    next(iter(self._cache)),
+                )
+                self._cache.pop(evicted, None)
+                self._symbol_locks.pop(evicted, None)
+        return outcomes
 
     def read(self, symbol: str) -> dict[MetricKind, str | None]:
         return self.read_direct(symbol).values

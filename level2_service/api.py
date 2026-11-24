@@ -431,6 +431,8 @@ def create_app(
     research_monitor: object | None = None,
     fund_flow_monitor: object | None = None,
     research_monitor_interval_seconds: float = 25.0,
+    fund_flow_monitor_interval_seconds: float = 20.0,
+    post_close_backfill: Callable[[str], Any] | None = None,
     push_dispatcher: object | None = None,
     premium_monitor: object | None = None,
     premium_monitor_interval_seconds: float = 15.0,
@@ -452,6 +454,8 @@ def create_app(
         raise ValueError("runner_poll_interval_seconds must be positive")
     if research_monitor_interval_seconds <= 0:
         raise ValueError("research_monitor_interval_seconds must be positive")
+    if fund_flow_monitor_interval_seconds <= 0:
+        raise ValueError("fund_flow_monitor_interval_seconds must be positive")
     if premium_monitor_interval_seconds <= 0:
         raise ValueError("premium_monitor_interval_seconds must be positive")
     if not 0 <= symbol_catalog_refresh_hour <= 23:
@@ -551,18 +555,29 @@ def create_app(
 
         async def research_loop() -> None:
             while not stop.is_set():
+                started = time.monotonic()
                 try:
                     if app.state.research_monitor is not None:
                         await app.state.research_monitor.poll_once()
+                except Exception:
+                    logger.exception("research monitoring poll failed")
+                remaining = max(2.0, research_monitor_interval_seconds - (time.monotonic() - started))
+                try:
+                    await wait_for(stop.wait(), timeout=remaining)
+                except TimeoutError:
+                    continue
+
+        async def fund_flow_loop() -> None:
+            while not stop.is_set():
+                started = time.monotonic()
+                try:
                     if app.state.fund_flow_monitor is not None:
                         await app.state.fund_flow_monitor.poll_once()
                 except Exception:
-                    logger.exception("research monitoring poll failed")
+                    logger.exception("fund flow monitoring poll failed")
+                remaining = max(2.0, fund_flow_monitor_interval_seconds - (time.monotonic() - started))
                 try:
-                    await wait_for(
-                        stop.wait(),
-                        timeout=research_monitor_interval_seconds,
-                    )
+                    await wait_for(stop.wait(), timeout=remaining)
                 except TimeoutError:
                     continue
 
@@ -640,7 +655,12 @@ def create_app(
         )
         app.state.research_task = (
             create_task(research_loop())
-            if app.state.research_monitor is not None or app.state.fund_flow_monitor is not None
+            if app.state.research_monitor is not None
+            else None
+        )
+        app.state.fund_flow_task = (
+            create_task(fund_flow_loop())
+            if app.state.fund_flow_monitor is not None
             else None
         )
         app.state.premium_task = (
@@ -663,6 +683,8 @@ def create_app(
                 await app.state.market_task
             if app.state.research_task is not None:
                 await app.state.research_task
+            if app.state.fund_flow_task is not None:
+                await app.state.fund_flow_task
             if app.state.premium_task is not None:
                 await app.state.premium_task
             if app.state.symbol_catalog_task is not None:
@@ -808,6 +830,7 @@ def create_app(
     app.state.research_store = research_store
     app.state.research_monitor = research_monitor
     app.state.fund_flow_monitor = fund_flow_monitor
+    app.state.post_close_backfill = post_close_backfill
     app.state.push_dispatcher = push_dispatcher
     app.state.premium_monitor = premium_monitor
     app.state.account_session_provider = account_session_provider

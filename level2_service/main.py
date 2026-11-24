@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import inspect
 import os
 import socket
 import time
 from math import isfinite
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timedelta, timezone
 from functools import partial
 from pathlib import Path
@@ -37,11 +38,13 @@ from .direct_market import (
 )
 from .market_accounts import RedisMarketSessionStore, SQLiteMarketAccountStore
 from .market_data import LocalTradingCalendar, MarketDataBroker, MarketPhaseResolver, SHANGHAI_TZ, is_china_market_open
+from .models import MetricKind
 from .parsed_values import (
     FUND_ONLY_METRICS,
     DirectReadOutcome,
     DualAccountParsedValueSource,
     FridaParsedValueSource,
+    is_exchange_fund_symbol,
 )
 from .public_market import (
     DirectEnrichedMarketDataSource,
@@ -114,6 +117,10 @@ class DeploymentSettings:
     fund_flow_five_day_interval_seconds: float = 300.0
     fund_flow_max_requests_per_second: float = 5.0
     goodluck_internal_token: str | None = field(default=None, repr=False)
+    market_max_symbols_per_user: int = 50
+    market_max_total_symbols: int = 50
+    research_monitor_interval_seconds: float = 25.0
+    fund_flow_monitor_interval_seconds: float = 20.0
 
     @classmethod
     def from_environ(cls, environ: Mapping[str, str] | None = None) -> "DeploymentSettings":
@@ -249,6 +256,8 @@ class DeploymentSettings:
             ("FUND_FLOW_THREE_DAY_INTERVAL_SECONDS", "120"),
             ("FUND_FLOW_FIVE_DAY_INTERVAL_SECONDS", "300"),
             ("FUND_FLOW_MAX_REQUESTS_PER_SECOND", "5"),
+            ("RESEARCH_MONITOR_INTERVAL_SECONDS", "25"),
+            ("FUND_FLOW_MONITOR_INTERVAL_SECONDS", "20"),
         ):
             try:
                 parsed = float(values.get(name, default))
@@ -311,6 +320,18 @@ class DeploymentSettings:
             market_direct_enrichment = False
         else:
             raise ValueError("MARKET_DIRECT_ENRICHMENT must be a boolean value")
+        int_values: dict[str, int] = {}
+        for name, default in (
+            ("MARKET_MAX_SYMBOLS_PER_USER", "50"),
+            ("MARKET_MAX_TOTAL_SYMBOLS", "50"),
+        ):
+            try:
+                parsed_int = int(values.get(name, default))
+            except ValueError as error:
+                raise ValueError(f"{name} must be a positive integer") from error
+            if parsed_int <= 0:
+                raise ValueError(f"{name} must be a positive integer")
+            int_values[name] = parsed_int
         return cls(
             redis_url=values.get("REDIS_URL", "redis://redis:6379/0"),
             redis_connect_timeout_seconds=positive_values[
@@ -388,6 +409,14 @@ class DeploymentSettings:
             ths_session_encryption_key=session_encryption_key or None,
             ths_session_root=session_root,
             goodluck_internal_token=values.get("GOODLUCK_INTERNAL_TOKEN", "").strip() or None,
+            market_max_symbols_per_user=int_values["MARKET_MAX_SYMBOLS_PER_USER"],
+            market_max_total_symbols=int_values["MARKET_MAX_TOTAL_SYMBOLS"],
+            research_monitor_interval_seconds=positive_values[
+                "RESEARCH_MONITOR_INTERVAL_SECONDS"
+            ],
+            fund_flow_monitor_interval_seconds=positive_values[
+                "FUND_FLOW_MONITOR_INTERVAL_SECONDS"
+            ],
         )
 
 
@@ -555,7 +584,11 @@ def create_production_app(
                     templates[f"tab:{label}"] = candidate
                     break
     navigator = Level2Navigator(core_bridge, OpenCVTemplateFallback(templates))
-    market_accounts = SQLiteMarketAccountStore(config.market_database_path)
+    market_accounts = SQLiteMarketAccountStore(
+        config.market_database_path,
+        max_symbols_per_user=config.market_max_symbols_per_user,
+        max_total_symbols=config.market_max_total_symbols,
+    )
     trading_calendar = LocalTradingCalendar(config.trading_calendar_path)
 
     def market_is_open() -> bool:
@@ -579,6 +612,13 @@ def create_production_app(
         minute = local.hour * 60 + local.minute
         return 15 * 60 <= minute <= 15 * 60 + 5
 
+    def is_fund_flow_post_close_window(moment: datetime) -> bool:
+        local = moment.astimezone(SHANGHAI_TZ)
+        if not trading_calendar.is_trading_day(local.date()):
+            return False
+        minute = local.hour * 60 + local.minute
+        return 15 * 60 + 1 <= minute <= 15 * 60 + 6
+
     def previous_trading_date(value: str) -> str:
         current = datetime.strptime(value, "%Y%m%d").date()
         current -= timedelta(days=1)
@@ -590,6 +630,24 @@ def create_production_app(
         if trading_calendar.is_trading_day(current):
             return current.strftime("%Y%m%d")
         return previous_trading_date(current.strftime("%Y%m%d"))
+
+    def latest_settled_trade_date() -> str:
+        local = datetime.now(timezone.utc).astimezone(SHANGHAI_TZ)
+        if (
+            trading_calendar.is_trading_day(local.date())
+            and (local.hour * 60 + local.minute) < 9 * 60 + 30
+        ):
+            return previous_trading_date(local.strftime("%Y%m%d"))
+        return resolve_trading_date(local.date())
+
+    def _supports_force(fn: object) -> bool:
+        try:
+            sig = inspect.signature(fn)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return False
+        return "force" in sig.parameters or any(
+            p.kind is inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+        )
 
     research_store = SQLiteResearchStore(
         config.research_database_path,
@@ -749,17 +807,59 @@ def create_production_app(
     )
 
     def closed_market_enrichment(symbol: str) -> DirectReadOutcome | None:
-        stored = research_store.latest_market_enrichment(symbol)
-        if stored is not None and any(stored.values.get(kind) is not None for kind in FUND_ONLY_METRICS):
+        expected_date = latest_settled_trade_date()
+        stored = research_store.latest_market_enrichment(
+            symbol,
+            expected_trade_date=expected_date,
+        )
+        if stored is not None and any(
+            stored.values.get(kind) is not None for kind in FUND_ONLY_METRICS
+        ):
             return stored
-        if database_first_fund_source is None:
+        if is_exchange_fund_symbol(symbol):
             return stored
+        read_fund = getattr(fund_flow_source, "read_direct", None) if fund_flow_source is not None else None
+        if not callable(read_fund):
+            if database_first_fund_source is None:
+                return stored
+            read_fund = database_first_fund_source.read_direct
         try:
-            fund = database_first_fund_source.read_direct(symbol)
+            raw_fund = (
+                read_fund(symbol, force=True)
+                if _supports_force(read_fund)
+                else read_fund(symbol)
+            )
         except Exception:
             return stored
+        fund = (
+            raw_fund
+            if isinstance(raw_fund, DirectReadOutcome)
+            else DirectReadOutcome(
+                values=raw_fund,
+                source_errors={"core_metrics": None, "main_fund_flow": None},
+            )
+        )
+        periods = DatabaseFirstFundFlowSource._periods_from_outcome(
+            fund,
+            allow_today=True,
+        )
+        if periods and symbol in set(market_accounts.list_watchlist_symbols()):
+            try:
+                research_store.record_fund_flow(
+                    symbol,
+                    trade_date=expected_date,
+                    minute="15:00",
+                    periods=periods,
+                    captured_at=datetime.now(SHANGHAI_TZ),
+                )
+            except Exception:
+                pass
+        fund_trade_dates = {
+            **fund.stored_trade_dates,
+            "main_fund_flow": expected_date,
+        }
         if stored is None:
-            return fund
+            return replace(fund, stored_trade_dates=fund_trade_dates)
         values = dict(stored.values)
         values.update({kind: fund.values.get(kind) for kind in FUND_ONLY_METRICS})
         return DirectReadOutcome(
@@ -768,15 +868,18 @@ def create_production_app(
             intraday_series={**stored.intraday_series, **fund.intraday_series},
             stored_trade_dates={
                 **stored.stored_trade_dates,
-                **fund.stored_trade_dates,
+                **fund_trade_dates,
             },
         )
 
     def intraday_core_fallback(symbol: str) -> DirectReadOutcome | None:
-        stored = research_store.latest_market_enrichment(symbol)
+        today = datetime.now(SHANGHAI_TZ).strftime("%Y%m%d")
+        stored = research_store.latest_market_enrichment(
+            symbol,
+            expected_trade_date=today,
+        )
         if stored is None:
             return None
-        today = datetime.now(SHANGHAI_TZ).strftime("%Y%m%d")
         if stored.stored_trade_dates.get("core_metrics") != today:
             return None
         return stored
@@ -825,6 +928,105 @@ def create_production_app(
         runner.market_snapshot_source = market_source
     if runner is not None and hasattr(runner, "market_phase_resolver"):
         runner.market_phase_resolver = market_phase_resolver
+
+    def post_close_backfill(symbol: str):
+        base_snap = public_market_source.read_market_snapshot(symbol, detail=True)
+        if is_exchange_fund_symbol(symbol, base_snap.market):
+            capabilities = dict(base_snap.capabilities)
+            capabilities["l2"] = {
+                "available": False,
+                "reason": "FUND_L2_UNSUPPORTED",
+            }
+            merged = replace(
+                base_snap,
+                capabilities=capabilities,
+                source_errors={
+                    **base_snap.source_errors,
+                    "core_metrics": None,
+                    "main_fund_flow": None,
+                },
+            )
+            market_broker.seed(merged)
+            return merged
+        if parsed_value_source is None:
+            market_broker.seed(base_snap)
+            return base_snap
+        best_effort = getattr(parsed_value_source, "read_direct_best_effort", None)
+        outcome = (
+            best_effort(symbol)
+            if callable(best_effort)
+            else parsed_value_source.read_direct(symbol)
+        )
+        expected_date = latest_settled_trade_date()
+        values = dict(outcome.values)
+        source_errors = dict(outcome.source_errors)
+        stored_trade_dates = dict(outcome.stored_trade_dates)
+        if any(
+            values.get(kind) is not None
+            for kind in (
+                MetricKind.LARGE_ORDER_NET,
+                MetricKind.LARGE_ORDER_AMOUNT,
+                MetricKind.RETAIL_COUNT,
+                MetricKind.MACDFS,
+            )
+        ) or any(series.get("points") for series in outcome.intraday_series.values()):
+            stored_trade_dates["core_metrics"] = expected_date
+        read_fund = getattr(fund_flow_source, "read_direct", None) if fund_flow_source is not None else None
+        if callable(read_fund):
+            try:
+                raw_fund = (
+                    read_fund(symbol, force=True)
+                    if _supports_force(read_fund)
+                    else read_fund(symbol)
+                )
+                fund_outcome = (
+                    raw_fund
+                    if isinstance(raw_fund, DirectReadOutcome)
+                    else DirectReadOutcome(
+                        values=raw_fund,
+                        source_errors={"core_metrics": None, "main_fund_flow": None},
+                    )
+                )
+                for kind in FUND_ONLY_METRICS:
+                    values[kind] = fund_outcome.values.get(kind)
+                source_errors["main_fund_flow"] = fund_outcome.source_errors.get("main_fund_flow")
+                periods = DatabaseFirstFundFlowSource._periods_from_outcome(
+                    fund_outcome,
+                    allow_today=True,
+                )
+                if periods:
+                    research_store.record_fund_flow(
+                        symbol,
+                        trade_date=expected_date,
+                        minute="15:00",
+                        periods=periods,
+                        captured_at=datetime.now(SHANGHAI_TZ),
+                    )
+                    stored_trade_dates["main_fund_flow"] = expected_date
+            except Exception as error:
+                source_errors["main_fund_flow"] = (
+                    getattr(error, "error_code", None)
+                    or source_errors.get("main_fund_flow")
+                    or "DIRECT_FUND_FLOW_REQUEST_FAILED"
+                )
+        final_outcome = DirectReadOutcome(
+            values=values,
+            source_errors=source_errors,
+            intraday_series=dict(outcome.intraday_series),
+            stored_trade_dates=stored_trade_dates,
+        )
+        merged = enriched_market_source._merge(base_snap, final_outcome)
+        research_store.record_snapshot(merged)
+        market_broker.seed(merged)
+        return merged
+
+    def _on_post_close_finalized(symbols: list[str]) -> None:
+        if database_first_fund_source is not None:
+            database_first_fund_source.invalidate()
+        enriched_market_source.invalidate_cache()
+        for sym in symbols:
+            market_broker.evict(sym)
+
     push_dispatcher = PushDispatcher()
     research_monitor = ResearchMonitor(
         market_accounts,
@@ -842,6 +1044,8 @@ def create_production_app(
             fund_flow_source,
             research_store,
             is_market_open=market_is_open,
+            is_post_close_window=is_fund_flow_post_close_window,
+            on_post_close_finalized=_on_post_close_finalized,
         )
         if fund_flow_source is not None
         else None
@@ -903,9 +1107,16 @@ def create_production_app(
         ),
         fund_session_invalidator=invalidate_fund_session,
         managed_resources=tuple(
-            resource
-            for resource in (direct_core_source, parsed_value_source, research_store)
-            if resource is not None and callable(getattr(resource, "close", None))
+            {
+                id(resource): resource
+                for resource in (
+                    direct_core_source,
+                    fund_flow_source,
+                    parsed_value_source,
+                    research_store,
+                )
+                if resource is not None and callable(getattr(resource, "close", None))
+            }.values()
         ),
         market_account_store=market_accounts,
         market_session_store=market_sessions,
@@ -913,6 +1124,9 @@ def create_production_app(
         research_store=research_store,
         research_monitor=research_monitor,
         fund_flow_monitor=fund_flow_monitor,
+        research_monitor_interval_seconds=config.research_monitor_interval_seconds,
+        fund_flow_monitor_interval_seconds=config.fund_flow_monitor_interval_seconds,
+        post_close_backfill=post_close_backfill,
         push_dispatcher=push_dispatcher,
         premium_monitor=premium_monitor,
         account_session_provider=account_session_provider,

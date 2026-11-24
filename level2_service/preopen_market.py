@@ -7,7 +7,7 @@ from datetime import date, datetime, timezone
 import json
 import time
 from threading import RLock
-from typing import Callable, Protocol
+from typing import Callable, Iterable, Protocol
 
 from .market_data import (
     MarketPhase,
@@ -456,6 +456,27 @@ class PreopenMarketDataSource:
             )
             for symbol in symbols
         }
+
+    def read_quotes_batch(self, symbols: Iterable[str]) -> dict[str, MarketSnapshot]:
+        symbol_list = list(dict.fromkeys(symbols))
+        if not symbol_list:
+            return {}
+        state, phase_error = self._phase()
+        if state.phase in self._PREOPEN_PHASES:
+            return self.read_market_snapshots(set(symbol_list), detail_symbols=set())
+        base_batch = getattr(self.base_source, "read_quotes_batch", None)
+        if not callable(base_batch):
+            return {
+                sym: self.read_market_snapshot(sym, detail=False)
+                for sym in symbol_list
+            }
+        raw = base_batch(symbol_list)
+        out: dict[str, MarketSnapshot] = {}
+        for sym, snap in raw.items():
+            current = self._with_phase(snap, state, phase_error=phase_error)
+            self._remember(current)
+            out[sym] = current
+        return out
 
     def read_market_series(
         self,

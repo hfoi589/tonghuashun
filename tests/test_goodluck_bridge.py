@@ -362,7 +362,7 @@ def test_bridge_quotes_snapshot_history_daily_monitoring_and_admin(tmp_path) -> 
         assert q_items["601872"]["today_unit"] == "万元"
         assert q_items["600036"]["today_main_hidden_inflow"] is None
 
-        # 单股详情快照（8项指标 + main_fund_flow，缺失指标保持 null）
+        # 单股详情快照（含开高低与成交额 + 8项指标 + main_fund_flow，缺失指标保持 null）
         snap_ok = client.get("/api/internal/goodluck/symbols/601872/snapshot", headers=_headers("uid:alice"))
         assert snap_ok.status_code == 200
         body = snap_ok.json()
@@ -371,6 +371,10 @@ def test_bridge_quotes_snapshot_history_daily_monitoring_and_admin(tmp_path) -> 
             "current_price": "7.12",
             "change_percent": "+1.42%",
             "turnover_rate": "1.28%",
+            "open": None,
+            "high": None,
+            "low": None,
+            "amount": None,
             "large_order_net": "0.18",
             "large_order_amount": "1234.5",
             "retail_count": "-0.34",
@@ -624,3 +628,69 @@ def test_bridge_marks_funds_no_darkpool_and_excludes_from_global_dedup_counts(tm
         assert admin_status["global_count"] == 1
         assert admin_status["monitored_count"] == 1
         assert [row["symbol"] for row in admin_status["monitoring"]] == ["601872"]
+
+
+def test_bridge_quotes_refreshes_closed_continuous_cache_and_post_close_backfill(tmp_path) -> None:
+    from dataclasses import replace
+
+    stale_quote = replace(
+        _make_snapshot("601872"),
+        source_time="14:31",
+        market_phase=MarketPhase.CONTINUOUS,
+        quote={
+            "price": "7.20",
+            "change_percent": "+2.10%",
+            "turnover_rate": "1.55%",
+            "open": "7.05",
+            "high": "7.25",
+            "low": "7.01",
+            "amount": "51234.5",
+            "large_order_net": "0.18",
+            "large_order_amount": "1234.5",
+            "retail_count": "-0.34",
+            "macdfs": "+0.012",
+        },
+    )
+
+    class ClosedRefreshBroker(FakeMarketBroker):
+        async def refresh(self, symbol: str, *, detail: bool, max_age_seconds: float = 0, force: bool = False):
+            self.refresh_calls.append((symbol, detail, max_age_seconds))
+            if force:
+                return replace(stale_quote, symbol=symbol, market_phase=MarketPhase.CLOSED, source_time="15:00")
+            return replace(stale_quote, symbol=symbol, market_phase=MarketPhase.CLOSED, source_time="15:00")
+
+    broker = ClosedRefreshBroker({"601872": stale_quote}, market_open=False)
+    app, _, _ = _build_app(tmp_path, broker=broker)
+    backfill_calls: list[str] = []
+    closed_snap = replace(stale_quote, market_phase=MarketPhase.CLOSED, source_time="15:00")
+    app.state.post_close_backfill = lambda sym: (backfill_calls.append(sym), closed_snap)[1]
+
+    with TestClient(app) as client:
+        wl = client.get("/api/internal/goodluck/watchlists", headers=_headers("uid:alice")).json()
+        primary_id = wl["groups"][0]["id"]
+        assert client.post(
+            f"/api/internal/goodluck/watchlists/groups/{primary_id}/symbols",
+            headers=_headers("uid:alice"),
+            json={"symbol": "601872"},
+        ).status_code == 201
+        backfill_calls.clear()
+        broker.refresh_calls.clear()
+
+        quotes = client.get("/api/internal/goodluck/quotes?symbols=601872", headers=_headers("uid:alice"))
+        assert quotes.status_code == 200
+        assert quotes.json()["items"]["601872"]["market_phase"] == "CLOSED"
+        assert quotes.json()["items"]["601872"]["source_time"] == "15:00"
+        assert ("601872", False, 10.0) in broker.refresh_calls
+
+        snap = client.get("/api/internal/goodluck/symbols/601872/snapshot", headers=_headers("uid:alice")).json()
+        assert snap["metrics"]["open"] == "7.05"
+        assert snap["metrics"]["high"] == "7.25"
+        assert snap["metrics"]["low"] == "7.01"
+        assert snap["metrics"]["amount"] == "51234.5"
+
+        bf = client.post(
+            "/api/internal/goodluck/monitoring/symbols/601872/backfill",
+            headers=_headers("uid:alice"),
+        )
+        assert bf.status_code == 200
+        assert backfill_calls == ["601872"]

@@ -586,3 +586,71 @@ def test_closed_refresh_replaces_stale_trading_phase_and_evict_forces_reload() -
     reloaded = asyncio.run(broker.refresh("301396", detail=True))
     assert reloaded.market_phase is MarketPhase.BREAK
     assert len(source.snapshot_calls) == 2
+
+
+def test_broker_force_refresh_and_batch_quotes_evicts_closed_continuous() -> None:
+    class BatchSource(FakeMarketSource):
+        def __init__(self) -> None:
+            super().__init__()
+            self.batch_calls: list[list[str]] = []
+
+        def read_market_snapshot(self, symbol: str, *, detail: bool) -> MarketSnapshot:
+            return replace(
+                super().read_market_snapshot(symbol, detail=detail),
+                market_phase=MarketPhase.CLOSED,
+                source_time="15:00",
+            )
+
+        def read_quotes_batch(self, symbols: list[str]) -> dict[str, MarketSnapshot]:
+            self.batch_calls.append(list(symbols))
+            return {
+                sym: replace(
+                    super(BatchSource, self).read_market_snapshot(sym, detail=False),
+                    market_phase=MarketPhase.CLOSED,
+                    source_time="15:00",
+                )
+                for sym in symbols
+            }
+
+    source = BatchSource()
+    broker = MarketDataBroker(source, clock=lambda: 100.0, is_market_open=lambda: False)
+    broker.seed(
+        MarketSnapshot(
+            symbol="000001",
+            name="平安银行",
+            market="33",
+            sequence=1,
+            source_time="14:31",
+            collected_at=datetime.now(timezone.utc),
+            quote={"price": "11.00"},
+            market_phase=MarketPhase.CONTINUOUS,
+        )
+    )
+    broker.seed(
+        MarketSnapshot(
+            symbol="601318",
+            name="中国平安",
+            market="17",
+            sequence=1,
+            source_time="15:00",
+            collected_at=datetime.now(timezone.utc),
+            quote={"price": "54.00"},
+            market_phase=MarketPhase.CLOSED,
+            main_fund_flow={"today": {"main_net_inflow": "5.68"}},
+            capabilities={"l2": {"available": True}},
+        )
+    )
+
+    # Normal closed refresh reuses already CLOSED 601318, while force=True refreshes it.
+    asyncio.run(broker.refresh("601318", detail=True))
+    assert len(source.snapshot_calls) == 0
+    forced = asyncio.run(broker.refresh("601318", detail=True, force=True))
+    assert forced.market_phase is MarketPhase.CLOSED
+    assert len(source.snapshot_calls) == 1
+
+    # refresh_quotes_batch reuses CLOSED 601318 and only batch-fetches stale CONTINUOUS 000001.
+    batch = asyncio.run(broker.refresh_quotes_batch(["000001", "601318"], max_age_seconds=10.0))
+    assert source.batch_calls == [["000001"]]
+    assert batch["000001"].market_phase is MarketPhase.CLOSED
+    assert batch["000001"].source_time == "15:00"
+    assert batch["601318"].market_phase is MarketPhase.CLOSED

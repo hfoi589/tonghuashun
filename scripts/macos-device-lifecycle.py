@@ -161,7 +161,7 @@ class DeviceLifecycleManager:
         configs: Mapping[str, DeviceConfig] | None = None,
         boot_timeout_seconds: float = 180.0,
         shutdown_timeout_seconds: float = 60.0,
-        app_start_timeout_seconds: float = 10.0,
+        app_start_timeout_seconds: float = 30.0,
         command_timeout_seconds: float = 10.0,
         poll_interval_seconds: float = 1.0,
         trusted_emulator_path: Path | None = None,
@@ -348,10 +348,14 @@ class DeviceLifecycleManager:
             )
         self._repair_bridge(config)
         self._launch_app(config)
-        deadline = time.monotonic() + self._app_start_timeout_seconds
+        last_launch_at = time.monotonic()
+        deadline = last_launch_at + self._app_start_timeout_seconds
         while time.monotonic() < deadline:
             if self._app_is_running(config):
                 return LifecycleState.RUNNING
+            if time.monotonic() - last_launch_at >= 10.0:
+                self._launch_app(config)
+                last_launch_at = time.monotonic()
             time.sleep(self._poll_interval_seconds)
         raise LifecycleFailure("DEVICE_APP_LAUNCH_FAILED")
 

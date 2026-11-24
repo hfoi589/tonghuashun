@@ -604,6 +604,9 @@ def install_goodluck_routes(
         if broker is None or store is None:
             raise HTTPException(status_code=503, detail="research monitoring is not configured")
         try:
+            evict = getattr(broker, "evict", None)
+            if callable(evict):
+                evict(normalized)
             snapshot = await broker.refresh(normalized, detail=True, max_age_seconds=0)
             changed = await asyncio.to_thread(store.record_snapshot, snapshot)
         except HTTPException:
@@ -1017,6 +1020,9 @@ def install_goodluck_routes(
         async def _backfill_one(code: str) -> dict[str, Any]:
             async with semaphore:
                 try:
+                    evict = getattr(broker, "evict", None)
+                    if callable(evict):
+                        evict(code)
                     snap = await broker.refresh(code, detail=True, max_age_seconds=0)
                     changed = await asyncio.to_thread(store.record_snapshot, snap)
                     return {"symbol": code, "ok": True, "changed_count": len(changed)}

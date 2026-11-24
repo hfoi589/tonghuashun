@@ -3,11 +3,16 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timezone
 from typing import Any, Callable, Mapping
+from zoneinfo import ZoneInfo
 
 from .market_data import fixed_market_error_code
 from .research_premium import PREMIUM_NAMES
 from .research_replay import build_replay_markers
+
+
+SHANGHAI = ZoneInfo("Asia/Shanghai")
 
 
 _FUND_PREFIXES = ("15", "16", "50", "51", "52", "56", "58")
@@ -143,7 +148,10 @@ class ResearchMonitor:
         *,
         dispatcher: object | None = None,
         symbol_lookup: Callable[[str], Any] | None = None,
-        max_concurrent: int = 4,
+        max_concurrent: int = 1,
+        is_market_open: Callable[[], bool] | None = None,
+        is_post_close_window: Callable[[datetime], bool] | None = None,
+        now: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
     ) -> None:
         self.accounts = accounts
         self.broker = broker
@@ -151,12 +159,33 @@ class ResearchMonitor:
         self.dispatcher = dispatcher
         self.symbol_lookup = symbol_lookup
         self.max_concurrent = max_concurrent
+        self.is_market_open = is_market_open
+        self.is_post_close_window = is_post_close_window
+        self.now = now
+        self._finalized_close_date: str | None = None
 
-    async def poll_once(self) -> dict[str, list[str]]:
+    async def poll_once(self, *, force: bool = False) -> dict[str, list[str]]:
+        post_close = False
+        trade_date: str | None = None
+        local_hhmm: str | None = None
+        if not force and self.is_market_open is not None and not self.is_market_open():
+            if self.is_post_close_window is None:
+                return {}
+            local = self.now().astimezone(SHANGHAI)
+            if not self.is_post_close_window(local):
+                return {}
+            trade_date = local.strftime("%Y%m%d")
+            local_hhmm = local.strftime("%H%M")
+            if self._finalized_close_date == trade_date:
+                return {}
+            post_close = True
+
         symbols = await asyncio.to_thread(self.accounts.list_monitored_symbols)
         semaphore = asyncio.Semaphore(self.max_concurrent)
+        had_error = False
 
         async def collect(symbol: str) -> tuple[str, list[str]]:
+            nonlocal had_error
             async with semaphore:
                 try:
                     snapshot = await self.broker.refresh(
@@ -177,6 +206,7 @@ class ResearchMonitor:
                             pass
                     return symbol, changed
                 except Exception as error:
+                    had_error = True
                     code = fixed_market_error_code(
                         error,
                         "MARKET_QUOTE_UNAVAILABLE",
@@ -185,6 +215,8 @@ class ResearchMonitor:
                     return symbol, []
 
         rows = await asyncio.gather(*(collect(symbol) for symbol in symbols))
+        if post_close and trade_date is not None and not had_error and local_hhmm is not None and local_hhmm >= "1501":
+            self._finalized_close_date = trade_date
         return dict(rows)
 
     async def _push_changed(self, symbol: str, changed: list[str]) -> None:

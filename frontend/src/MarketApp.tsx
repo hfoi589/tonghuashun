@@ -503,7 +503,7 @@ function fundFlowValuesForDailyPoint(point: FundFlowDailyPoint): MarketSnapshot[
   }
 }
 
-function FundFlow({ symbol, values, refreshEnabled }: { symbol: string, values: MarketSnapshot['main_fund_flow'], refreshEnabled: boolean }) {
+function FundFlow({ symbol, market, values, refreshEnabled }: { symbol: string, market?: string, values: MarketSnapshot['main_fund_flow'], refreshEnabled: boolean }) {
   const [history, setHistory] = useState<FundFlowHistoryResponse>()
   const [activeTab, setActiveTab] = useState<FundFlowChartTab>('today')
   const [dailyValues, setDailyValues] = useState<MarketSnapshot['main_fund_flow'] | null | undefined>()
@@ -535,6 +535,15 @@ function FundFlow({ symbol, values, refreshEnabled }: { symbol: string, values: 
   const handleDailyPointChange = useCallback((point: FundFlowDailyPoint) => {
     setDailyValues(fundFlowValuesForDailyPoint(point))
   }, [])
+  const isExchangeFund = (market === '20' || market === '36') && Object.keys(values).length === 0
+  if (isExchangeFund) {
+    return <section className="market-section market-fund-flow">
+      <div className="market-capability-gap">
+        <strong>交易所基金（ETF/LOF）无同花顺主力与暗盘资金统计</strong>
+        <span>系统已自动跳过资金账号轮询与历史接口拉取。</span>
+      </div>
+    </section>
+  }
   const displayedValues = activeTab === 'daily' ? dailyValues ?? {} : historicalValues ?? values
   const todayPanelId = `market-fund-flow-today-${symbol}`
   const dailyPanelId = `market-fund-flow-daily-${symbol}`
@@ -563,10 +572,10 @@ function FundFlow({ symbol, values, refreshEnabled }: { symbol: string, values: 
           <button type="button" role="tab" aria-selected={activeTab === 'daily'} aria-controls={dailyPanelId} className={activeTab === 'daily' ? 'active' : ''} onClick={() => selectTab('daily')}>近30日资金流向</button>
         </div>
         <div id={todayPanelId} role="tabpanel" aria-label="当天资金曲线内容" hidden={activeTab !== 'today'}>
-          <FundFlowHistoryPanel symbol={symbol} pollingEnabled={refreshEnabled} onHistoryChange={setHistory} />
+          <FundFlowHistoryPanel symbol={symbol} market={market} pollingEnabled={refreshEnabled} onHistoryChange={setHistory} />
         </div>
         <div id={dailyPanelId} role="tabpanel" aria-label="近30日资金流向内容" hidden={activeTab !== 'daily'}>
-          <FundFlowDailyPanel symbol={symbol} pollingEnabled={refreshEnabled} onSelectedPointChange={handleDailyPointChange} />
+          <FundFlowDailyPanel symbol={symbol} market={market} pollingEnabled={refreshEnabled} onSelectedPointChange={handleDailyPointChange} />
         </div>
       </div>
     </div>
@@ -735,7 +744,7 @@ function PremiumMonitor() {
 }
 
 function Detail({ item, snapshot, period, setPeriod, series, dailyLoading, dailyError, onRetryDaily }: {
-  item: { symbol: string, name: string },
+  item: { symbol: string, name: string, market?: string },
   snapshot?: MarketSnapshot,
   period: ChartPeriod,
   setPeriod: (period: ChartPeriod) => void,
@@ -813,8 +822,8 @@ function Detail({ item, snapshot, period, setPeriod, series, dailyLoading, daily
           ['大单净量', quote.large_order_net], ['大单金额', quote.large_order_amount == null ? null : `${Number(quote.large_order_amount.replace(/万元?$/, '')).toFixed(2)}万元`], ['散户数量', quote.retail_count], ['MACDFS', quote.macdfs],
         ].map(([label, value]) => <article key={label}><span>{label}</span><strong className={`market-number-${tone(value)}`}>{display(value)}</strong></article>)}
       </section>}
-      {isFundFlowPeriod(period) && snapshot && <FundFlow symbol={item.symbol} values={snapshot.main_fund_flow} refreshEnabled={snapshot.market_phase === 'CONTINUOUS' || snapshot.market_phase === 'PREOPEN_QUOTE' || snapshot.market_phase === 'CALL_AUCTION' || snapshot.market_phase === 'AUCTION_LOCKED'} />}
-      {isFundFlowPeriod(period) && !snapshot && <FundFlowHistoryPanel symbol={item.symbol} pollingEnabled={false} />}
+      {isFundFlowPeriod(period) && snapshot && <FundFlow symbol={item.symbol} market={snapshot.market ?? item.market} values={snapshot.main_fund_flow} refreshEnabled={snapshot.market_phase === 'CONTINUOUS' || snapshot.market_phase === 'PREOPEN_QUOTE' || snapshot.market_phase === 'CALL_AUCTION' || snapshot.market_phase === 'AUCTION_LOCKED'} />}
+      {isFundFlowPeriod(period) && !snapshot && <FundFlowHistoryPanel symbol={item.symbol} market={item.market} pollingEnabled={false} />}
       {!isFundFlowPeriod(period) && !l2Available && coreL2Error && <div className="market-capability-gap market-core-l2-gap"><strong>核心八项直连暂不可用</strong><span>{coreL2Error}</span></div>}
       {period === 'dark_pool'
         ? null
@@ -1233,7 +1242,7 @@ export function MarketApp({ embedded = false }: { embedded?: boolean } = {}) {
 
   return <main className={`market-app-shell${embedded ? ' market-app-embedded' : ''}`}>
     <header className="market-topbar">
-      <a href="/market" className="market-wordmark"><span>顺</span><strong>行情中心</strong></a>
+      {!embedded && <a href="/market" className="market-wordmark"><span>顺</span><strong>行情中心</strong></a>}
       <div className="market-search" ref={symbolSearchRef}>
         <form onSubmit={addSymbol}>
           <label className="sr-only" htmlFor="market-symbol">股票代码或名称</label>

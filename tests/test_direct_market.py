@@ -518,6 +518,106 @@ def test_fund_client_circuit_opens_immediately_for_auth_and_rate_limit(
     assert len(calls) == 1
 
 
+def test_fund_client_marks_no_auth_permission_flag_as_expired_and_invalidate_resets() -> None:
+    provider = StaticSessionProvider(session())
+    no_auth_payload = {
+        "data": {
+            "indexes": [
+                {
+                    "index_id": "charge_main_capital",
+                    "attribute": {"win_size": "1", "permission_flag": "NO_AUTH"},
+                    "req_uniq_id": "id_0",
+                },
+                {
+                    "index_id": "charge_main_listed_capital",
+                    "attribute": {"win_size": "1", "permission_flag": "NO_AUTH"},
+                    "req_uniq_id": "id_1",
+                },
+                {
+                    "index_id": "charge_main_grey_capital",
+                    "attribute": {"win_size": "1", "permission_flag": "NO_AUTH"},
+                    "req_uniq_id": "id_2",
+                },
+            ],
+            "data": [
+                {
+                    "code": "17:601872",
+                    "values": [
+                        {"idx": 0, "value": None},
+                        {"idx": 1, "value": None},
+                        {"idx": 2, "value": None},
+                    ],
+                }
+            ],
+            "total": 1,
+        },
+        "status_code": 0,
+        "status_msg": "success",
+    }
+    mode = ["no_auth"]
+
+    def request(_url, _headers, body, _timeout):
+        if mode[0] == "no_auth":
+            return HttpResponse(200, {}, json.dumps(no_auth_payload).encode())
+        return response_for(int(json.loads(body)["indexes"][0]["attribute"]["win_size"]))
+
+    client = FundFlowHttpClient(
+        provider,
+        requester=request,
+        max_requests_per_second=0,
+    )
+
+    with pytest.raises(DirectRequestError) as captured:
+        client.read_direct("601872")
+
+    assert captured.value.error_code == "DIRECT_SESSION_EXPIRED"
+    assert provider.errors == [("main_fund_flow", "DIRECT_SESSION_EXPIRED")]
+
+    mode[0] = "ok"
+    with pytest.raises(DirectRequestError) as tripped:
+        client.read_direct("601872")
+    assert tripped.value.error_code == "DIRECT_SESSION_EXPIRED"
+
+    client.invalidate()
+    outcome = client.read_direct("601872")
+    assert outcome.values[MetricKind.MAIN_FLOW_TODAY_NET] == "1.23456789"
+
+
+def test_fund_client_omits_unit_when_all_period_values_are_null() -> None:
+    empty_payload = {
+        "data": {
+            "indexes": [
+                {"index_id": "charge_main_capital", "attribute": {"win_size": "1", "op": "SUM"}, "req_uniq_id": "id_0"},
+                {"index_id": "charge_main_listed_capital", "attribute": {"win_size": "1", "op": "SUM"}, "req_uniq_id": "id_1"},
+                {"index_id": "charge_main_grey_capital", "attribute": {"win_size": "1", "op": "SUM"}, "req_uniq_id": "id_2"},
+            ],
+            "data": [
+                {
+                    "code": "17:601872",
+                    "values": [
+                        {"idx": 0, "value": None},
+                        {"idx": 1, "value": None},
+                        {"idx": 2, "value": None},
+                    ],
+                }
+            ],
+            "total": 1,
+        },
+        "status_code": 0,
+        "status_msg": "success",
+    }
+    client = FundFlowHttpClient(
+        StaticSessionProvider(session()),
+        requester=lambda *_args: HttpResponse(200, {}, json.dumps(empty_payload).encode()),
+        max_requests_per_second=0,
+    )
+
+    outcome = client.read_direct("601872")
+
+    assert outcome.values[MetricKind.MAIN_FLOW_TODAY_UNIT] is None
+    assert outcome.values[MetricKind.MAIN_FLOW_TODAY_NET] is None
+
+
 def test_shadow_source_returns_primary_and_logs_only_mismatched_field_names(
     caplog,
 ) -> None:

@@ -52,9 +52,13 @@ export function VibeWorkspace() {
     setWatchSyncWarning(null)
     setWorkspaceScope(user.id)
     void marketApi.bootstrapVibeWatchlist().then((result) => {
-      if (!cancelled) setWatchSyncWarning(result.warning)
+      if (cancelled) return
+      setWatchSyncWarning(result.warning)
       if (result.synced) notifyMarketWatchlistChanged()
-      return Promise.all([hydrateNotes(), hydrateWatch()])
+    }).catch(() => {
+      if (!cancelled) setWatchSyncWarning('Vibe 自选同步暂不可用，可刷新页面重试。')
+    }).then(() => {
+      if (!cancelled) return Promise.all([hydrateNotes(), hydrateWatch()])
     }).then(() => {
       if (!cancelled) setReadyUserId(user.id)
     }).catch((reason: unknown) => {

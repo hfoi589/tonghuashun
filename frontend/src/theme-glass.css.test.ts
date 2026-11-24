@@ -18,5 +18,7 @@ describe('aurora glass theme', () => {
 
   it('scopes market dark skin so the light workspace theme keeps its own palette', () => {
     expect(themeCss).not.toMatch(/^\.theme-market /m)
+    expect(themeCss).toContain('html.theme-market.light .market-app-shell')
+    expect(themeCss).toContain('--macd-dif: #1d4ed8;')
   })
 })

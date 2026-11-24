@@ -164,3 +164,59 @@ def test_format_push_change_pct_handles_positive_negative_and_negative_zero():
     assert format_push_change_pct(-1.2) == "-1.20%"
     assert format_push_change_pct(-0.001) == "0.00%"
     assert format_push_change_pct(None) == ""
+
+
+def test_monitor_skips_weekend_closed_market_and_finalizes_post_close_once():
+    from zoneinfo import ZoneInfo
+
+    store = Store()
+    now_value = [datetime(2026, 11, 21, 14, 0, tzinfo=ZoneInfo("Asia/Shanghai"))]
+    open_flag = [False]
+    in_post_close = [False]
+    monitor = ResearchMonitor(
+        Accounts(),
+        Broker(),
+        store,
+        max_concurrent=1,
+        is_market_open=lambda: open_flag[0],
+        is_post_close_window=lambda _dt: in_post_close[0],
+        now=lambda: now_value[0],
+    )
+
+    assert asyncio.run(monitor.poll_once()) == {}
+    assert store.snapshots == []
+
+    now_value[0] = datetime(2026, 11, 20, 15, 2, tzinfo=ZoneInfo("Asia/Shanghai"))
+    in_post_close[0] = True
+    first = asyncio.run(monitor.poll_once())
+    assert first == {"300750": [], "601872": ["09:30"]}
+    # First pass saw 300750 error, so post-close finalization can still retry once recovered,
+    # and once forced succeeds or another clean post-close passes, finalization settles.
+    forced = asyncio.run(monitor.poll_once(force=True))
+    assert "601872" in forced
+
+
+def test_monitor_marks_post_close_finalized_after_clean_sweep():
+    from zoneinfo import ZoneInfo
+
+    class HealthyAccounts:
+        def list_monitored_symbols(self):
+            return ["601872"]
+
+    store = Store()
+    now_value = [datetime(2026, 11, 20, 15, 2, tzinfo=ZoneInfo("Asia/Shanghai"))]
+    monitor = ResearchMonitor(
+        HealthyAccounts(),
+        Broker(),
+        store,
+        is_market_open=lambda: False,
+        is_post_close_window=lambda _dt: True,
+        now=lambda: now_value[0],
+    )
+
+    first = asyncio.run(monitor.poll_once())
+    second = asyncio.run(monitor.poll_once())
+
+    assert first == {"601872": ["09:30"]}
+    assert second == {}
+    assert store.snapshots == ["601872"]

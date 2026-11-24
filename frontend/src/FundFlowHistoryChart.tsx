@@ -48,6 +48,16 @@ function formatWan(value: number | null): string {
   return value === null || !Number.isFinite(value) ? '—' : value.toFixed(2)
 }
 
+export function formatFundFlowAxisTick(value: number, maxAbs: number): string {
+  if (!Number.isFinite(value)) return '0'
+  if (Math.abs(value) >= 10_000) {
+    const inYi = value / 10_000
+    return `${inYi.toFixed(Math.abs(value) >= 100_000 ? 1 : 2)}亿`
+  }
+  if (Math.abs(maxAbs) >= 1_000) return value.toFixed(0)
+  return value.toFixed(Math.abs(maxAbs) >= 100 ? 0 : 2)
+}
+
 export function FundFlowHistoryChart({ period }: { period: FundFlowHistoryPeriod }) {
   const points = period.points.filter((point) => intradayTimeRatio(point.time) !== null)
   const [selectedIndex, setSelectedIndex] = useState(Math.max(0, points.length - 1))
@@ -74,6 +84,7 @@ export function FundFlowHistoryChart({ period }: { period: FundFlowHistoryPeriod
 
   const minValue = Math.min(0, ...values)
   const maxValue = Math.max(0, ...values)
+  const maxAbs = Math.max(Math.abs(minValue), Math.abs(maxValue))
   const spread = Math.max(0.01, maxValue - minValue)
   const min = minValue - spread * 0.08
   const max = maxValue + spread * 0.08
@@ -96,6 +107,21 @@ export function FundFlowHistoryChart({ period }: { period: FundFlowHistoryPeriod
     })
     return path.trim()
   }
+  const selectAtClientX = (element: SVGSVGElement, clientX: number) => {
+    const rect = element.getBoundingClientRect()
+    if (rect.width <= 0) return
+    const svgX = ((clientX - rect.left) / rect.width) * width
+    let nearestIndex = 0
+    let nearestDistance = Number.POSITIVE_INFINITY
+    points.forEach((_point, index) => {
+      const distance = Math.abs(x(index) - svgX)
+      if (distance < nearestDistance) {
+        nearestDistance = distance
+        nearestIndex = index
+      }
+    })
+    setSelectedIndex(nearestIndex)
+  }
   const activeIndex = Math.min(selectedIndex, points.length - 1)
   const activePoint = points[activeIndex]
 
@@ -117,6 +143,8 @@ export function FundFlowHistoryChart({ period }: { period: FundFlowHistoryPeriod
       role="img"
       aria-label="主力明盘、主力暗盘、散户流入和主力净流入历史曲线"
       tabIndex={0}
+      onPointerMove={(event) => selectAtClientX(event.currentTarget, event.clientX)}
+      onPointerDown={(event) => selectAtClientX(event.currentTarget, event.clientX)}
       onKeyDown={(event) => {
         if (event.key === 'ArrowLeft') setSelectedIndex((index) => Math.max(0, index - 1))
         if (event.key === 'ArrowRight') setSelectedIndex((index) => Math.min(points.length - 1, index + 1))
@@ -125,7 +153,7 @@ export function FundFlowHistoryChart({ period }: { period: FundFlowHistoryPeriod
       {[0, 1, 2, 3, 4].map((tick) => {
         const value = max - tick / 4 * (max - min)
         const py = pad.top + tick / 4 * plotHeight
-        return <g key={tick}><line x1={pad.left} x2={width - pad.right} y1={py} y2={py} /><text x={pad.left - 9} y={py + 4} textAnchor="end">{value.toFixed(2)}</text></g>
+        return <g key={tick}><line x1={pad.left} x2={width - pad.right} y1={py} y2={py} /><text x={pad.left - 9} y={py + 4} textAnchor="end">{formatFundFlowAxisTick(value, maxAbs)}</text></g>
       })}
       <line className="fund-flow-history-zero" x1={pad.left} x2={width - pad.right} y1={y(0)} y2={y(0)} />
       {fundFlowSeriesConfig.map(({ key, className, color }) => <path

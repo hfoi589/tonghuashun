@@ -25,6 +25,8 @@ html.theme-market {
   --ag-text: #e8f0fb;
   --ag-muted: #8fa3bd;
   --ag-mono: "SF Mono", "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  --macd-dif: #e6edf5;
+  --macd-dea: #f06b35;
   color-scheme: dark;
 }
 
@@ -638,9 +640,85 @@ html.theme-market:not(.light) {
   --chart-axis: 216 34% 28%;
 }
 html.theme-market.light {
-  --primary: 205 90% 38%;
-  --info: 205 90% 38%;
+  --primary: 217 91% 50%;
+  --info: 217 91% 50%;
   --accent: 239 70% 52%;
+  --macd-dif: #1d4ed8;
+  --macd-dea: #b45309;
+  color-scheme: light;
+}
+html.theme-market.light .market-app-shell {
+  --market-red: #dc2626;
+  --market-red-dark: #b91c1c;
+  --market-green: #059669;
+  --market-ink: #0f172a;
+  --market-muted: #475569;
+  --market-line: rgba(15, 23, 42, 0.11);
+  --market-wash: #f4f7fb;
+  --market-paper: rgba(255, 255, 255, 0.90);
+  --intraday-grid: rgba(15, 23, 42, 0.08);
+  --intraday-zero: rgba(100, 116, 139, 0.45);
+  --intraday-cursor: #475569;
+  --intraday-axis: #64748b;
+  --intraday-ink: #0f172a;
+  --intraday-muted: #475569;
+  --intraday-surface: #ffffff;
+  color: var(--market-ink);
+  background: transparent;
+}
+html.theme-market.light body {
+  background-color: #f4f7fb;
+  background-image:
+    radial-gradient(56rem 34rem at 6% -8%, rgba(37, 99, 235, 0.08), transparent 60%),
+    radial-gradient(52rem 30rem at 94% -4%, rgba(14, 165, 233, 0.08), transparent 60%);
+}
+html.theme-market.light .market-topbar {
+  background: rgba(255, 255, 255, 0.88);
+  color: #0f172a;
+  border-bottom: 1px solid rgba(15, 23, 42, 0.10);
+  box-shadow: 0 10px 26px -18px rgba(15, 23, 42, 0.18);
+  -webkit-backdrop-filter: blur(18px) saturate(160%);
+  backdrop-filter: blur(18px) saturate(160%);
+}
+html.theme-market.light .market-wordmark,
+html.theme-market.light .market-account button,
+html.theme-market.light .market-account > span { color: #0f172a; }
+html.theme-market.light .market-search input {
+  background: rgba(248, 250, 252, 0.95);
+  color: #0f172a;
+  border-color: rgba(15, 23, 42, 0.16);
+}
+html.theme-market.light .market-watchlist,
+html.theme-market.light .market-quote-strip,
+html.theme-market.light .market-chart-panel,
+html.theme-market.light .market-section,
+html.theme-market.light .market-metric-grid,
+html.theme-market.light .market-portfolio-panel,
+html.theme-market.light .market-premium-panel,
+html.theme-market.light .market-research-panel {
+  border-color: rgba(15, 23, 42, 0.11);
+  background: rgba(255, 255, 255, 0.86);
+  color: #0f172a;
+  box-shadow: 0 14px 36px -20px rgba(15, 23, 42, 0.14);
+}
+html.theme-market.light .market-chart-panel > .market-fund-flow,
+html.theme-market.light .market-chart-panel .market-metric-grid {
+  border-left: 0;
+  border-right: 0;
+  background: transparent;
+  box-shadow: none;
+}
+html.theme-market.light .market-symbol-row { background: transparent; border-bottom-color: rgba(15, 23, 42, 0.08); }
+html.theme-market.light .market-symbol-row.active { background: rgba(37, 99, 235, 0.09); border-bottom-color: rgba(37, 99, 235, 0.25); }
+html.theme-market.light .market-symbol-list .market-symbol-name { color: #0f172a; }
+html.theme-market.light .market-period-tabs button.active,
+html.theme-market.light .market-fund-tablist button[aria-selected="true"] { color: #1d4ed8; border-color: #1d4ed8; }
+html.theme-market.light .fund-flow-history-dot { stroke: #ffffff; }
+html.theme-market .market-app-embedded .market-topbar {
+  min-height: 48px;
+  padding: 6px 14px;
+  grid-template-columns: minmax(220px, 460px) 1fr;
+  gap: 12px;
 }
 html.theme-market:not(.light) body { background-color: hsl(var(--background)); }
 html.theme-market.dark body,
@@ -1097,6 +1175,8 @@ html.theme-market:not(.light) .market-replay-performance strong { color: #7dd3fc
   html.theme-market:not(.light) .market-app-embedded .market-workspace { min-height: 0; }
   html.theme-market.dark .market-topbar,
   html.theme-market:not(.light) .market-topbar { grid-template-columns: auto minmax(0, 1fr); }
+  html.theme-market .market-app-embedded .market-topbar { grid-template-columns: minmax(0, 1fr); }
+  html.theme-market .market-app-embedded .market-search { grid-column: 1; }
   html.theme-market.dark .market-watchlist,
   html.theme-market:not(.light) .market-watchlist { margin: 10px 12px; }
   html.theme-market:not(.light) .market-main-pane { padding-inline: 12px; }

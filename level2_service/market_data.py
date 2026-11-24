@@ -467,6 +467,20 @@ class MarketDataBroker:
             else await asyncio.wait_for(next_pending(), timeout=timeout)
         )
 
+    def evict(self, symbol: str | None = None) -> None:
+        if symbol is None:
+            self._cache.clear()
+            self._cache_detail.clear()
+            self._last_polled.clear()
+            self._failure_counts.clear()
+            self._retry_after.clear()
+            return
+        self._cache.pop(symbol, None)
+        self._cache_detail.pop(symbol, None)
+        self._last_polled.pop(symbol, None)
+        self._failure_counts.pop(symbol, None)
+        self._retry_after.pop(symbol, None)
+
     async def refresh(
         self,
         symbol: str,
@@ -480,6 +494,7 @@ class MarketDataBroker:
             if (
                 not self.is_market_open()
                 and cached is not None
+                and cached.market_phase in {MarketPhase.CLOSED, MarketPhase.BREAK}
                 and (not detail or self._cache_detail.get(symbol, False))
             ):
                 return cached

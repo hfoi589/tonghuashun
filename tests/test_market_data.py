@@ -546,3 +546,43 @@ def test_broker_redacts_nonfixed_source_error_details() -> None:
 
     assert event["error_code"] == "MARKET_SOURCE_FAILED"
     assert "private" not in str(event)
+
+
+def test_closed_refresh_replaces_stale_trading_phase_and_evict_forces_reload() -> None:
+    class PhaseSwitchingSource(FakeMarketSource):
+        def __init__(self) -> None:
+            super().__init__()
+            self.phase = MarketPhase.BREAK
+
+        def read_market_snapshot(self, symbol: str, *, detail: bool) -> MarketSnapshot:
+            return replace(
+                super().read_market_snapshot(symbol, detail=detail),
+                market_phase=self.phase,
+            )
+
+    source = PhaseSwitchingSource()
+    broker = MarketDataBroker(source, clock=lambda: 100.0, is_market_open=lambda: False)
+    stale_continuous = MarketSnapshot(
+        symbol="301396",
+        name="宏景科技",
+        market="33",
+        sequence=1,
+        source_time="11:30",
+        collected_at=datetime.now(timezone.utc),
+        quote={"price": "106.33"},
+        market_phase=MarketPhase.CONTINUOUS,
+    )
+    broker.seed(stale_continuous)
+
+    refreshed = asyncio.run(broker.refresh("301396", detail=True))
+    assert refreshed.market_phase is MarketPhase.BREAK
+    assert len(source.snapshot_calls) == 1
+
+    cached = asyncio.run(broker.refresh("301396", detail=True))
+    assert cached.market_phase is MarketPhase.BREAK
+    assert len(source.snapshot_calls) == 1
+
+    broker.evict("301396")
+    reloaded = asyncio.run(broker.refresh("301396", detail=True))
+    assert reloaded.market_phase is MarketPhase.BREAK
+    assert len(source.snapshot_calls) == 2

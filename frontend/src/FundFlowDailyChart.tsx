@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react'
-import { fundFlowSeriesConfig, fundFlowToWan, type FundFlowSeriesKey } from './FundFlowHistoryChart'
+import { formatFundFlowAxisTick, fundFlowSeriesConfig, fundFlowToWan, type FundFlowSeriesKey } from './FundFlowHistoryChart'
 import { marketApi, type FundFlowDailyPoint, type FundFlowDailyResponse } from './market-api'
 
 function dateLabel(value: string): string {
@@ -65,7 +65,7 @@ export function FundFlowDailyChart({ points, onSelectedPointChange }: {
 
   const width = 900
   const height = 420
-  const pad = { top: 24, right: 18, bottom: 96, left: 62 }
+  const pad = { top: 24, right: 18, bottom: 96, left: 64 }
   const plotWidth = width - pad.left - pad.right
   const plotHeight = height - pad.top - pad.bottom
   const labelStep = Math.max(1, Math.ceil((cumulative.length - 1) / 5))
@@ -75,6 +75,7 @@ export function FundFlowDailyChart({ points, onSelectedPointChange }: {
   }, [])
   const minValue = Math.min(0, ...values)
   const maxValue = Math.max(0, ...values)
+  const maxAbs = Math.max(Math.abs(minValue), Math.abs(maxValue))
   const spread = Math.max(0.01, maxValue - minValue)
   const min = minValue - spread * 0.08
   const max = maxValue + spread * 0.08
@@ -86,6 +87,13 @@ export function FundFlowDailyChart({ points, onSelectedPointChange }: {
     return `${path}${path ? ' L' : 'M'}${x(index).toFixed(2)},${y(value).toFixed(2)}`
   }, '')
   const activePoint = cumulative[activeIndex]
+  const selectAtClientX = (element: SVGSVGElement, clientX: number) => {
+    const rect = element.getBoundingClientRect()
+    if (rect.width <= 0) return
+    const svgX = (clientX - rect.left) / rect.width * width
+    const ratio = Math.max(0, Math.min(1, (svgX - pad.left) / plotWidth))
+    setSelectedIndex(Math.round(ratio * Math.max(0, cumulative.length - 1)))
+  }
 
   return <section className="fund-flow-daily-chart" aria-label="近30日收盘资金流向">
     <div className="fund-flow-daily-readout" aria-live="polite">
@@ -100,13 +108,8 @@ export function FundFlowDailyChart({ points, onSelectedPointChange }: {
       role="img"
       aria-label="最近30个交易日资金流向折线图"
       tabIndex={0}
-      onPointerMove={(event) => {
-        const rect = event.currentTarget.getBoundingClientRect()
-        if (rect.width <= 0) return
-        const svgX = (event.clientX - rect.left) / rect.width * width
-        const ratio = Math.max(0, Math.min(1, (svgX - pad.left) / plotWidth))
-        setSelectedIndex(Math.round(ratio * Math.max(0, cumulative.length - 1)))
-      }}
+      onPointerMove={(event) => selectAtClientX(event.currentTarget, event.clientX)}
+      onPointerDown={(event) => selectAtClientX(event.currentTarget, event.clientX)}
       onKeyDown={(event) => {
         if (event.key === 'ArrowLeft') setSelectedIndex((index) => Math.max(0, index - 1))
         if (event.key === 'ArrowRight') setSelectedIndex((index) => Math.min(cumulative.length - 1, index + 1))
@@ -115,7 +118,7 @@ export function FundFlowDailyChart({ points, onSelectedPointChange }: {
       {[0, 1, 2, 3, 4].map((tick) => {
         const value = max - tick / 4 * (max - min)
         const py = pad.top + tick / 4 * plotHeight
-        return <g key={tick}><line x1={pad.left} x2={width - pad.right} y1={py} y2={py} /><text x={pad.left - 9} y={py + 4} textAnchor="end">{value.toFixed(2)}</text></g>
+        return <g key={tick}><line x1={pad.left} x2={width - pad.right} y1={py} y2={py} /><text x={pad.left - 9} y={py + 4} textAnchor="end">{formatFundFlowAxisTick(value, maxAbs)}</text></g>
       })}
       <line className="fund-flow-history-zero" x1={pad.left} x2={width - pad.right} y1={y(0)} y2={y(0)} />
       {fundFlowSeriesConfig.map(({ key, className, color }) => <path key={key} className={`fund-flow-history-series fund-flow-history-series-${className}`} d={pathFor(key)} style={{ stroke: color }} />)}
@@ -132,16 +135,23 @@ export function FundFlowDailyChart({ points, onSelectedPointChange }: {
   </section>
 }
 
-export function FundFlowDailyPanel({ symbol, pollingEnabled = true, onSelectedPointChange }: {
+export function FundFlowDailyPanel({ symbol, market, pollingEnabled: _pollingEnabled = false, onSelectedPointChange }: {
   symbol: string
+  market?: string
   pollingEnabled?: boolean
   onSelectedPointChange?: (point: FundFlowDailyPoint) => void
 }) {
   const [history, setHistory] = useState<FundFlowDailyResponse>()
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string>()
-  const [refreshVersion, setRefreshVersion] = useState(0)
+  const unsupportedFund = market === '20' || market === '36'
   useEffect(() => {
+    if (unsupportedFund) {
+      setHistory(undefined)
+      setError(undefined)
+      setLoading(false)
+      return
+    }
     const controller = new AbortController()
     setLoading(true)
     setError(undefined)
@@ -150,15 +160,11 @@ export function FundFlowDailyPanel({ symbol, pollingEnabled = true, onSelectedPo
       .catch((reason) => { if (!controller.signal.aborted) setError(reason instanceof Error ? reason.message : '资金日线读取失败') })
       .finally(() => { if (!controller.signal.aborted) setLoading(false) })
     return () => controller.abort()
-  }, [refreshVersion, symbol])
-  useEffect(() => {
-    if (!pollingEnabled) return
-    const timer = window.setInterval(() => setRefreshVersion((version) => version + 1), 30_000)
-    return () => window.clearInterval(timer)
-  }, [pollingEnabled])
+  }, [symbol, unsupportedFund])
   return <section className="fund-flow-daily-panel" aria-label="近30日收盘资金流向">
     <div className="market-section-title"><div><span>30D CAPITAL FLOW</span><h3>近30日资金流向</h3></div><small>每日收盘值 · 单位：万元</small></div>
-    {loading ? <div className="market-empty-chart">正在加载资金日线…</div>
+    {unsupportedFund ? <div className="market-empty-chart">交易所基金（ETF/LOF）无同花顺主力与暗盘日线统计</div>
+      : loading ? <div className="market-empty-chart">正在加载资金日线…</div>
       : error ? <div className="market-capability-gap"><strong>资金日线加载失败</strong><span>{error}</span></div>
         : <FundFlowDailyChart points={history?.points ?? []} onSelectedPointChange={onSelectedPointChange} />}
   </section>

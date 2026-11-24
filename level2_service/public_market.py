@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from threading import Lock, RLock
-from typing import Callable
+from typing import Any, Callable
 from urllib.request import Request, urlopen
 
 from .market_data import KlineBar, MarketSeriesPage, MarketSnapshot, TimesharePoint
@@ -582,6 +582,7 @@ class DirectEnrichedMarketDataSource:
         is_market_open: Callable[[], bool] = lambda: True,
         is_watchlist_symbol: Callable[[str], bool] = lambda _symbol: True,
         closed_enrichment: Callable[[str], DirectReadOutcome | None] | None = None,
+        fund_flow_fallback: Callable[[str], dict[str, Any] | None] | None = None,
     ) -> None:
         if ttl_seconds <= 0:
             raise ValueError("ttl_seconds must be positive")
@@ -595,6 +596,7 @@ class DirectEnrichedMarketDataSource:
         self.is_market_open = is_market_open
         self.is_watchlist_symbol = is_watchlist_symbol
         self.closed_enrichment = closed_enrichment
+        self.fund_flow_fallback = fund_flow_fallback
         self._lock = RLock()
         # Direct L2 reads are optional and may serialize behind the App
         # protocol client's connection lock. Never let one slow read stall
@@ -603,6 +605,10 @@ class DirectEnrichedMarketDataSource:
         self._cache: dict[str, _EnrichmentEntry] = {}
         self._closed_fallback_attempted: set[str] = set()
         self._closed_fallback_outcomes: dict[str, DirectReadOutcome] = {}
+
+    def invalidate_cache(self) -> None:
+        with self._lock:
+            self._cache.clear()
 
     def _read_enrichment(self, symbol: str) -> _EnrichmentEntry:
         now = self.clock()
@@ -653,10 +659,11 @@ class DirectEnrichedMarketDataSource:
                     )
         finally:
             self._enrichment_lock.release()
-        with self._lock:
-            self._cache[symbol] = entry
-            while len(self._cache) > self.max_cache_entries:
-                self._cache.pop(next(iter(self._cache)))
+        if entry.error_code != "DIRECT_ENRICHMENT_BUSY":
+            with self._lock:
+                self._cache[symbol] = entry
+                while len(self._cache) > self.max_cache_entries:
+                    self._cache.pop(next(iter(self._cache)))
         return entry
 
     @staticmethod
@@ -707,7 +714,7 @@ class DirectEnrichedMarketDataSource:
                 name: values.get(kind)
                 for name, kind in metrics.items()
             }
-            if unit is not None or any(
+            if any(
                 value is not None for value in period_values.values()
             ):
                 main_fund_flow[period] = {
@@ -785,11 +792,46 @@ class DirectEnrichedMarketDataSource:
             )
         entry = self._read_enrichment(symbol)
         if entry.outcome is None:
-            return self._without_enrichment(
+            merged = self._without_enrichment(
                 snapshot,
                 entry.error_code or "DIRECT_REQUEST_FAILED",
             )
-        return self._merge(snapshot, entry.outcome)
+        else:
+            merged = self._merge(snapshot, entry.outcome)
+        if (
+            not merged.main_fund_flow
+            and self.is_watchlist_symbol(symbol)
+            and callable(self.fund_flow_fallback)
+        ):
+            try:
+                stored_ff = self.fund_flow_fallback(symbol)
+            except Exception:
+                stored_ff = None
+            if isinstance(stored_ff, dict) and isinstance(stored_ff.get("periods"), dict):
+                fallback_periods = {
+                    period: row
+                    for period, row in stored_ff["periods"].items()
+                    if isinstance(row, dict)
+                    and any(
+                        row.get(k) is not None
+                        for k in (
+                            "main_net_inflow",
+                            "main_visible_inflow",
+                            "main_hidden_inflow",
+                            "retail_inflow",
+                        )
+                    )
+                }
+                if fallback_periods:
+                    stored_trade_dates = dict(merged.stored_trade_dates)
+                    if stored_ff.get("trade_date") is not None:
+                        stored_trade_dates["main_fund_flow"] = str(stored_ff["trade_date"])
+                    merged = replace(
+                        merged,
+                        main_fund_flow=fallback_periods,
+                        stored_trade_dates=stored_trade_dates,
+                    )
+        return merged
 
     def read_market_series(
         self,

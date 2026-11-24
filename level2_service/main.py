@@ -7,7 +7,7 @@ import socket
 import time
 from math import isfinite
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from functools import partial
 from pathlib import Path
 from typing import Callable, Mapping
@@ -556,12 +556,28 @@ def create_production_app(
                     break
     navigator = Level2Navigator(core_bridge, OpenCVTemplateFallback(templates))
     market_accounts = SQLiteMarketAccountStore(config.market_database_path)
-    research_store = SQLiteResearchStore(config.research_database_path)
     trading_calendar = LocalTradingCalendar(config.trading_calendar_path)
 
     def market_is_open() -> bool:
         local = datetime.now(timezone.utc).astimezone(SHANGHAI_TZ)
         return trading_calendar.is_trading_day(local.date()) and is_china_market_open(local)
+
+    def market_enrichment_is_open() -> bool:
+        local = datetime.now(timezone.utc).astimezone(SHANGHAI_TZ)
+        if not trading_calendar.is_trading_day(local.date()):
+            return False
+        minute = local.hour * 60 + local.minute
+        return (
+            9 * 60 + 30 <= minute <= 11 * 60 + 31
+            or 13 * 60 <= minute <= 15 * 60 + 5
+        )
+
+    def is_research_post_close_window(moment: datetime) -> bool:
+        local = moment.astimezone(SHANGHAI_TZ)
+        if not trading_calendar.is_trading_day(local.date()):
+            return False
+        minute = local.hour * 60 + local.minute
+        return 15 * 60 <= minute <= 15 * 60 + 5
 
     def previous_trading_date(value: str) -> str:
         current = datetime.strptime(value, "%Y%m%d").date()
@@ -569,6 +585,16 @@ def create_production_app(
         while not trading_calendar.is_trading_day(current):
             current -= timedelta(days=1)
         return current.strftime("%Y%m%d")
+
+    def resolve_trading_date(current: date) -> str:
+        if trading_calendar.is_trading_day(current):
+            return current.strftime("%Y%m%d")
+        return previous_trading_date(current.strftime("%Y%m%d"))
+
+    research_store = SQLiteResearchStore(
+        config.research_database_path,
+        resolve_trade_date=resolve_trading_date,
+    )
 
     market_phase_resolver = MarketPhaseResolver(
         is_trading_day=trading_calendar.is_trading_day,
@@ -746,16 +772,18 @@ def create_production_app(
             },
         )
 
+    enriched_market_source = DirectEnrichedMarketDataSource(
+        public_market_source,
+        direct_market_enrichment,
+        ttl_seconds=config.market_direct_enrichment_ttl_seconds,
+        is_market_open=market_enrichment_is_open,
+        is_watchlist_symbol=lambda symbol: symbol
+        in set(market_accounts.list_watchlist_symbols()),
+        closed_enrichment=closed_market_enrichment,
+        fund_flow_fallback=research_store.latest_fund_flow_snapshot,
+    )
     public_market_data_source = DailyKlineMarketDataSource(
-        DirectEnrichedMarketDataSource(
-            public_market_source,
-            direct_market_enrichment,
-            ttl_seconds=config.market_direct_enrichment_ttl_seconds,
-            is_market_open=market_is_open,
-            is_watchlist_symbol=lambda symbol: symbol
-            in set(market_accounts.list_watchlist_symbols()),
-            closed_enrichment=closed_market_enrichment,
-        ),
+        enriched_market_source,
         TonghuashunPublicDailyKlineProvider(),
         is_market_open=market_is_open,
     )
@@ -794,6 +822,9 @@ def create_production_app(
         research_store,
         dispatcher=push_dispatcher,
         symbol_lookup=symbol_catalog.lookup,
+        max_concurrent=1,
+        is_market_open=market_is_open,
+        is_post_close_window=is_research_post_close_window,
     )
     fund_flow_monitor = (
         FundFlowHistoryMonitor(
@@ -821,6 +852,14 @@ def create_production_app(
         and config.device_lifecycle_token is not None
         else None
     )
+    def invalidate_fund_session() -> None:
+        if config.dual_account_mode:
+            if hasattr(parsed_value_source, "invalidate_fund"):
+                parsed_value_source.invalidate_fund()
+        elif parsed_value_source is not None and hasattr(parsed_value_source, "invalidate"):
+            parsed_value_source.invalidate()
+        enriched_market_source.invalidate_cache()
+
     app = create_app(
         store=store,
         admin_password_hash=config.admin_password_hash,
@@ -852,6 +891,7 @@ def create_production_app(
             if direct_core_source is not None
             else None
         ),
+        fund_session_invalidator=invalidate_fund_session,
         managed_resources=tuple(
             resource
             for resource in (direct_core_source, parsed_value_source, research_store)

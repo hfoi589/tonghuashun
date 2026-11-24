@@ -9,6 +9,7 @@ from threading import RLock
 from typing import Any, Callable
 
 import asyncio
+import inspect
 import secrets
 
 from fastapi import Depends, FastAPI, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
@@ -957,7 +958,11 @@ def install_market_routes(
         if normalized not in accounts.monitoring_state(user.id):
             raise HTTPException(status_code=404, detail="watchlist symbol not found")
         try:
-            snapshot = await market_broker().refresh(
+            broker = market_broker()
+            evict = getattr(broker, "evict", None)
+            if callable(evict):
+                evict(normalized)
+            snapshot = await broker.refresh(
                 normalized,
                 detail=True,
                 max_age_seconds=0,
@@ -1041,7 +1046,10 @@ def install_market_routes(
         monitor = app.state.research_monitor
         if monitor is None:
             raise HTTPException(status_code=503, detail="research monitor is not configured")
-        result = await monitor.poll_once()
+        if "force" in inspect.signature(monitor.poll_once).parameters:
+            result = await monitor.poll_once(force=True)
+        else:
+            result = await monitor.poll_once()
         return {"symbols": result}
 
     @app.get("/api/admin/premium")
@@ -1162,8 +1170,12 @@ def install_market_routes(
                     if "already exists" not in str(error):
                         raise HTTPException(status_code=409, detail=str(error)) from None
             if bool(payload.get("backfill", True)):
+                broker = market_broker()
+                evict = getattr(broker, "evict", None)
                 for symbol in normalized:
-                    snapshot = await market_broker().refresh(symbol, detail=True, max_age_seconds=0)
+                    if callable(evict):
+                        evict(symbol)
+                    snapshot = await broker.refresh(symbol, detail=True, max_age_seconds=0)
                     research_store().record_snapshot(snapshot)
         elif action in {"activate", "deactivate"}:
             for symbol in normalized:
@@ -1172,8 +1184,12 @@ def install_market_routes(
                 except LookupError:
                     raise HTTPException(status_code=404, detail="watchlist symbol not found") from None
         elif action == "backfill":
+            broker = market_broker()
+            evict = getattr(broker, "evict", None)
             for symbol in normalized:
-                snapshot = await market_broker().refresh(symbol, detail=True, max_age_seconds=0)
+                if callable(evict):
+                    evict(symbol)
+                snapshot = await broker.refresh(symbol, detail=True, max_age_seconds=0)
                 research_store().record_snapshot(snapshot)
         else:
             raise HTTPException(status_code=422, detail="unsupported watchlist action")
@@ -1188,9 +1204,13 @@ def install_market_routes(
         accounts, _sessions = stores()
         symbols = [symbol for symbol, enabled in accounts.monitoring_state(user.id).items() if enabled]
         results = []
+        broker = market_broker()
+        evict = getattr(broker, "evict", None)
         for symbol in symbols:
             try:
-                snapshot = await market_broker().refresh(symbol, detail=True, max_age_seconds=0)
+                if callable(evict):
+                    evict(symbol)
+                snapshot = await broker.refresh(symbol, detail=True, max_age_seconds=0)
                 changed = research_store().record_snapshot(snapshot)
                 results.append({"code": symbol, "ok": True, "changedMinutes": changed})
             except Exception as error:

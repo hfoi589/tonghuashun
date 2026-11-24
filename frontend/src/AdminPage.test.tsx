@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { AdminPage, DeviceViewport } from './AdminPage'
@@ -168,6 +168,11 @@ describe('AdminPage', () => {
     expect(screen.getByRole('heading', { name: 'Server酱³' })).toBeInTheDocument()
     expect(screen.getByRole('heading', { name: '企业微信' })).toBeInTheDocument()
     expect(screen.getByRole('heading', { name: '推送规则' })).toBeInTheDocument()
+    expect(screen.getByText(/JSON 格式有效 · 共 1 条规则（启用 1 条）/)).toBeInTheDocument()
+    expect(screen.getByText(/\[买入\] 买入/)).toBeInTheDocument()
+    fireEvent.change(screen.getByLabelText('规则 JSON'), { target: { value: '{broken' } })
+    expect(await screen.findByText(/规则 JSON 校验失败：/)).toBeInTheDocument()
+    fireEvent.change(screen.getByLabelText('规则 JSON'), { target: { value: '[{"id":"buy","enabled":true,"side":"buy","title":"买入","joiner":"and","conditions":[]}]' } })
     fireEvent.change(screen.getByLabelText('MACD 短期'), { target: { value: '8' } })
     await userEvent.click(screen.getByRole('button', { name: '保存 MACD 参数' }))
     await waitFor(() => expect(requests.some((request) => request.url === '/api/admin/research/macd' && request.init?.method === 'PUT')).toBe(true))
@@ -821,6 +826,40 @@ describe('AdminPage', () => {
     render(<DeviceViewport role="core_metrics" active locked />)
 
     await waitFor(() => expect(FakeWebSocket.instance?.url).toBe(`ws://${window.location.host}/api/admin/device`))
+  })
+
+  it('automatically reconnects the device websocket after an unexpected close while active', async () => {
+    vi.useFakeTimers()
+    try {
+      class FakeWebSocket {
+        static instances: FakeWebSocket[] = []
+        static OPEN = 1
+        readyState = FakeWebSocket.OPEN
+        close = vi.fn()
+        send = vi.fn()
+        onopen: (() => void) | null = null
+        onclose: (() => void) | null = null
+        onerror: (() => void) | null = null
+        onmessage: ((event: MessageEvent) => void) | null = null
+        constructor(public readonly url: string) { FakeWebSocket.instances.push(this) }
+      }
+      vi.stubGlobal('WebSocket', FakeWebSocket)
+
+      render(<DeviceViewport role="main_fund_flow" active locked streamUrl="ws://runner/fund" />)
+      expect(FakeWebSocket.instances).toHaveLength(1)
+      act(() => {
+        FakeWebSocket.instances[0].onopen?.()
+        FakeWebSocket.instances[0].onclose?.()
+      })
+      expect(screen.getByText('设备画面连接不可用，当前离线')).toBeInTheDocument()
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(1500)
+      })
+      expect(FakeWebSocket.instances).toHaveLength(2)
+    } finally {
+      vi.useRealTimers()
+    }
   })
 
   it('keeps both account devices online simultaneously and warns against exiting the fund account', async () => {

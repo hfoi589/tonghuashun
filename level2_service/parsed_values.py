@@ -368,7 +368,7 @@ class DualAccountParsedValueSource:
                     metrics = FUND_FLOW_METRICS[period]
                     period_values = {name: values.get(kind) for name, kind in metrics.items()}
                     unit = values.get(unit_kind)
-                    if unit is not None or any(value is not None for value in period_values.values()):
+                    if any(value is not None for value in period_values.values()):
                         main_fund_flow[period] = {"unit": unit, **period_values}
                 result = main_fund_flow, outcome.source_errors.get("main_fund_flow") if isinstance(outcome, DirectReadOutcome) else None
         except DirectRequestError as error:
@@ -391,6 +391,14 @@ class DualAccountParsedValueSource:
         limit: int,
     ) -> MarketSeriesPage:
         return self.core_source.read_market_series(symbol, period, cursor, limit)
+
+    def invalidate_fund(self) -> None:
+        with self._fund_market_lock:
+            self._fund_market_cache.clear()
+        for source in (self.fund_read_source, self.fund_source):
+            invalidator = getattr(source, "invalidate", None)
+            if callable(invalidator):
+                invalidator()
 
     def close(self) -> None:
         self._executor.shutdown(wait=False, cancel_futures=True)
@@ -684,7 +692,7 @@ class FridaParsedValueSource:
         main_fund_flow: dict[str, Any] = {}
         for period, _label, unit_kind in FUND_FLOW_PERIODS:
             metrics = FUND_FLOW_METRICS[period]
-            if values.get(unit_kind) is None and all(values.get(kind) is None for kind in metrics.values()):
+            if all(values.get(kind) is None for kind in metrics.values()):
                 continue
             main_fund_flow[period] = {
                 "unit": values.get(unit_kind),

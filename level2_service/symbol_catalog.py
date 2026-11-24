@@ -52,6 +52,8 @@ def _http_get(url: str, timeout: float) -> str:
 
 
 _SINA_NODES = ("hs_a", "etf_hq_fund", "lof_hq_fund")
+# Sina fund counts can exceed the number of rows in the category pages.
+_SINA_COUNT_DRIFT_NODES = {"etf_hq_fund", "lof_hq_fund"}
 _NODE_KINDS = {
     "hs_a": {"17", "33", "151"},
     "etf_hq_fund": {"20", "36"},
@@ -149,7 +151,7 @@ class SinaSymbolCatalogSource:
             if not isinstance(payload, list):
                 raise SymbolCatalogError("SYMBOL_CATALOG_SOURCE_INVALID")
             if not payload:
-                if node == "lof_hq_fund" and seen_records > 0:
+                if node in _SINA_COUNT_DRIFT_NODES and seen_records > 0:
                     break
                 raise SymbolCatalogError("SYMBOL_CATALOG_SOURCE_INCOMPLETE")
             seen_records += len(payload)
@@ -158,7 +160,7 @@ class SinaSymbolCatalogSource:
                 if parsed is not None:
                     results.append(parsed)
             if len(payload) < self.page_size:
-                if expected_count - seen_records > 1 and node != "lof_hq_fund":
+                if expected_count - seen_records > 1 and node not in _SINA_COUNT_DRIFT_NODES:
                     raise SymbolCatalogError("SYMBOL_CATALOG_SOURCE_INCOMPLETE")
                 break
             page += 1
@@ -391,13 +393,19 @@ class SQLiteSymbolCatalog:
         now = self._now()
         with self._lock, self._connect() as connection:
             active = self._active_row(connection)
-            minimum = self.minimum_security_count
-            if active is not None:
-                minimum = max(minimum, int(active["security_count"] * self.shrink_ratio + 0.999999))
-            if len(candidates) < minimum:
+            if len(candidates) < self.minimum_security_count:
                 raise SymbolCatalogError(
                     "SYMBOL_CATALOG_TOO_SMALL" if active is None else "SYMBOL_CATALOG_SHRINK_REJECTED"
                 )
+            if active is not None:
+                previous_stock_count = connection.execute(
+                    """SELECT COUNT(*) FROM catalog_securities
+                       WHERE version_id=? AND market IN ('17', '33', '151')""",
+                    (active["version_id"],),
+                ).fetchone()[0]
+                stock_count = sum(value.market in _NODE_KINDS["hs_a"] for value in candidates)
+                if stock_count < previous_stock_count * self.shrink_ratio:
+                    raise SymbolCatalogError("SYMBOL_CATALOG_SHRINK_REJECTED")
             with connection:
                 cursor = connection.execute(
                     """INSERT INTO catalog_versions(

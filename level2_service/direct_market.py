@@ -1058,6 +1058,14 @@ class FundFlowHttpClient:
         self._breaker_open_until = 0.0
         self._breaker_error = "DIRECT_HTTP_FORBIDDEN"
 
+    def invalidate(self) -> None:
+        with self._lock:
+            self._cache.clear()
+        with self._breaker_lock:
+            self._breaker_failures = 0
+            self._breaker_trips = 0
+            self._breaker_open_until = 0.0
+
     def _wait_for_request_slot(self) -> None:
         """Reserve the next global request slot and sleep until it arrives."""
         if self.request_spacing_seconds <= 0:
@@ -1149,11 +1157,19 @@ class FundFlowHttpClient:
             raw_values = matching[0].get("values")
             if not isinstance(raw_values, list):
                 raise ValueError("fund flow response values are invalid")
-            index_names = {
-                position: item.get("index_id")
-                for position, item in enumerate(indexes)
-                if isinstance(item, dict) and item.get("index_id") in FUND_FLOW_INDEXES
-            }
+            index_names: dict[int, str] = {}
+            for position, item in enumerate(indexes):
+                if not isinstance(item, dict):
+                    continue
+                index_id = item.get("index_id")
+                if index_id not in FUND_FLOW_INDEXES:
+                    continue
+                attribute = item.get("attribute")
+                if isinstance(attribute, Mapping):
+                    flag = str(attribute.get("permission_flag") or "").strip().upper()
+                    if flag == "NO_AUTH":
+                        raise DirectRequestError("DIRECT_SESSION_EXPIRED")
+                index_names[position] = str(index_id)
             result = {name: None for name in FUND_FLOW_INDEXES}
             for item in raw_values:
                 if not isinstance(item, dict):
@@ -1166,6 +1182,8 @@ class FundFlowHttpClient:
                 if name is not None:
                     result[name] = _decimal(item.get("value"))
             return result
+        except DirectRequestError:
+            raise
         except (
             KeyError,
             TypeError,
@@ -1207,7 +1225,16 @@ class FundFlowHttpClient:
             raise DirectRequestError("DIRECT_HTTP_FORBIDDEN")
         if response.status_code < 200 or response.status_code >= 300:
             raise DirectRequestError("DIRECT_FUND_FLOW_REQUEST_FAILED")
-        raw = self._response_values(response, symbol, market)
+        try:
+            raw = self._response_values(response, symbol, market)
+        except DirectRequestError as error:
+            if error.error_code == "DIRECT_SESSION_EXPIRED":
+                self.session_provider.mark_error(
+                    "main_fund_flow",
+                    "DIRECT_SESSION_EXPIRED",
+                )
+                self._record_breaker_failure("DIRECT_SESSION_EXPIRED", immediate=True)
+            raise
         self._record_breaker_success()
         present = [number.copy_abs() for number in raw.values() if number is not None]
         divisor = (
@@ -1221,7 +1248,11 @@ class FundFlowHttpClient:
         listed = raw["charge_main_listed_capital"]
         grey = raw["charge_main_grey_capital"]
         return {
-            unit_kind: "亿元" if divisor == Decimal(100000000) else "万元",
+            unit_kind: (
+                ("亿元" if divisor == Decimal(100000000) else "万元")
+                if present
+                else None
+            ),
             metrics["main_net_inflow"]: _formatted(
                 main / divisor if main is not None else None
             ),
@@ -1413,6 +1444,12 @@ class ShadowParsedValueSource:
                     self.role,
                 )
         return primary
+
+    def invalidate(self) -> None:
+        for source in (self.primary, self.candidate):
+            invalidator = getattr(source, "invalidate", None)
+            if callable(invalidator):
+                invalidator()
 
     def __getattr__(self, name: str) -> object:
         return getattr(self.primary, name)

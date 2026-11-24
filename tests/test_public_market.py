@@ -982,3 +982,133 @@ def test_empty_direct_enrichment_does_not_mark_l2_available() -> None:
 
     assert result.capabilities["l2"]["available"] is False
     assert result.capabilities["l2"]["reason"] == "DIRECT_ENRICHMENT_EMPTY"
+
+
+def test_busy_direct_enrichment_error_returned_by_source_is_not_cached_for_ttl() -> None:
+    from level2_service.public_market import DirectEnrichedMarketDataSource
+
+    snapshot = MarketSnapshot(
+        symbol="601872",
+        name="招商轮船",
+        market="17",
+        sequence=0,
+        source_time="15:00",
+        collected_at=datetime.now(timezone.utc),
+        quote={"price": "18.62"},
+        source="TENCENT_PUBLIC",
+    )
+
+    class Base:
+        @staticmethod
+        def read_market_snapshot(_symbol: str, *, detail: bool):
+            return snapshot
+
+    calls = [0]
+
+    class FlakyDirect:
+        @staticmethod
+        def read_direct(_symbol: str):
+            calls[0] += 1
+            if calls[0] == 1:
+                raise DirectRequestError("DIRECT_ENRICHMENT_BUSY")
+            values = {kind: None for kind in MetricKind}
+            values[MetricKind.LARGE_ORDER_NET] = "0.50"
+            return DirectReadOutcome(
+                values=values,
+                source_errors={"core_metrics": None, "main_fund_flow": None},
+            )
+
+    source = DirectEnrichedMarketDataSource(
+        Base(),
+        FlakyDirect(),
+        ttl_seconds=60.0,
+        clock=lambda: 100.0,
+    )
+
+    first = source.read_market_snapshot("601872", detail=True)
+    second = source.read_market_snapshot("601872", detail=True)
+
+    assert first.source_errors["core_metrics"] == "DIRECT_ENRICHMENT_BUSY"
+    assert second.quote["large_order_net"] == "0.50"
+    assert calls[0] == 2
+
+
+def test_direct_enrichment_drops_empty_unit_shell_and_falls_back_to_stored_fund_flow() -> None:
+    from level2_service.public_market import DirectEnrichedMarketDataSource
+
+    snapshot = MarketSnapshot(
+        symbol="301396",
+        name="宏景科技",
+        market="33",
+        sequence=0,
+        source_time="11:30",
+        collected_at=datetime.now(timezone.utc),
+        quote={"price": "106.33"},
+        source="TENCENT_PUBLIC",
+    )
+
+    class Base:
+        @staticmethod
+        def read_market_snapshot(_symbol: str, *, detail: bool):
+            return snapshot
+
+    values = {kind: None for kind in MetricKind}
+    values.update(
+        {
+            MetricKind.LARGE_ORDER_NET: "0.03",
+            MetricKind.MAIN_FLOW_TODAY_UNIT: "万元",
+            MetricKind.MAIN_FLOW_THREE_DAY_UNIT: "万元",
+            MetricKind.MAIN_FLOW_FIVE_DAY_UNIT: "万元",
+        }
+    )
+
+    class Direct:
+        @staticmethod
+        def read_direct(_symbol: str):
+            return DirectReadOutcome(
+                values=values,
+                source_errors={"core_metrics": None, "main_fund_flow": "DIRECT_SESSION_EXPIRED"},
+            )
+
+    stored_periods = {
+        "today": {
+            "unit": "亿元",
+            "main_net_inflow": "-1.75",
+            "main_visible_inflow": "0.05",
+            "main_hidden_inflow": "-1.80",
+            "retail_inflow": "1.75",
+        },
+        "three_day": {
+            "unit": "亿元",
+            "main_net_inflow": "3.49",
+            "main_visible_inflow": "2.96",
+            "main_hidden_inflow": "0.52",
+            "retail_inflow": "-3.49",
+        },
+        "five_day": {
+            "unit": "亿元",
+            "main_net_inflow": "13.25",
+            "main_visible_inflow": "7.91",
+            "main_hidden_inflow": "5.34",
+            "retail_inflow": "-13.25",
+        },
+    }
+
+    without_fallback = DirectEnrichedMarketDataSource(
+        Base(),
+        Direct(),
+        is_market_open=lambda: True,
+    ).read_market_snapshot("301396", detail=True)
+    assert without_fallback.main_fund_flow == {}
+
+    with_fallback = DirectEnrichedMarketDataSource(
+        Base(),
+        Direct(),
+        is_market_open=lambda: True,
+        is_watchlist_symbol=lambda _s: True,
+        fund_flow_fallback=lambda _s: {"trade_date": "20261124", "periods": stored_periods},
+    ).read_market_snapshot("301396", detail=True)
+
+    assert with_fallback.main_fund_flow == stored_periods
+    assert with_fallback.stored_trade_dates["main_fund_flow"] == "20261124"
+    assert with_fallback.source_errors["main_fund_flow"] == "DIRECT_SESSION_EXPIRED"

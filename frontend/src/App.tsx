@@ -346,26 +346,17 @@ function TaskFundFlowTabs({ publicId, finished, hasFundFlow, allowHistoricalFall
   useEffect(() => {
     if (!eligible) {
       setHistory(undefined)
-      setDaily(undefined)
       setHistoryState('idle')
-      setDailyState('idle')
       return
     }
     let active = true
     let inFlight = false
-    const load = (showLoading: boolean) => {
+    const loadHistory = (showLoading: boolean) => {
       if (inFlight) return
       inFlight = true
       if (showLoading) {
         setHistory(undefined)
-        setDaily(undefined)
         setHistoryState('loading')
-        setDailyState('loading')
-      }
-      let completed = 0
-      const finish = () => {
-        completed += 1
-        if (completed === 2) inFlight = false
       }
       void api.fundFlowHistory(publicId).then((result) => {
         if (!active) return
@@ -378,26 +369,40 @@ function TaskFundFlowTabs({ publicId, finished, hasFundFlow, allowHistoricalFall
       }).catch((reason) => {
         if (!active) return
         setHistoryState(reason instanceof ApiError && reason.status === 404 ? 'empty' : 'error')
-      }).finally(finish)
-      void api.fundFlowDaily(publicId, 30).then((result) => {
-        if (!active) return
-        if (Array.isArray(result.points) && result.points.length > 0) {
-          setDaily(result)
-          setDailyState('ready')
-        } else {
-          setDailyState('empty')
-        }
-      }).catch((reason) => {
-        if (!active) return
-        setDailyState(reason instanceof ApiError && reason.status === 404 ? 'empty' : 'error')
-      }).finally(finish)
+      }).finally(() => {
+        inFlight = false
+      })
     }
-    load(true)
-    const refreshTimer = window.setInterval(() => load(false), FUND_FLOW_REFRESH_INTERVAL_MS)
+    loadHistory(true)
+    const refreshTimer = window.setInterval(() => loadHistory(false), FUND_FLOW_REFRESH_INTERVAL_MS)
     return () => {
       active = false
       window.clearInterval(refreshTimer)
     }
+  }, [eligible, publicId, reloadVersion])
+
+  useEffect(() => {
+    if (!eligible) {
+      setDaily(undefined)
+      setDailyState('idle')
+      return
+    }
+    let active = true
+    setDaily(undefined)
+    setDailyState('loading')
+    void api.fundFlowDaily(publicId, 30).then((result) => {
+      if (!active) return
+      if (Array.isArray(result.points) && result.points.length > 0) {
+        setDaily(result)
+        setDailyState('ready')
+      } else {
+        setDailyState('empty')
+      }
+    }).catch((reason) => {
+      if (!active) return
+      setDailyState(reason instanceof ApiError && reason.status === 404 ? 'empty' : 'error')
+    })
+    return () => { active = false }
   }, [eligible, publicId, reloadVersion])
 
   if (!eligible) return null
@@ -969,16 +974,26 @@ export default function App({ initialTask }: { initialTask?: Job }) {
     persistActiveTab(updated.public_id)
   }
 
-  function moveTabToTop(publicId: string) {
+  function updateTabInPlace(updated: Job, targetPublicId: string) {
     setTabs((current) => {
-      const selected = current.find((tab) => tab.public_id === publicId)
-      if (!selected) return current
-      const next = [selected, ...current.filter((tab) => tab.public_id !== publicId)]
+      const next = current.map((tab) => (tab.public_id === targetPublicId || tab.symbol === updated.symbol)
+        ? {
+          public_id: updated.public_id,
+          symbol: updated.symbol,
+          name: tabName(updated, tab.name),
+          task: updated,
+        }
+        : tab)
       persistStockTabs(next)
       return next
     })
-    setActivePublicId(publicId)
-    persistActiveTab(publicId)
+    setActivePublicId((current) => {
+      if (current === targetPublicId) {
+        persistActiveTab(updated.public_id)
+        return updated.public_id
+      }
+      return current
+    })
   }
 
   function retryTask(publicId: string): Promise<void> {
@@ -987,7 +1002,7 @@ export default function App({ initialTask }: { initialTask?: Job }) {
     setRetryingTaskId(publicId)
     setError('')
     const request = api.retryJob(publicId).then((updated) => {
-      if (!removedTabIds.current.has(publicId)) placeTabAtTop(updated)
+      if (!removedTabIds.current.has(publicId)) updateTabInPlace(updated, publicId)
     }).catch((reason) => {
       setError(reason instanceof Error ? reason.message : '重试失败，请稍后重试。')
     }).finally(() => {
@@ -999,9 +1014,9 @@ export default function App({ initialTask }: { initialTask?: Job }) {
   }
 
   function selectTab(publicId: string) {
-    const isCurrent = publicId === activePublicId
-    moveTabToTop(publicId)
-    if (!isCurrent) void retryTask(publicId)
+    setActivePublicId(publicId)
+    persistActiveTab(publicId)
+    setError('')
   }
 
   async function submit(event: FormEvent<HTMLFormElement>) {

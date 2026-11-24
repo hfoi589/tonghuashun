@@ -5,12 +5,13 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from threading import RLock
 from typing import Any, Callable, Iterable
 from zoneinfo import ZoneInfo
 
+from .fund_flow_history import has_fund_flow_values
 from .market_data import MarketSnapshot
 from .models import FUND_FLOW_METRICS, FUND_FLOW_PERIODS, MetricKind
 from .parsed_values import DirectReadOutcome, empty_metric_values
@@ -54,9 +55,15 @@ DEFAULT_PUSH_CONFIG: dict[str, Any] = {
 class SQLiteResearchStore:
     """Store replayable minute history without owning any data transport."""
 
-    def __init__(self, path: Path) -> None:
+    def __init__(
+        self,
+        path: Path,
+        *,
+        resolve_trade_date: Callable[[date], str] | None = None,
+    ) -> None:
         self.path = path.expanduser().resolve()
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._resolve_trade_date = resolve_trade_date
         self._lock = RLock()
         self._connection = sqlite3.connect(self.path, check_same_thread=False)
         self._connection.row_factory = sqlite3.Row
@@ -136,6 +143,8 @@ class SQLiteResearchStore:
                 );
                 CREATE INDEX IF NOT EXISTS fund_flow_history_symbol_date
                     ON fund_flow_history_points(symbol, trade_date, period, minute);
+                CREATE INDEX IF NOT EXISTS idx_fund_flow_history_daily_lookup
+                    ON fund_flow_history_points(symbol, trade_date DESC, period, minute DESC);
                 CREATE TABLE IF NOT EXISTS fund_flow_history_status (
                     symbol TEXT PRIMARY KEY,
                     latest_trade_date TEXT,
@@ -143,6 +152,14 @@ class SQLiteResearchStore:
                     last_sync_at TEXT,
                     last_error TEXT
                 );
+                DELETE FROM fund_flow_history_points
+                WHERE main_net_inflow IS NULL
+                  AND main_visible_inflow IS NULL
+                  AND main_hidden_inflow IS NULL
+                  AND retail_inflow IS NULL;
+                DELETE FROM fund_flow_history_points
+                WHERE period = 'today'
+                  AND REPLACE(minute, ':', '') < '0929';
                 """
             )
             existing_columns = {
@@ -166,12 +183,13 @@ class SQLiteResearchStore:
                         f"ALTER TABLE research_days ADD COLUMN {column} TEXT"
                     )
 
-    @staticmethod
-    def _trade_date(snapshot: MarketSnapshot) -> str:
+    def _trade_date(self, snapshot: MarketSnapshot) -> str:
         source_digits = "".join(character for character in (snapshot.source_time or "") if character.isdigit())
         if len(source_digits) >= 8:
             return source_digits[:8]
         local = snapshot.collected_at.astimezone(ZoneInfo("Asia/Shanghai"))
+        if self._resolve_trade_date is not None:
+            return self._resolve_trade_date(local.date())
         return local.strftime("%Y%m%d")
 
     @staticmethod
@@ -519,11 +537,14 @@ class SQLiteResearchStore:
         """Upsert one shared fund-flow sample and preserve prior non-null values."""
         fields = self._fund_flow_fields()
         captured = captured_at.isoformat()
+        compact_minute = minute.replace(":", "")
         changed = False
         recorded = False
         with self._lock, self._connection:
             for period, raw_values in periods.items():
                 if period not in {"today", "three_day", "five_day"}:
+                    continue
+                if period == "today" and compact_minute < "0929":
                     continue
                 incoming = {
                     field: (
@@ -533,7 +554,7 @@ class SQLiteResearchStore:
                     )
                     for field in fields
                 }
-                if not any(incoming[field] is not None for field in fields):
+                if not has_fund_flow_values(incoming):
                     continue
                 recorded = True
                 existing = self._connection.execute(
@@ -618,9 +639,18 @@ class SQLiteResearchStore:
                 (symbol, selected_date),
             ).fetchall()
         grouped: dict[str, dict[str, sqlite3.Row]] = {}
+        local_now = now.astimezone(ZoneInfo("Asia/Shanghai")) if now is not None else None
+        is_current_day = (
+            local_now is not None and selected_date == local_now.strftime("%Y%m%d")
+        )
+        if is_current_day and local_now is not None and local_now.strftime("%H%M") < "0929":
+            return None
         for row in rows:
-            if now is not None and selected_date == now.astimezone(ZoneInfo("Asia/Shanghai")).strftime("%Y%m%d"):
-                if str(row["minute"]).replace(":", "") > now.astimezone(ZoneInfo("Asia/Shanghai")).strftime("%H%M"):
+            compact = str(row["minute"]).replace(":", "")
+            if str(row["period"]) == "today" and compact < "0929":
+                continue
+            if is_current_day and local_now is not None:
+                if compact > local_now.strftime("%H%M"):
                     continue
             grouped.setdefault(str(row["minute"]), {})[str(row["period"])] = row
         fields = ("unit", "main_net_inflow", "main_visible_inflow", "main_hidden_inflow", "retail_inflow")
@@ -831,10 +861,16 @@ class SQLiteResearchStore:
         """Return one closing `today` fund-flow point per recent trade date."""
         if not 1 <= limit <= 60:
             raise ValueError("fund flow daily limit must be between 1 and 60")
+        non_null_metrics = (
+            "(main_net_inflow IS NOT NULL"
+            " OR main_visible_inflow IS NOT NULL"
+            " OR main_hidden_inflow IS NOT NULL"
+            " OR retail_inflow IS NOT NULL)"
+        )
         with self._lock:
             date_rows = self._connection.execute(
-                """SELECT DISTINCT trade_date FROM fund_flow_history_points
-                   WHERE symbol=? AND period='today'
+                f"""SELECT DISTINCT trade_date FROM fund_flow_history_points
+                   WHERE symbol=? AND period='today' AND {non_null_metrics}
                    ORDER BY trade_date DESC LIMIT ?""",
                 (symbol, limit),
             ).fetchall()
@@ -843,9 +879,24 @@ class SQLiteResearchStore:
                 return {"symbol": symbol, "limit": limit, "baseline_trade_date": None, "points": []}
             placeholders = ",".join("?" for _ in dates)
             rows = self._connection.execute(
-                f"""SELECT * FROM fund_flow_history_points
-                    WHERE symbol=? AND trade_date IN ({placeholders})
-                    ORDER BY trade_date,period,REPLACE(minute,':','')""",
+                f"""WITH ranked AS (
+                        SELECT trade_date,minute,period,unit,
+                               main_net_inflow,main_visible_inflow,
+                               main_hidden_inflow,retail_inflow,
+                               ROW_NUMBER() OVER (
+                                   PARTITION BY trade_date, period
+                                   ORDER BY REPLACE(minute,':','') DESC
+                               ) AS rn
+                        FROM fund_flow_history_points
+                        WHERE symbol=? AND trade_date IN ({placeholders})
+                          AND {non_null_metrics}
+                    )
+                    SELECT trade_date,minute,period,unit,
+                           main_net_inflow,main_visible_inflow,
+                           main_hidden_inflow,retail_inflow
+                    FROM ranked
+                    WHERE rn = 1
+                    ORDER BY trade_date ASC""",
                 (symbol, *dates),
             ).fetchall()
         latest_by_date: dict[str, dict[str, sqlite3.Row]] = {}

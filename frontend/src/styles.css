@@ -2141,12 +2141,12 @@ button.stock-tab[aria-selected="true"] span { color: var(--primary); }
     padding: .14rem 0;
   }
   .quote-secondary-metrics .value-label {
-    font-size: .58rem;
-    letter-spacing: -.045em;
+    font-size: .66rem;
+    letter-spacing: -.02em;
   }
-  .quote-secondary-metrics .indicator-value { font-size: .8rem; }
-  .quote-secondary-metrics .value-card:nth-child(3) .value-label { font-size: .54rem; }
-  .quote-secondary-metrics .value-card:nth-child(3) .indicator-value { font-size: .74rem; }
+  .quote-secondary-metrics .indicator-value { font-size: .82rem; }
+  .quote-secondary-metrics .value-card:nth-child(3) .value-label { font-size: .62rem; }
+  .quote-secondary-metrics .value-card:nth-child(3) .indicator-value { font-size: .78rem; }
   .fund-flow-heading-title,
   .fund-flow-inline-title { gap: .35rem; }
   .fund-flow-heading-title .eyebrow,
@@ -2184,12 +2184,12 @@ button.stock-tab[aria-selected="true"] span { color: var(--primary); }
   .quote-secondary-metrics .value-label {
     overflow: visible;
     text-overflow: clip;
-    font-size: .48rem;
-    letter-spacing: -.06em;
+    font-size: .56rem;
+    letter-spacing: -.04em;
   }
-  .quote-secondary-metrics .indicator-value { font-size: .68rem; }
-  .quote-secondary-metrics .value-card:nth-child(3) .value-label { font-size: .36rem; letter-spacing: -.08em; }
-  .quote-secondary-metrics .value-card:nth-child(3) .indicator-value { font-size: .56rem; }
+  .quote-secondary-metrics .indicator-value { font-size: .72rem; }
+  .quote-secondary-metrics .value-card:nth-child(3) .value-label { font-size: .52rem; letter-spacing: -.04em; }
+  .quote-secondary-metrics .value-card:nth-child(3) .indicator-value { font-size: .66rem; }
 }
 
 /* The result card keeps a quiet neutral outline; the old red rail and

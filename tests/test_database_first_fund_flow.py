@@ -156,3 +156,42 @@ def test_non_watchlist_symbol_always_uses_live_source(tmp_path):
     source.read_direct("601872")
 
     assert live.calls == ["601872"]
+
+
+def test_exchange_fund_short_circuits_without_hitting_live_source(tmp_path):
+    now = datetime(2026, 9, 9, 10, 30, tzinfo=SHANGHAI)
+    store = SQLiteResearchStore(tmp_path / "research.db")
+    live = Live()
+    source = DatabaseFirstFundFlowSource(
+        live,
+        Accounts(["513350"]),
+        store,
+        clock=lambda: now,
+        is_market_open=lambda: True,
+    )
+
+    result = source.read_direct("513350")
+
+    assert live.calls == []
+    assert result.values[MetricKind.MAIN_FLOW_TODAY_NET] is None
+
+
+def test_pre_0929_open_market_suppresses_today_fund_flow_persistence_and_return(tmp_path):
+    now = datetime(2026, 9, 9, 9, 14, tzinfo=SHANGHAI)
+    store = SQLiteResearchStore(tmp_path / "research.db")
+    live = Live()
+    source = DatabaseFirstFundFlowSource(
+        live,
+        Accounts(["601872"]),
+        store,
+        clock=lambda: now,
+        is_market_open=lambda: True,
+    )
+
+    result = source.read_direct("601872")
+
+    assert result.values[MetricKind.MAIN_FLOW_TODAY_NET] is None
+    assert result.values[MetricKind.MAIN_FLOW_THREE_DAY_NET] == "9.00"
+    history = store.read_fund_flow_history("601872", "20260909")
+    assert history["periods"]["today"]["points"] == []
+    assert history["periods"]["three_day"]["points"][0]["main_net_inflow"] == "9.00"

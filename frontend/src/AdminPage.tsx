@@ -1,4 +1,4 @@
-import { FormEvent, KeyboardEvent, PointerEvent, useCallback, useEffect, useRef, useState } from 'react'
+import { FormEvent, KeyboardEvent, PointerEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { ApiError, api, readCsrfToken, type AccountSessionStatus, type AdminDeviceHealth, type AdminMacdSettings, type AdminMarketMonitoringItem, type AdminMonitoringStatus, type AdminPushConfig, type DeviceLifecycleAction, type DeviceRole, type MarketAdminUser, type QueueState, type RunnerHealth } from './api'
 import { parseDeviceServerMessage, type DeviceInputEvent, type DeviceStatus } from './device-protocol'
 import { DeviceInputAdapter } from './device-stream'
@@ -86,13 +86,14 @@ export function DeviceViewport({
       setConnection(active ? 'UNCONFIGURED' : 'OFFLINE')
       return
     }
-    let client: WebSocket
+    let validUrl = false
     try {
       const url = new URL(streamUrl)
-      if (url.protocol !== 'ws:' && url.protocol !== 'wss:') throw new TypeError('Unsupported WebSocket protocol')
-      setConnection('CONNECTING')
-      client = new WebSocket(streamUrl)
+      if (url.protocol === 'ws:' || url.protocol === 'wss:') validUrl = true
     } catch {
+      validUrl = false
+    }
+    if (!validUrl) {
       socket.current = null
       setRunnerReady(false)
       setRunnerLocked(false)
@@ -100,39 +101,68 @@ export function DeviceViewport({
       setConnection('OFFLINE')
       return
     }
-    socket.current = client
-    client.onopen = () => setConnection('ONLINE')
-    client.onclose = () => {
-      if (socket.current === client) socket.current = null
-      setConnection('OFFLINE')
-      setRunnerReady(false)
-      setRunnerLocked(false)
-      setDeviceHealth(null)
-    }
-    client.onerror = () => setConnection('OFFLINE')
-    client.onmessage = (event) => {
-      if (typeof event.data !== 'string') return
-      let decoded: unknown
-      try { decoded = JSON.parse(event.data) } catch { return }
-      const message = parseDeviceServerMessage(decoded)
-      if (!message) return
-      if (message.type === 'runner_status') {
-        setRunnerReady(message.state === 'READY' || message.state === 'ADMIN_CONTROL')
-        setRunnerLocked(message.locked)
+    let disposed = false
+    let reconnectTimer: number | undefined
+    const connect = () => {
+      if (disposed) return
+      let client: WebSocket
+      try {
+        setConnection('CONNECTING')
+        client = new WebSocket(streamUrl)
+      } catch {
+        socket.current = null
+        setRunnerReady(false)
+        setRunnerLocked(false)
+        setDeviceHealth(null)
+        setConnection('OFFLINE')
         return
       }
-      if (message.type === 'device_status') {
-        setDeviceHealth(message)
-        return
+      socket.current = client
+      client.onopen = () => {
+        if (!disposed) setConnection('ONLINE')
       }
-      const image = new Image()
-      image.onload = () => {
-        const context = canvas.current?.getContext('2d')
-        if (context && canvas.current) context.drawImage(image, 0, 0, canvas.current.width, canvas.current.height)
+      client.onclose = () => {
+        if (socket.current === client) socket.current = null
+        setConnection('OFFLINE')
+        setRunnerReady(false)
+        setRunnerLocked(false)
+        setDeviceHealth(null)
+        if (!disposed) {
+          reconnectTimer = window.setTimeout(connect, 1500)
+        }
       }
-      image.src = `data:image/jpeg;base64,${message.data}`
+      client.onerror = () => setConnection('OFFLINE')
+      client.onmessage = (event) => {
+        if (typeof event.data !== 'string') return
+        let decoded: unknown
+        try { decoded = JSON.parse(event.data) } catch { return }
+        const message = parseDeviceServerMessage(decoded)
+        if (!message) return
+        if (message.type === 'runner_status') {
+          setRunnerReady(message.state === 'READY' || message.state === 'ADMIN_CONTROL')
+          setRunnerLocked(message.locked)
+          return
+        }
+        if (message.type === 'device_status') {
+          setDeviceHealth(message)
+          return
+        }
+        const image = new Image()
+        image.onload = () => {
+          const context = canvas.current?.getContext('2d')
+          if (context && canvas.current) context.drawImage(image, 0, 0, canvas.current.width, canvas.current.height)
+        }
+        image.src = `data:image/jpeg;base64,${message.data}`
+      }
     }
-    return () => client.close()
+    connect()
+    return () => {
+      disposed = true
+      if (reconnectTimer !== undefined) window.clearTimeout(reconnectTimer)
+      const current = socket.current
+      socket.current = null
+      current?.close()
+    }
   }, [active, streamUrl])
 
   const canSend = active && connection === 'ONLINE' && runnerReady && locked && runnerLocked
@@ -447,6 +477,42 @@ function MonitoringPushAdmin({ onError, autoLoad = false }: { onError: (reason: 
     finally { setBusy(false) }
   }
 
+  const rulesValidation = useMemo(() => {
+    const trimmed = rules.trim()
+    if (!trimmed) {
+      return { valid: false, error: '请输入 JSON 数组格式的推送规则', count: 0, enabled: 0, previews: [] as Array<{ id: string, side: string, title: string, enabled: boolean }> }
+    }
+    try {
+      const parsed = JSON.parse(trimmed)
+      if (!Array.isArray(parsed)) {
+        return { valid: false, error: '根节点必须是 JSON 数组 []', count: 0, enabled: 0, previews: [] as Array<{ id: string, side: string, title: string, enabled: boolean }> }
+      }
+      const previews = parsed
+        .filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === 'object')
+        .map((item, idx) => ({
+          id: String(item.id ?? `rule-${idx + 1}`),
+          side: item.side === 'sell' ? '卖出' : '买入',
+          title: String(item.title ?? item.id ?? `规则 ${idx + 1}`),
+          enabled: Boolean(item.enabled),
+        }))
+      return {
+        valid: true,
+        error: null,
+        count: parsed.length,
+        enabled: previews.filter((item) => item.enabled).length,
+        previews: previews.slice(0, 8),
+      }
+    } catch (reason) {
+      return {
+        valid: false,
+        error: reason instanceof Error ? reason.message : 'JSON 语法无效',
+        count: 0,
+        enabled: 0,
+        previews: [] as Array<{ id: string, side: string, title: string, enabled: boolean }>,
+      }
+    }
+  }, [rules])
+
   if (!loaded) return <section className="admin-controls admin-monitoring-loader"><div><h2>行情监控与推送</h2><p>正在自动加载监控采集、MACD、推送渠道和全局规则配置。</p></div><button type="button" className="secondary" onClick={() => void load()} disabled={busy}>{busy ? '加载中…' : '重新加载配置'}</button></section>
   if (!macd || !push) return null
   return <section className="admin-operations-suite">
@@ -460,7 +526,7 @@ function MonitoringPushAdmin({ onError, autoLoad = false }: { onError: (reason: 
         <section><h3>Server酱³</h3><label><input type="checkbox" checked={push.sc3_bot.enabled} onChange={(event) => setPush({ ...push, sc3_bot: { ...push.sc3_bot, enabled: event.target.checked } })} />启用</label><label>API 地址<input value={push.sc3_bot.base_url} onChange={(event) => setPush({ ...push, sc3_bot: { ...push.sc3_bot, base_url: event.target.value } })} /></label><label>Token<input type="password" placeholder={push.sc3_bot.token_configured ? '已配置，留空保持不变' : ''} value={push.sc3_bot.token} onChange={(event) => setPush({ ...push, sc3_bot: { ...push.sc3_bot, token: event.target.value } })} /></label><label>Chat ID<input value={push.sc3_bot.chat_id} onChange={(event) => setPush({ ...push, sc3_bot: { ...push.sc3_bot, chat_id: event.target.value } })} /></label></section>
         <section><h3>企业微信</h3><label><input type="checkbox" checked={push.wecom.enabled} onChange={(event) => setPush({ ...push, wecom: { ...push.wecom, enabled: event.target.checked } })} />启用</label><label>API 地址<input value={push.wecom.api_base_url} onChange={(event) => setPush({ ...push, wecom: { ...push.wecom, api_base_url: event.target.value } })} /></label><label>Corp ID<input value={push.wecom.corp_id} onChange={(event) => setPush({ ...push, wecom: { ...push.wecom, corp_id: event.target.value } })} /></label><label>Corp Secret<input type="password" placeholder={push.wecom.corp_secret_configured ? '已配置，留空保持不变' : ''} value={push.wecom.corp_secret} onChange={(event) => setPush({ ...push, wecom: { ...push.wecom, corp_secret: event.target.value } })} /></label><label>Agent ID<input type="number" value={push.wecom.agent_id} onChange={(event) => setPush({ ...push, wecom: { ...push.wecom, agent_id: Number(event.target.value) } })} /></label><label>接收用户<input value={push.wecom.to_user} onChange={(event) => setPush({ ...push, wecom: { ...push.wecom, to_user: event.target.value } })} /></label></section>
       </div>
-      <section className="admin-rules-editor"><h3>推送规则</h3><p className="minor">规则由管理员全局维护，同时用于实时提醒和 market 页复盘。</p><label>规则 JSON<textarea value={rules} onChange={(event) => setRules(event.target.value)} rows={14} /></label></section>
+      <section className="admin-rules-editor"><h3>推送规则</h3><p className="minor">规则由管理员全局维护，同时用于实时提醒和 market 页复盘。</p><label>规则 JSON<textarea value={rules} onChange={(event) => setRules(event.target.value)} rows={14} /></label><div className="admin-rules-validation" aria-live="polite">{rulesValidation.valid ? <p className="minor">JSON 格式有效 · 共 {rulesValidation.count} 条规则（启用 {rulesValidation.enabled} 条）{rulesValidation.previews.length > 0 ? ` · ${rulesValidation.previews.map((item) => `[${item.side}] ${item.title}`).join('、')}` : ''}</p> : <p className="error" role="alert">规则 JSON 校验失败：{rulesValidation.error}</p>}</div></section>
     </form>
     <section className="admin-ops-card"><div className="admin-ops-heading"><div><h3>QDII/LOF 溢价快照</h3><p className="minor">{premium?.as_of ? `最近刷新：${premium.as_of}，有效 ${premium.valid_count} 条` : '尚未刷新'}</p></div><div className="button-row"><button type="button" className="secondary" disabled={busy} onClick={async () => { setBusy(true); try { setPremium(await api.refreshPremium(readCsrfToken())); setStatus('溢价快照已刷新') } catch (reason) { onError(reason) } finally { setBusy(false) } }}>刷新溢价</button><button type="button" className="secondary" disabled={busy || !premium?.valid_count} onClick={async () => { try { await api.pushPremium(readCsrfToken()); setStatus('溢价推送已发送') } catch (reason) { onError(reason) } }}>立即推送溢价</button></div></div></section>
   </section>

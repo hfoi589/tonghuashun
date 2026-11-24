@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import type { ReactElement } from 'react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { FundFlowHistoryChart, fundFlowToWan, type FundFlowHistoryPeriod } from './FundFlowHistoryChart'
@@ -6,6 +6,7 @@ import { FundFlowDailyChart, FundFlowDailyPanel } from './FundFlowDailyChart'
 import { marketApi } from './market-api'
 
 afterEach(() => {
+  cleanup()
   vi.useRealTimers()
   vi.restoreAllMocks()
 })
@@ -127,6 +128,27 @@ describe('FundFlowHistoryChart', () => {
     expect(container.querySelectorAll('.fund-flow-history-active-label')).toHaveLength(0)
     expect(container.querySelector('[data-testid="fund-flow-readout-main-net"]')).toHaveTextContent('10000.00')
   })
+
+  it('scrubs crosshair on pointer move over the SVG and formats large 万元 ticks in 亿', () => {
+    const largePeriod: FundFlowHistoryPeriod = {
+      points: [
+        { time: '09:30', unit: '万元', main_net_inflow: '120000.00', main_visible_inflow: '80000.00', main_hidden_inflow: '40000.00', retail_inflow: '-120000.00' },
+        { time: '15:00', unit: '万元', main_net_inflow: '-150000.00', main_visible_inflow: '-90000.00', main_hidden_inflow: '-60000.00', retail_inflow: '150000.00' },
+      ],
+    }
+    const { container } = render(<FundFlowHistoryChart period={largePeriod} />)
+    const svg = container.querySelector('.fund-flow-history-svg')!
+    Object.defineProperty(svg, 'getBoundingClientRect', {
+      value: () => ({ left: 0, right: 900, top: 0, bottom: 320, width: 900, height: 320, x: 0, y: 0, toJSON: () => ({}) }),
+    })
+
+    const axisTexts = [...container.querySelectorAll('.fund-flow-history-svg > g > text')].map((n) => n.textContent)
+    expect(axisTexts.some((t) => t?.endsWith('亿'))).toBe(true)
+
+    fireEvent.pointerMove(svg, { clientX: 64 })
+    expect(screen.getByText('09:30', { selector: 'time' })).toBeInTheDocument()
+    expect(screen.getByTestId('fund-flow-readout-main-net')).toHaveTextContent('120000.00')
+  })
 })
 
 describe('FundFlowDailyChart', () => {
@@ -202,7 +224,7 @@ describe('FundFlowDailyChart', () => {
     })))
   })
 
-  it('refreshes the Market daily panel on the same 30-second cadence as history', async () => {
+  it('fetches the Market daily panel once without repeating 30-second interval polling', async () => {
     vi.useFakeTimers()
     const response = {
       symbol: '601872',
@@ -215,6 +237,6 @@ describe('FundFlowDailyChart', () => {
     expect(request).toHaveBeenCalledTimes(1)
 
     await act(async () => { await vi.advanceTimersByTimeAsync(30_000) })
-    expect(request).toHaveBeenCalledTimes(2)
+    expect(request).toHaveBeenCalledTimes(1)
   })
 })

@@ -238,3 +238,55 @@ def test_push_event_claim_is_atomic_and_deduplicated(tmp_path):
 
     assert store.claim_push_event("601872:20260831:09:31:buy") is True
     assert store.claim_push_event("601872:20260831:09:31:buy") is False
+
+
+def test_research_store_resolves_weekend_snapshot_to_previous_trading_date(tmp_path):
+    store = SQLiteResearchStore(
+        tmp_path / "research.db",
+        resolve_trade_date=lambda d: "20261120" if d.weekday() >= 5 else d.strftime("%Y%m%d"),
+    )
+    saturday_snapshot = MarketSnapshot(
+        symbol="601872",
+        name="招商轮船",
+        market="17",
+        sequence=1,
+        source_time="15:00",
+        collected_at=datetime(2026, 11, 21, 10, 0, tzinfo=timezone.utc),
+        source="TENCENT_PUBLIC",
+        quote={"pre_close": "10.00"},
+        timeshare=(TimesharePoint(time="09:30", price="10.10"),),
+    )
+
+    store.record_snapshot(saturday_snapshot)
+
+    assert store.available_dates("601872") == ["20261120"]
+
+
+def test_read_fund_flow_daily_migrates_null_rows_and_uses_latest_valid_minute(tmp_path):
+    import sqlite3
+
+    db_path = tmp_path / "research.db"
+    store = SQLiteResearchStore(db_path)
+    store.record_fund_flow(
+        "601872",
+        trade_date="20261120",
+        minute="14:58",
+        periods={"today": {"unit": "亿元", "main_net_inflow": "1.20", "main_visible_inflow": "0.80", "main_hidden_inflow": "0.40", "retail_inflow": "-1.20"}},
+        captured_at=datetime(2026, 11, 20, 14, 58, tzinfo=timezone.utc),
+    )
+    store.close()
+    # Inject legacy pre-0929 and all-null polluted rows directly before reopening.
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "INSERT INTO fund_flow_history_points VALUES('601872','20261120','09:12','today','亿元','9.99','5.00','4.99','-9.99','2026-11-20T09:12:00')"
+        )
+        conn.execute(
+            "INSERT INTO fund_flow_history_points VALUES('601872','20261120','15:00','today','亿元',NULL,NULL,NULL,NULL,'2026-11-20T15:00:00')"
+        )
+    reopened = SQLiteResearchStore(db_path)
+    daily = reopened.read_fund_flow_daily("601872", 30, lambda d: "20261119")
+    assert len(daily["points"]) == 2
+    assert daily["points"][1]["time"] == "14:58"
+    assert daily["points"][1]["main_net_inflow"] == "1.20"
+    history = reopened.read_fund_flow_history("601872", "20261120")
+    assert [pt["time"] for pt in history["periods"]["today"]["points"]] == ["14:58"]

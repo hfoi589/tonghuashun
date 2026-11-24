@@ -19,11 +19,13 @@ function dateLabel(value: string): string {
   return value.length === 8 ? `${value.slice(0, 4)}-${value.slice(4, 6)}-${value.slice(6)}` : value
 }
 
-export function FundFlowHistoryPanel({ symbol, pollingEnabled = true, onHistoryChange }: {
+export function FundFlowHistoryPanel({ symbol, market, pollingEnabled = true, onHistoryChange }: {
   symbol: string,
+  market?: string,
   pollingEnabled?: boolean,
   onHistoryChange?: (history: FundFlowHistoryResponse | undefined) => void,
 }) {
+  const unsupportedFund = market === '20' || market === '36'
   const [history, setHistory] = useState<FundFlowHistoryResponse>()
   const [selectedDate, setSelectedDate] = useState<string>()
   const [period, setPeriod] = useState<FundFlowPeriodKey>('today')
@@ -31,6 +33,7 @@ export function FundFlowHistoryPanel({ symbol, pollingEnabled = true, onHistoryC
   const [error, setError] = useState<string>()
 
   const load = useCallback(async (tradeDate?: string) => {
+    if (unsupportedFund) return
     setLoading(true)
     setError(undefined)
     try {
@@ -50,30 +53,37 @@ export function FundFlowHistoryPanel({ symbol, pollingEnabled = true, onHistoryC
     } finally {
       setLoading(false)
     }
-  }, [onHistoryChange, symbol])
+  }, [onHistoryChange, symbol, unsupportedFund])
 
   useEffect(() => {
     setHistory(undefined)
     setSelectedDate(undefined)
     setPeriod('today')
     onHistoryChange?.(undefined)
-    void load()
-  }, [load, onHistoryChange])
+    if (!unsupportedFund) void load()
+  }, [load, onHistoryChange, unsupportedFund])
 
   const latestDate = history?.available_dates[0]
   const followsLatest = selectedDate === undefined || selectedDate === latestDate
   useEffect(() => {
-    if (!pollingEnabled || !followsLatest) return
+    if (unsupportedFund || !pollingEnabled || !followsLatest) return
     const timer = window.setInterval(
       () => { void load(history?.trade_date ?? undefined) },
       fundFlowHistoryPollIntervalMs(Boolean(history?.trade_date)),
     )
     return () => window.clearInterval(timer)
-  }, [followsLatest, history?.trade_date, load, pollingEnabled])
+  }, [followsLatest, history?.trade_date, load, pollingEnabled, unsupportedFund])
 
   const selectedPeriod = history?.periods[period]
   const hasHistory = Boolean(history?.trade_date && history.available_dates.length)
   const periodLabel = useMemo(() => periods.find(([key]) => key === period)?.[1] ?? '当日', [period])
+
+  if (unsupportedFund) {
+    return <section className="fund-flow-history-panel" aria-label="主力流向历史">
+      <div className="fund-flow-history-toolbar"><div><span>历史折线</span><small>能力说明</small></div></div>
+      <p className="fund-flow-history-empty">交易所基金（ETF/LOF）无同花顺主力与暗盘资金统计，已跳过资金账号轮询。</p>
+    </section>
+  }
 
   return <section className="fund-flow-history-panel" aria-label="主力流向历史">
     <div className="fund-flow-history-toolbar">

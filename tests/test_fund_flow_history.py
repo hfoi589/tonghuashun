@@ -135,3 +135,67 @@ def test_fund_flow_monitor_marks_unit_only_response_as_empty(tmp_path):
 
     assert result == {"600026": False, "601872": False}
     assert store.read_fund_flow_history("601872") ["last_error"] == "DIRECT_FUND_FLOW_EMPTY"
+
+
+def test_fund_flow_monitor_skips_exchange_funds_and_suppresses_pre_0929_today(tmp_path):
+    store = SQLiteResearchStore(tmp_path / "research.db")
+
+    class MixedAccounts:
+        def list_watchlist_symbols(self):
+            return ["601872", "513350", "162411"]
+
+    source = _FundSource()
+    monitor = FundFlowHistoryMonitor(
+        MixedAccounts(),
+        source,
+        store,
+        is_market_open=lambda: True,
+        clock=lambda: datetime(2026, 9, 9, 9, 12, tzinfo=ZoneInfo("Asia/Shanghai")),
+    )
+
+    result = asyncio.run(monitor.poll_once())
+
+    assert source.calls == ["601872"]
+    assert result == {"601872": True}
+    history = store.read_fund_flow_history("601872", "20260909")
+    assert history["periods"]["today"]["points"] == []
+    assert len(history["periods"]["three_day"]["points"]) == 1
+    assert len(history["periods"]["five_day"]["points"]) == 1
+    assert store.available_fund_flow_dates("513350") == []
+
+
+def test_fund_flow_monitor_drops_unit_only_today_when_other_periods_have_values(tmp_path):
+    store = SQLiteResearchStore(tmp_path / "research.db")
+
+    class PartialTodaySource:
+        def read_direct(self, _symbol: str):
+            values = {kind: None for kind in MetricKind}
+            values[MetricKind.MAIN_FLOW_TODAY_UNIT] = "万元"
+            values[MetricKind.MAIN_FLOW_THREE_DAY_UNIT] = "亿元"
+            values[MetricKind.MAIN_FLOW_THREE_DAY_NET] = "2.50"
+            values[MetricKind.MAIN_FLOW_THREE_DAY_VISIBLE] = "1.50"
+            values[MetricKind.MAIN_FLOW_THREE_DAY_HIDDEN] = "1.00"
+            values[MetricKind.MAIN_FLOW_THREE_DAY_RETAIL] = "-2.50"
+            values[MetricKind.MAIN_FLOW_FIVE_DAY_UNIT] = "亿元"
+            values[MetricKind.MAIN_FLOW_FIVE_DAY_NET] = "3.50"
+            values[MetricKind.MAIN_FLOW_FIVE_DAY_VISIBLE] = "2.00"
+            values[MetricKind.MAIN_FLOW_FIVE_DAY_HIDDEN] = "1.50"
+            values[MetricKind.MAIN_FLOW_FIVE_DAY_RETAIL] = "-3.50"
+            return DirectReadOutcome(
+                values=values,
+                source_errors={"core_metrics": None, "main_fund_flow": None},
+            )
+
+    monitor = FundFlowHistoryMonitor(
+        _Accounts(),
+        PartialTodaySource(),
+        store,
+        is_market_open=lambda: True,
+        clock=lambda: datetime(2026, 9, 9, 9, 35, tzinfo=ZoneInfo("Asia/Shanghai")),
+    )
+
+    asyncio.run(monitor.poll_once())
+
+    history = store.read_fund_flow_history("601872", "20260909")
+    assert history["periods"]["today"]["points"] == []
+    assert history["periods"]["three_day"]["points"][0]["main_net_inflow"] == "2.50"

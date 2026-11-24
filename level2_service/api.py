@@ -422,6 +422,7 @@ def create_app(
     previous_trading_date: Callable[[str], str] | None = None,
     core_prewarmer: Callable[[str | None], None] | None = None,
     core_session_invalidator: Callable[[], None] | None = None,
+    fund_session_invalidator: Callable[[], None] | None = None,
     managed_resources: tuple[object, ...] = (),
     market_account_store: object | None = None,
     market_session_store: object | None = None,
@@ -586,31 +587,50 @@ def create_app(
                 "startup_refresh_required",
                 None,
             )
+            last_attempt_monotonic = time.monotonic()
             if callable(refresh) and (
                 not callable(needs_startup_refresh)
                 or needs_startup_refresh()
             ):
                 await _refresh_symbol_catalog(catalog)
-            while not stop.is_set():
-                local_now = datetime.now(ZoneInfo("Asia/Shanghai"))
-                next_refresh = local_now.replace(
+                last_attempt_monotonic = time.monotonic()
+
+            def compute_next_refresh(now: datetime) -> datetime:
+                target = now.replace(
                     hour=symbol_catalog_refresh_hour,
                     minute=symbol_catalog_refresh_minute,
                     second=0,
                     microsecond=0,
                 )
-                if next_refresh <= local_now:
-                    next_refresh += timedelta(days=1)
+                if target <= now:
+                    target += timedelta(days=1)
+                return target
+
+            next_refresh = compute_next_refresh(datetime.now(ZoneInfo("Asia/Shanghai")))
+            while not stop.is_set():
+                local_now = datetime.now(ZoneInfo("Asia/Shanghai"))
                 delay = max(
                     1.0,
                     (next_refresh - local_now).total_seconds(),
                 )
+                step = min(delay, 300.0)
                 try:
-                    await wait_for(stop.wait(), timeout=delay)
+                    await wait_for(stop.wait(), timeout=step)
                     continue
                 except TimeoutError:
                     pass
-                await _refresh_symbol_catalog(catalog)
+                wall_now = datetime.now(ZoneInfo("Asia/Shanghai"))
+                stale_catchup_due = (
+                    callable(refresh)
+                    and callable(needs_startup_refresh)
+                    and needs_startup_refresh(timedelta(hours=30))
+                    and (time.monotonic() - last_attempt_monotonic) >= 900.0
+                )
+                if wall_now >= next_refresh or stale_catchup_due:
+                    await _refresh_symbol_catalog(catalog)
+                    last_attempt_monotonic = time.monotonic()
+                    if wall_now >= next_refresh:
+                        next_refresh = compute_next_refresh(wall_now)
 
         app.state.cleanup_stop = stop
         app.state.cleanup_task = create_task(retention_loop())
@@ -780,6 +800,7 @@ def create_app(
     app.state.symbol_catalog = symbol_catalog
     app.state.core_prewarmer = core_prewarmer
     app.state.core_session_invalidator = core_session_invalidator
+    app.state.fund_session_invalidator = fund_session_invalidator
     app.state.managed_resources = tuple(managed_resources)
     app.state.market_account_store = market_account_store
     app.state.market_session_store = market_session_store
@@ -1311,6 +1332,14 @@ def create_app(
                 if callable(invalidator):
                     invalidator()
                 trigger_core_prewarm(None)
+            elif role == "main_fund_flow":
+                invalidator = app.state.fund_session_invalidator
+                if callable(invalidator):
+                    invalidator()
+            broker = app.state.market_data_broker
+            evict = getattr(broker, "evict", None)
+            if callable(evict):
+                evict()
         except DirectRequestError as error:
             provider.mark_error(
                 role,

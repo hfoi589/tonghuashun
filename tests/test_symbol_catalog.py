@@ -104,28 +104,30 @@ def test_sina_source_accepts_a_terminal_page_one_record_below_the_declared_count
     assert [item.symbol for item in result] == ["510050", "510300", "159919", "588000"]
 
 
-def test_sina_source_rejects_a_terminal_page_two_records_below_the_declared_count():
+@pytest.mark.parametrize("node", ["hs_a", "etf_hq_fund"])
+def test_sina_source_handles_terminal_count_drift_by_category(node):
     from level2_service.symbol_catalog import SinaSymbolCatalogSource, SymbolCatalogError
 
-    rows = [
-        {"symbol": "sh510050", "code": "510050", "name": "上证50ETF"},
-        {"symbol": "sh510300", "code": "510300", "name": "沪深300ETF"},
-        {"symbol": "sz159919", "code": "159919", "name": "深300ETF"},
-        {"symbol": "sh588000", "code": "588000", "name": "科创50ETF"},
+    codes = ["600000", "600001", "600002", "600003"] if node == "hs_a" else [
+        "510050", "510300", "510500", "588000",
     ]
+    rows = [{"symbol": f"sh{code}", "code": code, "name": code} for code in codes]
 
     def fetch(url: str, _timeout: float) -> str:
         if "getHQNodeStockCount" in url:
-            return "6"
+            return "15"
         page = int(url.split("page=")[1].split("&", 1)[0])
         start = (page - 1) * 3
-        return json.dumps(rows[start:start + 3], ensure_ascii=False)
+        return json.dumps(rows[start:start + 3])
 
     source = SinaSymbolCatalogSource(fetch=fetch)
     source.page_size = 3
 
-    with pytest.raises(SymbolCatalogError, match="SYMBOL_CATALOG_SOURCE_INCOMPLETE"):
-        source._fetch_node("etf_hq_fund")
+    if node == "hs_a":
+        with pytest.raises(SymbolCatalogError, match="SYMBOL_CATALOG_SOURCE_INCOMPLETE"):
+            source._fetch_node(node)
+    else:
+        assert [item.symbol for item in source._fetch_node(node)] == codes
 
 
 def test_sina_source_accepts_known_lof_terminal_count_drift():
@@ -382,6 +384,28 @@ def test_refresh_rejects_a_shrunken_snapshot_without_replacing_the_active_versio
 
     assert catalog.status().active_version == 1
     assert catalog.lookup("600000").name == "股票0"
+
+
+def test_refresh_accepts_fund_count_drop_when_stock_count_is_stable(tmp_path):
+    from level2_service.symbol_catalog import SQLiteSymbolCatalog
+
+    stocks = [SymbolLookup(f"6000{index:02d}", f"股票{index}", "17") for index in range(10)]
+    funds = [SymbolLookup(f"5100{index:02d}", f"基金{index}", "20") for index in range(10)]
+
+    class Source:
+        values = stocks + funds
+
+        def fetch_symbols(self):
+            return self.values
+
+    source = Source()
+    catalog = SQLiteSymbolCatalog(tmp_path / "symbols.db", source, minimum_security_count=10)
+    catalog.refresh()
+    source.values = stocks + funds[:5]
+
+    assert catalog.refresh().count == 15
+    assert catalog.lookup("600000").name == "股票0"
+    assert catalog.lookup("510000").name == "基金0"
 
 
 def test_lookup_and_search_fail_closed_after_the_catalog_is_stale(tmp_path):

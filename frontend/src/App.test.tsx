@@ -556,7 +556,7 @@ describe('Level2 web UI', () => {
     expect(screen.queryByRole('img', { name: '主力明盘、主力暗盘、散户流入和主力净流入历史曲线' })).not.toBeInTheDocument()
   })
 
-  it('refreshes both fund-flow curves while the result remains open', async () => {
+  it('refreshes intraday fund-flow history without re-polling 30-day closing history', async () => {
     vi.useFakeTimers()
     vi.mocked(fetch).mockImplementation((input) => {
       const url = String(input)
@@ -607,7 +607,7 @@ describe('Level2 web UI', () => {
     })
 
     expect(fetchMock.mock.calls.filter(([input]) => String(input).includes('/fund-flow-history')).length).toBe(2)
-    expect(fetchMock.mock.calls.filter(([input]) => String(input).includes('/fund-flow-daily')).length).toBe(2)
+    expect(fetchMock.mock.calls.filter(([input]) => String(input).includes('/fund-flow-daily')).length).toBe(1)
   })
 
   it('syncs the left fund-flow table to the selected 30-day date and restores today on tab switch', async () => {
@@ -1207,9 +1207,9 @@ describe('Level2 web UI', () => {
     expect(screen.getByText('股票页签')).toBeInTheDocument()
   })
 
-  it('selects an earlier stock, refreshes it, and moves its tab to the top', async () => {
+  it('switches to an earlier stock tab without reordering or automatic retry and keeps manual retry working', async () => {
     const firstTask = { ...task, status: 'COMPLETED' as const }
-    const secondTask = { ...task, public_id: 'public-job-2', symbol: '000001', status: 'COMPLETED' as const }
+    const secondTask = { ...task, public_id: 'public-job-2', symbol: '000001', status: 'COMPLETED' as const, values: { ...task.values, stock_name: '平安银行' } }
     const retriedTask = { ...firstTask, status: 'QUEUED' as const, error_code: null }
     vi.mocked(fetch)
       .mockResolvedValueOnce(jsonResponse(symbolLookup('600938', '中国海油')))
@@ -1234,11 +1234,16 @@ describe('Level2 web UI', () => {
 
     await user.click(screen.getByRole('tab', { name: /中国海油/ }))
 
-    await waitFor(() => expect(screen.getByText('已进入队列')).toBeInTheDocument())
-    expect(fetch).toHaveBeenLastCalledWith('/api/v1/jobs/public-job-1/retry', expect.objectContaining({ method: 'POST' }))
     expect(document.querySelectorAll('.job-result')).toHaveLength(1)
     expect(screen.getByText('任务 public-job-1')).toBeInTheDocument()
-    expect(screen.getAllByRole('tab')[0]).toHaveAccessibleName(/中国海油/)
+    expect(screen.getAllByRole('tab')[0]).toHaveAccessibleName(/平安银行/)
+    expect(screen.getAllByRole('tab')[1]).toHaveAccessibleName(/中国海油/)
+    expect(vi.mocked(fetch).mock.calls.filter(([url]) => String(url).endsWith('/retry'))).toHaveLength(0)
+
+    await user.click(screen.getByRole('button', { name: '重试 600938' }))
+    await waitFor(() => expect(screen.getByText('已进入队列')).toBeInTheDocument())
+    expect(fetch).toHaveBeenLastCalledWith('/api/v1/jobs/public-job-1/retry', expect.objectContaining({ method: 'POST' }))
+    expect(screen.getAllByRole('tab')[0]).toHaveAccessibleName(/平安银行/)
   })
 
   it('submits the same stock through the existing task id instead of adding a history row', async () => {
@@ -1298,10 +1303,10 @@ describe('Level2 web UI', () => {
 
     await user.click(screen.getByRole('tab', { name: /平安银行/ }))
 
-    await screen.findByTestId('job-result-skeleton')
-    expect(screen.queryByText('10.88')).not.toBeInTheDocument()
+    expect(screen.getByText('10.88')).toBeInTheDocument()
     expect(screen.queryByText('25.48')).not.toBeInTheDocument()
     expect(document.querySelectorAll('.job-result')).toHaveLength(1)
+    expect(vi.mocked(fetch).mock.calls.filter(([url]) => String(url).endsWith('/retry'))).toHaveLength(0)
   })
 
   it('migrates legacy browser history to one persistent tab per stock', async () => {

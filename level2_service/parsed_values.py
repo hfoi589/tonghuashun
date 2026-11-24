@@ -156,6 +156,15 @@ def empty_metric_values() -> dict[MetricKind, str | None]:
 
 
 FUND_ONLY_METRICS = frozenset(MetricKind) - REQUIRED_METRICS
+_EXCHANGE_FUND_PREFIXES = SHANGHAI_FUND_PREFIXES + SHENZHEN_FUND_PREFIXES
+
+
+def is_exchange_fund_symbol(symbol: str, market: str | None = None) -> bool:
+    """Return True when symbol or market belongs to an exchange fund without THS darkpool flow."""
+    if market in {"20", "36"}:
+        return True
+    clean = str(symbol or "").strip()
+    return len(clean) == 6 and clean.isdigit() and clean.startswith(_EXCHANGE_FUND_PREFIXES)
 
 
 class DualAccountParsedValueSource:
@@ -198,32 +207,42 @@ class DualAccountParsedValueSource:
         return self.symbol_source.search_symbols(query, limit)
 
     def read_direct(self, symbol: str) -> DirectReadOutcome:
+        skip_fund = is_exchange_fund_symbol(symbol)
         core_future = self._executor.submit(self.core_source.read_direct, symbol)
-        fund_future = self._executor.submit(self.fund_read_source.read_direct, symbol)
+        fund_future = (
+            None
+            if skip_fund
+            else self._executor.submit(self.fund_read_source.read_direct, symbol)
+        )
         try:
             core_result = core_future.result()
         except DirectRequestError as error:
-            fund_future.cancel()
+            if fund_future is not None:
+                fund_future.cancel()
             raise DirectRequestError(
                 sanitized_direct_error_code(
                     error.error_code, "DIRECT_REQUEST_FAILED"
                 )
             ) from None
         except Exception:
-            fund_future.cancel()
+            if fund_future is not None:
+                fund_future.cancel()
             raise DirectRequestError("DIRECT_REQUEST_FAILED") from None
 
         fund_error: str | None = None
-        try:
-            fund_result = fund_future.result()
-        except DirectRequestError as error:
-            fund_error = sanitized_direct_error_code(
-                error.error_code, "DIRECT_FUND_FLOW_REQUEST_FAILED"
-            )
-            fund_result = {}
-        except Exception:
-            fund_error = "DIRECT_FUND_FLOW_REQUEST_FAILED"
-            fund_result = {}
+        if fund_future is None:
+            fund_result: Any = {}
+        else:
+            try:
+                fund_result = fund_future.result()
+            except DirectRequestError as error:
+                fund_error = sanitized_direct_error_code(
+                    error.error_code, "DIRECT_FUND_FLOW_REQUEST_FAILED"
+                )
+                fund_result = {}
+            except Exception:
+                fund_error = "DIRECT_FUND_FLOW_REQUEST_FAILED"
+                fund_result = {}
 
         if isinstance(core_result, DirectReadOutcome):
             core_values = core_result.values
@@ -253,8 +272,13 @@ class DualAccountParsedValueSource:
 
     def read_direct_best_effort(self, symbol: str) -> DirectReadOutcome:
         """Read both direct sources independently, retaining whichever responds."""
+        skip_fund = is_exchange_fund_symbol(symbol)
         core_future = self._executor.submit(self.core_source.read_direct, symbol)
-        fund_future = self._executor.submit(self.fund_read_source.read_direct, symbol)
+        fund_future = (
+            None
+            if skip_fund
+            else self._executor.submit(self.fund_read_source.read_direct, symbol)
+        )
 
         core_error: str | None = None
         try:
@@ -269,16 +293,19 @@ class DualAccountParsedValueSource:
             core_result = {}
 
         fund_error: str | None = None
-        try:
-            fund_result = fund_future.result()
-        except DirectRequestError as error:
-            fund_error = sanitized_direct_error_code(
-                error.error_code, "DIRECT_FUND_FLOW_REQUEST_FAILED"
-            )
-            fund_result = {}
-        except Exception:
-            fund_error = "DIRECT_FUND_FLOW_REQUEST_FAILED"
-            fund_result = {}
+        if fund_future is None:
+            fund_result: Any = {}
+        else:
+            try:
+                fund_result = fund_future.result()
+            except DirectRequestError as error:
+                fund_error = sanitized_direct_error_code(
+                    error.error_code, "DIRECT_FUND_FLOW_REQUEST_FAILED"
+                )
+                fund_result = {}
+            except Exception:
+                fund_error = "DIRECT_FUND_FLOW_REQUEST_FAILED"
+                fund_result = {}
 
         if isinstance(core_result, DirectReadOutcome):
             core_values = core_result.values
@@ -318,28 +345,38 @@ class DualAccountParsedValueSource:
                     "main_fund_flow": None,
                 },
             )
+        skip_fund = is_exchange_fund_symbol(symbol)
         core_future = self._executor.submit(
             self.core_source.read_market_snapshot,
             symbol,
             detail=detail,
         )
-        fund_future = self._executor.submit(self._read_cached_fund_market, symbol)
+        fund_future = (
+            None
+            if skip_fund
+            else self._executor.submit(self._read_cached_fund_market, symbol)
+        )
         try:
             core = core_future.result()
         except DirectRequestError as error:
-            fund_future.cancel()
+            if fund_future is not None:
+                fund_future.cancel()
             raise DirectRequestError(
                 sanitized_direct_error_code(
                     error.error_code, "DIRECT_REQUEST_FAILED"
                 )
             ) from None
         except Exception:
-            fund_future.cancel()
+            if fund_future is not None:
+                fund_future.cancel()
             raise DirectRequestError("DIRECT_REQUEST_FAILED") from None
-        try:
-            main_fund_flow, fund_error = fund_future.result()
-        except Exception:
-            fund_error, main_fund_flow = "DIRECT_FUND_FLOW_REQUEST_FAILED", {}
+        if fund_future is None:
+            main_fund_flow, fund_error = {}, None
+        else:
+            try:
+                main_fund_flow, fund_error = fund_future.result()
+            except Exception:
+                fund_error, main_fund_flow = "DIRECT_FUND_FLOW_REQUEST_FAILED", {}
         return replace(
             core,
             main_fund_flow=main_fund_flow,

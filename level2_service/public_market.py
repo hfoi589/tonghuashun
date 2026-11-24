@@ -19,6 +19,7 @@ from .parsed_values import (
     DirectReadOutcome,
     DirectRequestError,
     SymbolLookup,
+    is_exchange_fund_symbol,
     sanitized_direct_error_code,
 )
 
@@ -577,25 +578,31 @@ class DirectEnrichedMarketDataSource:
         direct_source: object | None,
         *,
         ttl_seconds: float = 5.0,
+        stale_ttl_seconds: float = 120.0,
         max_cache_entries: int = 512,
         clock: Callable[[], float] = time.monotonic,
         is_market_open: Callable[[], bool] = lambda: True,
         is_watchlist_symbol: Callable[[str], bool] = lambda _symbol: True,
         closed_enrichment: Callable[[str], DirectReadOutcome | None] | None = None,
+        core_fallback: Callable[[str], DirectReadOutcome | None] | None = None,
         fund_flow_fallback: Callable[[str], dict[str, Any] | None] | None = None,
     ) -> None:
         if ttl_seconds <= 0:
             raise ValueError("ttl_seconds must be positive")
+        if stale_ttl_seconds < 0:
+            raise ValueError("stale_ttl_seconds must be non-negative")
         if not isinstance(max_cache_entries, int) or max_cache_entries <= 0:
             raise ValueError("max_cache_entries must be positive")
         self.base_source = base_source
         self.direct_source = direct_source
         self.ttl_seconds = ttl_seconds
+        self.stale_ttl_seconds = stale_ttl_seconds
         self.max_cache_entries = max_cache_entries
         self.clock = clock
         self.is_market_open = is_market_open
         self.is_watchlist_symbol = is_watchlist_symbol
         self.closed_enrichment = closed_enrichment
+        self.core_fallback = core_fallback
         self.fund_flow_fallback = fund_flow_fallback
         self._lock = RLock()
         # Direct L2 reads are optional and may serialize behind the App
@@ -603,12 +610,14 @@ class DirectEnrichedMarketDataSource:
         # every public snapshot for the watchlist.
         self._enrichment_lock = Lock()
         self._cache: dict[str, _EnrichmentEntry] = {}
+        self._last_good: dict[str, _EnrichmentEntry] = {}
         self._closed_fallback_attempted: set[str] = set()
         self._closed_fallback_outcomes: dict[str, DirectReadOutcome] = {}
 
     def invalidate_cache(self) -> None:
         with self._lock:
             self._cache.clear()
+            self._last_good.clear()
 
     def _read_enrichment(self, symbol: str) -> _EnrichmentEntry:
         now = self.clock()
@@ -617,6 +626,14 @@ class DirectEnrichedMarketDataSource:
             if cached is not None and now - cached.stored_at < self.ttl_seconds:
                 return cached
         if not self._enrichment_lock.acquire(blocking=False):
+            with self._lock:
+                last_good = self._last_good.get(symbol)
+            if (
+                last_good is not None
+                and last_good.outcome is not None
+                and now - last_good.stored_at < self.stale_ttl_seconds
+            ):
+                return last_good
             return _EnrichmentEntry(
                 outcome=None,
                 error_code="DIRECT_ENRICHMENT_BUSY",
@@ -664,6 +681,10 @@ class DirectEnrichedMarketDataSource:
                 self._cache[symbol] = entry
                 while len(self._cache) > self.max_cache_entries:
                     self._cache.pop(next(iter(self._cache)))
+                if entry.outcome is not None:
+                    self._last_good[symbol] = entry
+                    while len(self._last_good) > self.max_cache_entries:
+                        self._last_good.pop(next(iter(self._last_good)))
         return entry
 
     @staticmethod
@@ -792,14 +813,48 @@ class DirectEnrichedMarketDataSource:
             )
         entry = self._read_enrichment(symbol)
         if entry.outcome is None:
-            merged = self._without_enrichment(
-                snapshot,
-                entry.error_code or "DIRECT_REQUEST_FAILED",
-            )
+            recovered_outcome: DirectReadOutcome | None = None
+            if self.is_watchlist_symbol(symbol):
+                now = self.clock()
+                with self._lock:
+                    last_good = self._last_good.get(symbol)
+                if (
+                    entry.error_code != "DIRECT_ENRICHMENT_BUSY"
+                    and last_good is not None
+                    and last_good.outcome is not None
+                    and now - last_good.stored_at < self.stale_ttl_seconds
+                ):
+                    recovered_outcome = last_good.outcome
+                elif callable(self.core_fallback):
+                    try:
+                        recovered_outcome = self.core_fallback(symbol)
+                    except Exception:
+                        recovered_outcome = None
+            if isinstance(recovered_outcome, DirectReadOutcome):
+                merged = self._merge(snapshot, recovered_outcome)
+                if merged.capabilities.get("l2", {}).get("available") and entry.error_code != "DIRECT_ENRICHMENT_BUSY":
+                    capabilities = dict(merged.capabilities)
+                    capabilities["l2"] = {
+                        "available": False,
+                        "reason": entry.error_code or "DIRECT_REQUEST_FAILED",
+                    }
+                    source_errors = dict(merged.source_errors)
+                    source_errors["core_metrics"] = entry.error_code or "DIRECT_REQUEST_FAILED"
+                    merged = replace(
+                        merged,
+                        capabilities=capabilities,
+                        source_errors=source_errors,
+                    )
+            else:
+                merged = self._without_enrichment(
+                    snapshot,
+                    entry.error_code or "DIRECT_REQUEST_FAILED",
+                )
         else:
             merged = self._merge(snapshot, entry.outcome)
         if (
             not merged.main_fund_flow
+            and not is_exchange_fund_symbol(symbol, merged.market)
             and self.is_watchlist_symbol(symbol)
             and callable(self.fund_flow_fallback)
         ):

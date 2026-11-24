@@ -19,13 +19,25 @@ function dateLabel(value: string): string {
   return value.length === 8 ? `${value.slice(0, 4)}-${value.slice(4, 6)}-${value.slice(6)}` : value
 }
 
+const FUND_SYMBOL_PREFIXES = [
+  '158', '159', '160', '161', '162', '163', '164', '165', '166', '167', '168', '169', '180',
+  '501', '502', '506', '508', '510', '511', '512', '513', '515', '516', '517', '518', '519',
+  '520', '526', '530', '551', '560', '561', '562', '563', '588', '589',
+]
+
+export function isUnsupportedFundSymbol(symbol: string, market?: string): boolean {
+  if (market === '20' || market === '36') return true
+  const clean = symbol.trim()
+  return /^\d{6}$/.test(clean) && FUND_SYMBOL_PREFIXES.some((prefix) => clean.startsWith(prefix))
+}
+
 export function FundFlowHistoryPanel({ symbol, market, pollingEnabled = true, onHistoryChange }: {
   symbol: string,
   market?: string,
   pollingEnabled?: boolean,
   onHistoryChange?: (history: FundFlowHistoryResponse | undefined) => void,
 }) {
-  const unsupportedFund = market === '20' || market === '36'
+  const unsupportedFund = isUnsupportedFundSymbol(symbol, market)
   const [history, setHistory] = useState<FundFlowHistoryResponse>()
   const [selectedDate, setSelectedDate] = useState<string>()
   const [period, setPeriod] = useState<FundFlowPeriodKey>('today')

@@ -1303,6 +1303,11 @@ class FundFlowHttpClient:
 
     def read_direct(self, symbol: str) -> DirectReadOutcome:
         market = market_code_for_symbol(symbol)
+        if market in {"20", "36"}:
+            return DirectReadOutcome(
+                values=empty_metric_values(),
+                source_errors={"core_metrics": None, "main_fund_flow": None},
+            )
         with self._lock:
             symbol_lock = self._symbol_locks.setdefault(symbol, Lock())
         # Per-symbol locking: different symbols proceed concurrently and are
@@ -2165,6 +2170,11 @@ class Core9528Client:
 
     def read_direct(self, symbol: str) -> DirectReadOutcome:
         market = market_code_for_symbol(symbol)
+        if market in {"20", "36"}:
+            return DirectReadOutcome(
+                values=empty_metric_values(),
+                source_errors={"core_metrics": None, "main_fund_flow": None},
+            )
         gate = getattr(self.protocol, "ensure_read_direct_supported", None)
         if callable(gate):
             gate()

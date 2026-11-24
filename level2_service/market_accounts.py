@@ -19,7 +19,12 @@ from argon2 import PasswordHasher
 from argon2.exceptions import InvalidHashError, VerifyMismatchError
 from argon2.low_level import Type
 
-from .parsed_values import SymbolLookup
+from .parsed_values import (
+    SymbolLookup,
+    UnsupportedMarketError,
+    is_exchange_fund_symbol,
+    market_code_for_symbol,
+)
 
 
 def _utc_now() -> datetime:
@@ -286,6 +291,22 @@ class SQLiteMarketAccountStore:
                 """CREATE UNIQUE INDEX IF NOT EXISTS watchlist_groups_one_primary
                    ON watchlist_groups(user_id) WHERE is_primary=1"""
             )
+            fund_rows = self._connection.execute(
+                "SELECT DISTINCT symbol, market FROM watchlist_items"
+            ).fetchall()
+            for row in fund_rows:
+                sym = str(row["symbol"])
+                if not is_exchange_fund_symbol(sym):
+                    continue
+                try:
+                    expected_market = market_code_for_symbol(sym)
+                except UnsupportedMarketError:
+                    continue
+                if str(row["market"]) != expected_market:
+                    self._connection.execute(
+                        "UPDATE watchlist_items SET market=? WHERE symbol=?",
+                        (expected_market, sym),
+                    )
 
     @staticmethod
     def _username(value: str) -> str:
@@ -320,13 +341,18 @@ class SQLiteMarketAccountStore:
         )
 
     def total_symbol_count(self) -> int:
-        """Distinct symbols across every user's watchlists."""
+        """Distinct darkpool-eligible symbols across every user's watchlists."""
         with self._lock:
-            return int(
-                self._connection.execute(
-                    "SELECT COUNT(DISTINCT symbol) FROM watchlist_items"
-                ).fetchone()[0]
-            )
+            rows = self._connection.execute(
+                "SELECT DISTINCT symbol, market FROM watchlist_items"
+            ).fetchall()
+        return len(
+            {
+                str(row["symbol"])
+                for row in rows
+                if not is_exchange_fund_symbol(str(row["symbol"]), str(row["market"]))
+            }
+        )
 
     def user_symbol_count(self, user_id: int) -> int:
         """Distinct symbols held across one user's watchlist groups."""
@@ -785,7 +811,8 @@ class SQLiteMarketAccountStore:
                 if count >= self.max_symbols_per_user:
                     raise ValueError("watchlist symbol limit reached during Vibe sync")
                 if (
-                    not self._symbol_tracked_by_anyone(symbol.symbol)
+                    not is_exchange_fund_symbol(symbol.symbol, symbol.market)
+                    and not self._symbol_tracked_by_anyone(symbol.symbol)
                     and self.total_symbol_count() >= self.max_total_symbols
                 ):
                     raise MonitorLimitError(MONITOR_LIMIT_MESSAGE)
@@ -909,7 +936,8 @@ class SQLiteMarketAccountStore:
             if known >= self.max_symbols_per_user and already_known is None:
                 raise ValueError("watchlist symbol limit reached")
             if (
-                not self._symbol_tracked_by_anyone(symbol.symbol)
+                not is_exchange_fund_symbol(symbol.symbol, symbol.market)
+                and not self._symbol_tracked_by_anyone(symbol.symbol)
                 and self.total_symbol_count() >= self.max_total_symbols
             ):
                 raise MonitorLimitError(MONITOR_LIMIT_MESSAGE)

@@ -1112,3 +1112,97 @@ def test_direct_enrichment_drops_empty_unit_shell_and_falls_back_to_stored_fund_
     assert with_fallback.main_fund_flow == stored_periods
     assert with_fallback.stored_trade_dates["main_fund_flow"] == "20261124"
     assert with_fallback.source_errors["main_fund_flow"] == "DIRECT_SESSION_EXPIRED"
+
+
+def test_busy_direct_enrichment_reuses_last_good_and_today_core_fallback_and_skips_fund_flow_for_funds() -> None:
+    from dataclasses import replace
+    from level2_service.public_market import DirectEnrichedMarketDataSource
+
+    snapshot = MarketSnapshot(
+        symbol="601318",
+        name="中国平安",
+        market="17",
+        sequence=0,
+        source_time="13:57",
+        collected_at=datetime.now(timezone.utc),
+        quote={"price": "54.67", "turnover_rate": "0.60%"},
+        source="TENCENT_PUBLIC",
+    )
+
+    class Base:
+        @staticmethod
+        def read_market_snapshot(symbol: str, *, detail: bool):
+            return replace(snapshot, symbol=symbol, market="36" if symbol == "160723" else "17")
+
+    l2_values = {kind: None for kind in MetricKind}
+    l2_values.update(
+        {
+            MetricKind.LARGE_ORDER_NET: "0.05",
+            MetricKind.LARGE_ORDER_AMOUNT: "31116.89",
+            MetricKind.RETAIL_COUNT: "-13.60",
+            MetricKind.MACDFS: "+0.001",
+        }
+    )
+    l2_outcome = DirectReadOutcome(
+        values=l2_values,
+        source_errors={"core_metrics": None, "main_fund_flow": None},
+    )
+
+    now = [100.0]
+
+    class DirectOnceThenBusy:
+        calls = 0
+
+        def read_direct(self, _symbol: str):
+            self.calls += 1
+            if self.calls == 1:
+                return l2_outcome
+            raise AssertionError("busy lock should short-circuit before read_direct")
+
+    stale_source = DirectEnrichedMarketDataSource(
+        Base(),
+        DirectOnceThenBusy(),
+        ttl_seconds=5.0,
+        stale_ttl_seconds=120.0,
+        clock=lambda: now[0],
+        is_watchlist_symbol=lambda _s: True,
+    )
+    first = stale_source.read_market_snapshot("601318", detail=True)
+    assert first.quote["large_order_net"] == "0.05"
+    now[0] += 10.0  # past ttl_seconds=5.0, still within stale_ttl_seconds=120.0
+    assert stale_source._enrichment_lock.acquire(blocking=False)
+    try:
+        while_busy = stale_source.read_market_snapshot("601318", detail=True)
+    finally:
+        stale_source._enrichment_lock.release()
+    assert while_busy.quote["large_order_net"] == "0.05"
+    assert while_busy.capabilities["l2"]["available"] is True
+    assert while_busy.source_errors["core_metrics"] is None
+
+    # Cold cache with busy lock falls back to today's stored core metrics transparently.
+    cold_source = DirectEnrichedMarketDataSource(
+        Base(),
+        DirectOnceThenBusy(),
+        is_watchlist_symbol=lambda _s: True,
+        core_fallback=lambda _s: l2_outcome,
+    )
+    assert cold_source._enrichment_lock.acquire(blocking=False)
+    try:
+        cold_busy = cold_source.read_market_snapshot("601318", detail=True)
+    finally:
+        cold_source._enrichment_lock.release()
+    assert cold_busy.quote["large_order_amount"] == "31116.89"
+    assert cold_busy.capabilities["l2"]["available"] is True
+    assert cold_busy.source_errors["core_metrics"] is None
+
+    # Exchange funds never invoke fund_flow_fallback.
+    fund_fallback_calls: list[str] = []
+    fund_source = DirectEnrichedMarketDataSource(
+        Base(),
+        type("FundDirect", (), {"read_direct": staticmethod(lambda _s: l2_outcome)})(),
+        is_watchlist_symbol=lambda _s: True,
+        fund_flow_fallback=lambda sym: fund_fallback_calls.append(sym) or {},
+    )
+    fund_snap = fund_source.read_market_snapshot("160723", detail=True)
+    assert fund_snap.main_fund_flow == {}
+    assert fund_fallback_calls == []

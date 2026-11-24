@@ -16,7 +16,13 @@ from pydantic import BaseModel, Field
 
 from .market_accounts import MarketUser
 from .market_data import fixed_market_error_code
-from .parsed_values import DirectRequestError, SymbolLookup
+from .parsed_values import (
+    DirectRequestError,
+    SymbolLookup,
+    UnsupportedMarketError,
+    is_exchange_fund_symbol,
+    market_code_for_symbol,
+)
 from .research_monitor import (
     format_push_price_and_change,
     format_push_symbol,
@@ -253,6 +259,15 @@ def install_goodluck_routes(
         except Exception:
             return fallback
 
+    def _resolved_market(symbol: str, stored_market: str) -> str:
+        try:
+            return market_code_for_symbol(symbol)
+        except UnsupportedMarketError:
+            return stored_market
+
+    def _supports_darkpool(symbol: str, market: str | None = None) -> bool:
+        return not is_exchange_fund_symbol(symbol, market)
+
     def _schedule_warmup(symbol: str) -> None:
         broker = getattr(app.state, "market_data_broker", None)
         store = getattr(app.state, "research_store", None)
@@ -325,6 +340,7 @@ def install_goodluck_routes(
                     "name": item.name,
                     "market": item.market,
                     "market_label": item.market_label,
+                    "supports_darkpool": _supports_darkpool(item.symbol, item.market),
                 }
                 for item in search(normalized, limit)
             ]
@@ -344,10 +360,15 @@ def install_goodluck_routes(
     def bridge_lookup_symbol(
         symbol: str,
         _identity=Depends(require_goodluck_identity),
-    ) -> dict[str, str]:
+    ) -> dict[str, Any]:
         normalized = _validate_symbol(symbol)
         result = resolve_symbol(normalized)
-        return {"symbol": result.symbol, "name": result.name, "market": result.market}
+        return {
+            "symbol": result.symbol,
+            "name": result.name,
+            "market": result.market,
+            "supports_darkpool": _supports_darkpool(result.symbol, result.market),
+        }
 
     @app.get(f"{prefix}/watchlists")
     def bridge_get_watchlists(identity=Depends(require_goodluck_identity)) -> dict[str, Any]:
@@ -365,11 +386,13 @@ def install_goodluck_routes(
             items = []
             for item in group.items:
                 status_row = statuses.get(item.symbol, {})
+                market = _resolved_market(item.symbol, item.market)
                 items.append(
                     {
                         "symbol": item.symbol,
                         "name": _resolve_item_name(item.symbol, item.name),
-                        "market": item.market,
+                        "market": market,
+                        "supports_darkpool": _supports_darkpool(item.symbol, market),
                         "monitoring_enabled": bool(states.get(item.symbol, True)),
                         "latest_trade_date": status_row.get("latest_trade_date"),
                         "latest_time": status_row.get("latest_time"),
@@ -438,7 +461,10 @@ def install_goodluck_routes(
                 {
                     "symbol": item.symbol,
                     "name": _resolve_item_name(item.symbol, item.name),
-                    "market": item.market,
+                    "market": _resolved_market(item.symbol, item.market),
+                    "supports_darkpool": _supports_darkpool(
+                        item.symbol, _resolved_market(item.symbol, item.market)
+                    ),
                 }
                 for item in group.items
             ],
@@ -491,6 +517,7 @@ def install_goodluck_routes(
             "symbol": item.symbol,
             "name": item.name,
             "market": item.market,
+            "supports_darkpool": _supports_darkpool(item.symbol, item.market),
             "monitoring_enabled": True,
         }
 
@@ -658,7 +685,12 @@ def install_goodluck_routes(
                             snapshot = cached
                 if snapshot is None and store is not None:
                     snapshot = await asyncio.to_thread(store.latest_market_snapshot, code)
-            ff_meta, today_ff = await asyncio.to_thread(_extract_today_fund_flow, store, code)
+            resolved_market = _resolved_market(code, item.market)
+            supports_dp = _supports_darkpool(code, resolved_market)
+            if supports_dp:
+                ff_meta, today_ff = await asyncio.to_thread(_extract_today_fund_flow, store, code)
+            else:
+                ff_meta, today_ff = None, None
             if snapshot is not None:
                 public = snapshot.as_public()
                 quote = public.get("quote") or {}
@@ -667,7 +699,8 @@ def install_goodluck_routes(
                 summary = {
                     "symbol": code,
                     "name": public.get("name") or _resolve_item_name(code, item.name),
-                    "market": public.get("market") or item.market,
+                    "market": public.get("market") or resolved_market,
+                    "supports_darkpool": supports_dp,
                     "price": quote.get("price"),
                     "change_percent": quote.get("change_percent"),
                     "turnover_rate": quote.get("turnover_rate"),
@@ -680,7 +713,8 @@ def install_goodluck_routes(
                 summary = {
                     "symbol": code,
                     "name": _resolve_item_name(code, item.name),
-                    "market": item.market,
+                    "market": resolved_market,
+                    "supports_darkpool": supports_dp,
                     "price": None,
                     "change_percent": None,
                     "turnover_rate": None,
@@ -729,10 +763,13 @@ def install_goodluck_routes(
         stock_name = public.get("name") or _resolve_item_name(normalized, watchlist_item.name)
         market_phase = public.get("market_phase")
         phase_value = market_phase.value if hasattr(market_phase, "value") else market_phase
+        market = public.get("market") or _resolved_market(normalized, watchlist_item.market)
+        supports_dp = _supports_darkpool(normalized, market)
         return {
             "symbol": normalized,
             "name": stock_name,
-            "market": public.get("market") or watchlist_item.market,
+            "market": market,
+            "supports_darkpool": supports_dp,
             "source": public.get("source"),
             "source_time": public.get("source_time"),
             "collected_at": public.get("collected_at"),
@@ -749,10 +786,14 @@ def install_goodluck_routes(
                 "retail_count": quote.get("retail_count"),
                 "macdfs": quote.get("macdfs"),
             },
-            "main_fund_flow": public.get("main_fund_flow") or {},
+            "main_fund_flow": (public.get("main_fund_flow") or {}) if supports_dp else {},
             "capabilities": {
                 "l2": (public.get("capabilities") or {}).get("l2")
                 or {"available": False, "reason": None},
+                "darkpool": {
+                    "available": supports_dp,
+                    "reason": None if supports_dp else "FUND_DARKPOOL_UNSUPPORTED",
+                },
             },
             "source_errors": public.get("source_errors") or {},
             "stored_trade_dates": public.get("stored_trade_dates") or {},
@@ -772,6 +813,21 @@ def install_goodluck_routes(
         watchlist_item = _user_watchlist_items(accounts, user.id).get(normalized)
         if watchlist_item is None:
             raise HTTPException(status_code=404, detail="watchlist symbol not found")
+        if not _supports_darkpool(normalized, _resolved_market(normalized, watchlist_item.market)):
+            return {
+                "symbol": normalized,
+                "name": _resolve_item_name(normalized, watchlist_item.name),
+                "supports_darkpool": False,
+                "trade_date": None,
+                "available_dates": [],
+                "latest_sync_at": None,
+                "last_error": None,
+                "periods": {
+                    "today": {"points": []},
+                    "three_day": {"points": []},
+                    "five_day": {"points": []},
+                },
+            }
         store = getattr(app.state, "research_store", None)
         if store is None:
             raise HTTPException(status_code=503, detail="research monitoring is not configured")
@@ -782,7 +838,11 @@ def install_goodluck_routes(
             )
         except LookupError:
             raise HTTPException(status_code=404, detail="fund flow history not found") from None
-        return {**history, "name": _resolve_item_name(normalized, watchlist_item.name)}
+        return {
+            **history,
+            "name": _resolve_item_name(normalized, watchlist_item.name),
+            "supports_darkpool": True,
+        }
 
     @app.get(f"{prefix}/symbols/{{symbol}}/fund-flow/daily")
     def bridge_fund_flow_daily(
@@ -796,12 +856,22 @@ def install_goodluck_routes(
         watchlist_item = _user_watchlist_items(accounts, user.id).get(normalized)
         if watchlist_item is None:
             raise HTTPException(status_code=404, detail="watchlist symbol not found")
+        if not _supports_darkpool(normalized, _resolved_market(normalized, watchlist_item.market)):
+            return {
+                "symbol": normalized,
+                "name": _resolve_item_name(normalized, watchlist_item.name),
+                "supports_darkpool": False,
+                "limit": limit,
+                "baseline_trade_date": None,
+                "points": [],
+            }
         store = getattr(app.state, "research_store", None)
         if store is None:
             raise HTTPException(status_code=503, detail="research monitoring is not configured")
         return {
             **store.read_fund_flow_daily(normalized, limit, previous_trading_date),
             "name": _resolve_item_name(normalized, watchlist_item.name),
+            "supports_darkpool": True,
         }
 
     # ---- Oil & Gas QDII/LOF Premium Panel ----
@@ -1181,7 +1251,11 @@ def install_goodluck_routes(
         broker = getattr(app.state, "market_data_broker", None)
         store = getattr(app.state, "research_store", None)
         catalog = getattr(app.state, "symbol_catalog", None)
-        monitored_symbols = accounts.list_monitored_symbols()
+        monitored_symbols = [
+            symbol
+            for symbol in accounts.list_monitored_symbols()
+            if _supports_darkpool(symbol)
+        ]
         catalog_info = None
         if catalog is not None and callable(getattr(catalog, "status", None)):
             current = catalog.status()

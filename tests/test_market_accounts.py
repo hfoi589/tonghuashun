@@ -414,3 +414,69 @@ def test_redis_expired_session_is_removed_without_recursive_revoke() -> None:
 
     assert store.get(session.session_id) is None
     assert session.session_id not in client.sets[store._user_key(7)]
+
+
+def test_exchange_funds_are_migrated_and_excluded_from_global_darkpool_limit(tmp_path) -> None:
+    import sqlite3
+
+    path = tmp_path / "fund-limit.db"
+    connection = sqlite3.connect(path)
+    connection.executescript(
+        """
+        CREATE TABLE market_users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT NOT NULL COLLATE NOCASE UNIQUE,
+            password_hash TEXT NOT NULL,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            must_change_password INTEGER NOT NULL DEFAULT 1,
+            role TEXT NOT NULL DEFAULT 'user',
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE watchlist_groups (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            name TEXT NOT NULL,
+            sort_order INTEGER NOT NULL,
+            is_primary INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE TABLE watchlist_items (
+            group_id INTEGER NOT NULL,
+            symbol TEXT NOT NULL,
+            name TEXT NOT NULL,
+            market TEXT NOT NULL,
+            sort_order INTEGER NOT NULL,
+            monitoring_enabled INTEGER NOT NULL DEFAULT 1,
+            monitoring_enabled_at TEXT,
+            PRIMARY KEY(group_id, symbol)
+        );
+        INSERT INTO market_users VALUES(1,'wilson','hash',1,0,'admin','2026-08-19T09:00:00+08:00');
+        INSERT INTO watchlist_groups VALUES(1,1,'自选',0,1);
+        INSERT INTO watchlist_items VALUES(1,'601318','中国平安','17',0,1,NULL);
+        INSERT INTO watchlist_items VALUES(1,'160723','嘉实原油','33',1,1,NULL);
+        INSERT INTO watchlist_items VALUES(1,'501018','南方原油','17',2,1,NULL);
+        """
+    )
+    connection.close()
+
+    store = SQLiteMarketAccountStore(path, max_total_symbols=1)
+
+    migrated = {
+        row["symbol"]: row["market"]
+        for row in store._connection.execute(
+            "SELECT symbol, market FROM watchlist_items"
+        ).fetchall()
+    }
+    assert migrated == {"601318": "17", "160723": "36", "501018": "20"}
+    assert store.total_symbol_count() == 1
+
+    # Adding another exchange fund succeeds even though max_total_symbols=1 is already used by 601318.
+    added_fund = store.add_symbol(1, 1, SymbolLookup("161129", "原油LOF易方达", "36"))
+    assert added_fund.symbol == "161129"
+    assert store.total_symbol_count() == 1
+    assert "160723" in store.list_monitored_symbols()
+
+    import pytest
+    from level2_service.market_accounts import MonitorLimitError
+
+    with pytest.raises(MonitorLimitError):
+        store.add_symbol(1, 1, SymbolLookup("600026", "中远海能", "17"))

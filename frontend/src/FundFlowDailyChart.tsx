@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
 import { formatFundFlowAxisTick, fundFlowSeriesConfig, fundFlowToWan, type FundFlowSeriesKey } from './FundFlowHistoryChart'
+import { isUnsupportedFundSymbol } from './FundFlowHistoryPanel'
 import { marketApi, type FundFlowDailyPoint, type FundFlowDailyResponse } from './market-api'
 
 function dateLabel(value: string): string {
@@ -144,7 +145,7 @@ export function FundFlowDailyPanel({ symbol, market, pollingEnabled: _pollingEna
   const [history, setHistory] = useState<FundFlowDailyResponse>()
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string>()
-  const unsupportedFund = market === '20' || market === '36'
+  const unsupportedFund = isUnsupportedFundSymbol(symbol, market)
   useEffect(() => {
     if (unsupportedFund) {
       setHistory(undefined)

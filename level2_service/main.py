@@ -772,6 +772,15 @@ def create_production_app(
             },
         )
 
+    def intraday_core_fallback(symbol: str) -> DirectReadOutcome | None:
+        stored = research_store.latest_market_enrichment(symbol)
+        if stored is None:
+            return None
+        today = datetime.now(SHANGHAI_TZ).strftime("%Y%m%d")
+        if stored.stored_trade_dates.get("core_metrics") != today:
+            return None
+        return stored
+
     enriched_market_source = DirectEnrichedMarketDataSource(
         public_market_source,
         direct_market_enrichment,
@@ -780,6 +789,7 @@ def create_production_app(
         is_watchlist_symbol=lambda symbol: symbol
         in set(market_accounts.list_watchlist_symbols()),
         closed_enrichment=closed_market_enrichment,
+        core_fallback=intraday_core_fallback,
         fund_flow_fallback=research_store.latest_fund_flow_snapshot,
     )
     public_market_data_source = DailyKlineMarketDataSource(

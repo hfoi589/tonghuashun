@@ -23,6 +23,8 @@ CATALOG = {
     "601872": SymbolLookup(symbol="601872", name="招商轮船", market="17"),
     "600036": SymbolLookup(symbol="600036", name="招商银行", market="17"),
     "300750": SymbolLookup(symbol="300750", name="宁德时代", market="33"),
+    "160723": SymbolLookup(symbol="160723", name="嘉实原油", market="36"),
+    "161129": SymbolLookup(symbol="161129", name="原油LOF易方达", market="36"),
 }
 
 
@@ -559,3 +561,66 @@ def test_bridge_admin_only_intraday_replay_and_premium(tmp_path) -> None:
         )
         assert rule_test.status_code == 200
         assert rule_test.json()["evaluation"]["matched"] is True
+
+
+def test_bridge_marks_funds_no_darkpool_and_excludes_from_global_dedup_counts(tmp_path) -> None:
+    broker = FakeMarketBroker(
+        {
+            "601872": _make_snapshot("601872", with_l2=True, with_fund_flow=True),
+            "160723": _make_snapshot("160723", with_l2=True, with_fund_flow=True),
+            "161129": _make_snapshot("161129", with_l2=True, with_fund_flow=False),
+        }
+    )
+    app, _accounts, _store = _build_app(tmp_path, max_total_symbols=1, broker=broker)
+
+    with TestClient(app) as client:
+        wl = client.get("/api/internal/goodluck/watchlists", headers=_headers("uid:alice")).json()
+        primary_id = wl["groups"][0]["id"]
+
+        # Occupy the single global darkpool slot with an equity.
+        add_stock = client.post(
+            f"/api/internal/goodluck/watchlists/groups/{primary_id}/symbols",
+            headers=_headers("uid:alice"),
+            json={"symbol": "601872"},
+        )
+        assert add_stock.status_code == 201
+        assert add_stock.json()["supports_darkpool"] is True
+
+        # Adding funds without darkpool succeeds without consuming the global darkpool quota.
+        for code in ("160723", "161129"):
+            res = client.post(
+                f"/api/internal/goodluck/watchlists/groups/{primary_id}/symbols",
+                headers=_headers("uid:alice"),
+                json={"symbol": code},
+            )
+            assert res.status_code == 201
+            assert res.json()["supports_darkpool"] is False
+
+        wl_after = client.get("/api/internal/goodluck/watchlists", headers=_headers("uid:alice")).json()
+        assert wl_after["limits"]["global_count"] == 1
+        by_sym = {item["symbol"]: item for item in wl_after["groups"][0]["items"]}
+        assert by_sym["601872"]["supports_darkpool"] is True
+        assert by_sym["160723"]["supports_darkpool"] is False
+
+        snap = client.get("/api/internal/goodluck/symbols/160723/snapshot", headers=_headers("uid:alice")).json()
+        assert snap["supports_darkpool"] is False
+        assert snap["main_fund_flow"] == {}
+        assert snap["capabilities"]["darkpool"] == {
+            "available": False,
+            "reason": "FUND_DARKPOOL_UNSUPPORTED",
+        }
+
+        hist = client.get("/api/internal/goodluck/symbols/160723/fund-flow/history", headers=_headers("uid:alice"))
+        assert hist.status_code == 200
+        assert hist.json()["supports_darkpool"] is False
+        assert hist.json()["periods"]["today"]["points"] == []
+
+        daily = client.get("/api/internal/goodluck/symbols/160723/fund-flow/daily", headers=_headers("uid:alice"))
+        assert daily.status_code == 200
+        assert daily.json()["supports_darkpool"] is False
+        assert daily.json()["points"] == []
+
+        admin_status = client.get("/api/internal/goodluck/admin/status", headers=_headers("uid:admin", "admin")).json()
+        assert admin_status["global_count"] == 1
+        assert admin_status["monitored_count"] == 1
+        assert [row["symbol"] for row in admin_status["monitoring"]] == ["601872"]

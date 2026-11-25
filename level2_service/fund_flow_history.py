@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import re
 from datetime import datetime, timedelta
 from typing import Any, Callable, Mapping
 from zoneinfo import ZoneInfo
@@ -18,6 +19,59 @@ from .parsed_values import (
 
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
+_QUOTE_DATE_RE = re.compile(r"^\s*(20\d{2})[-/]?(0[1-9]|1[0-2])[-/]?(0[1-9]|[12]\d|3[01])")
+
+
+def extract_quote_trade_date(source_time: object) -> str | None:
+    """Extract YYYYMMDD from quote source_time when an explicit date prefix is present."""
+    matched = _QUOTE_DATE_RE.match(str(source_time or ""))
+    if not matched:
+        return None
+    return "".join(matched.groups())
+
+
+def read_fund_flow_history_for_view(
+    store: Any,
+    symbol: str,
+    trade_date: str | None = None,
+    *,
+    expected_intraday_trade_date: Callable[[], str | None] | None = None,
+) -> dict[str, Any]:
+    """Read fund-flow history without falling back to yesterday during today's session."""
+    requested_date = trade_date.strip() if trade_date else None
+    expected_today = (
+        expected_intraday_trade_date()
+        if callable(expected_intraday_trade_date)
+        else None
+    )
+    if expected_today and (requested_date is None or requested_date == expected_today):
+        try:
+            return store.read_fund_flow_history(symbol, expected_today)
+        except LookupError:
+            avail = list(store.available_fund_flow_dates(symbol))
+            merged_avail = [expected_today, *[d for d in avail if d != expected_today]]
+            status_reader = getattr(store, "fund_flow_status", None)
+            status = status_reader(symbol) if callable(status_reader) else {}
+            return {
+                "symbol": symbol,
+                "trade_date": expected_today,
+                "available_dates": merged_avail,
+                "latest_sync_at": status.get("last_sync_at"),
+                "last_error": status.get("last_error"),
+                "periods": {
+                    "today": {"points": []},
+                    "three_day": {"points": []},
+                    "five_day": {"points": []},
+                },
+            }
+    history = dict(store.read_fund_flow_history(symbol, requested_date))
+    if expected_today:
+        avail = list(history.get("available_dates") or [])
+        if expected_today not in avail:
+            history["available_dates"] = [expected_today, *avail]
+    return history
+
+
 FUND_FLOW_VALUE_FIELDS = (
     "main_net_inflow",
     "main_visible_inflow",
@@ -56,6 +110,7 @@ class FundFlowHistoryMonitor:
         is_market_open: Callable[[], bool] = is_china_market_open,
         is_post_close_window: Callable[[datetime], bool] | None = None,
         on_post_close_finalized: Callable[[list[str]], None] | None = None,
+        session_notifier: Any | None = None,
         clock: Callable[[], datetime] = lambda: datetime.now(SHANGHAI),
         max_concurrent: int = 4,
         retention_days: int = 180,
@@ -70,6 +125,7 @@ class FundFlowHistoryMonitor:
         self.is_market_open = is_market_open
         self.is_post_close_window = is_post_close_window
         self.on_post_close_finalized = on_post_close_finalized
+        self.session_notifier = session_notifier
         self.clock = clock
         self.max_concurrent = max_concurrent
         self.retention_days = retention_days
@@ -166,6 +222,19 @@ class FundFlowHistoryMonitor:
                         symbol,
                         code,
                     )
+                if self.session_notifier is not None and code in {
+                    "DIRECT_SESSION_EXPIRED",
+                    "DIRECT_SESSION_UNAVAILABLE",
+                }:
+                    try:
+                        await asyncio.to_thread(
+                            self.session_notifier.notify_error,
+                            "main_fund_flow",
+                            code,
+                            stage="盘中暗盘定时轮询",
+                        )
+                    except Exception:
+                        pass
                 return {symbol: False for symbol in symbols}
 
             to_record: dict[str, dict[str, dict[str, str | None]]] = {}
@@ -214,6 +283,17 @@ class FundFlowHistoryMonitor:
                     partial_symbols.add(symbol)
 
             if to_record:
+                if self.session_notifier is not None and any(
+                    sym not in partial_symbols for sym in to_record
+                ):
+                    try:
+                        await asyncio.to_thread(
+                            self.session_notifier.notify_recovered,
+                            "main_fund_flow",
+                            stage="盘中暗盘定时轮询",
+                        )
+                    except Exception:
+                        pass
                 batch_writer = getattr(self.store, "record_fund_flow_batch", None)
                 if callable(batch_writer):
                     changed_map = await asyncio.to_thread(
@@ -256,9 +336,11 @@ class FundFlowHistoryMonitor:
 
         semaphore = asyncio.Semaphore(self.max_concurrent)
         accepts_force = self._supports_force_kwarg(self.source.read_direct)
+        session_error_codes: list[str] = []
+        any_valid = False
 
         async def collect(symbol: str) -> tuple[str, bool]:
-            nonlocal had_error
+            nonlocal had_error, any_valid
             async with semaphore:
                 try:
                     if post_close and accepts_force:
@@ -306,6 +388,8 @@ class FundFlowHistoryMonitor:
                             symbol,
                             f"DIRECT_FUND_FLOW_{quality}",
                         )
+                    else:
+                        any_valid = True
                     return symbol, bool(changed) if quality == "VALID" else False
                 except Exception as error:
                     had_error = True
@@ -313,6 +397,8 @@ class FundFlowHistoryMonitor:
                         error,
                         "DIRECT_FUND_FLOW_REQUEST_FAILED",
                     )
+                    if code in {"DIRECT_SESSION_EXPIRED", "DIRECT_SESSION_UNAVAILABLE"}:
+                        session_error_codes.append(code)
                     await asyncio.to_thread(
                         self.store.record_fund_flow_error,
                         symbol,
@@ -321,6 +407,26 @@ class FundFlowHistoryMonitor:
                     return symbol, False
 
         rows = await asyncio.gather(*(collect(symbol) for symbol in symbols))
+        if self.session_notifier is not None:
+            if session_error_codes:
+                try:
+                    await asyncio.to_thread(
+                        self.session_notifier.notify_error,
+                        "main_fund_flow",
+                        session_error_codes[0],
+                        stage="盘中暗盘定时轮询",
+                    )
+                except Exception:
+                    pass
+            elif any_valid:
+                try:
+                    await asyncio.to_thread(
+                        self.session_notifier.notify_recovered,
+                        "main_fund_flow",
+                        stage="盘中暗盘定时轮询",
+                    )
+                except Exception:
+                    pass
         if post_close and not had_error:
             self._finalized_close_date = trade_date
             if callable(self.on_post_close_finalized):

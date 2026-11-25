@@ -420,6 +420,7 @@ def create_app(
     symbol_catalog_refresh_hour: int = 16,
     symbol_catalog_refresh_minute: int = 20,
     previous_trading_date: Callable[[str], str] | None = None,
+    expected_intraday_trade_date: Callable[[], str | None] | None = None,
     core_prewarmer: Callable[[str | None], None] | None = None,
     core_session_invalidator: Callable[[], None] | None = None,
     fund_session_invalidator: Callable[[], None] | None = None,
@@ -436,6 +437,8 @@ def create_app(
     push_dispatcher: object | None = None,
     premium_monitor: object | None = None,
     premium_monitor_interval_seconds: float = 15.0,
+    session_probe: object | None = None,
+    session_probe_interval_seconds: float = 30.0,
     account_session_provider: SessionProvider | None = None,
     account_session_refreshers: Mapping[
         str,
@@ -458,6 +461,8 @@ def create_app(
         raise ValueError("fund_flow_monitor_interval_seconds must be positive")
     if premium_monitor_interval_seconds <= 0:
         raise ValueError("premium_monitor_interval_seconds must be positive")
+    if session_probe_interval_seconds <= 0:
+        raise ValueError("session_probe_interval_seconds must be positive")
     if not 0 <= symbol_catalog_refresh_hour <= 23:
         raise ValueError("symbol_catalog_refresh_hour must be between 0 and 23")
     if not 0 <= symbol_catalog_refresh_minute <= 59:
@@ -592,6 +597,18 @@ def create_app(
                 except TimeoutError:
                     continue
 
+        async def session_probe_loop() -> None:
+            while not stop.is_set():
+                try:
+                    if app.state.session_probe is not None:
+                        await app.state.session_probe.poll_once()
+                except Exception:
+                    logger.exception("preopen session probe failed")
+                try:
+                    await wait_for(stop.wait(), timeout=session_probe_interval_seconds)
+                except TimeoutError:
+                    continue
+
         async def symbol_catalog_loop() -> None:
             catalog = app.state.symbol_catalog
             if catalog is None:
@@ -666,6 +683,9 @@ def create_app(
         app.state.premium_task = (
             create_task(premium_loop()) if app.state.premium_monitor is not None else None
         )
+        app.state.session_probe_task = (
+            create_task(session_probe_loop()) if app.state.session_probe is not None else None
+        )
         app.state.symbol_catalog_task = (
             create_task(symbol_catalog_loop())
             if app.state.symbol_catalog is not None
@@ -687,6 +707,8 @@ def create_app(
                 await app.state.fund_flow_task
             if app.state.premium_task is not None:
                 await app.state.premium_task
+            if app.state.session_probe_task is not None:
+                await app.state.session_probe_task
             if app.state.symbol_catalog_task is not None:
                 await app.state.symbol_catalog_task
             warmup_tasks = list(getattr(app.state, "goodluck_warmup_tasks", ()))
@@ -833,6 +855,7 @@ def create_app(
     app.state.post_close_backfill = post_close_backfill
     app.state.push_dispatcher = push_dispatcher
     app.state.premium_monitor = premium_monitor
+    app.state.session_probe = session_probe
     app.state.account_session_provider = account_session_provider
     app.state.workday_calendar = workday_calendar or default_china_workday_calendar()
     app.state.account_session_refreshers = dict(account_session_refreshers or {})
@@ -1727,12 +1750,14 @@ def create_app(
         resolve_symbol=resolve_symbol,
         secure_cookies=secure_admin_cookies,
         previous_trading_date=previous_trading_date,
+        expected_intraday_trade_date=expected_intraday_trade_date,
     )
 
     install_goodluck_routes(
         app,
         resolve_symbol=resolve_symbol,
         previous_trading_date=previous_trading_date,
+        expected_intraday_trade_date=expected_intraday_trade_date,
     )
 
     install_vibe_routes(

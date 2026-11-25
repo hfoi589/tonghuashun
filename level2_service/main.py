@@ -63,6 +63,7 @@ from .research_monitor import ResearchMonitor
 from .research_push import PushDispatcher
 from .research_premium import PublicPremiumProvider
 from .premium_monitor import PremiumMonitor
+from .session_alert import PreopenSessionProbe, SessionHealthNotifier
 from .runner import ADBDeviceBridge, DailyCheckState, Level2Navigator, Level2Runner, OpenCVTemplateFallback, RunnerControl, TAB_LABELS, long_capture_has_net_heading
 from .security import persist_password_hash
 from .symbol_catalog import SinaSymbolCatalogSource, SQLiteSymbolCatalog
@@ -640,6 +641,15 @@ def create_production_app(
             return previous_trading_date(local.strftime("%Y%m%d"))
         return resolve_trading_date(local.date())
 
+    def expected_intraday_trade_date() -> str | None:
+        local = datetime.now(timezone.utc).astimezone(SHANGHAI_TZ)
+        if not trading_calendar.is_trading_day(local.date()):
+            return None
+        hhmm = local.strftime("%H%M")
+        if not ("0930" <= hhmm <= "1505"):
+            return None
+        return local.strftime("%Y%m%d")
+
     def _supports_force(fn: object) -> bool:
         try:
             sig = inspect.signature(fn)  # type: ignore[arg-type]
@@ -652,6 +662,11 @@ def create_production_app(
     research_store = SQLiteResearchStore(
         config.research_database_path,
         resolve_trade_date=resolve_trading_date,
+    )
+    push_dispatcher = PushDispatcher()
+    session_notifier = SessionHealthNotifier(
+        research_store,
+        push_dispatcher,
     )
 
     market_phase_resolver = MarketPhaseResolver(
@@ -680,7 +695,14 @@ def create_production_app(
             account_session_provider = EncryptedFileSessionProvider(
                 config.ths_session_root,
                 config.ths_session_encryption_key,
+                on_error=lambda role, code: session_notifier.notify_error_background(
+                    role, code, stage="直连请求"
+                ),
+                on_put=lambda bundle: session_notifier.notify_recovered_background(
+                    bundle.role, stage="管理后台续签"
+                ),
             )
+            session_notifier.session_provider = account_session_provider
             account_session_refreshers["main_fund_flow"] = FundAccountSessionRefresher(
                 partial(
                     capture_fund_http_session,
@@ -884,6 +906,14 @@ def create_production_app(
             return None
         return stored
 
+    def intraday_fund_flow_fallback(symbol: str) -> dict[str, object] | None:
+        now_sh = datetime.now(SHANGHAI_TZ)
+        return research_store.latest_fund_flow_snapshot(
+            symbol,
+            now=now_sh,
+            trade_date=now_sh.strftime("%Y%m%d"),
+        )
+
     enriched_market_source = DirectEnrichedMarketDataSource(
         public_market_source,
         direct_market_enrichment,
@@ -893,7 +923,7 @@ def create_production_app(
         in set(market_accounts.list_watchlist_symbols()),
         closed_enrichment=closed_market_enrichment,
         core_fallback=intraday_core_fallback,
-        fund_flow_fallback=research_store.latest_fund_flow_snapshot,
+        fund_flow_fallback=intraday_fund_flow_fallback,
     )
     public_market_data_source = DailyKlineMarketDataSource(
         enriched_market_source,
@@ -1027,7 +1057,6 @@ def create_production_app(
         for sym in symbols:
             market_broker.evict(sym)
 
-    push_dispatcher = PushDispatcher()
     research_monitor = ResearchMonitor(
         market_accounts,
         market_broker,
@@ -1046,8 +1075,21 @@ def create_production_app(
             is_market_open=market_is_open,
             is_post_close_window=is_fund_flow_post_close_window,
             on_post_close_finalized=_on_post_close_finalized,
+            session_notifier=session_notifier,
         )
         if fund_flow_source is not None
+        else None
+    )
+    session_probe = (
+        PreopenSessionProbe(
+            is_trading_day=trading_calendar.is_trading_day,
+            accounts=market_accounts,
+            fund_source=fund_flow_source if config.fund_flow_transport == "direct" else None,
+            core_source=direct_core_source if config.core_metrics_transport == "direct" else None,
+            session_provider=account_session_provider,
+            notifier=session_notifier,
+        )
+        if config.dual_account_mode and account_session_provider is not None
         else None
     )
     premium_monitor = PremiumMonitor(
@@ -1095,6 +1137,7 @@ def create_production_app(
         symbol_catalog_refresh_hour=config.symbol_catalog_refresh_hour,
         symbol_catalog_refresh_minute=config.symbol_catalog_refresh_minute,
         previous_trading_date=previous_trading_date,
+        expected_intraday_trade_date=expected_intraday_trade_date,
         core_prewarmer=(
             direct_core_source.prewarm
             if direct_core_source is not None
@@ -1129,6 +1172,7 @@ def create_production_app(
         post_close_backfill=post_close_backfill,
         push_dispatcher=push_dispatcher,
         premium_monitor=premium_monitor,
+        session_probe=session_probe,
         account_session_provider=account_session_provider,
         account_session_refreshers=account_session_refreshers,
         device_lifecycle=device_lifecycle,

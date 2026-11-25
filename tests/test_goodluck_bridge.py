@@ -127,6 +127,7 @@ def _build_app(
     token: str | None = TOKEN,
     max_total_symbols: int = 50,
     broker: FakeMarketBroker | None = None,
+    expected_intraday_trade_date=None,
 ):
     accounts = SQLiteMarketAccountStore(tmp_path / "market.db", max_total_symbols=max_total_symbols)
     store = SQLiteResearchStore(tmp_path / "research.db")
@@ -154,6 +155,7 @@ def _build_app(
         market_data_broker=broker,
         symbol_lookup=lookup,
         symbol_search=search,
+        expected_intraday_trade_date=expected_intraday_trade_date,
         goodluck_internal_token=token,
     )
     return app, accounts, store
@@ -694,3 +696,104 @@ def test_bridge_quotes_refreshes_closed_continuous_cache_and_post_close_backfill
         )
         assert bf.status_code == 200
         assert backfill_calls == ["601872"]
+
+
+def test_bridge_quotes_and_history_isolate_cross_day_fund_flow_during_intraday(tmp_path) -> None:
+    from dataclasses import replace
+
+    today_snap = replace(_make_snapshot("601872", with_l2=True, with_fund_flow=False), source_time="09:35")
+    broker = FakeMarketBroker({"601872": today_snap}, market_open=True)
+    app, _, store = _build_app(
+        tmp_path,
+        broker=broker,
+        expected_intraday_trade_date=lambda: "20261125",
+    )
+    store.record_fund_flow(
+        "601872",
+        trade_date="20261124",
+        minute="15:00",
+        periods={
+            "today": {
+                "unit": "亿元",
+                "main_net_inflow": "2.00",
+                "main_visible_inflow": "0.86",
+                "main_hidden_inflow": "1.14",
+                "retail_inflow": "-2.00",
+            },
+            "three_day": {
+                "unit": "亿元",
+                "main_net_inflow": "3.00",
+                "main_visible_inflow": "1.20",
+                "main_hidden_inflow": "1.80",
+                "retail_inflow": "-3.00",
+            },
+            "five_day": {
+                "unit": "亿元",
+                "main_net_inflow": "4.00",
+                "main_visible_inflow": "1.50",
+                "main_hidden_inflow": "2.50",
+                "retail_inflow": "-4.00",
+            },
+        },
+        captured_at=datetime(2026, 11, 24, 7, 0, tzinfo=timezone.utc),
+    )
+    store.record_fund_flow_error("601872", "DIRECT_SESSION_EXPIRED")
+
+    with TestClient(app) as client:
+        wl = client.get("/api/internal/goodluck/watchlists", headers=_headers("uid:alice")).json()
+        primary_id = wl["groups"][0]["id"]
+        assert client.post(
+            f"/api/internal/goodluck/watchlists/groups/{primary_id}/symbols",
+            headers=_headers("uid:alice"),
+            json={"symbol": "601872"},
+        ).status_code == 201
+
+        quotes = client.get("/api/internal/goodluck/quotes?symbols=601872", headers=_headers("uid:alice"))
+        assert quotes.status_code == 200
+        q_row = quotes.json()["items"]["601872"]
+        assert q_row["today_main_hidden_inflow"] is None
+        assert q_row["fund_flow_trade_date"] is None
+
+        # Default history request during active session returns empty today placeholder with error instead of yesterday.
+        hist_today = client.get("/api/internal/goodluck/symbols/601872/fund-flow/history", headers=_headers("uid:alice"))
+        assert hist_today.status_code == 200
+        body_today = hist_today.json()
+        assert body_today["trade_date"] == "20261125"
+        assert body_today["available_dates"] == ["20261125", "20261124"]
+        assert body_today["last_error"] == "DIRECT_SESSION_EXPIRED"
+        assert body_today["periods"]["today"]["points"] == []
+
+        # Explicit historical date still returns yesterday's data normally.
+        hist_yday = client.get(
+            "/api/internal/goodluck/symbols/601872/fund-flow/history?trade_date=20261124",
+            headers=_headers("uid:alice"),
+        )
+        assert hist_yday.status_code == 200
+        body_yday = hist_yday.json()
+        assert body_yday["trade_date"] == "20261124"
+        assert body_yday["available_dates"] == ["20261125", "20261124"]
+        assert body_yday["periods"]["today"]["points"][0]["main_hidden_inflow"] == "1.14"
+
+        # Once today points land, default history immediately serves today's curve.
+        store.record_fund_flow(
+            "601872",
+            trade_date="20261125",
+            minute="09:43",
+            periods={
+                "today": {
+                    "unit": "万元",
+                    "main_net_inflow": "320.00",
+                    "main_visible_inflow": "100.00",
+                    "main_hidden_inflow": "220.00",
+                    "retail_inflow": "-320.00",
+                },
+            },
+            captured_at=datetime(2026, 11, 25, 1, 43, tzinfo=timezone.utc),
+        )
+        hist_recovered = client.get(
+            "/api/internal/goodluck/symbols/601872/fund-flow/history",
+            headers=_headers("uid:alice"),
+        )
+        assert hist_recovered.status_code == 200
+        assert hist_recovered.json()["trade_date"] == "20261125"
+        assert hist_recovered.json()["periods"]["today"]["points"][0]["main_hidden_inflow"] == "220.00"

@@ -735,7 +735,14 @@ def capture_core_session_material(
 class EncryptedFileSessionProvider:
     """Persist one Fernet-encrypted credential bundle per account role."""
 
-    def __init__(self, root: Path, encryption_key: str) -> None:
+    def __init__(
+        self,
+        root: Path,
+        encryption_key: str,
+        *,
+        on_error: Callable[[str, str], None] | None = None,
+        on_put: Callable[[AccountSessionBundle], None] | None = None,
+    ) -> None:
         try:
             self._fernet = Fernet(encryption_key.encode("ascii"))
         except (UnicodeEncodeError, ValueError) as error:
@@ -747,6 +754,8 @@ class EncryptedFileSessionProvider:
         os.chmod(self.root, 0o700)
         self._errors: dict[str, str] = {}
         self._lock = RLock()
+        self._on_error = on_error
+        self._on_put = on_put
 
     def _path(self, role: str) -> Path:
         return self.root / f"{_validated_role(role)}.session"
@@ -824,6 +833,11 @@ class EncryptedFileSessionProvider:
             os.replace(temporary, path)
             os.chmod(path, 0o600)
             self._errors.pop(bundle.role, None)
+        if callable(self._on_put):
+            try:
+                self._on_put(bundle)
+            except Exception:
+                pass
 
     def status(self, role: str) -> AccountSessionStatus:
         normalized = _validated_role(role)
@@ -844,5 +858,11 @@ class EncryptedFileSessionProvider:
 
     def mark_error(self, role: str, error_code: str) -> None:
         normalized = _validated_role(role)
+        code = str(error_code)
         with self._lock:
-            self._errors[normalized] = str(error_code)
+            self._errors[normalized] = code
+        if callable(self._on_error):
+            try:
+                self._on_error(normalized, code)
+            except Exception:
+                pass

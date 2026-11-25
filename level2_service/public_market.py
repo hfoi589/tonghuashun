@@ -13,6 +13,7 @@ from threading import Lock, RLock
 from typing import Any, Callable, Iterable, Sequence
 from urllib.request import Request, urlopen
 
+from .fund_flow_history import extract_quote_trade_date
 from .market_data import KlineBar, MarketSeriesPage, MarketSnapshot, TimesharePoint
 from .models import FUND_FLOW_METRICS, FUND_FLOW_PERIODS, MetricKind
 from .parsed_values import (
@@ -975,24 +976,41 @@ class DirectEnrichedMarketDataSource:
             except Exception:
                 stored_ff = None
             if isinstance(stored_ff, dict) and isinstance(stored_ff.get("periods"), dict):
-                fallback_periods = {
-                    period: row
-                    for period, row in stored_ff["periods"].items()
-                    if isinstance(row, dict)
-                    and any(
-                        row.get(k) is not None
-                        for k in (
-                            "main_net_inflow",
-                            "main_visible_inflow",
-                            "main_hidden_inflow",
-                            "retail_inflow",
+                stored_trade_date = (
+                    str(stored_ff["trade_date"]).strip()
+                    if stored_ff.get("trade_date") is not None
+                    else None
+                )
+                quote_trade_date = extract_quote_trade_date(merged.source_time)
+                cross_day_mismatch = (
+                    quote_trade_date is not None
+                    and stored_trade_date is not None
+                    and len(stored_trade_date) == 8
+                    and stored_trade_date.isdigit()
+                    and stored_trade_date != quote_trade_date
+                )
+                fallback_periods = (
+                    {}
+                    if cross_day_mismatch
+                    else {
+                        period: row
+                        for period, row in stored_ff["periods"].items()
+                        if isinstance(row, dict)
+                        and any(
+                            row.get(k) is not None
+                            for k in (
+                                "main_net_inflow",
+                                "main_visible_inflow",
+                                "main_hidden_inflow",
+                                "retail_inflow",
+                            )
                         )
-                    )
-                }
+                    }
+                )
                 if fallback_periods:
                     stored_trade_dates = dict(merged.stored_trade_dates)
-                    if stored_ff.get("trade_date") is not None:
-                        stored_trade_dates["main_fund_flow"] = str(stored_ff["trade_date"])
+                    if stored_trade_date is not None:
+                        stored_trade_dates["main_fund_flow"] = stored_trade_date
                     merged = replace(
                         merged,
                         main_fund_flow=fallback_periods,

@@ -15,6 +15,7 @@ from zoneinfo import ZoneInfo
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 
+from .fund_flow_history import extract_quote_trade_date, read_fund_flow_history_for_view
 from .market_accounts import MarketUser
 from .market_data import fixed_market_error_code
 from .parsed_values import (
@@ -122,24 +123,41 @@ def _validate_optional_date(trade_date: str | None) -> str | None:
     return cleaned
 
 
-def _supports_force_kwarg(fn: object) -> bool:
+def _supports_kwarg(fn: object, name: str) -> bool:
     try:
         sig = inspect.signature(fn)  # type: ignore[arg-type]
     except (TypeError, ValueError):
         return False
-    if "force" in sig.parameters:
+    if name in sig.parameters:
         return True
     return any(p.kind is inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
 
 
-def _extract_today_fund_flow(store: object, symbol: str) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+def _supports_force_kwarg(fn: object) -> bool:
+    return _supports_kwarg(fn, "force")
+
+
+def _extract_today_fund_flow(
+    store: object,
+    symbol: str,
+    *,
+    trade_date: str | None = None,
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
     if store is None:
         return None, None
-    snapshot = store.latest_fund_flow_snapshot(symbol)
+    snapshot = (
+        store.latest_fund_flow_snapshot(symbol, trade_date=trade_date)
+        if trade_date is not None
+        else store.latest_fund_flow_snapshot(symbol)
+    )
     if snapshot is not None:
         return snapshot, (snapshot.get("periods") or {}).get("today")
     try:
-        history = store.read_fund_flow_history(symbol)
+        history = (
+            store.read_fund_flow_history(symbol, trade_date)
+            if trade_date is not None
+            else store.read_fund_flow_history(symbol)
+        )
     except LookupError:
         return None, None
     points = ((history.get("periods") or {}).get("today") or {}).get("points") or []
@@ -219,6 +237,7 @@ def install_goodluck_routes(
     *,
     resolve_symbol: Callable[[str], SymbolLookup],
     previous_trading_date: Callable[[str], str] | None = None,
+    expected_intraday_trade_date: Callable[[], str | None] | None = None,
 ) -> None:
     """Install token-authenticated internal bridge routes for Guohang Goodluck."""
 
@@ -718,23 +737,11 @@ def install_goodluck_routes(
 
         broker = getattr(app.state, "market_data_broker", None)
         store = getattr(app.state, "research_store", None)
-        darkpool_codes = [
-            code
-            for code in target_symbols
-            if _supports_darkpool(code, _resolved_market(code, user_items[code].market))
-        ]
-        batch_ff_reader = (
-            getattr(store, "latest_today_fund_flow_map", None)
-            if store is not None
+        expected_today = (
+            expected_intraday_trade_date()
+            if callable(expected_intraday_trade_date)
             else None
         )
-        ff_map: dict[str, dict[str, Any]] = {}
-        if darkpool_codes and callable(batch_ff_reader):
-            try:
-                ff_map = await asyncio.to_thread(batch_ff_reader, darkpool_codes)
-            except Exception:
-                ff_map = {}
-
         batch_quotes_fn = (
             getattr(broker, "refresh_quotes_batch", None)
             if broker is not None
@@ -749,6 +756,37 @@ def install_goodluck_routes(
                 )
             except Exception:
                 batch_snapshots = {}
+
+        darkpool_codes = [
+            code
+            for code in target_symbols
+            if _supports_darkpool(code, _resolved_market(code, user_items[code].market))
+        ]
+        quote_dates = {
+            parsed_date
+            for snapshot in batch_snapshots.values()
+            if snapshot is not None
+            and (parsed_date := extract_quote_trade_date(getattr(snapshot, "source_time", None))) is not None
+        }
+        ff_trade_date = (
+            next(iter(quote_dates))
+            if len(quote_dates) == 1
+            else expected_today
+        )
+        batch_ff_reader = (
+            getattr(store, "latest_today_fund_flow_map", None)
+            if store is not None
+            else None
+        )
+        ff_map: dict[str, dict[str, Any]] = {}
+        if darkpool_codes and callable(batch_ff_reader):
+            try:
+                if ff_trade_date is not None and _supports_kwarg(batch_ff_reader, "trade_date"):
+                    ff_map = await asyncio.to_thread(batch_ff_reader, darkpool_codes, trade_date=ff_trade_date)
+                else:
+                    ff_map = await asyncio.to_thread(batch_ff_reader, darkpool_codes)
+            except Exception:
+                ff_map = {}
 
         semaphore = asyncio.Semaphore(6)
 
@@ -783,12 +821,25 @@ def install_goodluck_routes(
                         snapshot = await asyncio.to_thread(store.latest_market_snapshot, code)
             resolved_market = _resolved_market(code, item.market)
             supports_dp = _supports_darkpool(code, resolved_market)
+            snap_source_time = getattr(snapshot, "source_time", None) if snapshot is not None else None
+            target_ff_date = extract_quote_trade_date(snap_source_time) or ff_trade_date
             if supports_dp:
                 if callable(batch_ff_reader):
                     entry = ff_map.get(code)
                     ff_meta, today_ff = entry, entry
                 else:
-                    ff_meta, today_ff = await asyncio.to_thread(_extract_today_fund_flow, store, code)
+                    ff_meta, today_ff = await asyncio.to_thread(
+                        _extract_today_fund_flow,
+                        store,
+                        code,
+                        trade_date=target_ff_date,
+                    )
+                if (
+                    ff_meta is not None
+                    and target_ff_date is not None
+                    and ff_meta.get("trade_date") != target_ff_date
+                ):
+                    ff_meta, today_ff = None, None
             else:
                 ff_meta, today_ff = None, None
             if snapshot is not None:
@@ -936,9 +987,11 @@ def install_goodluck_routes(
         if store is None:
             raise HTTPException(status_code=503, detail="research monitoring is not configured")
         try:
-            history = store.read_fund_flow_history(
+            history = read_fund_flow_history_for_view(
+                store,
                 normalized,
                 trade_date.strip() if trade_date else None,
+                expected_intraday_trade_date=expected_intraday_trade_date,
             )
         except LookupError:
             raise HTTPException(status_code=404, detail="fund flow history not found") from None

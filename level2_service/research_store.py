@@ -75,7 +75,7 @@ class SQLiteResearchStore:
         self._read_cache_lock = RLock()
         self._history_cache: dict[tuple[str, str | None], tuple[float, dict[str, Any]]] = {}
         self._daily_cache: dict[tuple[str, int], tuple[float, dict[str, Any]]] = {}
-        self._today_ff_map_cache: dict[str, tuple[float, dict[str, Any]]] = {}
+        self._today_ff_map_cache: dict[tuple[str | None, str], tuple[float, dict[str, Any]]] = {}
         self._today_ff_map_cached_at: float = 0.0
         self._migrate()
         try:
@@ -498,6 +498,28 @@ class SQLiteResearchStore:
             )
         return cursor.rowcount == 1
 
+    def has_push_event_matching(self, prefix: str, contains: str = "") -> bool:
+        pattern = f"{prefix}%{contains}%" if contains else f"{prefix}%"
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT 1 FROM research_push_events WHERE event_key LIKE ? LIMIT 1",
+                (pattern,),
+            ).fetchone()
+        return row is not None
+
+    def fund_flow_status(self, symbol: str) -> dict[str, Any]:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT latest_trade_date,latest_time,last_sync_at,last_error FROM fund_flow_history_status WHERE symbol=?",
+                (symbol,),
+            ).fetchone()
+        return {
+            "latest_trade_date": row["latest_trade_date"] if row else None,
+            "latest_time": row["latest_time"] if row else None,
+            "last_sync_at": row["last_sync_at"] if row else None,
+            "last_error": row["last_error"] if row else None,
+        }
+
     def save_premium_snapshot(self, snapshot: dict[str, Any]) -> dict[str, Any]:
         now = datetime.now().astimezone().isoformat()
         with self._lock, self._connection:
@@ -548,8 +570,8 @@ class SQLiteResearchStore:
             for key in [k for k in self._daily_cache if k[0] in symbol_set]:
                 self._daily_cache.pop(key, None)
             self._today_ff_map_cached_at = 0.0
-            for sym in symbol_set:
-                self._today_ff_map_cache.pop(sym, None)
+            for key in [k for k in self._today_ff_map_cache if k[1] in symbol_set]:
+                self._today_ff_map_cache.pop(key, None)
 
     def _upsert_fund_flow_locked(
         self,
@@ -972,18 +994,19 @@ class SQLiteResearchStore:
         target_symbols = list(dict.fromkeys(str(symbol) for symbol in symbols if symbol))
         if not target_symbols:
             return {}
-        use_cache = now is None and trade_date is None
+        use_cache = now is None
         now_mono = time.monotonic()
         if use_cache:
             with self._read_cache_lock:
-                if (
-                    now_mono - self._today_ff_map_cached_at < 1.0
-                    and all(symbol in self._today_ff_map_cache for symbol in target_symbols)
+                if all(
+                    (entry := self._today_ff_map_cache.get((trade_date, symbol))) is not None
+                    and now_mono - entry[0] < 1.0
+                    for symbol in target_symbols
                 ):
                     return {
                         symbol: dict(payload)
                         for symbol in target_symbols
-                        if (payload := self._today_ff_map_cache[symbol][1])
+                        if (payload := self._today_ff_map_cache[(trade_date, symbol)][1])
                     }
         where_clauses = [
             "period='today'",
@@ -1046,7 +1069,7 @@ class SQLiteResearchStore:
             with self._read_cache_lock:
                 self._today_ff_map_cached_at = time.monotonic()
                 for symbol in target_symbols:
-                    self._today_ff_map_cache[symbol] = (
+                    self._today_ff_map_cache[(trade_date, symbol)] = (
                         self._today_ff_map_cached_at,
                         dict(out[symbol]) if symbol in out else {},
                     )

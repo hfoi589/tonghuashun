@@ -1268,3 +1268,67 @@ def test_tencent_read_quotes_batch_and_exchange_fund_l2_short_circuit() -> None:
     assert fund_snap.capabilities["l2"] == {"available": False, "reason": "FUND_L2_UNSUPPORTED"}
     assert fund_snap.source_errors["core_metrics"] is None
     assert direct_calls == []
+
+
+def test_direct_enrichment_blocks_cross_day_fund_flow_fallback_when_quote_has_today_date() -> None:
+    from level2_service.public_market import DirectEnrichedMarketDataSource
+
+    today_snapshot = MarketSnapshot(
+        symbol="601318",
+        name="中国平安",
+        market="17",
+        sequence=0,
+        source_time="2026-11-25 09:35:00",
+        collected_at=datetime.now(timezone.utc),
+        quote={"price": "54.80"},
+        source="TENCENT_PUBLIC",
+    )
+
+    class Base:
+        @staticmethod
+        def read_market_snapshot(_symbol: str, *, detail: bool):
+            del detail
+            return today_snapshot
+
+    class ExpiredDirect:
+        @staticmethod
+        def read_direct(_symbol: str):
+            values = {kind: None for kind in MetricKind}
+            values[MetricKind.LARGE_ORDER_NET] = "0.55"
+            return DirectReadOutcome(
+                values=values,
+                source_errors={"core_metrics": None, "main_fund_flow": "DIRECT_SESSION_EXPIRED"},
+            )
+
+    yesterday_periods = {
+        "today": {
+            "unit": "亿元",
+            "main_net_inflow": "5.90",
+            "main_visible_inflow": "4.00",
+            "main_hidden_inflow": "1.90",
+            "retail_inflow": "-5.90",
+        }
+    }
+
+    blocked = DirectEnrichedMarketDataSource(
+        Base(),
+        ExpiredDirect(),
+        is_market_open=lambda: True,
+        is_watchlist_symbol=lambda _s: True,
+        fund_flow_fallback=lambda _s: {"trade_date": "20261124", "periods": yesterday_periods},
+    ).read_market_snapshot("601318", detail=True)
+
+    assert blocked.main_fund_flow == {}
+    assert "main_fund_flow" not in blocked.stored_trade_dates
+    assert blocked.source_errors["main_fund_flow"] == "DIRECT_SESSION_EXPIRED"
+
+    same_day = DirectEnrichedMarketDataSource(
+        Base(),
+        ExpiredDirect(),
+        is_market_open=lambda: True,
+        is_watchlist_symbol=lambda _s: True,
+        fund_flow_fallback=lambda _s: {"trade_date": "20261125", "periods": yesterday_periods},
+    ).read_market_snapshot("601318", detail=True)
+
+    assert same_day.main_fund_flow == yesterday_periods
+    assert same_day.stored_trade_dates["main_fund_flow"] == "20261125"

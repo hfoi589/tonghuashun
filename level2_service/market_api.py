@@ -15,6 +15,7 @@ import secrets
 from fastapi import Depends, FastAPI, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel, Field
 
+from .fund_flow_history import read_fund_flow_history_for_view
 from .market_accounts import (
     DuplicateUserError,
     EmailCodeRateLimited,
@@ -212,6 +213,7 @@ def install_market_routes(
     resolve_symbol: Callable[[str], SymbolLookup],
     secure_cookies: bool,
     previous_trading_date: Callable[[str], str] | None = None,
+    expected_intraday_trade_date: Callable[[], str | None] | None = None,
 ) -> None:
     """Install routes after the parent app has constructed its shared dependencies."""
 
@@ -1429,7 +1431,12 @@ def install_market_routes(
         if store is None:
             raise HTTPException(status_code=503, detail="research monitoring is not configured")
         try:
-            history = store.read_fund_flow_history(normalized, trade_date.strip() if trade_date else None)
+            history = read_fund_flow_history_for_view(
+                store,
+                normalized,
+                trade_date.strip() if trade_date else None,
+                expected_intraday_trade_date=expected_intraday_trade_date,
+            )
         except LookupError:
             raise HTTPException(status_code=404, detail="fund flow history not found") from None
         return {**history, "name": watchlist_item.name}

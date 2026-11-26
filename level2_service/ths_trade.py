@@ -296,8 +296,53 @@ def _has_main_page_chrome(scope: ElementTree.Element) -> bool:
     return False
 
 
+_KEYPAD_COORDS: dict[str, tuple[int, int]] = {
+    "1": (0, 0),
+    "2": (1, 0),
+    "3": (2, 0),
+    "4": (0, 1),
+    "5": (1, 1),
+    "6": (2, 1),
+    "7": (0, 2),
+    "8": (1, 2),
+    "9": (2, 2),
+    "0": (1, 3),
+}
+_AUTO_LOGIN_HARD_FAIL_KEYWORDS = (
+    "密码错误",
+    "密码不正确",
+    "交易密码错",
+    "锁定",
+    "冻结",
+    "连续错误",
+    "多次错误",
+)
+_AUTO_LOGIN_COOLDOWN_KEYWORDS = (
+    "清算",
+    "日终",
+    "维护",
+    "暂停服务",
+    "非服务时间",
+    "系统忙",
+)
+_UNSUPPORTED_AUTH_KEYWORDS = (
+    "通讯密码",
+    "图形验证码",
+    "短信验证码",
+    "手势解锁",
+    "手势密码",
+    "人脸识别",
+)
+
+
 def detect_modal_dialog(root: ElementTree.Element) -> DialogInfo | None:
     """Inspect whether an overlay confirmation/alert/action dialog is currently displayed."""
+    for node in root.iter():
+        if (node.attrib.get("resource-id") or "") in {
+            "com.hexin.plat.android:id/login_component_base_view",
+            "com.hexin.plat.android:id/weituo_edit_trade_password",
+        }:
+            return None
     parent_map = _collect_ancestors(root)
 
     # Identify overlay containers: either android:id/content has >1 top-level Window/FrameLayout
@@ -852,6 +897,7 @@ class TonghuashunTradeExecutor:
     runner_yield_timeout_seconds: float = 0.0
     u2_factory: Callable[[str], Any] | None = None
     name_to_symbol: Callable[[str], str | None] | None = None
+    broker_trade_password: str | None = field(default=None, repr=False)
     _lock: RLock = field(default_factory=RLock, init=False, repr=False)
     _cache_lock: RLock = field(default_factory=RLock, init=False, repr=False)
     _device: Any | None = field(default=None, init=False, repr=False)
@@ -859,6 +905,10 @@ class TonghuashunTradeExecutor:
     _prestaged_state: dict[str, Any] | None = field(default=None, init=False, repr=False)
     _active_tab: str | None = field(default=None, init=False, repr=False)
     _last_gateway_touch_at: float = field(default=0.0, init=False, repr=False)
+    _auto_login_halted_reason: str | None = field(default=None, init=False, repr=False)
+    _auto_login_cooldown_until: float = field(default=0.0, init=False, repr=False)
+    _auto_login_cooldown_reason: str = field(default="", init=False, repr=False)
+    _last_bg_keepalive_at: float = field(default=0.0, init=False, repr=False)
     _last_account: dict[str, Any] | None = field(default=None, init=False, repr=False)
     _last_account_at: float = field(default=0.0, init=False, repr=False)
     _last_account_date: str = field(default="", init=False, repr=False)
@@ -1189,12 +1239,270 @@ class TonghuashunTradeExecutor:
                     return True
         return False
 
+    def _is_broker_password_prompt(self, root: ElementTree.Element) -> bool:
+        return (
+            self._find_node(root, resource_id="com.hexin.plat.android:id/weituo_edit_trade_password") is not None
+            or self._find_node(root, resource_id="com.hexin.plat.android:id/login_component_base_view") is not None
+        )
+
+    def _validated_broker_password(self) -> str:
+        pwd = str(self.broker_trade_password or "").strip()
+        if not pwd:
+            raise TradeExecutionError(
+                "BROKER_LOGIN_REQUIRED",
+                "国泰海通证券需要人工登录或密码验证，已安全中止操作",
+                409,
+            )
+        if not re.fullmatch(r"\d{4,12}", pwd):
+            raise TradeExecutionError(
+                "BROKER_LOGIN_REQUIRED",
+                "自动解锁交易密码格式无效，已安全中止自动输入",
+                409,
+            )
+        return pwd
+
+    def _raise_if_auto_login_blocked(self) -> None:
+        if self._auto_login_halted_reason:
+            raise TradeExecutionError(
+                "BROKER_LOGIN_REQUIRED",
+                f"国泰海通自动登录已保护性熔断：{self._auto_login_halted_reason}",
+                409,
+            )
+        now_m = time.monotonic()
+        if self._auto_login_cooldown_until > now_m:
+            remain = int(max(1.0, self._auto_login_cooldown_until - now_m))
+            reason = self._auto_login_cooldown_reason or "券商登录冷却中"
+            raise TradeExecutionError(
+                "BROKER_LOGIN_REQUIRED",
+                f"国泰海通自动解锁暂停（{reason}，剩余约 {remain} 秒）",
+                409,
+            )
+
+    @staticmethod
+    def _collect_all_texts(root: ElementTree.Element) -> list[str]:
+        return [
+            t
+            for n in root.iter()
+            if not (n.attrib.get("package") or "").startswith("com.android.systemui")
+            and (t := (n.attrib.get("text") or "").strip())
+        ]
+
+    @staticmethod
+    def _dismiss_overlay_dialog_if_present(device: Any, root: ElementTree.Element) -> None:
+        texts: list[str] = []
+        close_bounds = None
+        for n in root.iter():
+            if (n.attrib.get("package") or "").startswith("com.android.systemui"):
+                continue
+            t = (n.attrib.get("text") or "").strip()
+            if t:
+                texts.append(t)
+                if t in _ACK_BUTTON_TEXTS or t in _CANCEL_BUTTON_TEXTS:
+                    b = _parse_bounds(n.attrib.get("bounds"))
+                    if b is not None:
+                        close_bounds = b
+        if close_bounds is not None and texts:
+            cx, cy = _bounds_center(close_bounds)
+            device.click(int(round(cx)), int(round(cy)))
+            time.sleep(0.25)
+
+    def _clear_password_field(self, device: Any, full_root: ElementTree.Element) -> None:
+        pw_edit = self._find_node(full_root, resource_id="com.hexin.plat.android:id/weituo_edit_trade_password")
+        pw_text = (pw_edit.attrib.get("text") or "").strip() if pw_edit is not None else ""
+        if not pw_text or "请输入" in pw_text:
+            return
+        del_node = self._find_node(full_root, resource_id="com.hexin.plat.android:id/keyboard_key_del")
+        del_bounds = _parse_bounds(del_node.attrib.get("bounds")) if del_node is not None else None
+        if del_bounds is None:
+            return
+        for _ in range(max(8, len(pw_text) + 2)):
+            self._tap_bounds(device, del_bounds)
+            time.sleep(0.05)
+
+    def _tap_keypad_digits(
+        self,
+        device: Any,
+        kb_bounds: tuple[int, int, int, int],
+        pwd: str,
+        *,
+        same_digit_delay: float = 0.18,
+        diff_digit_delay: float = 0.10,
+    ) -> None:
+        x0, y0, x1, y1 = kb_bounds
+        prev_ch: str | None = None
+        for ch in pwd:
+            col, row = _KEYPAD_COORDS[ch]
+            x = int(round(x0 + (x1 - x0) * (col + 0.5) / 3.0))
+            y = int(round(y0 + (y1 - y0) * (row + 0.5) / 4.0))
+            device.click(x, y)
+            time.sleep(same_digit_delay if prev_ch == ch else diff_digit_delay)
+            prev_ch = ch
+
+    def _try_auto_unlock_broker(self, device: Any, _initial_root: ElementTree.Element) -> ElementTree.Element:
+        """Auto-enter configured Guotai Haitong numeric trade password on the keypad drawer."""
+        pwd = self._validated_broker_password()
+        self._raise_if_auto_login_blocked()
+
+        full_root = self._dump_root(device, compressed=False)
+        pw_fields = [
+            n
+            for n in full_root.iter()
+            if n.attrib.get("password") == "true"
+            and not (n.attrib.get("package") or "").startswith("com.android.systemui")
+        ]
+        if len(pw_fields) > 1:
+            raise TradeExecutionError(
+                "BROKER_LOGIN_REQUIRED",
+                "检测到多项密码输入框（疑似含通讯密码），已安全中止自动输入",
+                409,
+            )
+
+        all_texts = self._collect_all_texts(full_root)
+        joined_initial = " | ".join(all_texts)
+        for kw in _UNSUPPORTED_AUTH_KEYWORDS:
+            if kw in joined_initial:
+                raise TradeExecutionError(
+                    "BROKER_LOGIN_REQUIRED",
+                    f"国泰海通需要人工验证（{kw}），已安全中止自动输入",
+                    409,
+                )
+
+        qs_node = self._find_node(full_root, resource_id="com.hexin.plat.android:id/qs_name")
+        if qs_node is None:
+            qs_node = self._find_node(full_root, resource_id="com.hexin.plat.android:id/page_title_view")
+        broker_label = (qs_node.attrib.get("text") or "").strip() if qs_node is not None else ""
+        if "国泰海通" not in broker_label:
+            raise TradeExecutionError(
+                "BROKER_LOGIN_REQUIRED",
+                "当前登录弹窗非国泰海通证券账户，已安全中止自动输入",
+                409,
+            )
+
+        # Ensure "保持在线24小时" checkbox is enabled before login
+        chk_node = self._find_node(full_root, resource_id="com.hexin.plat.android:id/checked_tv")
+        if chk_node is not None and chk_node.attrib.get("checked") != "true":
+            if not self._click_node(device, full_root, resource_id="com.hexin.plat.android:id/check_layout"):
+                self._click_node(device, full_root, resource_id="com.hexin.plat.android:id/checked_tv")
+            time.sleep(0.15)
+            full_root = self._dump_root(device, compressed=False)
+
+        # Locate or focus-open the 3x4 custom numeric keypad
+        kb_node = self._find_node(full_root, resource_id="com.hexin.plat.android:id/keyboard")
+        if kb_node is None:
+            kb_node = self._find_node(full_root, resource_id="android:id/inputArea")
+        if kb_node is None:
+            if not self._click_node(device, full_root, resource_id="com.hexin.plat.android:id/weituo_edit_trade_password"):
+                raise TradeExecutionError("BROKER_LOGIN_REQUIRED", "未找到交易密码输入框，请人工登录", 409)
+            time.sleep(0.45)
+            full_root = self._dump_root(device, compressed=False)
+            kb_node = self._find_node(full_root, resource_id="com.hexin.plat.android:id/keyboard") or self._find_node(
+                full_root, resource_id="android:id/inputArea"
+            )
+        kb_bounds = _parse_bounds(kb_node.attrib.get("bounds")) if kb_node is not None else None
+        if kb_bounds is None:
+            raise TradeExecutionError("BROKER_LOGIN_REQUIRED", "未检测到同花顺数字密码键盘，已中止自动登录", 409)
+
+        # Clear stale input, tap digits carefully, verify length before clicking login
+        self._clear_password_field(device, full_root)
+        self._tap_keypad_digits(device, kb_bounds, pwd, same_digit_delay=0.18, diff_digit_delay=0.10)
+        time.sleep(0.18)
+
+        verify_root = self._dump_root(device, compressed=False)
+        pw_verify = self._find_node(verify_root, resource_id="com.hexin.plat.android:id/weituo_edit_trade_password")
+        v_text = (pw_verify.attrib.get("text") or "").strip() if pw_verify is not None else ""
+        if (not v_text or "请输入" in v_text) or len(v_text) != len(pwd):
+            # Retry input once carefully if any digit dropped before ever touching Submit
+            self._clear_password_field(device, verify_root)
+            self._tap_keypad_digits(device, kb_bounds, pwd, same_digit_delay=0.22, diff_digit_delay=0.18)
+            time.sleep(0.20)
+            verify_root = self._dump_root(device, compressed=False)
+            pw_verify = self._find_node(verify_root, resource_id="com.hexin.plat.android:id/weituo_edit_trade_password")
+            v_text = (pw_verify.attrib.get("text") or "").strip() if pw_verify is not None else ""
+            if not v_text or "请输入" in v_text or len(v_text) != len(pwd):
+                self._clear_password_field(device, verify_root)
+                raise TradeExecutionError(
+                    "BROKER_LOGIN_REQUIRED",
+                    f"交易密码键盘输入长度核对未通过（期望 {len(pwd)} 位，实际识别 {0 if '请输入' in v_text else len(v_text)} 位），已安全中止提交",
+                    409,
+                )
+
+        if not self._click_node(device, verify_root, resource_id="com.hexin.plat.android:id/keyboard_key_imeaction"):
+            if not self._click_node(device, verify_root, resource_id="com.hexin.plat.android:id/weituo_btn_login"):
+                raise TradeExecutionError("BROKER_LOGIN_REQUIRED", "未找到交易登录提交按钮", 409)
+
+        for _ in range(12):
+            time.sleep(0.45)
+            post_root = self._dump_root(device, compressed=True)
+            post_texts = " | ".join(self._collect_all_texts(post_root))
+
+            for kw in _UNSUPPORTED_AUTH_KEYWORDS:
+                if kw in post_texts:
+                    self._auto_login_cooldown_until = time.monotonic() + 600.0
+                    self._auto_login_cooldown_reason = f"需要人工验证（{kw}）"
+                    raise TradeExecutionError(
+                        "BROKER_LOGIN_REQUIRED",
+                        f"国泰海通需要人工验证（{kw}），已中止自动登录",
+                        409,
+                    )
+
+            for kw in _AUTO_LOGIN_HARD_FAIL_KEYWORDS:
+                if kw in post_texts:
+                    self._auto_login_halted_reason = "券商返回密码错误或账户保护提示，防锁号已停止自动重试"
+                    self._dismiss_overlay_dialog_if_present(device, post_root)
+                    raise TradeExecutionError(
+                        "BROKER_LOGIN_REQUIRED",
+                        self._auto_login_halted_reason,
+                        409,
+                    )
+
+            for kw in _AUTO_LOGIN_COOLDOWN_KEYWORDS:
+                if kw in post_texts:
+                    self._auto_login_cooldown_until = time.monotonic() + 900.0
+                    self._auto_login_cooldown_reason = f"券商处于{kw}时段"
+                    self._dismiss_overlay_dialog_if_present(device, post_root)
+                    raise TradeExecutionError(
+                        "BROKER_LOGIN_REQUIRED",
+                        f"国泰海通当前处于{kw}提示，已暂停自动解锁 15 分钟",
+                        409,
+                    )
+
+            if not self._is_broker_password_prompt(post_root):
+                has_workspace = (
+                    self._find_node(post_root, resource_id="com.hexin.plat.android:id/weituo_first_page") is not None
+                    or (
+                        self._find_node(post_root, resource_id="com.hexin.plat.android:id/btn", text="买入") is not None
+                        and self._find_node(post_root, resource_id="com.hexin.plat.android:id/btn", text="持仓") is not None
+                    )
+                )
+                if has_workspace:
+                    self._auto_login_halted_reason = None
+                    self._auto_login_cooldown_until = 0.0
+                    self._auto_login_cooldown_reason = ""
+                    self._last_gateway_touch_at = time.monotonic()
+                    return post_root
+
+        self._auto_login_cooldown_until = time.monotonic() + 600.0
+        self._auto_login_cooldown_reason = "登录后界面切换超时"
+        raise TradeExecutionError(
+            "BROKER_LOGIN_REQUIRED",
+            "国泰海通自动登录提交后等待超时，已暂停重试 10 分钟",
+            409,
+        )
+
     def _ensure_trade_workspace(self, device: Any, *, prefer_tab: str = "持仓") -> ElementTree.Element:
         """Ensure Tonghuashun is foregrounded and inside Guotai Haitong 5-tab workspace."""
         app_started = False
-        for _ in range(5):
+        unlock_attempted = False
+        for _ in range(7):
             root = self._dump_root(device, compressed=True)
-            self._check_auth_gate(root)
+            if self._is_broker_password_prompt(root):
+                if (not unlock_attempted) and bool(str(self.broker_trade_password or "").strip()):
+                    unlock_attempted = True
+                    root = self._try_auto_unlock_broker(device, root)
+                else:
+                    self._check_auth_gate(root)
+            else:
+                self._check_auth_gate(root)
             root = self._dismiss_guide_overlays(device, root)
 
             has_app_node = any((node.attrib.get("package") or "") == APP_PACKAGE for node in root.iter())
@@ -1236,6 +1544,7 @@ class TonghuashunTradeExecutor:
                         "当前处于模拟炒股页面，请确认国泰海通实盘账户登录状态",
                         409,
                     )
+                self._auto_login_halted_reason = None
                 return root
 
             # If inside 查询子页面 (当日委托/当日成交/历史委托/历史成交), press back once
@@ -1244,7 +1553,7 @@ class TonghuashunTradeExecutor:
                 time.sleep(0.45)
                 continue
 
-            # If on 交易 landing page (tab_a / weituo_first_page): scroll back to top if menu scrolled off-screen
+            # If on 交易 landing page (tab_a / weituo_first_page / nobindlist)
             tab_a = self._find_node(root, resource_id="com.hexin.plat.android:id/tab_a")
             weituo_landing = self._find_node(root, resource_id="com.hexin.plat.android:id/weituo_first_page")
             if tab_a is not None or weituo_landing is not None:
@@ -1257,10 +1566,40 @@ class TonghuashunTradeExecutor:
                         "com.hexin.plat.android:id/tab_mn",
                     )
                 )
-                if tab_a is not None and (
-                    other_tab_selected
-                    or (weituo_landing is None and tab_a.attrib.get("selected") != "true")
+                if tab_a is not None and other_tab_selected:
+                    self._click_node(device, root, resource_id="com.hexin.plat.android:id/tab_a")
+                    time.sleep(0.6)
+                    root = self._dump_root(device, compressed=True)
+
+                if weituo_landing is None and (
+                    self._find_node(root, resource_id="com.hexin.plat.android:id/nobindlist") is not None
+                    or self._find_node(root, resource_id="com.hexin.plat.android:id/txt_qsname") is not None
                 ):
+                    if not str(self.broker_trade_password or "").strip():
+                        raise TradeExecutionError(
+                            "BROKER_LOGIN_REQUIRED",
+                            "国泰海通证券当前处于未登录账户列表，请先登录或配置自动解锁密码",
+                            409,
+                        )
+                    self._raise_if_auto_login_blocked()
+                    card_bounds = None
+                    for node in root.iter():
+                        if (node.attrib.get("resource-id") or "") == "com.hexin.plat.android:id/txt_qsname":
+                            if "国泰海通" in (node.attrib.get("text") or ""):
+                                card_bounds = _parse_bounds(node.attrib.get("bounds"))
+                                if card_bounds is not None:
+                                    break
+                    if card_bounds is None:
+                        raise TradeExecutionError(
+                            "BROKER_LOGIN_REQUIRED",
+                            "未在同花顺委托列表找到国泰海通证券账户入口",
+                            409,
+                        )
+                    self._tap_bounds(device, card_bounds)
+                    time.sleep(0.85)
+                    continue
+
+                if tab_a is not None and weituo_landing is None and tab_a.attrib.get("selected") != "true":
                     self._click_node(device, root, resource_id="com.hexin.plat.android:id/tab_a")
                     time.sleep(0.6)
                     root = self._dump_root(device, compressed=True)
@@ -1998,6 +2337,49 @@ class TonghuashunTradeExecutor:
                 "positions_count": len(summary.get("positions") or []),
                 "tab": tab_label,
             }
+
+    def maybe_background_keepalive(
+        self,
+        *,
+        now_shanghai: datetime | None = None,
+        interval_seconds: float = 600.0,
+    ) -> dict[str, Any]:
+        """Keep Guotai Haitong 24h session alive in background when auto-unlock password is configured."""
+        if not str(self.broker_trade_password or "").strip():
+            return {"ok": False, "skipped": "no_password"}
+        if self._auto_login_halted_reason:
+            return {"ok": False, "skipped": "halted", "error_code": "BROKER_LOGIN_REQUIRED"}
+        now_m = time.monotonic()
+        if self._auto_login_cooldown_until > now_m:
+            return {"ok": False, "skipped": "cooldown", "error_code": "BROKER_LOGIN_REQUIRED"}
+        local_dt = (now_shanghai or datetime.now(timezone.utc)).astimezone(SHANGHAI_TZ)
+        hhmm = local_dt.strftime("%H%M")
+        if not ("0825" <= hhmm <= "2300"):
+            return {"ok": False, "skipped": "night_quiet_window"}
+        interval = max(60.0, float(interval_seconds))
+        if self._last_gateway_touch_at > 0.0 and (now_m - self._last_gateway_touch_at) < interval:
+            return {"ok": False, "skipped": "fresh_gateway"}
+        if self._last_bg_keepalive_at > 0.0 and (now_m - self._last_bg_keepalive_at) < interval:
+            return {"ok": False, "skipped": "recent_keepalive"}
+
+        self._last_bg_keepalive_at = now_m
+        today_key = local_dt.strftime("%Y%m%d")
+        with self._cache_lock:
+            need_account_seed = self._last_account is None or self._last_account_date != today_key
+        try:
+            if need_account_seed:
+                summary = self.get_account_summary(max_age_seconds=0.0)
+                self.keep_warm(side="buy", refresh_gateway=False)
+                metrics = summary.get("metrics") if isinstance(summary.get("metrics"), dict) else {}
+                return {
+                    "ok": True,
+                    "mode": "account_seed",
+                    "available_cash": metrics.get("available_cash"),
+                }
+            res = self.keep_warm(side="buy", refresh_gateway=True, gateway_max_idle_seconds=interval)
+            return {**res, "mode": "keep_warm"}
+        except TradeExecutionError as error:
+            return {"ok": False, "error_code": error.error_code, "message": error.message}
 
     def _resolve_known_holding_shares(
         self,

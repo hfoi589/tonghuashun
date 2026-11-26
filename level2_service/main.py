@@ -132,6 +132,7 @@ class DeploymentSettings:
     research_monitor_interval_seconds: float = 25.0
     fund_flow_monitor_interval_seconds: float = 20.0
     core_u2_endpoint: str | None = None
+    broker_trade_password: str | None = field(default=None, repr=False)
 
     @classmethod
     def from_environ(cls, environ: Mapping[str, str] | None = None) -> "DeploymentSettings":
@@ -429,6 +430,7 @@ class DeploymentSettings:
                 "FUND_FLOW_MONITOR_INTERVAL_SECONDS"
             ],
             core_u2_endpoint=values.get("CORE_U2_ENDPOINT", "").strip() or None,
+            broker_trade_password=values.get("THS_BROKER_TRADE_PASSWORD", "").strip() or None,
         )
 
 
@@ -1166,6 +1168,7 @@ def create_production_app(
             u2_endpoint=config.core_u2_endpoint,
             runner_yield_timeout_seconds=2.0,
             name_to_symbol=_resolve_symbol_by_name,
+            broker_trade_password=config.broker_trade_password,
         )
         if trade_serial and trade_serial != config.fund_adb_serial
         else None

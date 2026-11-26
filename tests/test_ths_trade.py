@@ -1346,3 +1346,192 @@ def test_keep_warm_refresh_gateway_and_probe_broker_session(monkeypatch: pytest.
     assert dev.refresh_clicks == 2
 
 
+class _KeypadLockDevice:
+    def __init__(self, *, correct_pwd: str = "246810", wrong_error_mode: bool = False) -> None:
+        self.info = {"displayWidth": 1080, "displayHeight": 1920}
+        self.correct_pwd = correct_pwd
+        self.wrong_error_mode = wrong_error_mode
+        self.stage = "nobindlist"
+        self.checked_keep_24h = False
+        self.typed = ""
+        self.login_submissions = 0
+        self.clicks: list[tuple[int, int]] = []
+
+    def app_current(self) -> dict[str, str]:
+        return {"package": "com.hexin.plat.android"}
+
+    def app_start(self, *_args, **_kwargs) -> None:
+        pass
+
+    def press(self, _key: str) -> None:
+        pass
+
+    def swipe(self, *_args, **_kwargs) -> None:
+        pass
+
+    def click(self, x: int, y: int) -> None:
+        self.clicks.append((x, y))
+        if self.stage == "nobindlist":
+            if 228 <= x <= 516 and 252 <= y <= 322:
+                self.stage = "password_modal"
+            return
+        if self.stage == "password_modal":
+            # Checkbox "保持在线24小时" check_layout [30,1222][120,1276]
+            if 30 <= x <= 120 and 1222 <= y <= 1276:
+                self.checked_keep_24h = not self.checked_keep_24h
+                return
+            # Delete key [810,1311][1080,1614]
+            if 810 <= x <= 1080 and 1311 <= y <= 1614:
+                self.typed = self.typed[:-1]
+                return
+            # Submit "登录" key [810,1616][1080,1920]
+            if 810 <= x <= 1080 and 1616 <= y <= 1920:
+                self.login_submissions += 1
+                if self.wrong_error_mode or self.typed != self.correct_pwd:
+                    self.stage = "wrong_password_alert"
+                else:
+                    self.stage = "workspace_holdings"
+                return
+            # 3x4 numeric keypad [0,1311][808,1920]
+            if 0 <= x <= 808 and 1311 <= y <= 1920:
+                col = min(2, max(0, int((x - 0) * 3 / 808)))
+                row = min(3, max(0, int((y - 1311) * 4 / (1920 - 1311))))
+                grid = {
+                    (0, 0): "1", (1, 0): "2", (2, 0): "3",
+                    (0, 1): "4", (1, 1): "5", (2, 1): "6",
+                    (0, 2): "7", (1, 2): "8", (2, 2): "9",
+                    (1, 3): "0",
+                }
+                ch = grid.get((col, row))
+                if ch is not None:
+                    self.typed += ch
+            return
+        if self.stage == "wrong_password_alert":
+            self.stage = "password_modal"
+
+    def dump_hierarchy(self, *, compressed: bool = True) -> str:
+        if self.stage == "nobindlist":
+            return (
+                "<hierarchy>"
+                '<node package="com.hexin.plat.android" resource-id="com.hexin.plat.android:id/tab_a" text="A股" selected="false" bounds="[164,95][300,192]" />'
+                '<node package="com.hexin.plat.android" resource-id="com.hexin.plat.android:id/nobindlist" text="" bounds="[0,216][1080,906]">'
+                '<node package="com.hexin.plat.android" resource-id="com.hexin.plat.android:id/txt_qsname" text="国泰海通证券" bounds="[228,252][516,322]" />'
+                '<node package="com.hexin.plat.android" resource-id="com.hexin.plat.android:id/txt_account_value" text="****9306" bounds="[384,331][558,379]" />'
+                "</node>"
+                "</hierarchy>"
+            )
+        if self.stage == "password_modal":
+            pw_text = "•" * len(self.typed) if self.typed else "请输入交易密码"
+            kb_xml = (
+                ""
+                if compressed
+                else '<node package="com.hexin.plat.android" resource-id="com.hexin.plat.android:id/keyboard" text="" bounds="[0,1311][808,1920]" />'
+            )
+            return (
+                "<hierarchy>"
+                '<node package="com.hexin.plat.android" resource-id="com.hexin.plat.android:id/login_component_base_view" text="" bounds="[0,527][1080,1920]">'
+                '<node package="com.hexin.plat.android" resource-id="com.hexin.plat.android:id/qs_name" text="国泰海通证券" bounds="[442,539][694,608]" />'
+                f'<node package="com.hexin.plat.android" resource-id="com.hexin.plat.android:id/weituo_edit_trade_password" text="{pw_text}" password="true" bounds="[207,672][1035,804]" />'
+                '<node package="com.hexin.plat.android" resource-id="com.hexin.plat.android:id/check_layout" text="" clickable="true" bounds="[30,1222][120,1276]" />'
+                f'<node package="com.hexin.plat.android" resource-id="com.hexin.plat.android:id/checked_tv" text="" checked="{"true" if self.checked_keep_24h else "false"}" bounds="[48,1222][102,1276]" />'
+                f"{kb_xml}"
+                '<node package="com.hexin.plat.android" resource-id="com.hexin.plat.android:id/keyboard_key_del" text="" bounds="[810,1311][1080,1614]" />'
+                '<node package="com.hexin.plat.android" resource-id="com.hexin.plat.android:id/keyboard_key_imeaction" text="登录" bounds="[810,1616][1080,1920]" />'
+                "</node>"
+                "</hierarchy>"
+            )
+        if self.stage == "wrong_password_alert":
+            return (
+                "<hierarchy>"
+                '<node package="com.hexin.plat.android" resource-id="com.hexin.plat.android:id/login_component_base_view" text="" bounds="[0,527][1080,1920]">'
+                '<node package="com.hexin.plat.android" resource-id="com.hexin.plat.android:id/qs_name" text="国泰海通证券" bounds="[442,539][694,608]" />'
+                '<node package="com.hexin.plat.android" resource-id="com.hexin.plat.android:id/weituo_edit_trade_password" text="请输入交易密码" password="true" bounds="[207,672][1035,804]" />'
+                "</node>"
+                '<node package="com.hexin.plat.android" text="交易密码错误，还剩4次机会" bounds="[120,760][960,840]" />'
+                '<node package="com.hexin.plat.android" text="确定" clickable="true" bounds="[360,920][720,1010]" />'
+                "</hierarchy>"
+            )
+        tabs = "".join(
+            f'<node package="com.hexin.plat.android" resource-id="com.hexin.plat.android:id/btn" '
+            f'text="{label}" selected="{"true" if label == "持仓" else "false"}" '
+            f'bounds="[{idx * 200 + 10},180][{idx * 200 + 180},240]" />'
+            for idx, label in enumerate(("买入", "卖出", "撤单", "持仓", "查询"))
+        )
+        return (
+            "<hierarchy>"
+            '<node package="com.hexin.plat.android" resource-id="com.hexin.plat.android:id/page_title_view" text="国泰海通证券" bounds="[40,80][400,140]" />'
+            '<node package="com.hexin.plat.android" resource-id="com.hexin.plat.android:id/account_info_view" text="资金账号12345678" bounds="[40,145][400,175]" />'
+            f"{tabs}"
+            '<node package="com.hexin.plat.android" resource-id="com.hexin.plat.android:id/capital_cell_title" text="总资产" bounds="[20,300][200,340]" />'
+            '<node package="com.hexin.plat.android" resource-id="com.hexin.plat.android:id/capital_cell_value" text="88000.00" bounds="[20,350][200,390]" />'
+            '<node package="com.hexin.plat.android" resource-id="com.hexin.plat.android:id/capital_cell_title" text="可用" bounds="[240,300][420,340]" />'
+            '<node package="com.hexin.plat.android" resource-id="com.hexin.plat.android:id/capital_cell_value" text="32000.00" bounds="[240,350][420,390]" />'
+            "</hierarchy>"
+        )
+
+
+def test_auto_unlock_from_nobindlist_and_enter_password_keypad(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("level2_service.ths_trade.time.sleep", lambda _s: None)
+    dev = _KeypadLockDevice(correct_pwd="246810")
+    executor = TonghuashunTradeExecutor(
+        adb_serial="emulator-5556",
+        u2_factory=lambda _s: dev,
+        broker_trade_password="246810",
+    )
+    assert "246810" not in repr(executor)
+
+    summary = executor.get_account_summary()
+    assert summary["logged_in"] is True
+    assert summary["metrics"]["available_cash"] == "32000.00"
+    assert dev.checked_keep_24h is True
+    assert dev.typed == "246810"
+    assert dev.login_submissions == 1
+
+
+def test_auto_unlock_halts_after_wrong_password_to_prevent_lockout(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("level2_service.ths_trade.time.sleep", lambda _s: None)
+    dev = _KeypadLockDevice(correct_pwd="999999", wrong_error_mode=True)
+    executor = TonghuashunTradeExecutor(
+        adb_serial="emulator-5556",
+        u2_factory=lambda _s: dev,
+        broker_trade_password="246810",
+    )
+
+    with pytest.raises(TradeExecutionError) as exc1:
+        executor.get_account_summary()
+    assert exc1.value.error_code == "BROKER_LOGIN_REQUIRED"
+    assert "246810" not in exc1.value.message
+    assert dev.login_submissions == 1
+
+    # Second attempt must halt immediately without submitting any password again
+    with pytest.raises(TradeExecutionError) as exc2:
+        executor.get_account_summary()
+    assert exc2.value.error_code == "BROKER_LOGIN_REQUIRED"
+    assert dev.login_submissions == 1
+
+
+def test_maybe_background_keepalive_window_and_fresh_skip(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("level2_service.ths_trade.time.sleep", lambda _s: None)
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    tz = ZoneInfo("Asia/Shanghai")
+    dev = _KeypadLockDevice(correct_pwd="246810")
+    executor = TonghuashunTradeExecutor(
+        adb_serial="emulator-5556",
+        u2_factory=lambda _s: dev,
+        broker_trade_password="246810",
+    )
+
+    night = executor.maybe_background_keepalive(now_shanghai=datetime(2026, 11, 26, 23, 30, tzinfo=tz))
+    assert night["ok"] is False and night["skipped"] == "night_quiet_window"
+
+    active = executor.maybe_background_keepalive(now_shanghai=datetime(2026, 11, 26, 21, 25, tzinfo=tz))
+    assert active["ok"] is True
+    assert active["mode"] == "account_seed"
+    assert active["available_cash"] == "32000.00"
+
+    fresh = executor.maybe_background_keepalive(now_shanghai=datetime(2026, 11, 26, 21, 26, tzinfo=tz))
+    assert fresh["ok"] is False and fresh["skipped"] == "fresh_gateway"
+
+

@@ -60,6 +60,7 @@ services:
       VRA_BACKEND_URL: ${VRA_BACKEND_URL:-http://host.docker.internal:8765}
       GOODLUCK_INTERNAL_TOKEN: ${GOODLUCK_INTERNAL_TOKEN:-}
       CORE_U2_ENDPOINT: ${CORE_U2_ENDPOINT:-}
+      THS_BROKER_TRADE_PASSWORD: ${THS_BROKER_TRADE_PASSWORD:-}
     depends_on:
       redis:
         condition: service_healthy

@@ -648,6 +648,13 @@ def create_app(
                                 await to_thread(prewarmer, None)
                         except (TypeError, ValueError):
                             await to_thread(prewarmer, None)
+                    trade_exec = getattr(app.state, "trade_executor", None)
+                    bg_keepalive = getattr(trade_exec, "maybe_background_keepalive", None) if trade_exec is not None else None
+                    if callable(bg_keepalive):
+                        try:
+                            await to_thread(bg_keepalive)
+                        except Exception:
+                            logger.warning("trade workspace background keepalive failed")
                 except Exception:
                     logger.exception("preopen session probe failed")
                 loop_timeout = session_probe_interval_seconds

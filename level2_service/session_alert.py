@@ -28,17 +28,29 @@ SESSION_ALERT_ERROR_CODES = frozenset(
 _ROLE_TITLES = {
     "main_fund_flow": "同花顺暗盘账号",
     "core_metrics": "同花顺 L2 核心账号",
+    "trade_workspace": "同花顺交易工作区",
 }
 
 _ROLE_LABELS = {
     "main_fund_flow": "主力暗盘资金账号 (main_fund_flow)",
     "core_metrics": "L2 核心八项账号 (core_metrics)",
+    "trade_workspace": "实盘交易工作区 (trade_workspace)",
 }
 
 _ROLE_IMPACTS = {
     "main_fund_flow": "请前往 THS 管理后台续签资金账号会话，避免盘中 09:30 起暗盘分钟曲线缺口",
     "core_metrics": "请前往 THS 管理后台续签核心账号会话，避免 9528 大单/散户/MACDFS 直连中断",
+    "trade_workspace": "请检查交易设备同花顺工作区/锁屏状态并完成恢复，避免信号触发后无法下单",
 }
+
+_TRADE_WORKSPACE_ALERT_CODES = frozenset(
+    {
+        "BROKER_LOGIN_REQUIRED",
+        "TRADE_DEVICE_OFFLINE",
+        "TRADE_NAVIGATION_FAILED",
+    }
+)
+_ALERT_ROLES = frozenset((*ACCOUNT_ROLES, "trade_workspace"))
 
 
 def _supports_force_kwarg(fn: object) -> bool:
@@ -95,6 +107,8 @@ class SessionHealthNotifier:
         self._active_incident_dates: dict[str, str] = {}
 
     def _credential_stamp(self, role: str) -> str:
+        if role == "trade_workspace":
+            return "workspace"
         provider = self.session_provider
         if provider is None:
             return "unknown"
@@ -115,9 +129,11 @@ class SessionHealthNotifier:
         return hashlib.sha256(updated_at.isoformat().encode("utf-8")).hexdigest()[:12]
 
     def _should_alert_error(self, role: str, error_code: str) -> bool:
-        if role not in ACCOUNT_ROLES:
+        if role not in _ALERT_ROLES:
             return False
         normalized = str(error_code or "").strip().upper()
+        if role == "trade_workspace":
+            return normalized in _TRADE_WORKSPACE_ALERT_CODES
         if normalized in SESSION_ALERT_ERROR_CODES:
             return True
         if role == "core_metrics" and normalized == "DIRECT_PROTOCOL_HANDSHAKE_FAILED":
@@ -194,7 +210,7 @@ class SessionHealthNotifier:
         return False
 
     def notify_recovered(self, role: str, *, stage: str = "会话续签/采集恢复") -> bool:
-        if role not in ACCOUNT_ROLES or self.store is None or self.dispatcher is None:
+        if role not in _ALERT_ROLES or self.store is None or self.dispatcher is None:
             return False
         local_now = self.clock().astimezone(SHANGHAI)
         date_str = local_now.strftime("%Y%m%d")
@@ -202,7 +218,7 @@ class SessionHealthNotifier:
             return False
 
         provider = self.session_provider
-        if provider is not None:
+        if provider is not None and role != "trade_workspace":
             try:
                 if provider.status(role).state != "READY":
                     return False
@@ -282,7 +298,7 @@ class SessionHealthNotifier:
 
 
 class PreopenSessionProbe:
-    """Actively verify THS direct sessions before continuous trading starts (08:50+)."""
+    """Actively verify THS direct sessions before continuous trading starts (08:50+ & 12:52)."""
 
     def __init__(
         self,
@@ -293,6 +309,7 @@ class PreopenSessionProbe:
         core_source: Any | None,
         session_provider: SessionProvider | None,
         notifier: SessionHealthNotifier,
+        trade_executor: Any | None = None,
         clock: Callable[[], datetime] = lambda: datetime.now(SHANGHAI),
         default_symbol: str = "601872",
     ) -> None:
@@ -302,9 +319,11 @@ class PreopenSessionProbe:
         self.core_source = core_source
         self.session_provider = session_provider
         self.notifier = notifier
+        self.trade_executor = trade_executor
         self.clock = clock
         self.default_symbol = default_symbol
         self._last_probed_date: str | None = None
+        self._probed_windows: set[tuple[str, str]] = set()
 
     def _pick_fund_probe_symbol(self) -> str:
         if self.accounts is not None:
@@ -323,18 +342,28 @@ class PreopenSessionProbe:
     async def poll_once(self, *, force: bool = False) -> dict[str, str]:
         local_now = self.clock().astimezone(SHANGHAI)
         today_str = local_now.strftime("%Y%m%d")
+        stage = "盘前 08:50 自动预检"
         if not force:
             if not self.is_trading_day(local_now.date()):
                 return {}
             hhmm = local_now.strftime("%H%M")
-            if not ("0850" <= hhmm <= "0924"):
+            if "0850" <= hhmm <= "0924":
+                window = "morning"
+                stage = "盘前 08:50 自动预检"
+            elif "1250" <= hhmm <= "1258":
+                window = "midday"
+                stage = "午休 12:52 自动预检"
+            else:
                 return {}
-            if self._last_probed_date == today_str:
+            if (today_str, window) in self._probed_windows:
                 return {}
-            self._last_probed_date = today_str
+            if window == "morning" and self._last_probed_date == today_str:
+                return {}
+            self._probed_windows.add((today_str, window))
+            if window == "morning":
+                self._last_probed_date = today_str
 
         results: dict[str, str] = {}
-        stage = "盘前 08:50 自动预检"
 
         # 1. Check main_fund_flow HTTP session with a single lightweight query.
         if self.fund_source is not None:
@@ -344,7 +373,46 @@ class PreopenSessionProbe:
         if self.core_source is not None or self.session_provider is not None:
             results["core_metrics"] = await self._probe_core_metrics(stage)
 
+        # 3. Check broker trade workspace readiness when executor is configured.
+        if self.trade_executor is not None:
+            results["trade_workspace"] = await self._probe_trade_workspace(stage)
+
         return results
+
+    async def _probe_trade_workspace(self, stage: str) -> str:
+        probe_fn = getattr(self.trade_executor, "probe_broker_session", None)
+        if not callable(probe_fn):
+            probe_fn = getattr(self.trade_executor, "keep_warm", None)
+        if not callable(probe_fn):
+            return "SKIPPED"
+        try:
+            res = await asyncio.to_thread(probe_fn)
+            if isinstance(res, dict) and res.get("ok") is False:
+                code = str(res.get("error_code") or "TRADE_NAVIGATION_FAILED").strip().upper()
+                if code in _TRADE_WORKSPACE_ALERT_CODES:
+                    await asyncio.to_thread(
+                        self.notifier.notify_error,
+                        "trade_workspace",
+                        code,
+                        stage=stage,
+                    )
+                return code
+            await asyncio.to_thread(
+                self.notifier.notify_recovered,
+                "trade_workspace",
+                stage=stage,
+            )
+            return "READY"
+        except Exception as error:
+            code = str(getattr(error, "error_code", "") or "TRADE_NAVIGATION_FAILED").strip().upper()
+            if code in _TRADE_WORKSPACE_ALERT_CODES:
+                await asyncio.to_thread(
+                    self.notifier.notify_error,
+                    "trade_workspace",
+                    code,
+                    stage=stage,
+                )
+            return code
 
     async def _probe_fund_flow(self, stage: str) -> str:
         if self.session_provider is not None:

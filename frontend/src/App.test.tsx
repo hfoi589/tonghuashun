@@ -1623,4 +1623,162 @@ describe('job SSE subscription', () => {
       })
     }
   })
+
+  it('lazy-loads ETF fund-flow tabs on job results and restores today flow when leaving 30-day tab', async () => {
+    const user = userEvent.setup()
+    vi.stubGlobal('fetch', vi.fn((input) => {
+      const url = String(input)
+      if (url.endsWith('/fund-flow-history')) {
+        return Promise.resolve(jsonResponse({
+          symbol: '600938', trade_date: '20260918', period: 'today',
+          points: [{ time: '10:00', unit: '万元', main_net_inflow: '100', main_visible_inflow: '60', main_hidden_inflow: '40', retail_inflow: '-100' }],
+        }))
+      }
+      if (url.includes('/fund-flow-daily')) {
+        return Promise.resolve(jsonResponse({
+          symbol: '600938', limit: 30, baseline_trade_date: '20260917',
+          points: [
+            {
+              trade_date: '20260918', time: '15:00', unit: '万元', main_net_inflow: '10', main_visible_inflow: '6', main_hidden_inflow: '4', retail_inflow: '-10',
+              periods: {
+                today: { unit: '万元', main_net_inflow: '10', main_visible_inflow: '6', main_hidden_inflow: '4', retail_inflow: '-10' },
+                three_day: { unit: '万元', main_net_inflow: '30', main_visible_inflow: '18', main_hidden_inflow: '12', retail_inflow: '-30' },
+                five_day: { unit: '万元', main_net_inflow: '50', main_visible_inflow: '30', main_hidden_inflow: '20', retail_inflow: '-50' },
+              },
+            },
+          ],
+        }))
+      }
+      if (url.includes('/etf-flow?period=60d')) {
+        return Promise.resolve(jsonResponse({
+          symbol: '600938', name: '中国海油', market: '17', period: '60d', available: true,
+          summary: {
+            latest_badge: { date: '11-24', full_date: '2026-11-24', value_text: '2500.00万', text: '11-24 净流入 2500.00万', tone: 'up' },
+            metrics: [
+              { key: '60d', label: '60日净流入', value_text: '5.20亿', tone: 'up' },
+              { key: '20d', label: '20日净流入', value_text: '1.10亿', tone: 'up' },
+              { key: '5d', label: '5日净流入', value_text: '5200.00万', tone: 'up' },
+              { key: '3d', label: '3日净流入', value_text: '2500.00万', tone: 'up' },
+            ],
+          },
+          chart: {
+            cumulative_unit: '亿', daily_unit: '万',
+            points: [{ date: '2026-11-24', short_date: '11-24', cumulative_value: 5.2, cumulative_text: '5.20亿', daily_value: 2500, daily_text: '2500.00万', close_price: 28.5, price_change: 0.2 }],
+          },
+          holdings: {
+            total_count: 1,
+            items: [{ symbol: '510330', market: '20', name: '沪深300ETF华夏', net_inflow_raw: 6304019.53, net_inflow_text: '630.4万', tone: 'up', streak_days: 7, hold_rate: 0.25, hold_rate_text: '0.25%' }],
+          },
+        }))
+      }
+      return Promise.reject(new Error(`unexpected request: ${url}`))
+    }))
+
+    render(<JobResult task={{
+      ...task,
+      status: 'COMPLETED',
+      values: {
+        ...task.values,
+        main_fund_flow: {
+          today: { unit: '万元', main_net_inflow: '100', main_visible_inflow: '60', main_hidden_inflow: '40', retail_inflow: '-100' },
+          three_day: { unit: '万元', main_net_inflow: '300', main_visible_inflow: '180', main_hidden_inflow: '120', retail_inflow: '-300' },
+          five_day: { unit: '万元', main_net_inflow: '500', main_visible_inflow: '300', main_hidden_inflow: '200', retail_inflow: '-500' },
+        },
+      },
+    }} />)
+
+    await user.click(await screen.findByRole('tab', { name: '近30日资金流向' }))
+    const netRow = within(screen.getByRole('table')).getAllByRole('row')[1]
+    expect(within(netRow).getByText('+10.00')).toBeInTheDocument()
+
+    await user.click(screen.getByRole('tab', { name: 'ETF资金' }))
+    expect(await screen.findByText('11-24 净流入 2500.00万 ↑')).toBeInTheDocument()
+    expect(within(netRow).getByText('+100.00')).toBeInTheDocument()
+
+    await user.click(screen.getByRole('tab', { name: 'ETF申购明细' }))
+    expect(await screen.findByText('沪深300ETF华夏')).toBeInTheDocument()
+  })
+
+  it('adds a fifth mobile App分时 tab on compact viewports to toggle intraday curves in place', async () => {
+    const user = userEvent.setup()
+    vi.stubGlobal('matchMedia', vi.fn((query: string) => ({
+      matches: query === '(max-width: 720px)',
+      media: query,
+      onchange: null,
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+      addListener: vi.fn(),
+      removeListener: vi.fn(),
+      dispatchEvent: vi.fn(),
+    })))
+    vi.stubGlobal('fetch', vi.fn((input) => {
+      const url = String(input)
+      if (url.endsWith('/fund-flow-history')) {
+        return Promise.resolve(jsonResponse({
+          symbol: '600938', trade_date: '20260918', period: 'today',
+          points: [{ time: '10:00', unit: '万元', main_net_inflow: '100', main_visible_inflow: '60', main_hidden_inflow: '40', retail_inflow: '-100' }],
+        }))
+      }
+      if (url.includes('/fund-flow-daily')) {
+        return Promise.resolve(jsonResponse({ symbol: '600938', limit: 30, baseline_trade_date: '20260917', points: [] }))
+      }
+      return Promise.reject(new Error(`unexpected request: ${url}`))
+    }))
+
+    render(<JobResult task={{
+      ...task,
+      status: 'COMPLETED',
+      values: {
+        ...task.values,
+        main_fund_flow: {
+          today: { unit: '万元', main_net_inflow: '100', main_visible_inflow: '60', main_hidden_inflow: '40', retail_inflow: '-100' },
+          three_day: { unit: '万元', main_net_inflow: '300', main_visible_inflow: '180', main_hidden_inflow: '120', retail_inflow: '-300' },
+          five_day: { unit: '万元', main_net_inflow: '500', main_visible_inflow: '300', main_hidden_inflow: '200', retail_inflow: '-500' },
+        },
+        intraday_series: {
+          large_order_net: { unit: null, points: [{ time: '09:30', value: '-0.02' }] },
+          large_order_amount: { unit: '万', points: [] },
+          retail_count: { unit: null, points: [] },
+        },
+      },
+    }} />)
+
+    const appIntradayTab = await screen.findByRole('tab', { name: 'App分时' })
+    const todayFundTab = screen.getByRole('tab', { name: '当天资金曲线' })
+    const intradaySection = screen.getByRole('heading', { name: '当日分时' }).closest('section')!
+
+    expect(todayFundTab).toHaveAttribute('aria-selected', 'true')
+    expect(appIntradayTab).toHaveAttribute('aria-selected', 'false')
+    expect(intradaySection).toHaveAttribute('data-mobile-hidden', 'true')
+
+    await user.click(appIntradayTab)
+    expect(appIntradayTab).toHaveAttribute('aria-selected', 'true')
+    expect(todayFundTab).toHaveAttribute('aria-selected', 'false')
+    expect(intradaySection).not.toHaveAttribute('data-mobile-hidden')
+
+    await user.click(todayFundTab)
+    expect(todayFundTab).toHaveAttribute('aria-selected', 'true')
+    expect(intradaySection).toHaveAttribute('data-mobile-hidden', 'true')
+  })
+
+  it('toggles between dark scheme A and light scheme C from the top-left split brand button', async () => {
+    const user = userEvent.setup()
+    window.localStorage.removeItem('ths_ui_skin')
+    window.localStorage.removeItem('vr-theme')
+
+    render(<App initialTask={task} />)
+
+    const toggleBtn = screen.getByRole('button', { name: '切换为同花顺红白浅色主题' })
+    expect(toggleBtn).toHaveClass('ths-split-brand-btn')
+    expect(document.documentElement.dataset.thsSkin).toBe('dark')
+
+    await user.click(toggleBtn)
+    expect(document.documentElement.dataset.thsSkin).toBe('light')
+    expect(window.localStorage.getItem('ths_ui_skin')).toBe('light')
+    expect(screen.getByRole('button', { name: '切换为同花顺暗色盘口主题' })).toBeInTheDocument()
+
+    await user.click(screen.getByRole('button', { name: '切换为同花顺暗色盘口主题' }))
+    expect(document.documentElement.dataset.thsSkin).toBe('dark')
+    expect(window.localStorage.getItem('ths_ui_skin')).toBe('dark')
+  })
 })

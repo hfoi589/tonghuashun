@@ -78,6 +78,7 @@ class SQLiteResearchStore:
         self._today_ff_map_cache: dict[tuple[str | None, str], tuple[float, dict[str, Any]]] = {}
         self._today_ff_map_cached_at: float = 0.0
         self._migrate()
+        self.purge_premature_closing_fund_flow_points()
         try:
             os.chmod(self.path, 0o600)
         except OSError:
@@ -1264,6 +1265,59 @@ class SQLiteResearchStore:
                 "periods": None,
             })
         return {"symbol": symbol, "limit": limit, "baseline_trade_date": baseline_date, "points": points}
+
+    def purge_premature_closing_fund_flow_points(self) -> int:
+        """Delete premature 15:00 fund-flow rows captured before 15:00 on the same trade date."""
+        with self._lock, self._connection:
+            rows = self._connection.execute(
+                """SELECT DISTINCT symbol
+                   FROM fund_flow_history_points
+                   WHERE minute = '15:00'
+                     AND length(captured_at) >= 16
+                     AND replace(substr(captured_at, 1, 10), '-', '') = trade_date
+                     AND substr(captured_at, 12, 5) < '15:00'"""
+            ).fetchall()
+            if not rows:
+                return 0
+            affected_symbols = [str(row["symbol"]) for row in rows]
+            cursor = self._connection.execute(
+                """DELETE FROM fund_flow_history_points
+                   WHERE minute = '15:00'
+                     AND length(captured_at) >= 16
+                     AND replace(substr(captured_at, 1, 10), '-', '') = trade_date
+                     AND substr(captured_at, 12, 5) < '15:00'"""
+            )
+            deleted = int(cursor.rowcount or 0)
+            for symbol in affected_symbols:
+                latest = self._connection.execute(
+                    """SELECT trade_date, minute, captured_at
+                       FROM fund_flow_history_points
+                       WHERE symbol = ?
+                       ORDER BY trade_date DESC, REPLACE(minute, ':', '') DESC
+                       LIMIT 1""",
+                    (symbol,),
+                ).fetchone()
+                if latest is None:
+                    self._connection.execute(
+                        "DELETE FROM fund_flow_history_status WHERE symbol = ?",
+                        (symbol,),
+                    )
+                else:
+                    self._connection.execute(
+                        """UPDATE fund_flow_history_status
+                           SET latest_trade_date = ?,
+                               latest_time = ?,
+                               last_sync_at = ?
+                           WHERE symbol = ?""",
+                        (
+                            latest["trade_date"],
+                            latest["minute"],
+                            latest["captured_at"],
+                            symbol,
+                        ),
+                    )
+        self._invalidate_fund_flow_caches(affected_symbols)
+        return deleted
 
     def cleanup_fund_flow_history(self, before_trade_date: str) -> int:
         with self._lock, self._connection:

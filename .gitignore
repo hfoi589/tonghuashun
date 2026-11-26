@@ -20,3 +20,7 @@ graphify-out/
 .venv/
 __pycache__/
 .pytest_cache/
+/vibe_research/*
+!/vibe_research/desktop/
+/vibe_research/desktop/*
+!/vibe_research/desktop/src/

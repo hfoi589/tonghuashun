@@ -5,9 +5,11 @@ from __future__ import annotations
 import gzip
 import hashlib
 import http.client
+import inspect
 import json
 import logging
 import base64
+from collections import deque
 import re
 import socket
 import struct
@@ -1772,6 +1774,7 @@ class CoreRequestMaterial:
     macdfs_params: tuple[int, int, int] | None
     timeout_seconds: float
     session_fingerprint: bytes = field(repr=False)
+    alphabet: str = field(default=CORE_BASE64_ALPHABET, repr=False)
 
 
 @dataclass
@@ -1798,13 +1801,17 @@ class Core9528TemplateProtocol:
         response_decoder: CoreResponseDecoder | None = None,
         max_response_frames: int = 64,
         frame_idle_timeout_seconds: float = 0.5,
+        secondary_batch_timeout_seconds: float = 1.5,
     ) -> None:
         if frame_idle_timeout_seconds <= 0:
             raise ValueError("frame_idle_timeout_seconds must be positive")
+        if secondary_batch_timeout_seconds <= 0:
+            raise ValueError("secondary_batch_timeout_seconds must be positive")
         self.socket_factory = socket_factory
         self.response_decoder = response_decoder
         self.max_response_frames = max_response_frames
         self.frame_idle_timeout_seconds = frame_idle_timeout_seconds
+        self.secondary_batch_timeout_seconds = secondary_batch_timeout_seconds
 
     def ensure_read_direct_supported(self) -> None:
         if self.response_decoder is None:
@@ -1896,7 +1903,7 @@ class Core9528TemplateProtocol:
 
     def prepare(self, material: object, symbol: str) -> CoreRequestMaterial:
         self.ensure_read_direct_supported()
-        host, port, packets, _alphabet = self._material_packets(material, symbol)
+        host, port, packets, alphabet = self._material_packets(material, symbol)
         macdfs_params = self._material_macdfs_params(material)
         if macdfs_params is None and callable(
             getattr(self.response_decoder, "with_macdfs_params", None)
@@ -1916,7 +1923,73 @@ class Core9528TemplateProtocol:
             macdfs_params=macdfs_params,
             timeout_seconds=timeout_seconds,
             session_fingerprint=self._session_fingerprint(material),
+            alphabet=alphabet,
         )
+
+    @classmethod
+    def _classify_request_packet(
+        cls,
+        packet: bytes,
+        alphabet: str = CORE_BASE64_ALPHABET,
+    ) -> str | None:
+        """Identify whether a captured 9528 request packet is a 2205 query or 6001 companion."""
+        try:
+            _validate_9528_outer_packet(packet)
+            if len(packet) < 15:
+                return None
+            header_length = struct.unpack_from("<H", packet, 13)[0]
+            body_start = 13 + header_length
+            if header_length < 2 or body_start >= len(packet):
+                return None
+            decoded = decode_core_base64(packet[body_start:], alphabet)
+        except (DirectRequestError, ValueError, struct.error):
+            return None
+        if len(decoded) >= 2 and decoded[0] == 0 and decoded[1] != 0:
+            encoding = "utf-16-be"
+        elif b"\x00" in decoded[:16]:
+            encoding = "utf-16-le"
+        else:
+            encoding = "latin1"
+        text = decoded.decode(encoding, errors="ignore")
+        if "id=2205" in text:
+            return "curve"
+        if "id=6001" in text:
+            return "companion"
+        return None
+
+    @classmethod
+    def _group_request_batches(
+        cls,
+        packets: Sequence[bytes],
+        *,
+        alphabet: str = CORE_BASE64_ALPHABET,
+    ) -> list[tuple[bytes, ...]]:
+        """Pair each 2205 request with its 6001 companion while dropping orphan duplicates."""
+        kinds = [cls._classify_request_packet(packet, alphabet) for packet in packets]
+        if "curve" not in kinds or "companion" not in kinds:
+            return [
+                tuple(packets[start : start + 2])
+                for start in range(0, len(packets), 2)
+            ]
+        batches: list[tuple[bytes, ...]] = []
+        index = 0
+        total = len(packets)
+        while index < total:
+            kind = kinds[index]
+            if kind == "curve":
+                if index + 1 < total and kinds[index + 1] == "companion":
+                    batches.append((packets[index], packets[index + 1]))
+                    index += 2
+                else:
+                    batches.append((packets[index],))
+                    index += 1
+            elif kind == "companion":
+                # Drop duplicated/orphan 6001 frames so they do not misalign later pairs.
+                index += 1
+            else:
+                batches.append((packets[index],))
+                index += 1
+        return batches
 
     @staticmethod
     def close_connection(warm: WarmCoreConnection) -> None:
@@ -2101,6 +2174,8 @@ class Core9528TemplateProtocol:
         prepared: CoreRequestMaterial,
         symbol: str,
         market: str,
+        *,
+        quote_only: bool = False,
     ) -> DirectReadOutcome:
         if warm.session_fingerprint != prepared.session_fingerprint:
             self.close_connection(warm)
@@ -2109,18 +2184,24 @@ class Core9528TemplateProtocol:
             frames: list[bytes] = []
             deadline = time.monotonic() + prepared.timeout_seconds
             # Captured request templates are emitted as adjacent pairs by the
-            # App (a request descriptor followed by its 6001 payload).  Keep
-            # each pair together and stop after its first curve response before
-            # moving on to the next indicator.  A final unpaired template is
-            # still sent as a single request for compatibility with captures.
+            # App (a 2205 request descriptor followed by its 6001 payload).
+            # Pair them semantically so duplicate 6001 captures do not misalign
+            # later indicators, and stop immediately after the quote curve when
+            # quote_only=True (pre-open call auction).
             seen_batches: set[tuple[bytes, ...]] = set()
-            for batch_start in range(0, len(prepared.request_packets), 2):
-                batch = tuple(
-                    prepared.request_packets[batch_start : batch_start + 2]
-                )
+            for batch in self._group_request_batches(
+                prepared.request_packets,
+                alphabet=prepared.alphabet,
+            ):
                 if batch in seen_batches:
                     continue
                 seen_batches.add(batch)
+                has_curve = any(self._is_curve_frame(frame) for frame in frames)
+                batch_deadline = (
+                    min(deadline, time.monotonic() + self.secondary_batch_timeout_seconds)
+                    if has_curve
+                    else deadline
+                )
                 for packet in batch:
                     warm.connection.sendall(packet)
                 try:
@@ -2128,7 +2209,7 @@ class Core9528TemplateProtocol:
                         self._read_frames(
                             warm.connection,
                             prepared.timeout_seconds,
-                            deadline=deadline,
+                            deadline=batch_deadline,
                             stop_after_curves=1,
                         )
                     )
@@ -2138,10 +2219,12 @@ class Core9528TemplateProtocol:
                     # preserve an already received curve and decode it below.
                     if (
                         error.error_code == "DIRECT_PROTOCOL_RESPONSE_TIMEOUT"
-                        and any(self._is_curve_frame(frame) for frame in frames)
+                        and (has_curve or any(self._is_curve_frame(frame) for frame in frames))
                     ):
                         break
                     raise
+                if quote_only and any(self._is_curve_frame(frame) for frame in frames):
+                    break
             assert self.response_decoder is not None
             response_decoder = self.response_decoder
             if prepared.macdfs_params is not None:
@@ -2175,12 +2258,34 @@ class Core9528TemplateProtocol:
         finally:
             self.close_connection(warm)
 
-    def read_direct(
-        self, material: object, symbol: str, market: str
+    def _read_direct_mode(
+        self,
+        material: object,
+        symbol: str,
+        market: str,
+        *,
+        quote_only: bool,
     ) -> DirectReadOutcome:
         prepared = self.prepare(material, symbol)
         warm = self.authenticate(prepared)
-        return self.read_authenticated(warm, prepared, symbol, market)
+        return self.read_authenticated(
+            warm,
+            prepared,
+            symbol,
+            market,
+            quote_only=quote_only,
+        )
+
+    def read_direct(
+        self, material: object, symbol: str, market: str
+    ) -> DirectReadOutcome:
+        return self._read_direct_mode(material, symbol, market, quote_only=False)
+
+    def read_quote_direct(
+        self, material: object, symbol: str, market: str
+    ) -> DirectReadOutcome:
+        """Read only the primary quote curve without querying secondary L2 indicators."""
+        return self._read_direct_mode(material, symbol, market, quote_only=True)
 
     def read_market_snapshot(
         self,
@@ -2217,13 +2322,14 @@ def _start_warm_background(task: Callable[[], None]) -> None:
 
 
 class Core9528WarmPool:
-    """Hold one authenticated connection that may be consumed exactly once."""
+    """Hold authenticated connections that may each be consumed once."""
 
     def __init__(
         self,
         protocol: object,
         *,
         max_idle_seconds: float = 25.0,
+        max_size: int = 1,
         clock: Callable[[], float] = time.monotonic,
         start_background: Callable[[Callable[[], None]], None] = (
             _start_warm_background
@@ -2231,21 +2337,24 @@ class Core9528WarmPool:
     ) -> None:
         if max_idle_seconds <= 0:
             raise ValueError("max_idle_seconds must be positive")
+        if max_size < 1:
+            raise ValueError("max_size must be positive")
         self.protocol = protocol
         self.max_idle_seconds = max_idle_seconds
+        self.max_size = int(max_size)
         self.clock = clock
         self.start_background = start_background
         self._lock = Lock()
-        self._ready: WarmCoreConnection | None = None
+        self._ready_queue: deque[WarmCoreConnection] = deque()
         self._session_fingerprint: bytes | None = None
-        self._refilling = False
+        self._refilling_count = 0
         self._closed = False
         self._generation = 0
 
     @property
     def ready_count(self) -> int:
         with self._lock:
-            return int(self._ready is not None)
+            return len(self._ready_queue)
 
     def close_connection(self, warm: WarmCoreConnection) -> None:
         close_connection = getattr(self.protocol, "close_connection", None)
@@ -2272,13 +2381,33 @@ class Core9528WarmPool:
             raise DirectRequestError("DIRECT_PROTOCOL_HANDSHAKE_FAILED")
         return prepare(session, symbol)
 
+    def _prune_expired_locked(self) -> list[WarmCoreConnection]:
+        now = self.clock()
+        expired: list[WarmCoreConnection] = []
+        kept: deque[WarmCoreConnection] = deque()
+        while self._ready_queue:
+            conn = self._ready_queue.popleft()
+            if now - conn.authenticated_at > self.max_idle_seconds:
+                expired.append(conn)
+            else:
+                kept.append(conn)
+        self._ready_queue = kept
+        return expired
+
+    def _close_all(self, connections: Sequence[WarmCoreConnection]) -> None:
+        for conn in connections:
+            self.close_connection(conn)
+
     def _schedule_refill(
         self,
         prepared: CoreRequestMaterial,
         *,
         expected_generation: int | None = None,
+        refresh_older_than_seconds: float | None = None,
     ) -> bool:
-        stale: WarmCoreConnection | None = None
+        stale: list[WarmCoreConnection] = []
+        slots_to_start = 0
+        generation = 0
         with self._lock:
             if self._closed:
                 return False
@@ -2289,30 +2418,45 @@ class Core9528WarmPool:
             ):
                 return False
             if self._session_fingerprint != prepared.session_fingerprint:
-                stale = self._ready
-                self._ready = None
+                stale = list(self._ready_queue)
+                self._ready_queue.clear()
                 self._session_fingerprint = prepared.session_fingerprint
                 self._generation += 1
-                self._refilling = False
-            if self._ready is not None or self._refilling:
-                should_start = False
+                self._refilling_count = 0
             else:
-                self._refilling = True
-                should_start = True
+                stale = self._prune_expired_locked()
+            near_stale = 0
+            if refresh_older_than_seconds is not None and self._ready_queue:
+                now = self.clock()
+                near_stale = sum(
+                    1
+                    for conn in self._ready_queue
+                    if (now - conn.authenticated_at) >= refresh_older_than_seconds
+                )
+            missing = max(0, self.max_size - len(self._ready_queue))
+            target_in_flight = min(self.max_size, missing + near_stale)
+            slots_to_start = max(0, target_in_flight - self._refilling_count)
+            if slots_to_start > 0:
+                self._refilling_count += slots_to_start
                 generation = self._generation
-        if stale is not None:
-            self.close_connection(stale)
-        if not should_start:
+        if stale:
+            self._close_all(stale)
+        if slots_to_start <= 0:
             return True
-        try:
-            self.start_background(
-                lambda: self._refill(prepared, generation)
-            )
-        except Exception:
-            with self._lock:
-                self._refilling = False
-            return False
-        return True
+        started_any = False
+        for _ in range(slots_to_start):
+            try:
+                self.start_background(
+                    lambda gen=generation: self._refill(prepared, gen)
+                )
+                started_any = True
+            except Exception:
+                with self._lock:
+                    if generation == self._generation and self._refilling_count > 0:
+                        self._refilling_count -= 1
+                if not started_any:
+                    return False
+        return started_any
 
     def _refill(
         self,
@@ -2327,33 +2471,45 @@ class Core9528WarmPool:
             warm = authenticate(prepared)
         except Exception:
             warm = None
-        stale: WarmCoreConnection | None = None
+        stale: list[WarmCoreConnection] = []
         with self._lock:
             if generation == self._generation:
-                self._refilling = False
+                if self._refilling_count > 0:
+                    self._refilling_count -= 1
                 if (
                     warm is not None
                     and not self._closed
                     and self._session_fingerprint
                     == warm.session_fingerprint
-                    and self._ready is None
                 ):
-                    self._ready = warm
+                    stale = self._prune_expired_locked()
+                    if len(self._ready_queue) >= self.max_size:
+                        stale.append(self._ready_queue.popleft())
+                    self._ready_queue.append(warm)
                     warm = None
-                elif self._ready is not None and self._closed:
-                    stale = self._ready
-                    self._ready = None
+                elif self._closed and self._ready_queue:
+                    stale = list(self._ready_queue)
+                    self._ready_queue.clear()
         if warm is not None:
             self.close_connection(warm)
-        if stale is not None:
-            self.close_connection(stale)
+        if stale:
+            self._close_all(stale)
 
-    def prewarm(self, session: object, symbol: str | None = None) -> None:
+    def prewarm(
+        self,
+        session: object,
+        symbol: str | None = None,
+        *,
+        refresh_older_than_seconds: float | None = None,
+    ) -> None:
         prepared = self._prepare(
             session,
             symbol or self._template_symbol(session),
         )
-        self._schedule_refill(prepared)
+        self._schedule_refill(
+            prepared,
+            refresh_older_than_seconds=refresh_older_than_seconds,
+        )
 
     def replenish(self, prepared: CoreRequestMaterial) -> None:
         self._schedule_refill(prepared)
@@ -2364,31 +2520,30 @@ class Core9528WarmPool:
         symbol: str,
     ) -> tuple[CoreRequestMaterial, WarmCoreConnection]:
         prepared = self._prepare(session, symbol)
-        stale: WarmCoreConnection | None = None
+        stale: list[WarmCoreConnection] = []
+        warm: WarmCoreConnection | None = None
         with self._lock:
             if self._closed:
                 raise DirectRequestError("DIRECT_PROTOCOL_HANDSHAKE_FAILED")
             if self._session_fingerprint != prepared.session_fingerprint:
-                stale = self._ready
-                self._ready = None
+                stale = list(self._ready_queue)
+                self._ready_queue.clear()
                 self._session_fingerprint = prepared.session_fingerprint
                 self._generation += 1
-                self._refilling = False
+                self._refilling_count = 0
             generation = self._generation
-            warm = self._ready
-            self._ready = None
-            if (
-                warm is not None
-                and self.clock() - warm.authenticated_at
-                > self.max_idle_seconds
-            ):
-                if stale is None:
-                    stale = warm
+            while self._ready_queue:
+                candidate = self._ready_queue.popleft()
+                if (
+                    self.clock() - candidate.authenticated_at
+                    > self.max_idle_seconds
+                ):
+                    stale.append(candidate)
                 else:
-                    self.close_connection(warm)
-                warm = None
-        if stale is not None:
-            self.close_connection(stale)
+                    warm = candidate
+                    break
+        if stale:
+            self._close_all(stale)
         if warm is None:
             authenticate = getattr(self.protocol, "authenticate", None)
             if not callable(authenticate):
@@ -2408,24 +2563,24 @@ class Core9528WarmPool:
 
     def invalidate(self) -> None:
         with self._lock:
-            stale = self._ready
-            self._ready = None
+            stale = list(self._ready_queue)
+            self._ready_queue.clear()
             self._session_fingerprint = None
             self._generation += 1
-            self._refilling = False
-        if stale is not None:
-            self.close_connection(stale)
+            self._refilling_count = 0
+        if stale:
+            self._close_all(stale)
 
     def close(self) -> None:
         with self._lock:
             self._closed = True
-            stale = self._ready
-            self._ready = None
+            stale = list(self._ready_queue)
+            self._ready_queue.clear()
             self._session_fingerprint = None
             self._generation += 1
-            self._refilling = False
-        if stale is not None:
-            self.close_connection(stale)
+            self._refilling_count = 0
+        if stale:
+            self._close_all(stale)
 
 
 class Core9528Client:
@@ -2465,7 +2620,23 @@ class Core9528Client:
             raise DirectRequestError("DIRECT_PROTOCOL_HANDSHAKE_FAILED")
         return session
 
-    def read_direct(self, symbol: str) -> DirectReadOutcome:
+    @staticmethod
+    def _supports_quote_only(fn: object) -> bool:
+        try:
+            sig = inspect.signature(fn)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return False
+        return "quote_only" in sig.parameters or any(
+            p.kind is inspect.Parameter.VAR_KEYWORD
+            for p in sig.parameters.values()
+        )
+
+    def _read_direct_with_mode(
+        self,
+        symbol: str,
+        *,
+        quote_only: bool,
+    ) -> DirectReadOutcome:
         market = market_code_for_symbol(symbol)
         if market in {"20", "36"}:
             return DirectReadOutcome(
@@ -2491,6 +2662,14 @@ class Core9528Client:
                         raise DirectRequestError(
                             "DIRECT_PROTOCOL_HANDSHAKE_FAILED"
                         )
+                    if quote_only and self._supports_quote_only(read_authenticated):
+                        return read_authenticated(
+                            warm,
+                            prepared,
+                            symbol,
+                            market,
+                            quote_only=True,
+                        )
                     return read_authenticated(
                         warm,
                         prepared,
@@ -2499,16 +2678,38 @@ class Core9528Client:
                     )
                 finally:
                     self.warm_pool.replenish(prepared)
+            if quote_only:
+                read_quote_direct = getattr(
+                    self.protocol, "read_quote_direct", None
+                )
+                if callable(read_quote_direct):
+                    return read_quote_direct(session, symbol, market)
             return self.protocol.read_direct(session, symbol, market)
 
-    def prewarm(self, symbol: str | None = None) -> None:
+    def read_direct(self, symbol: str) -> DirectReadOutcome:
+        return self._read_direct_with_mode(symbol, quote_only=False)
+
+    def read_quote_direct(self, symbol: str) -> DirectReadOutcome:
+        """Read only the primary quote curve for pre-open/auction quotes."""
+        return self._read_direct_with_mode(symbol, quote_only=True)
+
+    def prewarm(
+        self,
+        symbol: str | None = None,
+        *,
+        refresh_older_than_seconds: float | None = None,
+    ) -> None:
         if self.warm_pool is None:
             return
         if not self._request_lock.acquire(blocking=False):
             return
         try:
             session = self._session()
-            self.warm_pool.prewarm(session, symbol)
+            self.warm_pool.prewarm(
+                session,
+                symbol,
+                refresh_older_than_seconds=refresh_older_than_seconds,
+            )
         finally:
             self._request_lock.release()
 

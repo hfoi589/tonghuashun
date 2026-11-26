@@ -257,3 +257,46 @@ def test_market_fund_flow_history_isolates_intraday_empty_today(tmp_path):
         assert yday_res.status_code == 200
         assert yday_res.json()["trade_date"] == "20261124"
         assert yday_res.json()["periods"]["today"]["points"][0]["main_hidden_inflow"] == "1.00"
+
+
+def test_market_fund_flow_history_clips_unreached_intraday_points(tmp_path):
+    accounts = SQLiteMarketAccountStore(tmp_path / "market.db")
+    user = accounts.create_user("trader", "temporary-123")
+    accounts.change_password(user.id, "temporary-123", "permanent-456")
+    group = accounts.list_watchlists(user.id)[0]
+    accounts.add_symbol(user.id, group.id, SymbolLookup(symbol="601872", name="招商轮船", market="17"))
+    store = SQLiteResearchStore(tmp_path / "research.db")
+    for minute in ("09:30", "11:30", "15:00"):
+        store.record_fund_flow(
+            "601872",
+            trade_date="20261125",
+            minute=minute,
+            periods={"today": {"unit": "万元", "main_net_inflow": "100.00", "main_visible_inflow": "60.00", "main_hidden_inflow": "40.00", "retail_inflow": "-100.00"}},
+            captured_at=datetime(2026, 11, 25, 11, 30),
+        )
+    store.record_fund_flow(
+        "601872",
+        trade_date="20261124",
+        minute="15:00",
+        periods={"today": {"unit": "万元", "main_net_inflow": "50.00", "main_visible_inflow": "30.00", "main_hidden_inflow": "20.00", "retail_inflow": "-50.00"}},
+        captured_at=datetime(2026, 11, 24, 15, 0),
+    )
+
+    app = create_app(
+        admin_password_hash=PasswordHasher().hash("admin-secret"),
+        secure_admin_cookies=False,
+        market_account_store=accounts,
+        market_session_store=InMemoryMarketSessionStore(),
+        research_store=store,
+        symbol_lookup=lambda symbol: SymbolLookup(symbol=symbol, name="招商轮船", market="17"),
+        expected_intraday_trade_date=lambda: "20261125",
+        intraday_minute_cap=lambda trade_date: "11:30" if trade_date == "20261125" else None,
+    )
+
+    with TestClient(app) as client:
+        assert client.post("/api/v1/session", json={"username": "trader", "password": "permanent-456"}).status_code == 200
+        today_res = client.get("/api/v1/market/symbols/601872/fund-flow/history")
+        assert today_res.status_code == 200
+        assert [pt["time"] for pt in today_res.json()["periods"]["today"]["points"]] == ["09:30", "11:30"]
+        yday_res = client.get("/api/v1/market/symbols/601872/fund-flow/history?trade_date=20261124")
+        assert [pt["time"] for pt in yday_res.json()["periods"]["today"]["points"]] == ["15:00"]

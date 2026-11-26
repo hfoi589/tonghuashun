@@ -118,11 +118,14 @@ class CoreDirectPreopenQuoteClient:
         phase: MarketPhase,
     ) -> MarketSnapshot:
         del detail
-        read_direct = getattr(self.direct_source, "read_direct", None)
-        if not callable(read_direct):
+        market = market_code_for_symbol(symbol)
+        reader = getattr(self.direct_source, "read_quote_direct", None)
+        if not callable(reader):
+            reader = getattr(self.direct_source, "read_direct", None)
+        if not callable(reader):
             raise DirectRequestError("DIRECT_SESSION_UNAVAILABLE")
         try:
-            outcome = read_direct(symbol)
+            outcome = reader(symbol)
         except DirectRequestError:
             raise
         except Exception:
@@ -133,7 +136,6 @@ class CoreDirectPreopenQuoteClient:
         if price in (None, "") or change in (None, ""):
             raise DirectRequestError("DIRECT_PROTOCOL_RESPONSE_INVALID")
         name = values.get(MetricKind.STOCK_NAME)
-        market = market_code_for_symbol(symbol)
         precision = 3 if market in {"20", "36"} else 2
         now = self.clock().astimezone(SHANGHAI_TZ)
         return MarketSnapshot(
@@ -420,6 +422,20 @@ class PreopenMarketDataSource:
             auction_error=error_code,
         )
 
+    def cached_snapshot_for_timeout(self, symbol: str) -> MarketSnapshot | None:
+        """Return a same-day cached auction snapshot when a direct wait times out."""
+        state = self.phase_resolver.resolve(self.clock())
+        if state.phase not in self._PREOPEN_PHASES:
+            return None
+        cached = self._cached(symbol)
+        if cached is None:
+            return None
+        return self._with_phase(
+            cached,
+            state,
+            auction_error="DIRECT_REQUEST_TIMEOUT",
+        )
+
     def read_market_snapshots(
         self,
         symbols: set[str],
@@ -449,13 +465,21 @@ class PreopenMarketDataSource:
                 raise
             except Exception:
                 raise DirectRequestError("AUCTION_QUOTE_UNAVAILABLE") from None
-        return {
-            symbol: self.read_market_snapshot(
-                symbol,
-                detail=symbol in detail_symbols,
-            )
-            for symbol in symbols
-        }
+        ordered = sorted(symbols, key=lambda value: (value not in detail_symbols, value))
+        results: dict[str, MarketSnapshot] = {}
+        first_error: Exception | None = None
+        for symbol in ordered:
+            try:
+                results[symbol] = self.read_market_snapshot(
+                    symbol,
+                    detail=symbol in detail_symbols,
+                )
+            except Exception as error:
+                if first_error is None:
+                    first_error = error
+        if not results and first_error is not None:
+            raise first_error
+        return results
 
     def read_quotes_batch(self, symbols: Iterable[str]) -> dict[str, MarketSnapshot]:
         symbol_list = list(dict.fromkeys(symbols))

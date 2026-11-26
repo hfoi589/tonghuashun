@@ -21,4 +21,9 @@ describe('aurora glass theme', () => {
     expect(themeCss).toContain('html.theme-market.light .market-app-shell')
     expect(themeCss).toContain('--macd-dif: #1d4ed8;')
   })
+
+  it('keeps ETF table header sort buttons transparent without inheriting global button gradients', () => {
+    expect(themeCss).toMatch(/\.theme-console button\.etf-sort-button[\s\S]*?\{[^}]*background:\s*transparent;/)
+    expect(themeCss).toMatch(/\.theme-console button\.etf-sort-button[\s\S]*?\{[^}]*min-height:\s*0;/)
+  })
 })

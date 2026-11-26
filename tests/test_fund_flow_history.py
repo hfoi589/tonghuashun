@@ -4,7 +4,11 @@ import asyncio
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-from level2_service.fund_flow_history import FundFlowHistoryMonitor
+from level2_service.fund_flow_history import (
+    FundFlowHistoryMonitor,
+    intraday_fund_flow_cap_minute,
+    settled_fund_flow_minute,
+)
 from level2_service.models import FUND_FLOW_METRICS, FUND_FLOW_PERIODS, MetricKind
 from level2_service.parsed_values import DirectReadOutcome
 from level2_service.research_store import SQLiteResearchStore
@@ -240,3 +244,54 @@ def test_fund_flow_monitor_post_close_150130_sweeps_1500_and_fires_callback_once
     assert second == {}
     assert finalized == [["000001", "601872"]]
     assert [pt["time"] for pt in store.read_fund_flow_history("601872", "20261124")["periods"]["today"]["points"]] == ["15:00"]
+
+
+def test_settled_fund_flow_minute_and_intraday_cap_respect_trading_windows():
+    sh = ZoneInfo("Asia/Shanghai")
+    assert settled_fund_flow_minute("20261124", datetime(2026, 11, 25, 11, 52, tzinfo=sh)) == "15:00"
+    assert settled_fund_flow_minute("20261125", datetime(2026, 11, 25, 9, 15, tzinfo=sh)) is None
+    assert settled_fund_flow_minute("20261125", datetime(2026, 11, 25, 10, 42, tzinfo=sh)) == "10:42"
+    assert settled_fund_flow_minute("20261125", datetime(2026, 11, 25, 11, 52, tzinfo=sh)) == "11:30"
+    assert settled_fund_flow_minute("20261125", datetime(2026, 11, 25, 13, 45, tzinfo=sh)) == "13:45"
+    assert settled_fund_flow_minute("20261125", datetime(2026, 11, 25, 15, 2, tzinfo=sh)) == "15:00"
+
+    assert intraday_fund_flow_cap_minute("20261124", datetime(2026, 11, 25, 12, 26, tzinfo=sh)) is None
+    assert intraday_fund_flow_cap_minute("20261125", datetime(2026, 11, 25, 9, 15, tzinfo=sh)) == "09:29"
+    assert intraday_fund_flow_cap_minute("20261125", datetime(2026, 11, 25, 12, 26, tzinfo=sh)) == "11:30"
+    assert intraday_fund_flow_cap_minute("20261125", datetime(2026, 11, 25, 15, 1, tzinfo=sh)) is None
+
+
+def test_store_startup_purges_premature_1500_rows_captured_intraday(tmp_path):
+    sh = ZoneInfo("Asia/Shanghai")
+    db_path = tmp_path / "research.db"
+    store = SQLiteResearchStore(db_path)
+    store.record_fund_flow(
+        "601872",
+        trade_date="20261124",
+        minute="15:00",
+        periods=_period_values("1.00"),
+        captured_at=datetime(2026, 11, 24, 15, 1, tzinfo=sh),
+    )
+    store.record_fund_flow(
+        "601872",
+        trade_date="20261125",
+        minute="11:30",
+        periods=_period_values("2.00"),
+        captured_at=datetime(2026, 11, 25, 11, 30, tzinfo=sh),
+    )
+    store.record_fund_flow(
+        "601872",
+        trade_date="20261125",
+        minute="15:00",
+        periods=_period_values("2.00"),
+        captured_at=datetime(2026, 11, 25, 11, 52, 41, tzinfo=sh),
+    )
+    store.close()
+
+    reopened = SQLiteResearchStore(db_path)
+    today_pts = reopened.read_fund_flow_history("601872", "20261125")["periods"]["today"]["points"]
+    yday_pts = reopened.read_fund_flow_history("601872", "20261124")["periods"]["today"]["points"]
+    assert [pt["time"] for pt in today_pts] == ["11:30"]
+    assert [pt["time"] for pt in yday_pts] == ["15:00"]
+    assert reopened.fund_flow_status("601872")["latest_time"] == "11:30"
+    reopened.close()

@@ -61,6 +61,9 @@ ensure_bridge() {
 
     adb_for shell pidof ths-frida-server >/dev/null 2>&1 || return 1
     adb_for forward "tcp:$host_port" "tcp:$device_port" >/dev/null 2>&1 || return 1
+    if [ -n "${THS_U2_HOST_PORT:-}" ]; then
+        adb_for forward "tcp:${THS_U2_HOST_PORT}" "tcp:7912" >/dev/null 2>&1 || true
+    fi
     return 0
 }
 

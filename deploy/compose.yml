@@ -59,6 +59,7 @@ services:
       VRA_API_TOKEN: ${VRA_API_TOKEN:-}
       VRA_BACKEND_URL: ${VRA_BACKEND_URL:-http://host.docker.internal:8765}
       GOODLUCK_INTERNAL_TOKEN: ${GOODLUCK_INTERNAL_TOKEN:-}
+      CORE_U2_ENDPOINT: ${CORE_U2_ENDPOINT:-}
     depends_on:
       redis:
         condition: service_healthy

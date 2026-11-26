@@ -7,17 +7,41 @@ from datetime import datetime
 import hashlib
 import hmac
 import inspect
+import json
 import re
-from typing import Any, Callable
+from threading import RLock
+import time
+from typing import Any, AsyncIterator, Callable, Literal
 from urllib.parse import unquote
 from zoneinfo import ZoneInfo
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
+from .brent_market import (
+    BRENT_SYMBOL,
+    backfill_brent_to_research_store,
+    build_brent_premium_panel,
+)
+from .etf_fund_flow import ETF_FLOW_PERIODS, EtfFundFlowError, fetch_etf_flow_payload
 from .fund_flow_history import extract_quote_trade_date, read_fund_flow_history_for_view
 from .market_accounts import MarketUser
 from .market_data import fixed_market_error_code
+from .quant_rules import (
+    backfill_intraday_history,
+    compact_quant_rule_record,
+    enrich_store_with_line_funds,
+    evaluate_quant_strategy,
+    export_quant_dataset,
+    get_quant_rule_schema,
+)
+from .device_lifecycle import (
+    DeviceLifecycleAction,
+    DeviceLifecycleError,
+    DeviceLifecycleState,
+)
+from .ths_trade import TradeExecutionError
 from .parsed_values import (
     DirectRequestError,
     SymbolLookup,
@@ -39,6 +63,7 @@ from .research_replay import (
 
 
 _SYMBOL_RE = re.compile(r"^[0-9]{6}\Z")
+_QUANT_SYMBOL_RE = re.compile(r"^(?:[0-9]{6}|BRN0Y)\Z")
 _DATE_RE = re.compile(r"^[0-9]{8}\Z")
 _SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
 
@@ -97,6 +122,132 @@ class BridgePushRuleTestRequest(BaseModel):
     config: dict[str, Any] | None = None
 
 
+class BridgeTradeOrderRequest(BaseModel):
+    symbol: str
+    side: Literal["buy", "sell"]
+    price: str | float
+    quantity: int = Field(ge=100, le=1000000)
+    dry_run: bool = False
+    auto_cancel: bool = False
+    idempotency_key: str | None = None
+
+
+class BridgeTradePrestageRequest(BaseModel):
+    symbol: str
+    side: Literal["buy", "sell"] = "buy"
+    price: str | float
+    quantity: int = Field(default=100, ge=100, le=1000000)
+
+
+class BridgeTradeCancelRequest(BaseModel):
+    entrust_no: str | None = None
+    symbol: str | None = None
+    side: Literal["buy", "sell"] | None = None
+
+
+class BridgeTradeDeviceActionRequest(BaseModel):
+    action: Literal["start", "shutdown"]
+
+
+class BridgeSymbolRuleBinding(BaseModel):
+    signal_source: Literal["intraday_macd_flow", "lof_premium", "combo_confirm", "quant_rule"] = "quant_rule"
+    quant_rule_id: str | None = None
+    enabled: bool = True
+    priority: int = Field(default=10, ge=1, le=100)
+    weight_scale: float = Field(default=1.0, ge=0.1, le=2.0)
+
+
+class BridgeSymbolQuantProfileRequest(BaseModel):
+    enabled: bool = True
+    signal_source: Literal["intraday_macd_flow", "lof_premium", "combo_confirm", "quant_rule"] | None = None
+    quant_rule_id: str | None = None
+    sizing_mode: Literal["model_auto", "fixed_qty"] | None = None
+    capital_cap: float | None = Field(default=None, ge=100.0, le=10000000.0)
+    order_quantity: int | None = Field(default=None, ge=100, le=1000000)
+    order_book_level: int | None = Field(default=None, ge=1, le=5)
+    rule_bindings: list[BridgeSymbolRuleBinding] | None = Field(default=None, max_length=8)
+
+
+class BridgeUpsertSymbolStrategyRequest(BridgeSymbolQuantProfileRequest):
+    reconcile_broker: bool = True
+
+
+class BridgeAutoTradeConfigRequest(BaseModel):
+    enabled: bool = True
+    signal_source: Literal["intraday_macd_flow", "lof_premium", "combo_confirm", "quant_rule"] = "intraday_macd_flow"
+    quant_rule_id: str | None = None
+    execution_mode: Literal["dry_run", "semi_auto", "full_auto"] = "semi_auto"
+    sizing_mode: Literal["model_auto", "fixed_qty"] | None = None
+    symbols: list[str] = Field(min_length=1, max_length=50)
+    order_quantity: int = Field(ge=100, le=1000000)
+    pricing_mode: Literal["counterparty_book", "fixed_ticks"] = "counterparty_book"
+    order_book_level: int = Field(default=3, ge=1, le=5)
+    slippage_ticks: int = Field(ge=0, le=20)
+    max_slippage_pct: float = Field(default=1.5, ge=0.1, le=10.0)
+    refresh_book_on_confirm: bool = True
+    auto_cancel_seconds: int = Field(ge=0, le=600)
+    daily_max_buy_amount: float = Field(ge=100.0, le=10000000.0)
+    block_non_continuous_session: bool = True
+    symbol_profiles: dict[str, BridgeSymbolQuantProfileRequest] | None = None
+    reconcile_broker: bool = False
+
+
+class BridgeQuantBackfillRequest(BaseModel):
+    symbol: str = "160723"
+    start_date: str = "20260701"
+    end_date: str | None = None
+
+
+class BridgeQuantEvaluateRequest(BaseModel):
+    rule_id: str | None = None
+    symbol: str = "160723"
+    start_date: str | None = None
+    end_date: str | None = None
+    primary_horizon_minutes: int | None = Field(default=None, ge=1, le=30)
+    min_move_pct: float | None = Field(default=None, ge=0.0, le=5.0)
+    data_scope: Literal["auto", "all", "flow_only"] | None = None
+    morning_start: str | None = None
+    morning_end: str | None = None
+    max_daily_trades: int | None = Field(default=None, ge=1, le=20)
+    round_trip_fee_pct: float | None = Field(default=None, ge=0.0, le=1.0)
+    capital_cap: float | None = Field(default=None, ge=1000.0, le=10000000.0)
+    signal_limit: int = Field(default=200, ge=1, le=5000)
+    macd_settings: dict[str, Any] | None = None
+    buy_rule: dict[str, Any] | None = None
+    sell_rule: dict[str, Any] | None = None
+    position_sizing: dict[str, Any] | None = None
+    eval_criteria: dict[str, Any] | None = None
+
+
+class BridgeQuantRuleUpsertRequest(BaseModel):
+    id: str | None = None
+    name: str = Field(min_length=1, max_length=80)
+    description: str = ""
+    source: Literal["ai", "manual", "builtin"] = "ai"
+    symbols: list[str] = Field(default_factory=lambda: ["160723"])
+    macd_settings: dict[str, Any] | None = None
+    buy_rule: dict[str, Any] | None = None
+    sell_rule: dict[str, Any] | None = None
+    position_sizing: dict[str, Any] | None = None
+    eval_criteria: dict[str, Any] | None = None
+    enabled: bool = True
+
+
+class BridgeAutoTradeSimulateRequest(BaseModel):
+    symbol: str | None = None
+    side: Literal["buy", "sell"] = "buy"
+    viewer_open: bool | None = None
+
+
+class BridgeAutoTradeDecideRequest(BaseModel):
+    action: Literal["approve", "reject"]
+    dry_run: bool = False
+    override_price: str | float | None = None
+    override_quantity: int | None = Field(default=None, ge=100, le=1000000)
+    override_book_level: int | None = Field(default=None, ge=1, le=5)
+    idempotency_key: str | None = None
+
+
 def _token_matches(provided: str | None, expected: str | None) -> bool:
     if not provided or not expected:
         return False
@@ -109,6 +260,13 @@ def _validate_symbol(symbol: str) -> str:
     normalized = symbol.strip()
     if not _SYMBOL_RE.fullmatch(normalized):
         raise HTTPException(status_code=422, detail="symbol must be a six-digit stock code")
+    return normalized
+
+
+def _validate_quant_symbol(symbol: str) -> str:
+    normalized = symbol.strip().upper()
+    if not _QUANT_SYMBOL_RE.fullmatch(normalized):
+        raise HTTPException(status_code=422, detail="symbol must be a six-digit code or BRN0Y")
     return normalized
 
 
@@ -238,6 +396,7 @@ def install_goodluck_routes(
     resolve_symbol: Callable[[str], SymbolLookup],
     previous_trading_date: Callable[[str], str] | None = None,
     expected_intraday_trade_date: Callable[[], str | None] | None = None,
+    intraday_minute_cap: Callable[[str], str | None] | None = None,
 ) -> None:
     """Install token-authenticated internal bridge routes for Guohang Goodluck."""
 
@@ -992,6 +1151,7 @@ def install_goodluck_routes(
                 normalized,
                 trade_date.strip() if trade_date else None,
                 expected_intraday_trade_date=expected_intraday_trade_date,
+                intraday_minute_cap=intraday_minute_cap,
             )
         except LookupError:
             raise HTTPException(status_code=404, detail="fund flow history not found") from None
@@ -1031,12 +1191,54 @@ def install_goodluck_routes(
             "supports_darkpool": True,
         }
 
+    @app.get(f"{prefix}/symbols/{{symbol}}/etf-flow")
+    async def bridge_etf_flow(
+        symbol: str,
+        period: str = "60d",
+        identity=Depends(require_goodluck_identity),
+    ) -> dict[str, Any]:
+        user, _is_admin = identity
+        normalized = _validate_symbol(symbol)
+        if period not in ETF_FLOW_PERIODS:
+            raise HTTPException(status_code=422, detail="unsupported etf flow period")
+        accounts = account_store()
+        watchlist_item = _user_watchlist_items(accounts, user.id).get(normalized)
+        if watchlist_item is None:
+            raise HTTPException(status_code=404, detail="watchlist symbol not found")
+        service = getattr(app.state, "etf_flow_service", None)
+        if service is None:
+            raise HTTPException(status_code=503, detail="etf fund flow service is not configured")
+        try:
+            payload = await fetch_etf_flow_payload(
+                service,
+                getattr(app.state, "market_data_broker", None),
+                normalized,
+                period,
+            )
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from None
+        except EtfFundFlowError as error:
+            raise HTTPException(
+                status_code=503,
+                detail=fixed_market_error_code(error, "ETF_FUND_FLOW_UNAVAILABLE"),
+            ) from None
+        except Exception as error:
+            raise HTTPException(
+                status_code=503,
+                detail=fixed_market_error_code(error, "ETF_FUND_FLOW_UNAVAILABLE"),
+            ) from None
+        return {
+            **payload,
+            "name": _resolve_item_name(normalized, watchlist_item.name),
+        }
+
     # ---- Oil & Gas QDII/LOF Premium Panel ----
 
     @app.get(f"{prefix}/premium")
     async def bridge_get_premium(_identity=Depends(require_goodluck_identity)) -> dict[str, Any]:
         store = getattr(app.state, "research_store", None)
         monitor = getattr(app.state, "premium_monitor", None)
+        brent_monitor = getattr(app.state, "brent_monitor", None)
         snapshot = await asyncio.to_thread(store.premium_snapshot) if store is not None else None
         if snapshot is None and monitor is not None:
             try:
@@ -1050,21 +1252,39 @@ def install_goodluck_routes(
                 push_enabled = bool(push_cfg.get("premium_push_enabled"))
             except Exception:
                 push_enabled = False
+        brent_panel = None
+        if store is not None:
+            try:
+                brent_panel = await asyncio.to_thread(build_brent_premium_panel, store, brent_monitor)
+            except Exception:
+                brent_panel = None
         base = snapshot or {"as_of": None, "rows": [], "valid_count": 0, "errors": {}}
-        return {**base, "push_enabled": push_enabled}
+        return {**base, "push_enabled": push_enabled, "brent": brent_panel}
 
     @app.post(f"{prefix}/premium/refresh")
     async def bridge_refresh_premium(_admin=Depends(require_goodluck_admin)) -> dict[str, Any]:
         monitor = getattr(app.state, "premium_monitor", None)
         store = getattr(app.state, "research_store", None)
+        brent_monitor = getattr(app.state, "brent_monitor", None)
         if monitor is None:
             raise HTTPException(status_code=503, detail="premium monitor is not configured")
         snapshot = await monitor.poll_once(force=True)
+        if brent_monitor is not None:
+            try:
+                await brent_monitor.poll_once(force=True)
+            except Exception:
+                pass
         push_enabled = False
         if store is not None:
             push_cfg = await asyncio.to_thread(store.push_config, public=True)
             push_enabled = bool(push_cfg.get("premium_push_enabled"))
-        return {**snapshot, "push_enabled": push_enabled}
+        brent_panel = None
+        if store is not None:
+            try:
+                brent_panel = await asyncio.to_thread(build_brent_premium_panel, store, brent_monitor)
+            except Exception:
+                brent_panel = None
+        return {**snapshot, "push_enabled": push_enabled, "brent": brent_panel}
 
     @app.post(f"{prefix}/premium/push")
     async def bridge_push_premium(_admin=Depends(require_goodluck_admin)) -> dict[str, Any]:
@@ -1115,6 +1335,17 @@ def install_goodluck_routes(
             try:
                 live_snap = await broker.refresh(normalized, detail=True, max_age_seconds=0)
                 changed = await asyncio.to_thread(store.record_snapshot, live_snap)
+                if is_exchange_fund_symbol(normalized):
+                    try:
+                        await asyncio.to_thread(
+                            enrich_store_with_line_funds,
+                            store,
+                            normalized,
+                            trade_date=today_str,
+                            now=now_sh,
+                        )
+                    except Exception:
+                        pass
                 if changed and monitor is not None and getattr(monitor, "dispatcher", None) is not None:
                     try:
                         await monitor._push_changed(normalized, changed)
@@ -1463,3 +1694,1039 @@ def install_goodluck_routes(
             "premium": premium_info,
             "monitoring": store.monitoring_status(monitored_symbols) if store is not None else [],
         }
+
+    # ---- Admin-only Broker Trade Execution (Guotai Haitong on core emulator) ----
+
+    def _require_trade_executor() -> Any:
+        executor = getattr(app.state, "trade_executor", None)
+        if executor is None:
+            raise HTTPException(
+                status_code=503,
+                detail={"error_code": "TRADE_UNCONFIGURED", "message": "交易执行器未配置"},
+            )
+        return executor
+
+    def _resolve_idempotency_key(request: Request, body_key: str | None) -> str | None:
+        raw = str(request.headers.get("X-Idempotency-Key") or body_key or "").strip()
+        if not raw:
+            return None
+        if len(raw) > 128 or not re.fullmatch(r"[A-Za-z0-9._:/-]+", raw):
+            raise HTTPException(
+                status_code=422,
+                detail={"error_code": "TRADE_INVALID_IDEMPOTENCY_KEY", "message": "幂等键格式无效"},
+            )
+        return raw
+
+    def _payload_hash(data: Any) -> str:
+        encoded = json.dumps(data, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+    def _check_idempotency_cache(scope: str, key: str, payload_hash: str) -> dict[str, Any] | None:
+        engine = getattr(app.state, "auto_trade_engine", None)
+        store = getattr(engine, "auto_store", None) if engine is not None else None
+        if store is not None and callable(getattr(store, "check_idempotency", None)):
+            state, hit = store.check_idempotency(
+                scope=scope,
+                idempotency_key=key,
+                payload_hash=payload_hash,
+                now_epoch=time.time(),
+            )
+            if state == "conflict":
+                raise HTTPException(
+                    status_code=409,
+                    detail={"error_code": "TRADE_IDEMPOTENCY_CONFLICT", "message": "幂等键与已有请求参数不一致"},
+                )
+            if state == "hit" and hit is not None:
+                body = dict(hit["body"])
+                body["idempotent_replayed"] = True
+                return body
+            return None
+        mem_lock = getattr(app.state, "_trade_idemp_lock", None)
+        if mem_lock is None:
+            mem_lock = RLock()
+            app.state._trade_idemp_lock = mem_lock
+            app.state._trade_idemp_cache = {}
+        mem_cache: dict[tuple[str, str], tuple[str, dict[str, Any], float]] = app.state._trade_idemp_cache
+        now_ep = time.time()
+        with mem_lock:
+            for k in [k for k, (_, _, exp) in mem_cache.items() if exp <= now_ep]:
+                mem_cache.pop(k, None)
+            entry = mem_cache.get((scope, key))
+            if entry is None:
+                return None
+            saved_hash, saved_body, _ = entry
+            if saved_hash != payload_hash:
+                raise HTTPException(
+                    status_code=409,
+                    detail={"error_code": "TRADE_IDEMPOTENCY_CONFLICT", "message": "幂等键与已有请求参数不一致"},
+                )
+            body = dict(saved_body)
+            body["idempotent_replayed"] = True
+            return body
+
+    def _save_idempotency_cache(scope: str, key: str, payload_hash: str, body: dict[str, Any]) -> None:
+        engine = getattr(app.state, "auto_trade_engine", None)
+        store = getattr(engine, "auto_store", None) if engine is not None else None
+        if store is not None and callable(getattr(store, "save_idempotency", None)):
+            store.save_idempotency(
+                scope=scope,
+                idempotency_key=key,
+                payload_hash=payload_hash,
+                status_code=200,
+                body=body,
+                now_epoch=time.time(),
+            )
+            return
+        mem_lock = getattr(app.state, "_trade_idemp_lock", None)
+        mem_cache = getattr(app.state, "_trade_idemp_cache", None)
+        if mem_lock is not None and isinstance(mem_cache, dict):
+            with mem_lock:
+                mem_cache[(scope, key)] = (payload_hash, dict(body), time.time() + 3600.0)
+
+    def _raise_trade_http_error(error: TradeExecutionError) -> None:
+        raise HTTPException(
+            status_code=error.status_code,
+            detail={"error_code": error.error_code, "message": error.message},
+        ) from None
+
+    _TRADE_DEVICE_ROLE = "core_metrics"
+    _LIFECYCLE_ERROR_MESSAGES: dict[str, tuple[int, str]] = {
+        "DEVICE_ACTION_IN_PROGRESS": (409, "交易虚拟机正在开机或关机中，请稍候"),
+        "DEVICE_BOOT_TIMEOUT": (504, "交易虚拟机启动超时，请稍后重试"),
+        "DEVICE_AVD_NOT_FOUND": (503, "未找到交易虚拟机配置镜像，请检查宿主机 AVD"),
+        "DEVICE_APP_LAUNCH_FAILED": (503, "交易虚拟机已开机，但同花顺应用启动失败"),
+        "DEVICE_SHUTDOWN_FAILED": (503, "交易虚拟机关闭失败，请稍后重试"),
+        "DEVICE_LIFECYCLE_UNAVAILABLE": (503, "宿主机虚拟机生命周期服务未开启或不可用"),
+    }
+
+    def _raise_lifecycle_http_error(code: str) -> None:
+        status_code, msg = _LIFECYCLE_ERROR_MESSAGES.get(
+            code, (503, "交易虚拟机控制操作失败，请稍后重试")
+        )
+        raise HTTPException(
+            status_code=status_code,
+            detail={"error_code": code, "message": msg},
+        ) from None
+
+    def _reset_trade_executor_cache(exec_obj: Any) -> None:
+        if exec_obj is None:
+            return
+        exec_obj._device = None
+        exec_obj._last_verified_at = 0.0
+        exec_obj._prestaged_state = None
+
+    def _read_trade_device_status_sync() -> dict[str, Any]:
+        lifecycle = getattr(app.state, "device_lifecycle", None)
+        control = getattr(app.state, "runner_control", None)
+        executor = getattr(app.state, "trade_executor", None)
+        device_serial = getattr(executor, "adb_serial", "emulator-5556")
+        lc_state = "UNCONFIGURED" if lifecycle is None else "UNKNOWN"
+        operation_id: str | None = None
+        error_code: str | None = None
+        updated_at: str | None = None
+
+        if lifecycle is not None:
+            try:
+                statuses = lifecycle.devices()
+            except DeviceLifecycleError as error:
+                error_code = error.error_code
+                lc_state = DeviceLifecycleState.UNKNOWN.value
+            except Exception:
+                error_code = "DEVICE_LIFECYCLE_FAILED"
+                lc_state = DeviceLifecycleState.UNKNOWN.value
+            else:
+                by_role = {s.role: s for s in statuses}
+                if control is not None:
+                    for s in statuses:
+                        control.reconcile_operation(s.role, s.operation_id, s.state.value)
+                core_status = by_role.get(_TRADE_DEVICE_ROLE)
+                if core_status is not None:
+                    lc_state = core_status.state.value
+                    operation_id = core_status.operation_id
+                    error_code = core_status.error_code
+                    updated_at = core_status.updated_at.isoformat() if core_status.updated_at else None
+                    tracked_op = getattr(app.state, "goodluck_device_op_id", None)
+                    if (
+                        tracked_op
+                        and lc_state in {"RUNNING", "STOPPED", "ERROR"}
+                        and control is not None
+                    ):
+                        app.state.goodluck_device_op_id = None
+                        control.resume_queue()
+                else:
+                    error_code = "DEVICE_LIFECYCLE_FAILED"
+                    lc_state = DeviceLifecycleState.UNKNOWN.value
+
+        if lc_state in {"STOPPED", "STOPPING", "STARTING"} and executor is not None:
+            lock = getattr(executor, "_lock", None)
+            if lock is not None and lock.acquire(blocking=False):
+                try:
+                    _reset_trade_executor_cache(executor)
+                finally:
+                    lock.release()
+
+        probes = getattr(app.state, "device_health_probes", None) or {}
+        probe = probes.get(_TRADE_DEVICE_ROLE)
+        bridges = getattr(app.state, "device_bridges", None) or {}
+        bridge = bridges.get(_TRADE_DEVICE_ROLE) or getattr(app.state, "device_bridge", None)
+        adb_state = "OFFLINE"
+        app_state = "OFFLINE"
+        if lc_state == "RUNNING" or lifecycle is None:
+            if callable(probe):
+                try:
+                    health = dict(probe())
+                except Exception:
+                    health = {}
+                adb_state = str(health.get("adb") or "OFFLINE")
+                app_state = str(health.get("app") or adb_state)
+            elif bridge is not None:
+                try:
+                    online = bool(bridge.is_online())
+                except Exception:
+                    online = False
+                adb_state = "ONLINE" if online else "OFFLINE"
+                app_state = adb_state
+
+        ready = (
+            lc_state == "RUNNING" or (lifecycle is None and adb_state == "ONLINE")
+        ) and adb_state == "ONLINE"
+        return {
+            "role": _TRADE_DEVICE_ROLE,
+            "device_serial": device_serial,
+            "lifecycle_configured": lifecycle is not None,
+            "state": lc_state,
+            "adb": adb_state,
+            "app": app_state,
+            "ready": ready,
+            "operation_id": operation_id,
+            "error_code": error_code,
+            "updated_at": updated_at,
+        }
+
+    async def _watch_trade_device_op(op_id: str, action: str) -> None:
+        lifecycle = getattr(app.state, "device_lifecycle", None)
+        control = getattr(app.state, "runner_control", None)
+        executor = getattr(app.state, "trade_executor", None)
+        if lifecycle is None:
+            return
+        try:
+            final_state: str | None = None
+            for _ in range(95):
+                await asyncio.sleep(2.0)
+                try:
+                    op = await asyncio.to_thread(lifecycle.operation, op_id)
+                except Exception:
+                    break
+                st = op.state.value
+                if control is not None:
+                    control.reconcile_operation(op.role, op.operation_id, st)
+                if st in {"RUNNING", "STOPPED", "ERROR"}:
+                    final_state = st
+                    break
+            if control is not None:
+                if getattr(app.state, "goodluck_device_op_id", None) == op_id:
+                    app.state.goodluck_device_op_id = None
+                control.resume_queue()
+            if action == "start" and final_state == "RUNNING" and executor is not None:
+                keep_warm_fn = getattr(executor, "keep_warm", None)
+                if callable(keep_warm_fn):
+                    await asyncio.sleep(4.0)
+                    try:
+                        await asyncio.to_thread(keep_warm_fn, side="buy")
+                    except Exception:
+                        pass
+        except asyncio.CancelledError:
+            return
+
+    def _submit_trade_device_action_sync(action: Literal["start", "shutdown"]) -> dict[str, Any]:
+        _read_trade_device_status_sync()
+        lifecycle = getattr(app.state, "device_lifecycle", None)
+        if lifecycle is None:
+            _raise_lifecycle_http_error("DEVICE_LIFECYCLE_UNAVAILABLE")
+
+        control = getattr(app.state, "runner_control", None)
+        if control is not None:
+            with control._maintenance_gate:
+                if control._lock_owner is not None:
+                    raise HTTPException(
+                        status_code=409,
+                        detail={"error_code": "TRADE_DEVICE_BUSY", "message": "设备当前被后台维护控制台接管，请先释放"},
+                    )
+
+        executor = getattr(app.state, "trade_executor", None)
+        if action == "shutdown":
+            task_store = getattr(app.state, "store", None)
+            if (
+                task_store is not None
+                and callable(getattr(task_store, "has_running_task", None))
+                and task_store.has_running_task()
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail={"error_code": "TRADE_DEVICE_BUSY", "message": "交易虚拟机正在执行采集队列任务，请稍后再关机"},
+                )
+            if executor is not None:
+                lock = getattr(executor, "_lock", None)
+                if lock is not None:
+                    if not lock.acquire(blocking=False):
+                        raise HTTPException(
+                            status_code=409,
+                            detail={"error_code": "TRADE_DEVICE_BUSY", "message": "交易虚拟机正在执行委托操作，请稍后再关机"},
+                        )
+                    try:
+                        _reset_trade_executor_cache(executor)
+                    finally:
+                        lock.release()
+
+        target_action = (
+            DeviceLifecycleAction.START_AND_LAUNCH_APP
+            if action == "start"
+            else DeviceLifecycleAction.SHUTDOWN
+        )
+        try:
+            operation = lifecycle.submit(_TRADE_DEVICE_ROLE, target_action)
+        except DeviceLifecycleError as error:
+            _raise_lifecycle_http_error(error.error_code)
+        except Exception:
+            _raise_lifecycle_http_error("DEVICE_LIFECYCLE_FAILED")
+
+        if control is not None:
+            if operation.state in {DeviceLifecycleState.STARTING, DeviceLifecycleState.STOPPING}:
+                control.begin_operation(_TRADE_DEVICE_ROLE, operation.operation_id)
+                app.state.goodluck_device_op_id = operation.operation_id
+            else:
+                control.reconcile_operation(operation.role, operation.operation_id, operation.state.value)
+                app.state.goodluck_device_op_id = None
+                control.resume_queue()
+
+        status_doc = _read_trade_device_status_sync()
+        status_doc["state"] = operation.state.value
+        status_doc["operation_id"] = operation.operation_id
+        status_doc["error_code"] = operation.error_code
+        status_doc["updated_at"] = operation.updated_at.isoformat()
+        status_doc["ready"] = status_doc["state"] == "RUNNING" and status_doc["adb"] == "ONLINE"
+        return status_doc
+
+    @app.get(f"{prefix}/trade/device")
+    async def bridge_trade_device_status(_admin=Depends(require_goodluck_admin)) -> dict[str, Any]:
+        return await asyncio.to_thread(_read_trade_device_status_sync)
+
+    @app.post(f"{prefix}/trade/device")
+    async def bridge_trade_device_action(
+        payload: BridgeTradeDeviceActionRequest,
+        _admin=Depends(require_goodluck_admin),
+    ) -> dict[str, Any]:
+        status_doc = await asyncio.to_thread(_submit_trade_device_action_sync, payload.action)
+        op_id = status_doc.get("operation_id")
+        if (
+            isinstance(op_id, str)
+            and op_id
+            and status_doc.get("state") in {"STARTING", "STOPPING"}
+        ):
+            tasks = getattr(app.state, "goodluck_warmup_tasks", None)
+            task = asyncio.create_task(_watch_trade_device_op(op_id, payload.action))
+            if isinstance(tasks, set):
+                tasks.add(task)
+                task.add_done_callback(tasks.discard)
+        return status_doc
+
+    @app.get(f"{prefix}/trade/account")
+    async def bridge_trade_account(
+        force: bool = Query(default=False),
+        _admin=Depends(require_goodluck_admin),
+    ) -> dict[str, Any]:
+        executor = _require_trade_executor()
+        try:
+            max_age = 0.0 if force else 25.0
+            if _supports_kwarg(executor.get_account_summary, "max_age_seconds"):
+                return await asyncio.to_thread(executor.get_account_summary, max_age_seconds=max_age)
+            return await asyncio.to_thread(executor.get_account_summary)
+        except TradeExecutionError as error:
+            _raise_trade_http_error(error)
+
+    @app.get(f"{prefix}/trade/orders")
+    async def bridge_trade_orders(
+        force: bool = Query(default=False),
+        _admin=Depends(require_goodluck_admin),
+    ) -> dict[str, Any]:
+        executor = _require_trade_executor()
+        try:
+            max_age = 0.0 if force else 25.0
+            if _supports_kwarg(executor.get_today_orders, "max_age_seconds"):
+                return await asyncio.to_thread(executor.get_today_orders, max_age_seconds=max_age)
+            return await asyncio.to_thread(executor.get_today_orders)
+        except TradeExecutionError as error:
+            _raise_trade_http_error(error)
+
+    @app.get(f"{prefix}/trade/trades")
+    async def bridge_trade_trades(
+        force: bool = Query(default=False),
+        _admin=Depends(require_goodluck_admin),
+    ) -> dict[str, Any]:
+        executor = _require_trade_executor()
+        try:
+            max_age = 0.0 if force else 25.0
+            if _supports_kwarg(executor.get_today_trades, "max_age_seconds"):
+                return await asyncio.to_thread(executor.get_today_trades, max_age_seconds=max_age)
+            return await asyncio.to_thread(executor.get_today_trades)
+        except TradeExecutionError as error:
+            _raise_trade_http_error(error)
+
+    def _prepare_trade_order_params(
+        symbol: str,
+        price: str | float,
+        quantity: int,
+    ) -> tuple[SymbolLookup, str, int]:
+        normalized = _validate_symbol(symbol)
+        if quantity % 100 != 0:
+            raise HTTPException(
+                status_code=422,
+                detail={"error_code": "TRADE_INVALID_QUANTITY", "message": "委托数量必须为 100 的整数倍"},
+            )
+        lookup = resolve_symbol(normalized)
+        precision = 3 if is_exchange_fund_symbol(lookup.symbol, lookup.market) else 2
+        raw_price = str(price).strip()
+        try:
+            price_val = float(raw_price)
+        except ValueError:
+            raise HTTPException(
+                status_code=422,
+                detail={"error_code": "TRADE_INVALID_PRICE", "message": "委托价格必须为有效正数"},
+            ) from None
+        if not (price_val > 0 and price_val < 1_000_000):
+            raise HTTPException(
+                status_code=422,
+                detail={"error_code": "TRADE_INVALID_PRICE", "message": "委托价格必须大于 0"},
+            )
+        return lookup, f"{price_val:.{precision}f}", precision
+
+    @app.post(f"{prefix}/trade/prestage")
+    async def bridge_trade_prestage_order(
+        payload: BridgeTradePrestageRequest,
+        _admin=Depends(require_goodluck_admin),
+    ) -> dict[str, Any]:
+        executor = _require_trade_executor()
+        lookup, formatted_price, precision = _prepare_trade_order_params(
+            payload.symbol,
+            payload.price,
+            payload.quantity,
+        )
+        try:
+            return await asyncio.to_thread(
+                executor.prestage_order,
+                symbol=lookup.symbol,
+                expected_name=lookup.name,
+                side=payload.side,
+                price=formatted_price,
+                quantity=payload.quantity,
+                precision=precision,
+            )
+        except TradeExecutionError as error:
+            _raise_trade_http_error(error)
+
+    @app.post(f"{prefix}/trade/orders")
+    async def bridge_trade_place_order(
+        request: Request,
+        payload: BridgeTradeOrderRequest,
+        _admin=Depends(require_goodluck_admin),
+    ) -> dict[str, Any]:
+        executor = _require_trade_executor()
+        idemp_key = _resolve_idempotency_key(request, payload.idempotency_key)
+        lookup, formatted_price, precision = _prepare_trade_order_params(
+            payload.symbol,
+            payload.price,
+            payload.quantity,
+        )
+        req_hash = (
+            _payload_hash(
+                {
+                    "symbol": lookup.symbol,
+                    "side": payload.side,
+                    "price": formatted_price,
+                    "quantity": payload.quantity,
+                    "dry_run": payload.dry_run,
+                    "auto_cancel": payload.auto_cancel,
+                }
+            )
+            if idemp_key
+            else ""
+        )
+        if idemp_key:
+            cached = await asyncio.to_thread(_check_idempotency_cache, "trade:orders", idemp_key, req_hash)
+            if cached is not None:
+                return cached
+        try:
+            result = await asyncio.to_thread(
+                executor.place_order,
+                symbol=lookup.symbol,
+                expected_name=lookup.name,
+                side=payload.side,
+                price=formatted_price,
+                quantity=payload.quantity,
+                precision=precision,
+                dry_run=payload.dry_run,
+                auto_cancel=payload.auto_cancel,
+            )
+            if idemp_key and isinstance(result, dict):
+                await asyncio.to_thread(_save_idempotency_cache, "trade:orders", idemp_key, req_hash, result)
+            return result
+        except TradeExecutionError as error:
+            _raise_trade_http_error(error)
+
+    @app.post(f"{prefix}/trade/cancel")
+    async def bridge_trade_cancel_order(
+        payload: BridgeTradeCancelRequest,
+        _admin=Depends(require_goodluck_admin),
+    ) -> dict[str, Any]:
+        executor = _require_trade_executor()
+        entrust_no = (payload.entrust_no or "").strip() or None
+        symbol = _validate_symbol(payload.symbol) if payload.symbol and payload.symbol.strip() else None
+        if entrust_no is None and symbol is None:
+            raise HTTPException(
+                status_code=422,
+                detail={"error_code": "TRADE_INVALID_CANCEL", "message": "撤单请提供合同编号或证券代码"},
+            )
+        expected_name = resolve_symbol(symbol).name if symbol else None
+        engine = getattr(app.state, "auto_trade_engine", None)
+        scheduler = getattr(engine, "_scheduler", None) if engine is not None else None
+        try:
+            if scheduler is not None and callable(getattr(scheduler, "hold", None)):
+                p0 = int(getattr(scheduler, "P0_CRITICAL", 0))
+                async with scheduler.hold(p0, side=payload.side, symbol=symbol):
+                    return await asyncio.to_thread(
+                        executor.cancel_order,
+                        entrust_no=entrust_no,
+                        symbol=symbol,
+                        expected_name=expected_name,
+                        side=payload.side,
+                    )
+            return await asyncio.to_thread(
+                executor.cancel_order,
+                entrust_no=entrust_no,
+                symbol=symbol,
+                expected_name=expected_name,
+                side=payload.side,
+            )
+        except TradeExecutionError as error:
+            _raise_trade_http_error(error)
+
+    # ---- Admin-only Quantitative Strategy & Auto-Trading Control ----
+
+    def _require_auto_trade_engine() -> Any:
+        engine = getattr(app.state, "auto_trade_engine", None)
+        if engine is None:
+            raise HTTPException(
+                status_code=503,
+                detail={"error_code": "TRADE_UNCONFIGURED", "message": "量化自动交易策略引擎未配置"},
+            )
+        return engine
+
+    @app.get(f"{prefix}/trade/strategy")
+    async def bridge_trade_strategy_status(
+        viewer_open: str | None = Query(default=None),
+        _admin=Depends(require_goodluck_admin),
+    ) -> dict[str, Any]:
+        engine = _require_auto_trade_engine()
+        if viewer_open is not None:
+            normalized = viewer_open.strip().lower()
+            if normalized in {"1", "true", "yes"}:
+                engine.set_viewer_open(True)
+            elif normalized in {"0", "false", "no"}:
+                engine.set_viewer_open(False)
+        return await asyncio.to_thread(engine.get_status)
+
+    @app.get(f"{prefix}/trade/strategy/live-eval")
+    async def bridge_trade_strategy_live_eval(
+        symbol: str | None = Query(default=None),
+        _admin=Depends(require_goodluck_admin),
+    ) -> dict[str, Any]:
+        engine = _require_auto_trade_engine()
+        normalized = _validate_symbol(symbol) if symbol and symbol.strip() else None
+        eval_fn = getattr(engine, "evaluate_live_snapshot", None)
+        if not callable(eval_fn):
+            raise HTTPException(status_code=501, detail="live strategy indicator evaluation unavailable")
+        return await asyncio.to_thread(eval_fn, normalized)
+
+    @app.put(f"{prefix}/trade/strategy")
+    async def bridge_trade_strategy_update(
+        payload: BridgeAutoTradeConfigRequest,
+        _admin=Depends(require_goodluck_admin),
+    ) -> dict[str, Any]:
+        engine = _require_auto_trade_engine()
+        if payload.order_quantity % 100 != 0:
+            raise HTTPException(
+                status_code=422,
+                detail={"error_code": "TRADE_INVALID_QUANTITY", "message": "委托数量必须为 100 的整数倍"},
+            )
+        normalized_symbols = [_validate_symbol(sym) for sym in payload.symbols]
+        patch: dict[str, Any] = {
+            "enabled": payload.enabled,
+            "signal_source": payload.signal_source,
+            "quant_rule_id": payload.quant_rule_id,
+            "execution_mode": payload.execution_mode,
+            "symbols": normalized_symbols,
+            "order_quantity": payload.order_quantity,
+            "pricing_mode": payload.pricing_mode,
+            "order_book_level": payload.order_book_level,
+            "slippage_ticks": payload.slippage_ticks,
+            "max_slippage_pct": payload.max_slippage_pct,
+            "refresh_book_on_confirm": payload.refresh_book_on_confirm,
+            "auto_cancel_seconds": payload.auto_cancel_seconds,
+            "daily_max_buy_amount": payload.daily_max_buy_amount,
+            "block_non_continuous_session": payload.block_non_continuous_session,
+        }
+        if payload.sizing_mode is not None:
+            patch["sizing_mode"] = payload.sizing_mode
+        if payload.symbol_profiles is not None:
+            norm_profiles: dict[str, dict[str, Any]] = {}
+            for raw_sym, prof in payload.symbol_profiles.items():
+                norm_sym = _validate_symbol(raw_sym)
+                if prof.order_quantity is not None and prof.order_quantity % 100 != 0:
+                    raise HTTPException(
+                        status_code=422,
+                        detail={"error_code": "TRADE_INVALID_QUANTITY", "message": f"{norm_sym} 委托数量必须为 100 的整数倍"},
+                    )
+                norm_profiles[norm_sym] = {
+                    k: v
+                    for k, v in prof.model_dump(exclude_unset=True).items()
+                    if v is not None or k in {"enabled", "quant_rule_id"}
+                }
+            patch["symbol_profiles"] = norm_profiles
+        try:
+            reconcile_fn = getattr(engine, "reconcile_and_update_config", None)
+            if callable(reconcile_fn):
+                return await asyncio.to_thread(
+                    reconcile_fn,
+                    patch,
+                    reconcile_broker=payload.reconcile_broker,
+                )
+            return await asyncio.to_thread(engine.update_config, patch)
+        except TradeExecutionError as error:
+            _raise_trade_http_error(error)
+
+    @app.put(f"{prefix}/trade/strategy/symbols/{{symbol}}")
+    async def bridge_trade_strategy_upsert_symbol(
+        symbol: str,
+        payload: BridgeUpsertSymbolStrategyRequest,
+        _admin=Depends(require_goodluck_admin),
+    ) -> dict[str, Any]:
+        normalized = _validate_symbol(symbol)
+        if payload.order_quantity is not None and payload.order_quantity % 100 != 0:
+            raise HTTPException(
+                status_code=422,
+                detail={"error_code": "TRADE_INVALID_QUANTITY", "message": "委托数量必须为 100 的整数倍"},
+            )
+        engine = _require_auto_trade_engine()
+        prof_patch = {
+            k: v
+            for k, v in payload.model_dump(exclude={"reconcile_broker"}, exclude_unset=True).items()
+            if v is not None or k in {"enabled", "quant_rule_id"}
+        }
+        try:
+            return await asyncio.to_thread(
+                engine.upsert_symbol_profile,
+                normalized,
+                prof_patch,
+                reconcile_broker=payload.reconcile_broker,
+            )
+        except TradeExecutionError as error:
+            _raise_trade_http_error(error)
+
+    @app.delete(f"{prefix}/trade/strategy/symbols/{{symbol}}")
+    async def bridge_trade_strategy_remove_symbol(
+        symbol: str,
+        _admin=Depends(require_goodluck_admin),
+    ) -> dict[str, Any]:
+        normalized = _validate_symbol(symbol)
+        engine = _require_auto_trade_engine()
+        try:
+            return await asyncio.to_thread(engine.remove_symbol_profile, normalized)
+        except TradeExecutionError as error:
+            _raise_trade_http_error(error)
+
+    @app.get(f"{prefix}/trade/order-book/{{symbol}}")
+    async def bridge_trade_order_book(
+        symbol: str,
+        _admin=Depends(require_goodluck_admin),
+    ) -> dict[str, Any]:
+        normalized = _validate_symbol(symbol)
+        lookup = resolve_symbol(normalized)
+        engine = _require_auto_trade_engine()
+        get_ob = engine.get_order_book
+        try:
+            supports_force = "force_refresh" in inspect.signature(get_ob).parameters
+        except (TypeError, ValueError):
+            supports_force = False
+        book = await (
+            asyncio.to_thread(get_ob, lookup.symbol, lookup.market, force_refresh=True)
+            if supports_force
+            else asyncio.to_thread(get_ob, lookup.symbol, lookup.market)
+        )
+        if book is None:
+            raise HTTPException(
+                status_code=503,
+                detail={"error_code": "MARKET_QUOTE_UNAVAILABLE", "message": "实时五档盘口暂不可用，请稍后重试"},
+            )
+        return book
+
+    @app.post(f"{prefix}/trade/strategy/reset-circuit")
+    async def bridge_trade_strategy_reset_circuit(_admin=Depends(require_goodluck_admin)) -> dict[str, Any]:
+        engine = _require_auto_trade_engine()
+        return await asyncio.to_thread(engine.reset_circuit)
+
+    @app.post(f"{prefix}/trade/strategy/simulate")
+    async def bridge_trade_strategy_simulate(
+        payload: BridgeAutoTradeSimulateRequest,
+        _admin=Depends(require_goodluck_admin),
+    ) -> dict[str, Any]:
+        engine = _require_auto_trade_engine()
+        sym = _validate_symbol(payload.symbol) if payload.symbol and payload.symbol.strip() else None
+        try:
+            return await engine.simulate_signal(
+                symbol=sym,
+                side=payload.side,
+                viewer_open=payload.viewer_open,
+            )
+        except TradeExecutionError as error:
+            _raise_trade_http_error(error)
+
+    @app.post(f"{prefix}/trade/strategy/signals/{{signal_id}}/decide")
+    async def bridge_trade_strategy_decide(
+        signal_id: str,
+        request: Request,
+        payload: BridgeAutoTradeDecideRequest,
+        _admin=Depends(require_goodluck_admin),
+    ) -> dict[str, Any]:
+        engine = _require_auto_trade_engine()
+        idemp_key = _resolve_idempotency_key(request, payload.idempotency_key)
+        override_price = (
+            str(payload.override_price).strip()
+            if payload.override_price is not None and str(payload.override_price).strip()
+            else None
+        )
+        req_hash = (
+            _payload_hash(
+                {
+                    "signal_id": signal_id,
+                    "action": payload.action,
+                    "dry_run": payload.dry_run,
+                    "override_price": override_price,
+                    "override_quantity": payload.override_quantity,
+                    "override_book_level": payload.override_book_level,
+                }
+            )
+            if idemp_key
+            else ""
+        )
+        if idemp_key:
+            cached = await asyncio.to_thread(_check_idempotency_cache, f"trade:decide:{signal_id}", idemp_key, req_hash)
+            if cached is not None:
+                return cached
+        try:
+            result = await engine.decide_signal(
+                signal_id,
+                action=payload.action,
+                dry_run=payload.dry_run,
+                override_price=override_price,
+                override_quantity=payload.override_quantity,
+                override_book_level=payload.override_book_level,
+            )
+            if idemp_key and isinstance(result, dict):
+                await asyncio.to_thread(
+                    _save_idempotency_cache, f"trade:decide:{signal_id}", idemp_key, req_hash, result
+                )
+            return result
+        except KeyError:
+            raise HTTPException(
+                status_code=404,
+                detail={"error_code": "TRADE_SIGNAL_NOT_FOUND", "message": "未找到对应的交易信号记录"},
+            ) from None
+        except TradeExecutionError as error:
+            _raise_trade_http_error(error)
+
+    @app.get(f"{prefix}/trade/events")
+    async def bridge_trade_events(
+        request: Request,
+        viewer_open: str | None = Query(default=None),
+        _admin=Depends(require_goodluck_admin),
+    ) -> StreamingResponse:
+        engine = _require_auto_trade_engine()
+        if viewer_open is not None:
+            normalized = viewer_open.strip().lower()
+            if normalized in {"1", "true", "yes"}:
+                engine.set_viewer_open(True)
+            elif normalized in {"0", "false", "no"}:
+                engine.set_viewer_open(False)
+
+        async def _event_stream() -> AsyncIterator[str]:
+            q = engine.subscribe()
+            try:
+                snap = await asyncio.to_thread(engine.get_status)
+                yield f"event: snapshot\ndata: {json.dumps(snap, ensure_ascii=False)}\n\n"
+                while True:
+                    if await request.is_disconnected():
+                        break
+                    try:
+                        ev = await asyncio.wait_for(q.get(), timeout=15.0)
+                        ev_type = str(ev.get("type") or "message")
+                        yield f"event: {ev_type}\ndata: {json.dumps(ev, ensure_ascii=False)}\n\n"
+                    except asyncio.TimeoutError:
+                        yield ": ping\n\n"
+            finally:
+                engine.unsubscribe(q)
+
+        return StreamingResponse(
+            _event_stream(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
+    # ---- Admin-only Quantitative Strategy Research, AI Rule API & Backtest ----
+
+    def _require_quant_stores() -> tuple[Any, Any]:
+        research_store = getattr(app.state, "research_store", None)
+        quant_store = getattr(app.state, "quant_rule_store", None)
+        if research_store is None or quant_store is None:
+            raise HTTPException(status_code=503, detail="量化规则复盘库未配置")
+        return research_store, quant_store
+
+    @app.get(f"{prefix}/quant/schema")
+    def bridge_quant_schema(_admin=Depends(require_goodluck_admin)) -> dict[str, Any]:
+        return get_quant_rule_schema()
+
+    @app.get(f"{prefix}/quant/dataset")
+    async def bridge_quant_dataset(
+        symbol: str = "160723",
+        start_date: str = "20260701",
+        end_date: str | None = None,
+        mode: Literal["summary", "daily", "minutes"] = "summary",
+        limit_days: int = Query(default=30, ge=1, le=200),
+        short: int = Query(default=10, ge=2, le=200),
+        long: int = Query(default=20, ge=3, le=200),
+        signal: int = Query(default=5, ge=1, le=100),
+        marker_threshold: float = Query(default=0.00001, ge=0.0, le=1.0),
+        _admin=Depends(require_goodluck_admin),
+    ) -> dict[str, Any]:
+        research_store, _ = _require_quant_stores()
+        normalized = _validate_quant_symbol(symbol)
+        clean_start = _validate_optional_date(start_date) or "20260701"
+        clean_end = _validate_optional_date(end_date)
+        return await asyncio.to_thread(
+            export_quant_dataset,
+            research_store,
+            normalized,
+            start_date=clean_start,
+            end_date=clean_end,
+            mode=mode,
+            limit_days=limit_days,
+            macd_settings={
+                "short": short,
+                "long": max(short + 1, long),
+                "signal": signal,
+                "marker_threshold": marker_threshold,
+            },
+        )
+
+    @app.post(f"{prefix}/quant/backfill-history")
+    async def bridge_quant_backfill_history(
+        payload: BridgeQuantBackfillRequest,
+        _admin=Depends(require_goodluck_admin),
+    ) -> dict[str, Any]:
+        research_store, _ = _require_quant_stores()
+        normalized = _validate_quant_symbol(payload.symbol)
+        clean_start = _validate_optional_date(payload.start_date) or "20260301"
+        clean_end = _validate_optional_date(payload.end_date)
+        if normalized == BRENT_SYMBOL:
+            try:
+                return await asyncio.to_thread(
+                    backfill_brent_to_research_store,
+                    research_store,
+                    start_date=clean_start,
+                    end_date=clean_end,
+                )
+            except Exception as error:
+                raise HTTPException(status_code=503, detail=f"BRN0Y 历史数据补齐失败: {error}") from None
+        try:
+            lookup = resolve_symbol(normalized)
+            sym_name, sym_market = lookup.name, lookup.market
+        except Exception:
+            sym_name, sym_market = None, None
+        try:
+            return await asyncio.to_thread(
+                backfill_intraday_history,
+                research_store,
+                normalized,
+                start_date=clean_start,
+                end_date=clean_end,
+                name=sym_name,
+                market=sym_market,
+            )
+        except Exception as error:
+            raise HTTPException(status_code=503, detail=f"历史分时补齐失败: {error}") from None
+
+    @app.post(f"{prefix}/quant/evaluate")
+    async def bridge_quant_evaluate(
+        payload: BridgeQuantEvaluateRequest,
+        _admin=Depends(require_goodluck_admin),
+    ) -> dict[str, Any]:
+        research_store, quant_store = _require_quant_stores()
+        normalized = _validate_quant_symbol(payload.symbol)
+        clean_start = _validate_optional_date(payload.start_date)
+        clean_end = _validate_optional_date(payload.end_date)
+        if payload.rule_id and payload.buy_rule is None and payload.sell_rule is None:
+            stored = await asyncio.to_thread(quant_store.get_rule, payload.rule_id)
+            if stored is None:
+                raise HTTPException(status_code=404, detail="未找到指定量化规则")
+            spec = dict(stored)
+            if payload.position_sizing is not None:
+                spec["position_sizing"] = payload.position_sizing
+        else:
+            spec = {
+                "id": payload.rule_id or "adhoc-eval",
+                "symbols": [normalized],
+                "macd_settings": payload.macd_settings,
+                "buy_rule": payload.buy_rule,
+                "sell_rule": payload.sell_rule,
+                "position_sizing": payload.position_sizing,
+                "eval_criteria": payload.eval_criteria,
+            }
+        try:
+            return await asyncio.to_thread(
+                evaluate_quant_strategy,
+                research_store,
+                spec,
+                symbol=normalized,
+                start_date=clean_start,
+                end_date=clean_end,
+                primary_horizon_minutes=payload.primary_horizon_minutes,
+                min_move_pct=payload.min_move_pct,
+                data_scope=payload.data_scope,
+                morning_start=payload.morning_start,
+                morning_end=payload.morning_end,
+                max_daily_trades=payload.max_daily_trades,
+                round_trip_fee_pct=payload.round_trip_fee_pct,
+                capital_cap=payload.capital_cap,
+                signal_limit=payload.signal_limit,
+            )
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from None
+
+    @app.get(f"{prefix}/quant/rules")
+    async def bridge_quant_list_rules(
+        compact: bool = Query(default=False),
+        _admin=Depends(require_goodluck_admin),
+    ) -> dict[str, Any]:
+        research_store, quant_store = _require_quant_stores()
+        rules = await asyncio.to_thread(quant_store.list_rules)
+        for idx, item in enumerate(rules):
+            if item.get("latest_eval") is None:
+                res = await asyncio.to_thread(
+                    quant_store.evaluate_and_save_rule,
+                    item["id"],
+                    research_store,
+                )
+                rules[idx] = res["rule"]
+        if compact:
+            rules = [compact_quant_rule_record(item) for item in rules]
+        return {"rules": rules}
+
+    @app.get(f"{prefix}/quant/rules/{{rule_id}}")
+    async def bridge_quant_get_rule(
+        rule_id: str,
+        _admin=Depends(require_goodluck_admin),
+    ) -> dict[str, Any]:
+        research_store, quant_store = _require_quant_stores()
+        rule = await asyncio.to_thread(quant_store.get_rule, rule_id)
+        if rule is None:
+            raise HTTPException(status_code=404, detail="未找到指定量化规则")
+        if rule.get("latest_eval") is None:
+            res = await asyncio.to_thread(
+                quant_store.evaluate_and_save_rule,
+                rule["id"],
+                research_store,
+            )
+            rule = res["rule"]
+        return {"rule": rule}
+
+    @app.post(f"{prefix}/quant/rules")
+    async def bridge_quant_create_or_upsert_rule(
+        payload: BridgeQuantRuleUpsertRequest,
+        _admin=Depends(require_goodluck_admin),
+    ) -> dict[str, Any]:
+        research_store, quant_store = _require_quant_stores()
+        try:
+            saved = await asyncio.to_thread(
+                quant_store.upsert_rule,
+                payload.model_dump(),
+                research_store=research_store,
+                rule_id=payload.id,
+            )
+            return {"rule": saved}
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from None
+
+    @app.put(f"{prefix}/quant/rules/{{rule_id}}")
+    async def bridge_quant_update_rule(
+        rule_id: str,
+        payload: BridgeQuantRuleUpsertRequest,
+        _admin=Depends(require_goodluck_admin),
+    ) -> dict[str, Any]:
+        research_store, quant_store = _require_quant_stores()
+        try:
+            saved = await asyncio.to_thread(
+                quant_store.upsert_rule,
+                payload.model_dump(),
+                research_store=research_store,
+                rule_id=rule_id,
+            )
+            return {"rule": saved}
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from None
+
+    @app.delete(f"{prefix}/quant/rules/{{rule_id}}", status_code=204)
+    async def bridge_quant_delete_rule(
+        rule_id: str,
+        _admin=Depends(require_goodluck_admin),
+    ) -> None:
+        _, quant_store = _require_quant_stores()
+        try:
+            await asyncio.to_thread(quant_store.delete_rule, rule_id)
+        except LookupError:
+            raise HTTPException(status_code=404, detail="未找到指定量化规则") from None
+        except ValueError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from None
+
+    @app.post(f"{prefix}/quant/rules/{{rule_id}}/evaluate")
+    async def bridge_quant_evaluate_rule(
+        rule_id: str,
+        payload: BridgeQuantEvaluateRequest | None = None,
+        _admin=Depends(require_goodluck_admin),
+    ) -> dict[str, Any]:
+        research_store, quant_store = _require_quant_stores()
+        req = payload or BridgeQuantEvaluateRequest()
+        try:
+            return await asyncio.to_thread(
+                quant_store.evaluate_and_save_rule,
+                rule_id,
+                research_store,
+                symbol=_validate_quant_symbol(req.symbol) if req.symbol else None,
+                start_date=_validate_optional_date(req.start_date),
+                end_date=_validate_optional_date(req.end_date),
+                primary_horizon_minutes=req.primary_horizon_minutes,
+                min_move_pct=req.min_move_pct,
+                data_scope=req.data_scope,
+                morning_start=req.morning_start,
+                morning_end=req.morning_end,
+                max_daily_trades=req.max_daily_trades,
+                round_trip_fee_pct=req.round_trip_fee_pct,
+                capital_cap=req.capital_cap,
+                signal_limit=req.signal_limit,
+            )
+        except LookupError:
+            raise HTTPException(status_code=404, detail="未找到指定量化规则") from None
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from None

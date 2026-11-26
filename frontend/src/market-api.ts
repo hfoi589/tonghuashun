@@ -1,4 +1,14 @@
-import { ApiError, type IntradayMetricSeries, type MainFundFlowPeriod, type SymbolLookup, type SymbolSuggestion } from './api'
+import { ApiError, type EtfFlowPeriod, type EtfFundFlowResponse, type IntradayMetricSeries, type MainFundFlowPeriod, type SymbolLookup, type SymbolSuggestion } from './api'
+
+export type {
+  EtfFlowPeriod,
+  EtfFlowSummaryMetric,
+  EtfFlowChartPoint,
+  EtfHoldingItem,
+  EtfFundFlowResponse,
+  EtfSourceErrors,
+  EtfUpdateStatus,
+} from './api'
 
 export const marketAuthExpiredEvent = 'ths-market-auth-expired'
 const watchlistsChangedEvent = 'ths-market-watchlists-changed'
@@ -365,6 +375,10 @@ export const marketApi = {
   ),
   fundFlowDaily: (symbol: string, limit = 30, signal?: AbortSignal) => request<FundFlowDailyResponse>(
     `/api/v1/market/symbols/${encodeURIComponent(symbol)}/fund-flow/daily?limit=${limit}`,
+    { signal },
+  ),
+  etfFlow: (symbol: string, period: EtfFlowPeriod = '60d', signal?: AbortSignal) => request<EtfFundFlowResponse>(
+    `/api/v1/market/symbols/${encodeURIComponent(symbol)}/etf-flow?period=${encodeURIComponent(period)}`,
     { signal },
   ),
   monitoring: () => request<MonitoringState[]>('/api/v1/monitoring'),

@@ -2573,3 +2573,250 @@ def test_fund_client_read_direct_batch_chunks_200_and_isolates_periods() -> None
     forced = client.read_direct_batch(symbols[:2], force_all_periods=True)
     assert len(forced) == 2
     assert calls == [(1, 2), (3, 2), (5, 2)]
+
+
+def _captured_9528_request(text: str, *, utf16le: bool = False) -> bytes:
+    raw = text.encode("utf-16-le" if utf16le else "latin1")
+    header = struct.pack("<HiiHiiiI", 76, 1, 262144, 10157, 0, 2205, len(raw), 0)
+    header += b"\x00" * (76 - len(header))
+    return framed_9528(header + encode_core_base64(raw, CORE_BASE64_ALPHABET))
+
+
+def test_core_template_protocol_regroups_misaligned_pairs_and_bounds_secondary_timeout(
+    monkeypatch,
+) -> None:
+    class Clock:
+        value = 0.0
+
+        def __call__(self) -> float:
+            return self.value
+
+    clock = Clock()
+    monkeypatch.setattr("level2_service.direct_market.time.monotonic", clock)
+
+    q2205 = _captured_9528_request("[frame]\r\nid=2205\r\nreqPage=10157\r\nstockcode=600519\r\n")
+    jitu_6001 = _captured_9528_request("[frame]\r\nid=6001\r\nkey=JiTu\r\nstockcode=600519\r\n", utf16le=True)
+    bbd_2205 = _captured_9528_request("[frame]\r\nid=2205\r\nreqPage=10159\r\ntech=BBD\r\nstockcode=600519\r\n")
+    dde_2205 = _captured_9528_request("[frame]\r\nid=2205\r\nreqPage=10159\r\ntech=DDE\r\nstockcode=600519\r\n")
+    shsl_2205 = _captured_9528_request("[frame]\r\nid=2205\r\nreqPage=10159\r\ntech=SHSL\r\nstockcode=600519\r\n")
+
+    raw_packets = [
+        q2205,
+        jitu_6001,
+        jitu_6001,
+        bbd_2205,
+        jitu_6001,
+        dde_2205,
+        jitu_6001,
+        shsl_2205,
+        jitu_6001,
+    ]
+    grouped = Core9528TemplateProtocol._group_request_batches(
+        raw_packets, alphabet=CORE_BASE64_ALPHABET
+    )
+    assert grouped == [
+        (q2205, jitu_6001),
+        (bbd_2205, jitu_6001),
+        (dde_2205, jitu_6001),
+        (shsl_2205, jitu_6001),
+    ]
+
+    auth = framed_9528(b"auth")
+    quote_curve = _core_curve_frame(
+        "601872",
+        "招商轮船",
+        [(1, "int"), (10, "hxl"), (13, "hxl"), (19, "hxl"), (34312, "hxl")],
+        [[925, 15.55, 1000, 15550, 0.0]],
+        ext_values={10: ("hxl", 15.55), 6: ("hxl", 15.29), 34315: ("hxl", 1.7), 34312: ("hxl", 0.0)},
+    )
+
+    class Socket:
+        def __init__(self) -> None:
+            self.sent: list[bytes] = []
+            self.buffer = auth
+            self.timeout = 0.0
+            self.closed = False
+
+        def settimeout(self, timeout: float) -> None:
+            self.timeout = timeout
+
+        def sendall(self, value: bytes) -> None:
+            self.sent.append(value)
+            if len(self.sent) == 3:
+                self.buffer += quote_curve
+
+        def recv(self, size: int) -> bytes:
+            if self.buffer:
+                chunk, self.buffer = self.buffer[:size], self.buffer[size:]
+                return chunk
+            clock.value += self.timeout
+            raise TimeoutError("synthetic idle timeout")
+
+        def close(self) -> None:
+            self.closed = True
+
+    material = replace(
+        session(),
+        role="core_metrics",
+        core_material={
+            "server_ip": "127.0.0.1",
+            "server_port": "9528",
+            "auth_packet_hex": auth.hex(),
+            "base64_alphabet": CORE_BASE64_ALPHABET,
+            "template_symbol": "600519",
+            "request_packets_hex": json.dumps([pkt.hex() for pkt in raw_packets]),
+            "macdfs_params": json.dumps([12, 26, 9]),
+        },
+    )
+    socket = Socket()
+    outcome = Core9528TemplateProtocol(
+        socket_factory=lambda _address, _timeout: socket,
+        response_decoder=Core9528CurveDecoder(),
+        secondary_batch_timeout_seconds=1.5,
+    ).read_direct(material, "601872", "17")
+
+    assert outcome.values[MetricKind.CURRENT_PRICE] == "15.55"
+    assert outcome.values[MetricKind.CHANGE_PERCENT] == "1.70%"
+    # Auth idle (0.5s) + silent secondary BBD pair bounded by
+    # secondary_batch_timeout_seconds (1.5s) = 2.0s total (not 10.0s),
+    # sending auth (1) + quote pair (2) + silent BBD pair (2) = 5 packets.
+    assert len(socket.sent) == 5
+    assert clock.value == pytest.approx(2.0)
+
+
+def test_core_client_read_quote_direct_stops_after_primary_quote_curve() -> None:
+    q2205 = _captured_9528_request("[frame]\r\nid=2205\r\nreqPage=10157\r\nstockcode=600519\r\n")
+    jitu_6001 = _captured_9528_request("[frame]\r\nid=6001\r\nkey=JiTu\r\nstockcode=600519\r\n", utf16le=True)
+    bbd_2205 = _captured_9528_request("[frame]\r\nid=2205\r\nreqPage=10159\r\ntech=BBD\r\nstockcode=600519\r\n")
+    auth = framed_9528(b"auth")
+    quote_curve = _core_curve_frame(
+        "601872",
+        "招商轮船",
+        [(1, "int"), (10, "hxl"), (13, "hxl"), (19, "hxl"), (34312, "hxl")],
+        [[925, 15.55, 1000, 15550, 0.0]],
+        ext_values={10: ("hxl", 15.55), 6: ("hxl", 15.29), 34315: ("hxl", 1.7), 34312: ("hxl", 0.0)},
+    )
+
+    class Socket:
+        def __init__(self) -> None:
+            self.sent: list[bytes] = []
+            self.buffer = auth
+
+        def settimeout(self, _timeout: float) -> None:
+            pass
+
+        def sendall(self, value: bytes) -> None:
+            self.sent.append(value)
+            if len(self.sent) == 3:
+                self.buffer += quote_curve
+
+        def recv(self, size: int) -> bytes:
+            if self.buffer:
+                chunk, self.buffer = self.buffer[:size], self.buffer[size:]
+                return chunk
+            raise TimeoutError("synthetic idle timeout")
+
+        def close(self) -> None:
+            pass
+
+    material = replace(
+        session(),
+        role="core_metrics",
+        core_material={
+            "server_ip": "127.0.0.1",
+            "server_port": "9528",
+            "auth_packet_hex": auth.hex(),
+            "base64_alphabet": CORE_BASE64_ALPHABET,
+            "template_symbol": "600519",
+            "request_packets_hex": json.dumps([q2205.hex(), jitu_6001.hex(), bbd_2205.hex(), jitu_6001.hex()]),
+            "macdfs_params": json.dumps([12, 26, 9]),
+        },
+    )
+    socket = Socket()
+    protocol = Core9528TemplateProtocol(
+        socket_factory=lambda _address, _timeout: socket,
+        response_decoder=Core9528CurveDecoder(),
+    )
+    client = Core9528Client(
+        StaticSessionProvider(material),
+        protocol=protocol,
+        warm_pool=Core9528WarmPool(protocol, start_background=lambda _task: None),
+    )
+
+    outcome = client.read_quote_direct("601872")
+
+    assert outcome.values[MetricKind.STOCK_NAME] == "招商轮船"
+    assert outcome.values[MetricKind.CURRENT_PRICE] == "15.55"
+    assert outcome.values[MetricKind.CHANGE_PERCENT] == "1.70%"
+    # Auth (1) + first quote pair (2); secondary BBD pair was never sent.
+    assert len(socket.sent) == 3
+
+
+def test_core_warm_pool_max_size_two_and_near_stale_refresh() -> None:
+    from level2_service.direct_market import (
+        CORE_BASE64_ALPHABET,
+        CoreRequestMaterial,
+        WarmCoreConnection,
+    )
+
+    now_holder = [100.0]
+    closed_conns: list[int] = []
+    auth_seq = 0
+
+    class _DummyConn:
+        def __init__(self, cid: int) -> None:
+            self.cid = cid
+
+        def close(self) -> None:
+            closed_conns.append(self.cid)
+
+    class _FakeProto:
+        def prepare(self, _session: object, _symbol: str) -> CoreRequestMaterial:
+            return CoreRequestMaterial(
+                host="127.0.0.1",
+                port=9528,
+                auth_packet=b"auth",
+                request_packets=(b"req",),
+                macdfs_params=None,
+                timeout_seconds=3.0,
+                session_fingerprint=b"fp-v1",
+                alphabet=CORE_BASE64_ALPHABET,
+            )
+
+        def authenticate(self, prepared: CoreRequestMaterial) -> WarmCoreConnection:
+            nonlocal auth_seq
+            auth_seq += 1
+            return WarmCoreConnection(
+                connection=_DummyConn(auth_seq),
+                session_fingerprint=prepared.session_fingerprint,
+                authenticated_at=now_holder[0],
+            )
+
+        def close_connection(self, warm: WarmCoreConnection) -> None:
+            warm.connection.close()
+
+    pool = Core9528WarmPool(
+        _FakeProto(),
+        max_idle_seconds=25.0,
+        max_size=2,
+        clock=lambda: now_holder[0],
+        start_background=lambda task: task(),
+    )
+
+    sess = object()
+    pool.prewarm(sess, "601872")
+    assert pool.ready_count == 2
+    assert auth_seq == 2
+
+    # Near-stale refresh at +15s replaces both connections proactively.
+    now_holder[0] = 115.0
+    pool.prewarm(sess, "601872", refresh_older_than_seconds=14.0)
+    assert pool.ready_count == 2
+    assert auth_seq == 4
+    assert sorted(closed_conns) == [1, 2]
+
+    _, warm_a = pool.acquire(sess, "601872")
+    _, warm_b = pool.acquire(sess, "601872")
+    assert warm_a.connection.cid != warm_b.connection.cid
+    assert auth_seq == 4
+    assert pool.ready_count == 0

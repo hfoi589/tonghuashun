@@ -257,3 +257,61 @@ def test_fund_flow_monitor_notifies_expired_and_recovered(tmp_path: Path) -> Non
     asyncio.run(monitor.poll_once())
     assert len(dispatcher.sent) == 2
     assert "已恢复" in dispatcher.sent[1][0]
+
+
+def test_preopen_probe_dual_window_and_trade_workspace_recovery(tmp_path) -> None:
+    from level2_service.ths_trade import TradeExecutionError
+
+    store = _store_with_push(tmp_path)
+    dispatcher = _FakeDispatcher()
+    now_holder = [datetime(2026, 11, 26, 8, 55, tzinfo=SH)]
+
+    class _TradeExecutorStub:
+        def __init__(self) -> None:
+            self.login_expired = True
+            self.calls = 0
+
+        def probe_broker_session(self) -> dict[str, object]:
+            self.calls += 1
+            if self.login_expired:
+                raise TradeExecutionError("BROKER_LOGIN_REQUIRED", "需要重新认证", 409)
+            return {"ok": True, "status": "READY"}
+
+    executor = _TradeExecutorStub()
+    notifier = SessionHealthNotifier(
+        store=store,
+        dispatcher=dispatcher,
+        session_provider=None,
+        clock=lambda: now_holder[0],
+    )
+    probe = PreopenSessionProbe(
+        is_trading_day=lambda _d: True,
+        accounts=None,
+        fund_source=None,
+        core_source=None,
+        session_provider=None,
+        notifier=notifier,
+        trade_executor=executor,
+        clock=lambda: now_holder[0],
+    )
+
+    morning_res = asyncio.run(probe.poll_once())
+    assert morning_res == {"trade_workspace": "BROKER_LOGIN_REQUIRED"}
+    assert executor.calls == 1
+    assert len(dispatcher.sent) == 1
+    assert "交易登录态" in dispatcher.sent[0][1] or "BROKER_LOGIN_REQUIRED" in dispatcher.sent[0][1]
+
+    # Same morning window will not re-probe.
+    now_holder[0] = datetime(2026, 11, 26, 9, 5, tzinfo=SH)
+    assert asyncio.run(probe.poll_once()) == {}
+    assert executor.calls == 1
+
+    # Midday window 12:52 triggers second probe and dispatches recovery notice.
+    executor.login_expired = False
+    now_holder[0] = datetime(2026, 11, 26, 12, 52, tzinfo=SH)
+    midday_res = asyncio.run(probe.poll_once())
+    assert midday_res == {"trade_workspace": "READY"}
+    assert executor.calls == 2
+    assert len(dispatcher.sent) == 2
+    assert "已恢复" in dispatcher.sent[1][0]
+    store.close()

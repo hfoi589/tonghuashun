@@ -11,7 +11,7 @@ from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timedelta, timezone
 from functools import partial
 from pathlib import Path
-from typing import Callable, Mapping
+from typing import Any, Callable, Mapping, Sequence
 
 from fastapi import FastAPI
 from cryptography.fernet import Fernet
@@ -27,7 +27,12 @@ from .app_sessions import (
 from .daily_kline import DailyKlineMarketDataSource, TonghuashunPublicDailyKlineProvider
 from .device_lifecycle import DeviceLifecycleClient
 from .database_first_fund_flow import DatabaseFirstFundFlowSource
-from .fund_flow_history import FundFlowHistoryMonitor
+from .etf_fund_flow import EtfFundFlowMonitor, TonghuashunEtfFundFlowService
+from .fund_flow_history import (
+    FundFlowHistoryMonitor,
+    intraday_fund_flow_cap_minute,
+    settled_fund_flow_minute,
+)
 from .direct_market import (
     Core9528Client,
     Core9528CurveDecoder,
@@ -65,6 +70,10 @@ from .research_premium import PublicPremiumProvider
 from .premium_monitor import PremiumMonitor
 from .session_alert import PreopenSessionProbe, SessionHealthNotifier
 from .runner import ADBDeviceBridge, DailyCheckState, Level2Navigator, Level2Runner, OpenCVTemplateFallback, RunnerControl, TAB_LABELS, long_capture_has_net_heading
+from .ths_trade import TonghuashunTradeExecutor
+from .auto_trade import AutoTradeEngine, SQLiteAutoTradeStore
+from .brent_market import BrentMarketMonitor
+from .quant_rules import SQLiteQuantRuleStore, enrich_store_with_line_funds
 from .security import persist_password_hash
 from .symbol_catalog import SinaSymbolCatalogSource, SQLiteSymbolCatalog
 from .request_logs import RequestLogStore
@@ -122,6 +131,7 @@ class DeploymentSettings:
     market_max_total_symbols: int = 50
     research_monitor_interval_seconds: float = 25.0
     fund_flow_monitor_interval_seconds: float = 20.0
+    core_u2_endpoint: str | None = None
 
     @classmethod
     def from_environ(cls, environ: Mapping[str, str] | None = None) -> "DeploymentSettings":
@@ -418,6 +428,7 @@ class DeploymentSettings:
             fund_flow_monitor_interval_seconds=positive_values[
                 "FUND_FLOW_MONITOR_INTERVAL_SECONDS"
             ],
+            core_u2_endpoint=values.get("CORE_U2_ENDPOINT", "").strip() or None,
         )
 
 
@@ -650,6 +661,10 @@ def create_production_app(
             return None
         return local.strftime("%Y%m%d")
 
+    def intraday_minute_cap(trade_date: str) -> str | None:
+        now_sh = datetime.now(timezone.utc).astimezone(SHANGHAI_TZ)
+        return intraday_fund_flow_cap_minute(trade_date, now_sh)
+
     def _supports_force(fn: object) -> bool:
         try:
             sig = inspect.signature(fn)  # type: ignore[arg-type]
@@ -730,6 +745,7 @@ def create_production_app(
                     max_idle_seconds=(
                         config.core_warm_connection_max_idle_seconds
                     ),
+                    max_size=2,
                 ),
             )
             core_source = (
@@ -866,16 +882,19 @@ def create_production_app(
             allow_today=True,
         )
         if periods and symbol in set(market_accounts.list_watchlist_symbols()):
-            try:
-                research_store.record_fund_flow(
-                    symbol,
-                    trade_date=expected_date,
-                    minute="15:00",
-                    periods=periods,
-                    captured_at=datetime.now(SHANGHAI_TZ),
-                )
-            except Exception:
-                pass
+            now_sh = datetime.now(timezone.utc).astimezone(SHANGHAI_TZ)
+            settled_minute = settled_fund_flow_minute(expected_date, now_sh)
+            if settled_minute is not None:
+                try:
+                    research_store.record_fund_flow(
+                        symbol,
+                        trade_date=expected_date,
+                        minute=settled_minute,
+                        periods=periods,
+                        captured_at=now_sh,
+                    )
+                except Exception:
+                    pass
         fund_trade_dates = {
             **fund.stored_trade_dates,
             "main_fund_flow": expected_date,
@@ -1025,14 +1044,17 @@ def create_production_app(
                     allow_today=True,
                 )
                 if periods:
-                    research_store.record_fund_flow(
-                        symbol,
-                        trade_date=expected_date,
-                        minute="15:00",
-                        periods=periods,
-                        captured_at=datetime.now(SHANGHAI_TZ),
-                    )
-                    stored_trade_dates["main_fund_flow"] = expected_date
+                    now_sh = datetime.now(timezone.utc).astimezone(SHANGHAI_TZ)
+                    settled_minute = settled_fund_flow_minute(expected_date, now_sh)
+                    if settled_minute is not None:
+                        research_store.record_fund_flow(
+                            symbol,
+                            trade_date=expected_date,
+                            minute=settled_minute,
+                            periods=periods,
+                            captured_at=now_sh,
+                        )
+                        stored_trade_dates["main_fund_flow"] = expected_date
             except Exception as error:
                 source_errors["main_fund_flow"] = (
                     getattr(error, "error_code", None)
@@ -1064,7 +1086,7 @@ def create_production_app(
         dispatcher=push_dispatcher,
         symbol_lookup=symbol_catalog.lookup,
         max_concurrent=1,
-        is_market_open=market_is_open,
+        is_market_open=market_enrichment_is_open,
         is_post_close_window=is_research_post_close_window,
     )
     fund_flow_monitor = (
@@ -1078,18 +1100,6 @@ def create_production_app(
             session_notifier=session_notifier,
         )
         if fund_flow_source is not None
-        else None
-    )
-    session_probe = (
-        PreopenSessionProbe(
-            is_trading_day=trading_calendar.is_trading_day,
-            accounts=market_accounts,
-            fund_source=fund_flow_source if config.fund_flow_transport == "direct" else None,
-            core_source=direct_core_source if config.core_metrics_transport == "direct" else None,
-            session_provider=account_session_provider,
-            notifier=session_notifier,
-        )
-        if config.dual_account_mode and account_session_provider is not None
         else None
     )
     premium_monitor = PremiumMonitor(
@@ -1116,6 +1126,100 @@ def create_production_app(
             parsed_value_source.invalidate()
         enriched_market_source.invalidate_cache()
 
+    etf_flow_service = TonghuashunEtfFundFlowService(
+        cache_path=config.research_database_path.parent / "etf-fund-flow.db",
+        timeout_seconds=config.public_market_timeout_seconds,
+        is_trading_day=trading_calendar.is_trading_day,
+    )
+    etf_flow_monitor = EtfFundFlowMonitor(
+        market_accounts,
+        etf_flow_service,
+        is_trading_day=trading_calendar.is_trading_day,
+    )
+
+    def _resolve_symbol_by_name(name: str) -> str | None:
+        cleaned = (name or "").strip()
+        if not cleaned:
+            return None
+        try:
+            matches = symbol_catalog.search(cleaned, 5)
+        except Exception:
+            return None
+        for item in matches:
+            if item.name == cleaned:
+                return item.symbol
+        for item in matches:
+            if item.name.startswith(cleaned) or cleaned.startswith(item.name):
+                return item.symbol
+        return None
+
+    trade_serial = (
+        config.core_adb_serial if config.dual_account_mode else config.adb_serial
+    ) or config.adb_serial
+    trade_executor = (
+        TonghuashunTradeExecutor(
+            adb_serial=trade_serial,
+            prohibited_serial=config.fund_adb_serial,
+            runner_control=control,
+            task_store=store,
+            adb_server_socket=config.adb_server_socket,
+            u2_endpoint=config.core_u2_endpoint,
+            runner_yield_timeout_seconds=2.0,
+            name_to_symbol=_resolve_symbol_by_name,
+        )
+        if trade_serial and trade_serial != config.fund_adb_serial
+        else None
+    )
+    session_probe = (
+        PreopenSessionProbe(
+            is_trading_day=trading_calendar.is_trading_day,
+            accounts=market_accounts,
+            fund_source=fund_flow_source if config.fund_flow_transport == "direct" else None,
+            core_source=direct_core_source if config.core_metrics_transport == "direct" else None,
+            session_provider=account_session_provider,
+            notifier=session_notifier,
+            trade_executor=trade_executor,
+        )
+        if config.dual_account_mode and account_session_provider is not None
+        else None
+    )
+    auto_trade_store = SQLiteAutoTradeStore(config.research_database_path)
+    quant_rule_store = SQLiteQuantRuleStore(config.research_database_path)
+    brent_monitor = BrentMarketMonitor(
+        research_store,
+        auto_backfill=True,
+    )
+    order_book_provider = TencentPublicMarketProvider(
+        timeout_seconds=min(3.0, config.public_market_timeout_seconds)
+    )
+
+    def _safe_lookup_symbol(sym: str) -> Any:
+        try:
+            return symbol_catalog.lookup(sym)
+        except Exception:
+            return None
+
+    def _fetch_order_books_batch(syms: Sequence[str]) -> dict[str, dict[str, Any]]:
+        identities = [looked for sym in syms if (looked := _safe_lookup_symbol(sym)) is not None]
+        if not identities:
+            return {}
+        return order_book_provider.read_order_books_batch(identities)
+
+    auto_trade_engine = AutoTradeEngine(
+        auto_store=auto_trade_store,
+        research_store=research_store,
+        broker=market_broker,
+        trade_executor=trade_executor,
+        push_dispatcher=push_dispatcher,
+        symbol_lookup=symbol_catalog.lookup,
+        is_trading_day=trading_calendar.is_trading_day,
+        quant_rule_store=quant_rule_store,
+        order_book_fetcher=lambda sym, _mkt=None: order_book_provider.read_order_book(
+            symbol_catalog.lookup(sym)
+        ),
+        batch_order_book_fetcher=_fetch_order_books_batch,
+    )
+
     app = create_app(
         store=store,
         admin_password_hash=config.admin_password_hash,
@@ -1138,6 +1242,7 @@ def create_production_app(
         symbol_catalog_refresh_minute=config.symbol_catalog_refresh_minute,
         previous_trading_date=previous_trading_date,
         expected_intraday_trade_date=expected_intraday_trade_date,
+        intraday_minute_cap=intraday_minute_cap,
         core_prewarmer=(
             direct_core_source.prewarm
             if direct_core_source is not None
@@ -1156,7 +1261,10 @@ def create_production_app(
                     direct_core_source,
                     fund_flow_source,
                     parsed_value_source,
+                    etf_flow_service,
                     research_store,
+                    auto_trade_store,
+                    quant_rule_store,
                 )
                 if resource is not None and callable(getattr(resource, "close", None))
             }.values()
@@ -1178,6 +1286,12 @@ def create_production_app(
         device_lifecycle=device_lifecycle,
         request_log_store=RequestLogStore(config.research_database_path),
         goodluck_internal_token=config.goodluck_internal_token,
+        etf_flow_service=etf_flow_service,
+        etf_flow_monitor=etf_flow_monitor,
+        trade_executor=trade_executor,
+        auto_trade_engine=auto_trade_engine,
+        quant_rule_store=quant_rule_store,
+        brent_monitor=brent_monitor,
     )
     app.state.deployment_settings = config
     app.state.runner = runner

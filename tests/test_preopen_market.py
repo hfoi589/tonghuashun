@@ -1,9 +1,11 @@
+import asyncio
 from datetime import datetime, timezone
 import json
+import time
 
 import pytest
 
-from level2_service.market_data import MarketPhase, MarketPhaseState, MarketSnapshot
+from level2_service.market_data import MarketDataBroker, MarketPhase, MarketPhaseState, MarketSnapshot
 from level2_service.parsed_values import DirectRequestError
 from level2_service.models import MetricKind
 from level2_service.parsed_values import DirectReadOutcome
@@ -268,4 +270,99 @@ def test_preopen_source_uses_batch_watchlist_reader_when_available() -> None:
 
     assert set(snapshots) == {"600000", "000001"}
     assert all(item.source == "THS_DIRECT_QUOTE" for item in snapshots.values())
+    assert base.calls == []
+
+
+def test_preopen_client_uses_read_quote_direct_and_isolates_fund_failures() -> None:
+    class DirectSource:
+        def __init__(self) -> None:
+            self.quote_calls: list[str] = []
+
+        def read_direct(self, symbol: str) -> DirectReadOutcome:
+            raise AssertionError(f"full read_direct should not be called for preopen {symbol}")
+
+        def read_quote_direct(self, symbol: str) -> DirectReadOutcome:
+            self.quote_calls.append(symbol)
+            if symbol == "160723":
+                return DirectReadOutcome(
+                    values={kind: None for kind in MetricKind},
+                    source_errors={"core_metrics": None, "main_fund_flow": None},
+                )
+            return DirectReadOutcome(
+                values={
+                    MetricKind.STOCK_NAME: "招商轮船",
+                    MetricKind.CURRENT_PRICE: "15.55",
+                    MetricKind.CHANGE_PERCENT: "1.70%",
+                },
+                source_errors={"core_metrics": None, "main_fund_flow": None},
+            )
+
+    base = FakeBaseSource()
+    direct_source = DirectSource()
+    client = CoreDirectPreopenQuoteClient(
+        direct_source,
+        clock=lambda: datetime(2026, 8, 24, 1, 16, tzinfo=timezone.utc),
+    )
+    source = PreopenMarketDataSource(
+        base,
+        client,
+        clock=lambda: datetime(2026, 8, 24, 1, 16, tzinfo=timezone.utc),
+    )
+
+    snapshots = source.read_market_snapshots(
+        {"160723", "601872"},
+        detail_symbols={"601872"},
+    )
+
+    assert set(snapshots) == {"601872"}
+    assert snapshots["601872"].quote["price"] == "15.55"
+    assert snapshots["601872"].source == "THS_DIRECT_QUOTE"
+    assert direct_source.quote_calls[0] == "601872"
+    assert base.calls == []
+
+
+def test_broker_refresh_timeout_falls_back_to_same_day_redis_auction_cache() -> None:
+    class FakeRedis:
+        def __init__(self) -> None:
+            self.values: dict[str, bytes] = {}
+
+        def setex(self, key: str, _ttl: int, value: str) -> None:
+            self.values[key] = value.encode()
+
+        def get(self, key: str) -> bytes | None:
+            return self.values.get(key)
+
+    class SlowDirectClient(FakePreopenClient):
+        def read_quote(self, symbol: str, *, detail: bool, phase: MarketPhase) -> MarketSnapshot:
+            time.sleep(0.15)
+            return super().read_quote(symbol, detail=detail, phase=phase)
+
+    redis = FakeRedis()
+    cache = RedisPreopenQuoteCache(redis)
+    seed_source = PreopenMarketDataSource(
+        FakeBaseSource(),
+        FakePreopenClient(MarketPhase.CALL_AUCTION),
+        cache=cache,
+        clock=lambda: datetime(2026, 8, 24, 1, 16, tzinfo=timezone.utc),
+    )
+    seed_source.read_market_snapshot("601872", detail=False)
+
+    base = FakeBaseSource()
+    slow_source = PreopenMarketDataSource(
+        base,
+        SlowDirectClient(MarketPhase.CALL_AUCTION),
+        cache=RedisPreopenQuoteCache(redis),
+        clock=lambda: datetime(2026, 8, 24, 1, 20, tzinfo=timezone.utc),
+    )
+    broker = MarketDataBroker(
+        slow_source,
+        refresh_timeout_seconds=0.03,
+        is_market_open=lambda: True,
+    )
+
+    recovered = asyncio.run(broker.refresh("601872", detail=True))
+
+    assert recovered.quote["price"] == "10.20"
+    assert recovered.market_phase is MarketPhase.CALL_AUCTION
+    assert recovered.source_errors["auction_quote"] == "DIRECT_REQUEST_TIMEOUT"
     assert base.calls == []

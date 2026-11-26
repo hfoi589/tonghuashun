@@ -1,7 +1,8 @@
 import { FormEvent, KeyboardEvent, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react'
 import { ApiError, type MainFundFlowPeriod, type SymbolSuggestion } from './api'
 import { DailyKChart, type DailyKSelection } from './DailyKChart'
-import { FundFlowHistoryPanel } from './FundFlowHistoryPanel'
+import { EtfFundFlowChartPanel, EtfHoldingsTablePanel } from './EtfFundFlowPanel'
+import { FundFlowHistoryPanel, isUnsupportedFundSymbol } from './FundFlowHistoryPanel'
 import { FundFlowDailyPanel } from './FundFlowDailyChart'
 import { IntradayMacdChart, IntradayMetricChart } from './IntradayMetricChart'
 import { intradayAxisTicks, intradayPointIndexForTime, intradayPointRatio, intradayTimeRatio, nearestIntradayPointIndex } from './intraday-axis'
@@ -10,6 +11,8 @@ import {
   marketApi,
   marketStreamUrl,
   subscribeMarketWatchlistChanges,
+  type EtfFlowPeriod,
+  type EtfFundFlowResponse,
   type FundFlowDailyPoint,
   type FundFlowHistoryResponse,
   type KlineBar,
@@ -27,6 +30,7 @@ import {
   type WatchlistItem,
 } from './market-api'
 import { MarketSessionContext } from './market-session'
+import { useThsSkin } from './ths-skin'
 import './market.css'
 
 type AuthState = 'loading' | 'anonymous' | 'authenticated'
@@ -91,6 +95,19 @@ function compact(value: string | null | undefined, unit: '股' | '元'): string 
   if (Math.abs(number) >= 100_000_000) return `${(number / 100_000_000).toFixed(2)}亿${unit}`
   if (Math.abs(number) >= 10_000) return `${(number / 10_000).toFixed(2)}万${unit}`
   return `${number.toFixed(2)}${unit}`
+}
+
+export function formatQuoteVolume(value: string | null | undefined): string {
+  if (value === null || value === undefined) return '—'
+  const trimmed = value.trim()
+  if (!trimmed) return '—'
+  if (/[万亿手股]$/.test(trimmed)) return trimmed
+  const shares = Number(trimmed.replaceAll(',', ''))
+  if (!Number.isFinite(shares)) return trimmed
+  const hands = shares / 100
+  if (Math.abs(hands) >= 100_000_000) return `${(hands / 100_000_000).toFixed(2)}亿手`
+  if (Math.abs(hands) >= 10_000) return `${(hands / 10_000).toFixed(2)}万手`
+  return `${Math.round(hands)}手`
 }
 
 function fundFlowToWan(value: string | null | undefined, unit: string | null | undefined): string | null {
@@ -461,7 +478,7 @@ export function Login({ onLogin }: { onLogin: (user: MarketUser) => void }) {
 }
 
 type FundFlowPeriodKey = 'today' | 'three_day' | 'five_day'
-type FundFlowChartTab = 'today' | 'daily'
+type FundFlowChartTab = 'today' | 'daily' | 'etf_flow' | 'etf_holdings'
 
 const fundFlowPeriods: Array<[FundFlowPeriodKey, string]> = [
   ['today', '当日'],
@@ -507,11 +524,50 @@ function FundFlow({ symbol, market, values, refreshEnabled }: { symbol: string, 
   const [history, setHistory] = useState<FundFlowHistoryResponse>()
   const [activeTab, setActiveTab] = useState<FundFlowChartTab>('today')
   const [dailyValues, setDailyValues] = useState<MarketSnapshot['main_fund_flow'] | null | undefined>()
+  const [etfPeriod, setEtfPeriod] = useState<EtfFlowPeriod>('60d')
+  const [etfData, setEtfData] = useState<EtfFundFlowResponse>()
+  const [etfLoading, setEtfLoading] = useState(false)
+  const [etfError, setEtfError] = useState<string>()
+  const [etfRetryVersion, setEtfRetryVersion] = useState(0)
+  const loadedEtfKeyRef = useRef<string | null>(null)
+  const etfUnsupportedFund = isUnsupportedFundSymbol(symbol, market)
   useEffect(() => {
     setHistory(undefined)
     setActiveTab('today')
     setDailyValues(undefined)
+    setEtfPeriod('60d')
+    setEtfData(undefined)
+    setEtfLoading(false)
+    setEtfError(undefined)
+    loadedEtfKeyRef.current = null
   }, [symbol])
+  useEffect(() => {
+    if (activeTab !== 'etf_flow' && activeTab !== 'etf_holdings') return
+    if (etfUnsupportedFund) {
+      setEtfData(undefined)
+      setEtfError(undefined)
+      setEtfLoading(false)
+      return
+    }
+    const requestKey = `${symbol}:${etfPeriod}:${etfRetryVersion}`
+    if (loadedEtfKeyRef.current === requestKey) return
+    const controller = new AbortController()
+    setEtfLoading(true)
+    setEtfError(undefined)
+    void marketApi.etfFlow(symbol, etfPeriod, controller.signal)
+      .then((result) => {
+        if (controller.signal.aborted) return
+        loadedEtfKeyRef.current = requestKey
+        setEtfData(result)
+      })
+      .catch((reason) => {
+        if (!controller.signal.aborted) setEtfError(reason instanceof Error ? reason.message : 'ETF资金读取失败')
+      })
+      .finally(() => {
+        if (!controller.signal.aborted) setEtfLoading(false)
+      })
+    return () => controller.abort()
+  }, [activeTab, etfPeriod, etfRetryVersion, etfUnsupportedFund, symbol])
   const historicalValues = useMemo<MarketSnapshot['main_fund_flow'] | undefined>(() => {
     if (!history?.trade_date) return undefined
     const result: MarketSnapshot['main_fund_flow'] = {}
@@ -530,10 +586,14 @@ function FundFlow({ symbol, market, values, refreshEnabled }: { symbol: string, 
   }, [history])
   const selectTab = useCallback((tab: FundFlowChartTab) => {
     setActiveTab(tab)
-    if (tab === 'today') setDailyValues(undefined)
+    if (tab !== 'daily') setDailyValues(undefined)
   }, [])
   const handleDailyPointChange = useCallback((point: FundFlowDailyPoint) => {
     setDailyValues(fundFlowValuesForDailyPoint(point))
+  }, [])
+  const retryEtfFlow = useCallback(() => {
+    loadedEtfKeyRef.current = null
+    setEtfRetryVersion((version) => version + 1)
   }, [])
   const isExchangeFund = (market === '20' || market === '36') && Object.keys(values).length === 0
   if (isExchangeFund) {
@@ -547,6 +607,8 @@ function FundFlow({ symbol, market, values, refreshEnabled }: { symbol: string, 
   const displayedValues = activeTab === 'daily' ? dailyValues ?? {} : historicalValues ?? values
   const todayPanelId = `market-fund-flow-today-${symbol}`
   const dailyPanelId = `market-fund-flow-daily-${symbol}`
+  const etfFlowPanelId = `market-fund-flow-etf-${symbol}`
+  const etfHoldingsPanelId = `market-fund-flow-etf-holdings-${symbol}`
   const fundFlowDateLabel = history?.trade_date ?? (Object.keys(values).length ? '数据库优先' : '暂无实时值')
   return <section className="market-section market-fund-flow">
     <div className="market-fund-layout">
@@ -570,12 +632,37 @@ function FundFlow({ symbol, market, values, refreshEnabled }: { symbol: string, 
         <div className="market-fund-tablist" role="tablist" aria-label="资金曲线类型">
           <button type="button" role="tab" aria-selected={activeTab === 'today'} aria-controls={todayPanelId} className={activeTab === 'today' ? 'active' : ''} onClick={() => selectTab('today')}>当天资金曲线</button>
           <button type="button" role="tab" aria-selected={activeTab === 'daily'} aria-controls={dailyPanelId} className={activeTab === 'daily' ? 'active' : ''} onClick={() => selectTab('daily')}>近30日资金流向</button>
+          <button type="button" role="tab" aria-selected={activeTab === 'etf_flow'} aria-controls={etfFlowPanelId} className={activeTab === 'etf_flow' ? 'active' : ''} onClick={() => selectTab('etf_flow')}>ETF资金</button>
+          <button type="button" role="tab" aria-selected={activeTab === 'etf_holdings'} aria-controls={etfHoldingsPanelId} className={activeTab === 'etf_holdings' ? 'active' : ''} onClick={() => selectTab('etf_holdings')}>ETF申购明细</button>
         </div>
         <div id={todayPanelId} role="tabpanel" aria-label="当天资金曲线内容" hidden={activeTab !== 'today'}>
           <FundFlowHistoryPanel symbol={symbol} market={market} pollingEnabled={refreshEnabled} onHistoryChange={setHistory} />
         </div>
         <div id={dailyPanelId} role="tabpanel" aria-label="近30日资金流向内容" hidden={activeTab !== 'daily'}>
           <FundFlowDailyPanel symbol={symbol} market={market} pollingEnabled={refreshEnabled} onSelectedPointChange={handleDailyPointChange} />
+        </div>
+        <div id={etfFlowPanelId} role="tabpanel" aria-label="ETF资金内容" hidden={activeTab !== 'etf_flow'}>
+          <EtfFundFlowChartPanel
+            symbol={symbol}
+            market={market}
+            data={etfData}
+            period={etfPeriod}
+            loading={etfLoading}
+            error={etfError}
+            onPeriodChange={setEtfPeriod}
+            onRetry={retryEtfFlow}
+            onOpenHoldings={() => selectTab('etf_holdings')}
+          />
+        </div>
+        <div id={etfHoldingsPanelId} role="tabpanel" aria-label="ETF申购明细内容" hidden={activeTab !== 'etf_holdings'}>
+          <EtfHoldingsTablePanel
+            symbol={symbol}
+            market={market}
+            data={etfData}
+            loading={etfLoading}
+            error={etfError}
+            onRetry={retryEtfFlow}
+          />
         </div>
       </div>
     </div>
@@ -785,6 +872,11 @@ function Detail({ item, snapshot, period, setPeriod, series, dailyLoading, daily
     : null
   const displayedPrice = selectedDailyBar ? fixed(selectedDailyBar.close, pricePrecision) : display(quote.price)
   const displayedChange = selectedDailyBar ? display(selectedDailyChange) : display(quote.change_percent)
+  const rawPrice = !selectedDailyBar ? Number(quote.price) : Number.NaN
+  const rawPrevClose = !selectedDailyBar ? Number(quote.previous_close) : Number.NaN
+  const priceDelta = Number.isFinite(rawPrice) && Number.isFinite(rawPrevClose)
+    ? `${rawPrice - rawPrevClose > 0 ? '+' : ''}${(rawPrice - rawPrevClose).toFixed(pricePrecision)}`
+    : null
   const changeTone = tone(selectedDailyBar ? selectedDailyChange : quote.change_percent)
   const klineAvailable = snapshot?.capabilities.kline?.available === true
   const quoteFields = selectedDailyBar
@@ -802,18 +894,34 @@ function Detail({ item, snapshot, period, setPeriod, series, dailyLoading, daily
       ['最低', display(quote.low)],
       ['昨收', display(quote.previous_close)],
       ['换手', display(quote.turnover_rate)],
-      ['成交量', display(quote.volume)],
+      ['成交量', formatQuoteVolume(quote.volume)],
     ]
+  const l2StripItems = [
+    ['大单净量', quote.large_order_net],
+    ['大单金额', quote.large_order_amount == null ? null : `${Number(quote.large_order_amount.replace(/万元?$/, '')).toFixed(1)}万`],
+    ['散户数量', quote.retail_count],
+    ['MACDFS', quote.macdfs],
+  ] as const
   const sourceLabel = marketSourceLabel(snapshot?.source, snapshot?.market_phase)
   const phaseLabel = marketPhaseLabel(snapshot?.market_phase)
   return <section className="market-detail">
-    <header className="market-quote-head">
-      <div><p>{item.symbol} · {selectedDailyBar ? `${selectedDailyBar.time} 日K` : '实时行情'}</p><h1>{snapshot?.name ?? item.name}</h1></div>
-      <div className={`market-last-price market-number-${changeTone}`}><strong>{displayedPrice}</strong><span>{displayedChange}</span></div>
-      <div className="market-live-status"><i className={snapshot?.stale ? 'stale' : ''} /><span>{phaseLabel}</span><span>{sourceLabel}</span><span>{selectedDailyBar ? '十字线选中日' : snapshot?.source_time ? `${snapshot.source_time} 更新` : '正在读取行情'}</span></div>
-    </header>
-    <div className="market-quote-strip">
-      {quoteFields.map(([label, value]) => <div key={label}><span>{label}</span><strong>{value}</strong></div>)}
+    <div className="market-quote-band">
+      <header className="market-quote-head">
+        <div className="market-quote-identity"><h1>{snapshot?.name ?? item.name}</h1><p>{item.symbol} · {selectedDailyBar ? `${selectedDailyBar.time} 日K` : '实时行情'}</p></div>
+        <div className="market-live-status"><i className={snapshot?.stale ? 'stale' : ''} /><span>{phaseLabel}</span><span>{sourceLabel}</span><span>{selectedDailyBar ? '十字线选中日' : snapshot?.source_time ? `${snapshot.source_time} 更新` : '正在读取行情'}</span></div>
+      </header>
+      <div className="market-ths-board">
+        <div className={`market-last-price market-number-${changeTone}`}>
+          <strong>{displayedPrice}</strong>
+          <div className="market-last-deltas">{priceDelta !== null && <em>{priceDelta}</em>}<span>{displayedChange}</span></div>
+        </div>
+        <div className="market-quote-strip">
+          {quoteFields.map(([label, value]) => <div key={label}><span>{label}</span><strong>{value}</strong></div>)}
+        </div>
+      </div>
+      {isFundFlowPeriod(period) && l2Available && <div className="market-quote-l2-strip" aria-label="盘口L2核心指标">
+        {l2StripItems.map(([label, value]) => <div key={label}><span>{label}</span><strong className={`market-number-${tone(value)}`}>{display(value)}</strong></div>)}
+      </div>}
     </div>
     <section className="market-chart-panel">
       <nav className="market-period-tabs" aria-label="图表周期">{chartPeriods.map(([value, label]) => <button type="button" key={value} className={period === value ? 'active' : ''} onClick={() => setPeriod(value)}>{label}</button>)}</nav>
@@ -852,6 +960,7 @@ function Detail({ item, snapshot, period, setPeriod, series, dailyLoading, daily
 export function MarketApp({ embedded = false }: { embedded?: boolean } = {}) {
   // 内嵌在工作台里时，登录态已由外层确认，不再重复请求并闪出第二个“正在连接”页面
   const hostSession = useContext(MarketSessionContext)
+  const [skin, toggleSkin] = useThsSkin()
   const inheritedUser = embedded ? hostSession?.user ?? null : null
   const [auth, setAuth] = useState<AuthState>(inheritedUser ? 'authenticated' : 'loading')
   const [user, setUser] = useState<MarketUser | null>(inheritedUser)
@@ -1242,7 +1351,16 @@ export function MarketApp({ embedded = false }: { embedded?: boolean } = {}) {
 
   return <main className={`market-app-shell${embedded ? ' market-app-embedded' : ''}`}>
     <header className="market-topbar">
-      {!embedded && <a href="/market" className="market-wordmark"><span>顺</span><strong>行情中心</strong></a>}
+      {!embedded && <div className="market-brand-cluster">
+        <button
+          type="button"
+          className="ths-split-brand-btn"
+          onClick={toggleSkin}
+          aria-label={skin === 'dark' ? '切换为同花顺红白浅色主题' : '切换为同花顺暗色盘口主题'}
+          title={skin === 'dark' ? '当前：方案A暗色盘口（点击切换方案C红白浅色）' : '当前：方案C红白浅色（点击切换方案A暗色盘口）'}
+        >顺</button>
+        <a href="/market" className="market-wordmark"><strong>行情中心</strong></a>
+      </div>}
       <div className="market-search" ref={symbolSearchRef}>
         <form onSubmit={addSymbol}>
           <label className="sr-only" htmlFor="market-symbol">股票代码或名称</label>

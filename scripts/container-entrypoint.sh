@@ -13,4 +13,4 @@ if [ "${ADB_CONNECT:-0}" = "1" ]; then
     done
 fi
 
-exec uvicorn level2_service.main:create_production_app --factory --host 0.0.0.0 --port 8000
+exec uvicorn level2_service.main:create_production_app --factory --host 0.0.0.0 --port 8000 --timeout-keep-alive "${UVICORN_TIMEOUT_KEEP_ALIVE:-75}"

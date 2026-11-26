@@ -104,6 +104,16 @@ def _source_time(value: object) -> str | None:
     return None
 
 
+def _quote_clock_time(value: object) -> str | None:
+    digits = "".join(character for character in str(value or "") if character.isdigit())
+    if len(digits) >= 6:
+        hhmmss = digits[-6:]
+        hour, minute, second = int(hhmmss[:2]), int(hhmmss[2:4]), int(hhmmss[4:6])
+        if 0 <= hour <= 23 and 0 <= minute <= 59 and 0 <= second <= 59:
+            return f"{hour:02d}:{minute:02d}:{second:02d}"
+    return _source_time(value)
+
+
 def _session_time(value: str) -> str | None:
     compact = value.replace(":", "").strip()
     if not re.fullmatch(r"[0-9]{4}", compact):
@@ -253,6 +263,108 @@ class TencentPublicMarketProvider:
             return body.split("~")
         except (UnicodeDecodeError, ValueError):
             raise PublicMarketError("PUBLIC_MARKET_RESPONSE_INVALID") from None
+
+    @staticmethod
+    def _parse_order_book_fields(
+        identity: SymbolLookup,
+        fields: Sequence[str],
+    ) -> dict[str, Any]:
+        if len(fields) < 35 or fields[2].strip() != identity.symbol:
+            raise PublicMarketError("PUBLIC_MARKET_RESPONSE_INVALID")
+        precision = _precision(identity)
+        name = identity.name.strip() or fields[1].strip()
+        last_price = _decimal(fields[3])
+        previous_close = _decimal(fields[4])
+        limit_up = _decimal(fields[47]) if len(fields) > 47 else None
+        limit_down = _decimal(fields[48]) if len(fields) > 48 else None
+
+        def _parse_ladder(start_idx: int, prefix: str) -> list[dict[str, Any]]:
+            items: list[dict[str, Any]] = []
+            for idx in range(5):
+                p_idx = start_idx + idx * 2
+                v_idx = p_idx + 1
+                raw_p = _decimal(fields[p_idx]) if p_idx < len(fields) else None
+                raw_v = _decimal(fields[v_idx]) if v_idx < len(fields) else None
+                valid_price = raw_p is not None and raw_p > 0
+                items.append(
+                    {
+                        "level": idx + 1,
+                        "label": f"{prefix}{idx + 1}",
+                        "price": _number(raw_p, precision) if valid_price else None,
+                        "volume_lots": int(raw_v) if raw_v is not None and raw_v >= 0 else 0,
+                    }
+                )
+            return items
+
+        return {
+            "symbol": identity.symbol,
+            "name": name,
+            "market": identity.market,
+            "precision": precision,
+            "last_price": _number(last_price, precision) if last_price is not None and last_price > 0 else None,
+            "previous_close": _number(previous_close, precision) if previous_close is not None and previous_close > 0 else None,
+            "limit_up": _number(limit_up, precision) if limit_up is not None and limit_up > 0 else None,
+            "limit_down": _number(limit_down, precision) if limit_down is not None and limit_down > 0 else None,
+            "source_time": _quote_clock_time(fields[30]) if len(fields) > 30 else None,
+            "bids": _parse_ladder(9, "买"),
+            "asks": _parse_ladder(19, "卖"),
+        }
+
+    def read_order_book(self, identity: SymbolLookup) -> dict[str, Any]:
+        """Fetch real-time 5-level bid/ask order book from Tencent quote endpoint."""
+        provider_id = _provider_id(identity)
+        fields = self._quote_fields(
+            self._request(self.quote_url.format(provider_id=provider_id)),
+            provider_id,
+        )
+        return self._parse_order_book_fields(identity, fields)
+
+    def read_order_books_batch(
+        self,
+        identities: Sequence[SymbolLookup],
+        *,
+        chunk_size: int = 60,
+    ) -> dict[str, dict[str, Any]]:
+        """Fetch 5-level bid/ask order books for multiple symbols using batched Tencent requests."""
+        if not identities:
+            return {}
+        results: dict[str, dict[str, Any]] = {}
+        size = max(1, int(chunk_size))
+        for start in range(0, len(identities), size):
+            chunk = list(identities[start : start + size])
+            by_pid: dict[str, SymbolLookup] = {}
+            for identity in chunk:
+                try:
+                    by_pid[_provider_id(identity)] = identity
+                except PublicMarketError:
+                    continue
+            if not by_pid:
+                continue
+            raw_bytes = self._request(
+                self.batch_quote_url.format(provider_ids=",".join(by_pid))
+            )
+            try:
+                text = raw_bytes.decode("gb18030")
+            except UnicodeDecodeError:
+                raise PublicMarketError("PUBLIC_MARKET_RESPONSE_INVALID") from None
+            for line in text.split(";"):
+                snippet = line.strip()
+                if not snippet.startswith("v_") or '="' not in snippet:
+                    continue
+                head, rest = snippet.split('="', 1)
+                pid = head[2:].strip()
+                identity = by_pid.get(pid)
+                if identity is None:
+                    continue
+                body = rest.rsplit('"', 1)[0]
+                try:
+                    results[identity.symbol] = self._parse_order_book_fields(
+                        identity,
+                        body.split("~"),
+                    )
+                except PublicMarketError:
+                    continue
+        return results
 
     def read_snapshot(
         self,

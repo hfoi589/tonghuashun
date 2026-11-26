@@ -510,14 +510,29 @@ class MarketDataBroker:
                     and (not detail or self._cache_detail.get(symbol, False))
                 ):
                     return cached
-            snapshot = await asyncio.wait_for(
-                asyncio.to_thread(
-                    self.source.read_market_snapshot,
-                    symbol,
-                    detail=detail,
-                ),
-                timeout=self.refresh_timeout_seconds,
-            )
+            try:
+                snapshot = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        self.source.read_market_snapshot,
+                        symbol,
+                        detail=detail,
+                    ),
+                    timeout=self.refresh_timeout_seconds,
+                )
+            except TimeoutError:
+                timeout_fallback = getattr(
+                    self.source,
+                    "cached_snapshot_for_timeout",
+                    None,
+                )
+                recovered = (
+                    timeout_fallback(symbol)
+                    if callable(timeout_fallback)
+                    else None
+                )
+                if not isinstance(recovered, MarketSnapshot):
+                    raise
+                snapshot = recovered
             sequence = self._sequence.get(symbol, 0) + 1
             current = replace(snapshot, sequence=sequence)
             self._sequence[symbol] = sequence

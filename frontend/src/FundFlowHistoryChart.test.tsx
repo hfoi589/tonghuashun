@@ -149,6 +149,27 @@ describe('FundFlowHistoryChart', () => {
     expect(screen.getByText('09:30', { selector: 'time' })).toBeInTheDocument()
     expect(screen.getByTestId('fund-flow-readout-main-net')).toHaveTextContent('120000.00')
   })
+
+  it('drops unreached afternoon points for today while preserving the full-day x-axis', () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-11-25T12:26:00+08:00'))
+    const { container } = render(<FundFlowHistoryChart
+      tradeDate="20261125"
+      period={{
+        points: [
+          { ...period.points[0], time: '09:30' },
+          { ...period.points[1], time: '11:30' },
+          { ...period.points[1], time: '15:00' },
+        ],
+      }}
+    />)
+
+    expect(screen.getByText('11:30', { selector: 'time' })).toBeInTheDocument()
+    const path = container.querySelector('.fund-flow-history-series-visible')?.getAttribute('d') ?? ''
+    expect(path).toContain('L472.00,')
+    expect(path).not.toContain('882.00')
+    expect(container.querySelectorAll('.fund-flow-history-x-axis-tick')).toHaveLength(9)
+  })
 })
 
 describe('FundFlowDailyChart', () => {

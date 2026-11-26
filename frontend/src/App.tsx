@@ -1,10 +1,13 @@
 import { FormEvent, KeyboardEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { AdminPage } from './AdminPage'
-import { ApiError, api, type IntradaySeriesValues, type Job, type JobStatus, type JobStreamState, type MainFundFlowPeriod, type MainFundFlowValues, type SymbolLookup, type SymbolSuggestion, type TaskFundFlowDaily, type TaskFundFlowHistory, type ValueSource, subscribeToJob } from './api'
+import { ApiError, api, type EtfFlowPeriod, type EtfFundFlowResponse, type IntradaySeriesValues, type Job, type JobStatus, type JobStreamState, type MainFundFlowPeriod, type MainFundFlowValues, type SymbolLookup, type SymbolSuggestion, type TaskFundFlowDaily, type TaskFundFlowHistory, type ValueSource, subscribeToJob } from './api'
 import { IntradayMetricChart } from './IntradayMetricChart'
+import { EtfFundFlowChartPanel, EtfHoldingsTablePanel } from './EtfFundFlowPanel'
 import { FundFlowHistoryChart } from './FundFlowHistoryChart'
 import { FundFlowDailyChart } from './FundFlowDailyChart'
+import { isUnsupportedFundSymbol } from './FundFlowHistoryPanel'
 import type { FundFlowDailyPoint } from './market-api'
+import { useThsSkin } from './ths-skin'
 import './styles.css'
 import './theme-glass.css'
 
@@ -280,8 +283,26 @@ function FundFlowTable({ task, finished, override }: { task: Job, finished: bool
   </section>
 }
 
-type FundFlowChartTab = 'today' | 'daily'
+type FundFlowChartTab = 'today' | 'daily' | 'etf_flow' | 'etf_holdings'
 const FUND_FLOW_REFRESH_INTERVAL_MS = 15_000
+
+function useCompactMobileViewport(): boolean {
+  const query = '(max-width: 720px)'
+  const [compact, setCompact] = useState(() => (
+    typeof window !== 'undefined' && typeof window.matchMedia === 'function'
+      ? window.matchMedia(query).matches
+      : false
+  ))
+  useEffect(() => {
+    if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') return
+    const media = window.matchMedia(query)
+    const sync = () => setCompact(media.matches)
+    sync()
+    media.addEventListener('change', sync)
+    return () => media.removeEventListener('change', sync)
+  }, [])
+  return compact
+}
 
 function fundFlowValuesForDailyPoint(point: FundFlowDailyPoint): MainFundFlowValues | null {
   if (point.periods === null || point.periods === undefined) return null
@@ -305,7 +326,7 @@ function TaskFundFlowHistory({ history, state, onRetry }: {
     {state === 'loading' && <p className="fund-flow-chart-status">正在加载当天资金曲线…</p>}
     {state === 'error' && <p className="fund-flow-chart-status error">当天资金曲线加载失败。<button type="button" className="inline-retry" onClick={onRetry}>重新加载</button></p>}
     {state === 'empty' && <p className="fund-flow-chart-status">暂无当天资金曲线。</p>}
-    {state === 'ready' && history && <FundFlowHistoryChart period={{ points: history.points }} />}
+    {state === 'ready' && history && <FundFlowHistoryChart period={{ points: history.points }} tradeDate={history.trade_date} />}
   </section>
 }
 
@@ -327,13 +348,18 @@ function TaskFundFlowDaily({ daily, state, onRetry, onPointChange }: {
   </section>
 }
 
-function TaskFundFlowTabs({ publicId, finished, hasFundFlow, allowHistoricalFallback, onTabChange, onDailyPointChange }: {
+function TaskFundFlowTabs({ publicId, symbol, finished, hasFundFlow, allowHistoricalFallback, onTabChange, onDailyPointChange, mobileIntradayTab }: {
   publicId: string
+  symbol: string
   finished: boolean
   hasFundFlow: boolean
   allowHistoricalFallback: boolean
   onTabChange: (tab: FundFlowChartTab) => void
   onDailyPointChange: (point: FundFlowDailyPoint) => void
+  mobileIntradayTab?: {
+    active: boolean
+    onSelect: () => void
+  }
 }) {
   const [activeTab, setActiveTab] = useState<FundFlowChartTab>('today')
   const [history, setHistory] = useState<TaskFundFlowHistory>()
@@ -341,7 +367,54 @@ function TaskFundFlowTabs({ publicId, finished, hasFundFlow, allowHistoricalFall
   const [historyState, setHistoryState] = useState<'idle' | 'loading' | 'ready' | 'empty' | 'error'>('idle')
   const [dailyState, setDailyState] = useState<'idle' | 'loading' | 'ready' | 'empty' | 'error'>('idle')
   const [reloadVersion, setReloadVersion] = useState(0)
+  const [etfPeriod, setEtfPeriod] = useState<EtfFlowPeriod>('60d')
+  const [etfData, setEtfData] = useState<EtfFundFlowResponse>()
+  const [etfLoading, setEtfLoading] = useState(false)
+  const [etfError, setEtfError] = useState<string>()
+  const [etfRetryVersion, setEtfRetryVersion] = useState(0)
+  const loadedEtfKeyRef = useRef<string | null>(null)
+  const etfUnsupportedFund = isUnsupportedFundSymbol(symbol)
   const eligible = (finished || allowHistoricalFallback) && (hasFundFlow || allowHistoricalFallback)
+  const retryEtfFlow = useCallback(() => {
+    loadedEtfKeyRef.current = null
+    setEtfRetryVersion((version) => version + 1)
+  }, [])
+
+  useEffect(() => {
+    setEtfPeriod('60d')
+    setEtfData(undefined)
+    setEtfLoading(false)
+    setEtfError(undefined)
+    loadedEtfKeyRef.current = null
+  }, [publicId, symbol])
+
+  useEffect(() => {
+    if (!eligible || (activeTab !== 'etf_flow' && activeTab !== 'etf_holdings')) return
+    if (etfUnsupportedFund) {
+      setEtfData(undefined)
+      setEtfError(undefined)
+      setEtfLoading(false)
+      return
+    }
+    const requestKey = `${publicId}:${etfPeriod}:${etfRetryVersion}`
+    if (loadedEtfKeyRef.current === requestKey) return
+    const controller = new AbortController()
+    setEtfLoading(true)
+    setEtfError(undefined)
+    void api.etfFlow(publicId, etfPeriod, controller.signal)
+      .then((result) => {
+        if (controller.signal.aborted) return
+        loadedEtfKeyRef.current = requestKey
+        setEtfData(result)
+      })
+      .catch((reason) => {
+        if (!controller.signal.aborted) setEtfError(reason instanceof Error ? reason.message : 'ETF资金读取失败')
+      })
+      .finally(() => {
+        if (!controller.signal.aborted) setEtfLoading(false)
+      })
+    return () => controller.abort()
+  }, [activeTab, eligible, etfPeriod, etfRetryVersion, etfUnsupportedFund, publicId])
 
   useEffect(() => {
     if (!eligible) {
@@ -410,17 +483,66 @@ function TaskFundFlowTabs({ publicId, finished, hasFundFlow, allowHistoricalFall
     setActiveTab(tab)
     onTabChange(tab)
   }
+  const mobileIntradayActive = mobileIntradayTab?.active === true
+  const tabCount = (etfUnsupportedFund ? 2 : 4) + (mobileIntradayTab ? 1 : 0)
   const todayPanelId = `fund-flow-today-panel-${publicId}`
   const dailyPanelId = `fund-flow-daily-panel-${publicId}`
+  const etfFlowPanelId = `fund-flow-etf-panel-${publicId}`
+  const etfHoldingsPanelId = `fund-flow-etf-holdings-panel-${publicId}`
+  const panelId = activeTab === 'today'
+    ? todayPanelId
+    : activeTab === 'daily'
+      ? dailyPanelId
+      : activeTab === 'etf_flow'
+        ? etfFlowPanelId
+        : etfHoldingsPanelId
+  const panelLabel = activeTab === 'today'
+    ? '当天资金曲线内容'
+    : activeTab === 'daily'
+      ? '近30日资金流向内容'
+      : activeTab === 'etf_flow'
+        ? 'ETF资金内容'
+        : 'ETF申购明细内容'
   return <section className="fund-flow-chart-tabs" aria-label="资金曲线切换">
-    <div className="fund-flow-chart-tablist" role="tablist" aria-label="资金曲线类型">
-      <button type="button" role="tab" aria-selected={activeTab === 'today'} aria-controls={todayPanelId} className={activeTab === 'today' ? 'active' : ''} onClick={() => selectTab('today')}>当天资金曲线</button>
-      <button type="button" role="tab" aria-selected={activeTab === 'daily'} aria-controls={dailyPanelId} className={activeTab === 'daily' ? 'active' : ''} onClick={() => selectTab('daily')}>近30日资金流向</button>
+    <div className="fund-flow-chart-tablist" data-tabs={tabCount} role="tablist" aria-label="资金曲线类型">
+      <button type="button" role="tab" aria-selected={!mobileIntradayActive && activeTab === 'today'} aria-controls={todayPanelId} className={!mobileIntradayActive && activeTab === 'today' ? 'active' : ''} onClick={() => selectTab('today')}>当天资金曲线</button>
+      <button type="button" role="tab" aria-selected={!mobileIntradayActive && activeTab === 'daily'} aria-controls={dailyPanelId} className={!mobileIntradayActive && activeTab === 'daily' ? 'active' : ''} onClick={() => selectTab('daily')}>近30日资金流向</button>
+      {!etfUnsupportedFund && <>
+        <button type="button" role="tab" aria-selected={!mobileIntradayActive && activeTab === 'etf_flow'} aria-controls={etfFlowPanelId} className={!mobileIntradayActive && activeTab === 'etf_flow' ? 'active' : ''} onClick={() => selectTab('etf_flow')}>ETF资金</button>
+        <button type="button" role="tab" aria-selected={!mobileIntradayActive && activeTab === 'etf_holdings'} aria-controls={etfHoldingsPanelId} className={!mobileIntradayActive && activeTab === 'etf_holdings' ? 'active' : ''} onClick={() => selectTab('etf_holdings')}>ETF申购明细</button>
+      </>}
+      {mobileIntradayTab && <button
+        type="button"
+        role="tab"
+        aria-selected={mobileIntradayActive}
+        aria-controls={`intraday-charts-${publicId}`}
+        className={`mobile-intraday-switch-tab${mobileIntradayActive ? ' active' : ''}`}
+        onClick={mobileIntradayTab.onSelect}
+      >App分时</button>}
     </div>
-    <div id={activeTab === 'today' ? todayPanelId : dailyPanelId} role="tabpanel" aria-label={activeTab === 'today' ? '当天资金曲线内容' : '近30日资金流向内容'}>
+    <div id={panelId} role="tabpanel" aria-label={panelLabel} hidden={mobileIntradayActive}>
       {activeTab === 'today'
         ? <TaskFundFlowHistory history={history} state={historyState} onRetry={() => setReloadVersion((version) => version + 1)} />
-        : <TaskFundFlowDaily daily={daily} state={dailyState} onRetry={() => setReloadVersion((version) => version + 1)} onPointChange={onDailyPointChange} />}
+        : activeTab === 'daily'
+          ? <TaskFundFlowDaily daily={daily} state={dailyState} onRetry={() => setReloadVersion((version) => version + 1)} onPointChange={onDailyPointChange} />
+          : activeTab === 'etf_flow'
+            ? <EtfFundFlowChartPanel
+              symbol={symbol}
+              data={etfData}
+              period={etfPeriod}
+              loading={etfLoading}
+              error={etfError}
+              onPeriodChange={setEtfPeriod}
+              onRetry={retryEtfFlow}
+              onOpenHoldings={() => selectTab('etf_holdings')}
+            />
+            : <EtfHoldingsTablePanel
+              symbol={symbol}
+              data={etfData}
+              loading={etfLoading}
+              error={etfError}
+              onRetry={retryEtfFlow}
+            />}
     </div>
   </section>
 }
@@ -428,7 +550,7 @@ function TaskFundFlowTabs({ publicId, finished, hasFundFlow, allowHistoricalFall
 function MarketSnapshotResult({ task }: { task: Job }) {
   const [historicalFundFlow, setHistoricalFundFlow] = useState<MainFundFlowValues | null | undefined>()
   const handleFundFlowTabChange = useCallback((tab: FundFlowChartTab) => {
-    if (tab === 'today') setHistoricalFundFlow(undefined)
+    if (tab !== 'daily') setHistoricalFundFlow(undefined)
   }, [])
   const handleDailyPointChange = useCallback((point: FundFlowDailyPoint) => {
     setHistoricalFundFlow(fundFlowValuesForDailyPoint(point))
@@ -472,6 +594,7 @@ function MarketSnapshotResult({ task }: { task: Job }) {
       <FundFlowTable task={snapshotTask} finished override={historicalFundFlow} />
       <TaskFundFlowTabs
         publicId={task.public_id}
+        symbol={task.symbol}
         finished
         hasFundFlow
         allowHistoricalFallback
@@ -485,7 +608,7 @@ function MarketSnapshotResult({ task }: { task: Job }) {
   </section>
 }
 
-function IntradayCharts({ series, publicId }: { series: IntradaySeriesValues, publicId: string }) {
+function IntradayCharts({ series, publicId, mobileHidden = false }: { series: IntradaySeriesValues, publicId: string, mobileHidden?: boolean }) {
   const charts = [
     ['large_order_net', '大单净量', true, 2],
     ['large_order_amount', '大单金额', true, 2],
@@ -504,7 +627,7 @@ function IntradayCharts({ series, publicId }: { series: IntradaySeriesValues, pu
   const activeChart = charts.find(([key]) => key === activeKey) ?? availableCharts[0]
   const chartsId = `intraday-charts-${publicId}`
   const [key, title, directional, precision] = activeChart
-  return <section className="intraday-section" aria-labelledby={`intraday-title-${publicId}`}>
+  return <section className="intraday-section" data-mobile-hidden={mobileHidden ? 'true' : undefined} aria-labelledby={`intraday-title-${publicId}`}>
     <div className="section-heading intraday-heading">
       <div>
         <p className="eyebrow">App 内部曲线</p>
@@ -544,19 +667,35 @@ export function JobResult({ task, isLatest = false, onRetry, retrying = false }:
   onRetry?: () => void,
   retrying?: boolean,
 }) {
+  const compactMobile = useCompactMobileViewport()
+  const [mobilePane, setMobilePane] = useState<'fund' | 'intraday'>('fund')
   const [historicalFundFlow, setHistoricalFundFlow] = useState<MainFundFlowValues | null | undefined>()
   const handleFundFlowTabChange = useCallback((tab: FundFlowChartTab) => {
-    if (tab === 'today') setHistoricalFundFlow(undefined)
+    setMobilePane('fund')
+    if (tab !== 'daily') setHistoricalFundFlow(undefined)
   }, [])
   const handleDailyPointChange = useCallback((point: FundFlowDailyPoint) => {
     setHistoricalFundFlow(fundFlowValuesForDailyPoint(point))
   }, [])
   useEffect(() => {
+    setMobilePane('fund')
     setHistoricalFundFlow(undefined)
   }, [task.public_id])
   const finished = task.status === 'COMPLETED' || task.status === 'PARTIAL'
   const loading = loadingStatuses.has(task.status)
   const stockDisplayName = task.values.stock_name ? `${task.values.stock_name}（${task.symbol}）` : task.symbol
+  const hasFundFlow = Object.values(task.values.main_fund_flow ?? {}).some((period) => (
+    Object.entries(period).some(([key, value]) => key !== 'unit' && value !== null)
+  ))
+  const allowHistoricalFallback = task.status === 'FAILED' && task.error_code === 'DIRECT_PROTOCOL_RESPONSE_TIMEOUT'
+  const hasFundFlowTabs = (finished || allowHistoricalFallback) && (hasFundFlow || allowHistoricalFallback)
+  const hasIntradayPoints = Boolean(
+    task.values.intraday_series && (
+      task.values.intraday_series.large_order_net.points.length > 0
+      || task.values.intraday_series.large_order_amount.points.length > 0
+      || task.values.intraday_series.retail_count.points.length > 0
+    ),
+  )
 
   return <article className={`job-result${isLatest ? ' latest-job' : ''}`} aria-live="polite" aria-busy={loading}>
     <div className="job-heading">
@@ -603,18 +742,23 @@ export function JobResult({ task, isLatest = false, onRetry, retrying = false }:
       <FundFlowTable task={task} finished={finished} override={historicalFundFlow} />
       <TaskFundFlowTabs
         publicId={task.public_id}
+        symbol={task.symbol}
         finished={finished}
-        hasFundFlow={Object.values(task.values.main_fund_flow ?? {}).some((period) => Object.entries(period).some(([key, value]) => key !== 'unit' && value !== null))}
-        allowHistoricalFallback={task.status === 'FAILED' && task.error_code === 'DIRECT_PROTOCOL_RESPONSE_TIMEOUT'}
+        hasFundFlow={hasFundFlow}
+        allowHistoricalFallback={allowHistoricalFallback}
         onTabChange={handleFundFlowTabChange}
         onDailyPointChange={handleDailyPointChange}
+        mobileIntradayTab={compactMobile && hasIntradayPoints && hasFundFlowTabs ? {
+          active: mobilePane === 'intraday',
+          onSelect: () => setMobilePane('intraday'),
+        } : undefined}
       />
-      </div>
-
       {task.values.intraday_series && <IntradayCharts
-      publicId={task.public_id}
-      series={task.values.intraday_series}
+        publicId={task.public_id}
+        series={task.values.intraday_series}
+        mobileHidden={compactMobile && hasFundFlowTabs && mobilePane !== 'intraday'}
       />}
+      </div>
     </>}
     {task.status === 'MARKET_SNAPSHOT' && task.market_snapshot && <MarketSnapshotResult task={task} />}
 
@@ -731,6 +875,7 @@ function StockTabs({ tabs, activePublicId, onSelect, onRequestDelete }: {
 
 export default function App({ initialTask }: { initialTask?: Job }) {
   const isAdmin = window.location.hash === '#admin'
+  const [skin, toggleSkin] = useThsSkin()
   const [symbol, setSymbol] = useState('')
   const [symbolLookup, setSymbolLookup] = useState<SymbolLookupState>({ status: 'idle' })
   const [suggestions, setSuggestions] = useState<SymbolSuggestion[]>([])
@@ -1164,109 +1309,117 @@ export default function App({ initialTask }: { initialTask?: Job }) {
 
   if (isAdmin) return <AdminPage autoLoad />
 
-  return <main className="page-shell">
-    <header className="query-header">
-      <div className="query-brand">
-        <span className="query-brand-mark" aria-hidden="true">顺</span>
-        <div>
-          <h1>股票数据查询</h1>
-          <p>八项核心指标 · 主力资金 · 分时曲线</p>
-        </div>
-      </div>
-      <div className="more-menu" ref={moreMenuRef}>
-        <button type="button" aria-expanded={moreOpen} aria-haspopup="true" aria-controls="more-menu-panel" onClick={() => setMoreOpen((open) => !open)}>更多</button>
-        {moreOpen && <nav className="more-menu-panel" id="more-menu-panel" aria-label="辅助入口">
-          <a href="/market">进入行情中心</a>
-          <a href="/#admin">管理台</a>
-          {!initialTask && tabs.length > 0 && <button type="button" className="menu-danger" onClick={clearHistory}>清空本机记录</button>}
-        </nav>}
-      </div>
-    </header>
-
-    <section className="panel submit-panel" aria-label="提交采集任务">
-      <form onSubmit={submit}>
-        <label className="sr-only" htmlFor="symbol">股票代码或名称</label>
-        <div className="form-row">
-          <div className="symbol-entry-field" ref={symbolEntryRef}>
-            <input
-              ref={symbolInputRef}
-              id="symbol"
-              name="stock-symbol"
-              type="text"
-              inputMode="search"
-              autoComplete="off"
-              role="combobox"
-              aria-autocomplete="list"
-              aria-expanded={suggestionsOpen}
-              aria-controls="symbol-suggestion-list"
-              aria-activedescendant={activeSuggestionIndex >= 0 ? `symbol-suggestion-${activeSuggestionIndex}` : undefined}
-              aria-describedby="symbol-lookup-status"
-              value={symbol}
-              onChange={(event) => changeSymbol(event.target.value)}
-              onKeyDown={handleSymbolKeyDown}
-              onCompositionStart={() => setComposingSymbol(true)}
-              onCompositionEnd={(event) => {
-                setComposingSymbol(false)
-                changeSymbol(event.currentTarget.value)
-              }}
-              onFocus={() => {
-                if (suggestionState !== 'idle') setSuggestionsOpen(true)
-              }}
-              placeholder="输入代码、名称或拼音前缀"
-              maxLength={32}
-            />
-            {suggestionsOpen && <div
-              className="symbol-suggestion-list"
-              id="symbol-suggestion-list"
-              role="listbox"
-              aria-label="股票候选"
-            >
-              {suggestionState === 'loading' && <p role="status">正在搜索股票…</p>}
-              {suggestionState === 'empty' && <p>没有匹配的股票</p>}
-              {suggestionState === 'unavailable' && <p>股票候选查询暂时不可用</p>}
-              {suggestionState === 'ready' && suggestions.map((suggestion, index) => <button
-                type="button"
-                role="option"
-                aria-selected={index === activeSuggestionIndex}
-                id={`symbol-suggestion-${index}`}
-                key={`${suggestion.symbol}-${suggestion.market}`}
-                className="symbol-suggestion-option"
-                onMouseDown={(event) => event.preventDefault()}
-                onClick={() => chooseSuggestion(suggestion)}
-              >
-                <strong>{suggestion.name}</strong>
-                <span>{suggestion.symbol}</span>
-                <small>{suggestion.market_label || suggestion.market}</small>
-              </button>)}
-            </div>}
+  return <main className={tabs.length > 0 ? 'page-shell has-stock-tabs' : 'page-shell'}>
+    <div className="query-command-bar">
+      <header className="query-header">
+        <div className="query-brand">
+          <button
+            type="button"
+            className="query-brand-mark ths-split-brand-btn"
+            onClick={toggleSkin}
+            aria-label={skin === 'dark' ? '切换为同花顺红白浅色主题' : '切换为同花顺暗色盘口主题'}
+            title={skin === 'dark' ? '当前：方案A暗色盘口（点击切换方案C红白浅色）' : '当前：方案C红白浅色（点击切换方案A暗色盘口）'}
+          >顺</button>
+          <div>
+            <h1>股票数据查询</h1>
+            <p>八项核心指标 · 主力资金 · 分时曲线</p>
           </div>
-          <button type="submit" aria-label="提交采集任务" disabled={submitting || !verifiedSymbol}>{submitting ? '提交中…' : '查询'}</button>
         </div>
-        <div
-          id="symbol-lookup-status"
-          className={`symbol-lookup symbol-lookup-${symbolLookup.status}`}
-          aria-live="polite"
-        >
-          {symbolLookup.status === 'idle' && suggestionState === 'idle' && <span>输入 2 位以上代码、名称或拼音前缀搜索</span>}
-          {symbolLookup.status === 'idle' && suggestionState === 'ready' && <span>选择候选后将进行六位代码精确确认</span>}
-          {symbolLookup.status === 'loading' && <span>正在查询股票…</span>}
-          {symbolLookup.status === 'invalid' && <span>未找到该股票</span>}
-          {symbolLookup.status === 'unavailable' && <span>股票查询暂时不可用</span>}
-          {symbolLookup.status === 'valid' && <>
-            <strong className="symbol-lookup-value">{symbolLookup.result.name}（{symbolLookup.result.symbol}）</strong>
-            <button
-              type="button"
-              className="symbol-edit"
-              onClick={() => {
-                symbolInputRef.current?.focus()
-                symbolInputRef.current?.select()
-              }}
-            >修改代码</button>
-          </>}
+        <div className="more-menu" ref={moreMenuRef}>
+          <button type="button" aria-expanded={moreOpen} aria-haspopup="true" aria-controls="more-menu-panel" onClick={() => setMoreOpen((open) => !open)}>更多</button>
+          {moreOpen && <nav className="more-menu-panel" id="more-menu-panel" aria-label="辅助入口">
+            <a href="/market">进入行情中心</a>
+            <a href="/#admin">管理台</a>
+            {!initialTask && tabs.length > 0 && <button type="button" className="menu-danger" onClick={clearHistory}>清空本机记录</button>}
+          </nav>}
         </div>
-      </form>
-      {error && <p className="error form-error" role="alert">{error}</p>}
-    </section>
+      </header>
+
+      <section className="panel submit-panel" aria-label="提交采集任务">
+        <form onSubmit={submit}>
+          <label className="sr-only" htmlFor="symbol">股票代码或名称</label>
+          <div className="form-row">
+            <div className="symbol-entry-field" ref={symbolEntryRef}>
+              <input
+                ref={symbolInputRef}
+                id="symbol"
+                name="stock-symbol"
+                type="text"
+                inputMode="search"
+                autoComplete="off"
+                role="combobox"
+                aria-autocomplete="list"
+                aria-expanded={suggestionsOpen}
+                aria-controls="symbol-suggestion-list"
+                aria-activedescendant={activeSuggestionIndex >= 0 ? `symbol-suggestion-${activeSuggestionIndex}` : undefined}
+                aria-describedby="symbol-lookup-status"
+                value={symbol}
+                onChange={(event) => changeSymbol(event.target.value)}
+                onKeyDown={handleSymbolKeyDown}
+                onCompositionStart={() => setComposingSymbol(true)}
+                onCompositionEnd={(event) => {
+                  setComposingSymbol(false)
+                  changeSymbol(event.currentTarget.value)
+                }}
+                onFocus={() => {
+                  if (suggestionState !== 'idle') setSuggestionsOpen(true)
+                }}
+                placeholder="输入代码、名称或拼音前缀"
+                maxLength={32}
+              />
+              {suggestionsOpen && <div
+                className="symbol-suggestion-list"
+                id="symbol-suggestion-list"
+                role="listbox"
+                aria-label="股票候选"
+              >
+                {suggestionState === 'loading' && <p role="status">正在搜索股票…</p>}
+                {suggestionState === 'empty' && <p>没有匹配的股票</p>}
+                {suggestionState === 'unavailable' && <p>股票候选查询暂时不可用</p>}
+                {suggestionState === 'ready' && suggestions.map((suggestion, index) => <button
+                  type="button"
+                  role="option"
+                  aria-selected={index === activeSuggestionIndex}
+                  id={`symbol-suggestion-${index}`}
+                  key={`${suggestion.symbol}-${suggestion.market}`}
+                  className="symbol-suggestion-option"
+                  onMouseDown={(event) => event.preventDefault()}
+                  onClick={() => chooseSuggestion(suggestion)}
+                >
+                  <strong>{suggestion.name}</strong>
+                  <span>{suggestion.symbol}</span>
+                  <small>{suggestion.market_label || suggestion.market}</small>
+                </button>)}
+              </div>}
+            </div>
+            <button type="submit" aria-label="提交采集任务" disabled={submitting || !verifiedSymbol}>{submitting ? '提交中…' : '查询'}</button>
+          </div>
+          <div
+            id="symbol-lookup-status"
+            className={`symbol-lookup symbol-lookup-${symbolLookup.status}${symbolLookup.status === 'idle' && suggestionState === 'idle' ? ' symbol-lookup-idle' : ''}`}
+            aria-live="polite"
+          >
+            {symbolLookup.status === 'idle' && suggestionState === 'idle' && <span>输入 2 位以上代码、名称或拼音前缀搜索</span>}
+            {symbolLookup.status === 'idle' && suggestionState === 'ready' && <span>选择候选后将进行六位代码精确确认</span>}
+            {symbolLookup.status === 'loading' && <span>正在查询股票…</span>}
+            {symbolLookup.status === 'invalid' && <span>未找到该股票</span>}
+            {symbolLookup.status === 'unavailable' && <span>股票查询暂时不可用</span>}
+            {symbolLookup.status === 'valid' && <>
+              <strong className="symbol-lookup-value">{symbolLookup.result.name}（{symbolLookup.result.symbol}）</strong>
+              <button
+                type="button"
+                className="symbol-edit"
+                onClick={() => {
+                  symbolInputRef.current?.focus()
+                  symbolInputRef.current?.select()
+                }}
+              >修改代码</button>
+            </>}
+          </div>
+        </form>
+        {error && <p className="error form-error" role="alert">{error}</p>}
+      </section>
+    </div>
 
     <section className="history-section" aria-labelledby="history-title">
       <div className="history-heading">

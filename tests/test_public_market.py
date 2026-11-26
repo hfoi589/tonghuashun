@@ -1332,3 +1332,54 @@ def test_direct_enrichment_blocks_cross_day_fund_flow_fallback_when_quote_has_to
 
     assert same_day.main_fund_flow == yesterday_periods
     assert same_day.stored_trade_dates["main_fund_flow"] == "20261125"
+
+
+def test_tencent_read_order_books_batch_parses_stock_and_exchange_fund() -> None:
+    from level2_service.public_market import TencentPublicMarketProvider
+
+    def _raw_ob(symbol: str, name: str, price: str, prev_close: str, bid1: str, ask1: str, lup: str, ldown: str) -> str:
+        fields = [""] * 50
+        fields[0] = "1"
+        fields[1] = name
+        fields[2] = symbol
+        fields[3] = price
+        fields[4] = prev_close
+        for lvl in range(5):
+            fields[9 + lvl * 2] = bid1 if lvl == 0 else "0.00"
+            fields[10 + lvl * 2] = str(100 + lvl) if lvl == 0 else "0"
+            fields[19 + lvl * 2] = ask1 if lvl == 0 else "0.00"
+            fields[20 + lvl * 2] = str(200 + lvl) if lvl == 0 else "0"
+        fields[30] = "20261126101500"
+        fields[47] = lup
+        fields[48] = ldown
+        return "~".join(fields)
+
+    r1 = _raw_ob("601872", "招商轮船", "10.20", "10.00", "10.19", "10.20", "11.00", "9.00")
+    r2 = _raw_ob("000001", "平安银行", "11.50", "11.40", "11.49", "11.50", "12.54", "10.26")
+    r3 = _raw_ob("160723", "嘉实原油", "2.115", "2.100", "2.114", "2.115", "2.310", "1.890")
+    urls: list[str] = []
+
+    def fake_fetch(url: str, _timeout: float) -> bytes:
+        urls.append(url)
+        if "sh601872,sz000001" in url:
+            return f'v_sh601872="{r1}";v_sz000001="{r2}";'.encode("gb18030")
+        return f'v_sz160723="{r3}";'.encode("gb18030")
+
+    provider = TencentPublicMarketProvider(fetch=fake_fetch)
+    books = provider.read_order_books_batch(
+        [
+            SymbolLookup(symbol="601872", name="招商轮船", market="17"),
+            SymbolLookup(symbol="000001", name="平安银行", market="33"),
+            SymbolLookup(symbol="160723", name="嘉实原油", market="36"),
+        ],
+        chunk_size=2,
+    )
+
+    assert len(urls) == 2
+    assert set(books) == {"601872", "000001", "160723"}
+    assert books["601872"]["precision"] == 2
+    assert books["601872"]["bids"][0]["price"] == "10.19"
+    assert books["601872"]["asks"][0]["price"] == "10.20"
+    assert books["160723"]["precision"] == 3
+    assert books["160723"]["bids"][0]["price"] == "2.114"
+    assert books["160723"]["asks"][0]["price"] == "2.115"

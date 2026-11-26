@@ -159,6 +159,83 @@ export interface TaskFundFlowDaily {
   points: TaskFundFlowDailyPoint[]
 }
 
+export type EtfFlowPeriod = '20d' | '60d' | '120d' | '250d'
+export type EtfFlowTone = 'up' | 'down' | 'flat'
+
+export interface EtfFlowSummaryMetric {
+  key: string
+  label: string
+  value_text: string
+  tone: EtfFlowTone
+}
+
+export interface EtfFlowLatestBadge {
+  date: string
+  full_date: string | null
+  value_text: string
+  text: string
+  tone: EtfFlowTone
+}
+
+export interface EtfFlowChartPoint {
+  date: string
+  short_date: string
+  cumulative_value: number | null
+  cumulative_text: string | null
+  daily_value: number | null
+  daily_text: string | null
+  close_price: number | null
+  price_change: number | null
+}
+
+export interface EtfHoldingItem {
+  symbol: string
+  market: string
+  name: string
+  net_inflow_raw: number | null
+  net_inflow_text: string
+  tone: EtfFlowTone
+  streak_days: number | null
+  hold_rate: number | null
+  hold_rate_text: string
+}
+
+export type EtfUpdateStatus = 'settled' | 'pending_morning_update' | 'stale_fallback' | 'partial' | 'empty'
+
+export interface EtfSourceErrors {
+  summary: string | null
+  line: string | null
+  holdings: string | null
+  daily_kline: string | null
+}
+
+export interface EtfFundFlowResponse {
+  symbol: string
+  name: string | null
+  market: string
+  period: EtfFlowPeriod
+  available: boolean
+  data_date?: string | null
+  expected_trade_date?: string | null
+  stale?: boolean
+  degraded?: boolean
+  update_status?: EtfUpdateStatus
+  source_errors?: EtfSourceErrors
+  summary: {
+    latest_badge: EtfFlowLatestBadge | null
+    metrics: EtfFlowSummaryMetric[]
+  }
+  chart: {
+    cumulative_unit: '万' | '亿'
+    daily_unit: '万' | '亿'
+    points: EtfFlowChartPoint[]
+  }
+  holdings: {
+    total_count: number
+    items: EtfHoldingItem[]
+  }
+}
+
 export interface RequestLog { id:number; timestamp:string; ip:string|null; user_id:number|null; user_name:string|null; device_type:string|null; user_agent:string|null; path:string; action:string; symbol:string|null; stock_name:string|null; status_code:number; task_status:string|null; error_code:string|null; duration_ms:number; public_id:string|null }
 
 export interface RunnerHealth {
@@ -348,6 +425,10 @@ export const api = {
   getJob: (publicId: string) => request<Job>(`/api/v1/jobs/${encodeURIComponent(publicId)}`),
   fundFlowHistory: (publicId: string) => request<TaskFundFlowHistory>(`/api/v1/jobs/${encodeURIComponent(publicId)}/fund-flow-history`, { cache: 'no-store' }),
   fundFlowDaily: (publicId: string, limit = 30) => request<TaskFundFlowDaily>(`/api/v1/jobs/${encodeURIComponent(publicId)}/fund-flow-daily?limit=${limit}`, { cache: 'no-store' }),
+  etfFlow: (publicId: string, period: EtfFlowPeriod = '60d', signal?: AbortSignal) => request<EtfFundFlowResponse>(
+    `/api/v1/jobs/${encodeURIComponent(publicId)}/etf-flow?period=${encodeURIComponent(period)}`,
+    { cache: 'no-store', signal },
+  ),
   retryJob: (publicId: string) => request<Job>(`/api/v1/jobs/${encodeURIComponent(publicId)}/retry`, {
     method: 'POST',
   }),

@@ -98,17 +98,21 @@ export function FundFlowHistoryPanel({ symbol, market, pollingEnabled = true, on
   }
 
   return <section className="fund-flow-history-panel" aria-label="主力流向历史">
-    <div className="fund-flow-history-toolbar">
-      <div><span>历史折线</span><small>{loading ? '正在更新…' : hasHistory ? `单位：万元 · ${periodLabel}` : '暂无历史数据'}</small></div>
-      {hasHistory && <label>交易日<select value={selectedDate ?? ''} onChange={(event) => { setSelectedDate(event.target.value); void load(event.target.value) }} aria-label="选择资金流交易日">
-        {history?.available_dates.map((date) => <option key={date} value={date}>{dateLabel(date)}</option>)}
-      </select></label>}
-    </div>
-    {hasHistory && <div className="fund-flow-history-periods" role="tablist" aria-label="资金流周期">
-      {periods.map(([value, label]) => <button type="button" role="tab" aria-selected={period === value} className={period === value ? 'active' : ''} key={value} onClick={() => setPeriod(value)}>{label}</button>)}
+    {hasHistory ? <div className="fund-flow-history-toolbar fund-flow-history-toolbar-merged">
+      <div className="fund-flow-history-periods" role="tablist" aria-label="资金流周期">
+        {periods.map(([value, label]) => <button type="button" role="tab" aria-selected={period === value} className={period === value ? 'active' : ''} key={value} onClick={() => setPeriod(value)}>{label}</button>)}
+      </div>
+      <div className="fund-flow-history-meta-right">
+        <small>{loading ? '正在更新…' : `单位：万元 · ${periodLabel}`}</small>
+        <label><span className="sr-only">交易日</span><select value={selectedDate ?? ''} onChange={(event) => { setSelectedDate(event.target.value); void load(event.target.value) }} aria-label="选择资金流交易日">
+          {history?.available_dates.map((date) => <option key={date} value={date}>{dateLabel(date)}</option>)}
+        </select></label>
+      </div>
+    </div> : <div className="fund-flow-history-toolbar">
+      <div><span>历史折线</span><small>{loading ? '正在更新…' : '暂无历史数据'}</small></div>
     </div>}
     {error && <p className="market-capability-gap"><strong>资金流历史加载失败</strong><span>{error}</span><button type="button" onClick={() => void load(selectedDate)}>重新加载</button></p>}
-    {!error && hasHistory && selectedPeriod && <FundFlowHistoryChart period={selectedPeriod} />}
+    {!error && hasHistory && selectedPeriod && <FundFlowHistoryChart period={selectedPeriod} tradeDate={history?.trade_date} />}
     {!error && !hasHistory && <p className="fund-flow-history-empty">定期刷新后，这里会按交易日累积明盘、暗盘、散户流入和主力净流入曲线。</p>}
   </section>
 }

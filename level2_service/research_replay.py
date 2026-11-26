@@ -147,6 +147,37 @@ def _minute(value: object) -> int | None:
     return int(digits[:2]) * 60 + int(digits[2:4])
 
 
+def _trading_minute(value: object) -> int | None:
+    """Map A-share intraday HH:MM to continuous trading minutes (0..240)."""
+    clock = _minute(value)
+    if clock is None:
+        return None
+    if 9 * 60 + 30 <= clock <= 11 * 60 + 30:
+        return clock - (9 * 60 + 30)
+    if 13 * 60 <= clock <= 15 * 60:
+        return 120 + (clock - 13 * 60)
+    return None
+
+
+def rule_uses_flow(rules: Sequence[Mapping[str, Any]]) -> bool:
+    """Return True when any rule condition depends on intraday fund/large-order flow."""
+    for rule in rules:
+        if not isinstance(rule, Mapping):
+            continue
+        for cond in rule.get("conditions") or []:
+            if not isinstance(cond, Mapping):
+                continue
+            ctype = str(cond.get("type") or "")
+            if ctype == "flow_change_pct":
+                return True
+            if ctype == "swing_reversal" and str(cond.get("flowFilter") or "off") in {
+                "increase",
+                "decrease",
+            }:
+                return True
+    return False
+
+
 def _macd_signal(
     points: Sequence[Mapping[str, object]],
     index: int,
@@ -531,6 +562,149 @@ def _condition_matches(
             markers = build_swing_reversal_markers(points, condition)
             matched = any(int(m["index"]) == index and m["side"] == side for m in markers)
         return matched, f"T0波段{'卖点' if side == 'sell' else '买点'}{'触发' if matched else '未触发'}"
+    if kind == "vwap_deviation_pct":
+        price = _number(current.get("price"))
+        avg_price = _number(current.get("average_price"))
+        target = _number(condition.get("value"))
+        if price is None or avg_price is None or avg_price <= 0 or target is None:
+            return False, "分时均价偏离数据或阈值无效"
+        dev = (price - avg_price) / avg_price * 100.0
+        is_lte = str(condition.get("direction") or "lte").lower() == "lte"
+        matched = dev <= target if is_lte else dev >= target
+        return matched, f"均价偏离 {dev:+.3f}% {'<=' if is_lte else '>='} {target:g}%"
+    if kind == "macd_state":
+        metric = str(condition.get("metric") or "diff").strip().lower()
+        raw_val = (
+            abs(_number(current.get("macd")) or 0.0)
+            if metric == "abs_macd" and _number(current.get("macd")) is not None
+            else _number(current.get(metric if metric in {"diff", "dea", "macd"} else "diff"))
+        )
+        target = _number(condition.get("value"))
+        if target is None:
+            target = 0.0
+        if raw_val is None:
+            return False, "MACD 状态指标无效"
+        is_lte = str(condition.get("direction") or "gte").lower() == "lte"
+        matched = raw_val <= target if is_lte else raw_val >= target
+        return matched, f"{metric} {raw_val:.5f} {'<=' if is_lte else '>='} {target:g}"
+    if kind == "time_window":
+        cur_min = _minute(current.get("time"))
+        if cur_min is None:
+            return False, "当前分钟时间无效"
+        windows = condition.get("windows")
+        parsed_windows: list[tuple[int, int]] = []
+        if isinstance(windows, Sequence) and not isinstance(windows, (str, bytes)):
+            for w in windows:
+                if isinstance(w, Sequence) and len(w) >= 2:
+                    s_min, e_min = _minute(w[0]), _minute(w[1])
+                    if s_min is not None and e_min is not None:
+                        parsed_windows.append((min(s_min, e_min), max(s_min, e_min)))
+        elif condition.get("start") or condition.get("end"):
+            s_min = _minute(condition.get("start") or "09:30")
+            e_min = _minute(condition.get("end") or "15:00")
+            if s_min is not None and e_min is not None:
+                parsed_windows.append((min(s_min, e_min), max(s_min, e_min)))
+        if not parsed_windows:
+            return False, "时间窗口配置无效"
+        matched = any(s <= cur_min <= e for s, e in parsed_windows)
+        return matched, f"时间 {current.get('time')} {'命中' if matched else '不在'}目标时段"
+    if kind == "volume_ratio":
+        lookback = max(2, min(120, int(_number(condition.get("lookback")) or 20)))
+        curr_vol = _number(current.get("volume") or current.get("volume_shares"))
+        prev_vols = [
+            v
+            for item in points[max(0, index - lookback) : index]
+            if (v := _number(item.get("volume") or item.get("volume_shares"))) is not None and v >= 0
+        ]
+        target = _number(condition.get("value"))
+        if curr_vol is None or not prev_vols or target is None:
+            return False, "成交量均量基线不足"
+        avg_vol = sum(prev_vols) / len(prev_vols)
+        if avg_vol <= 0:
+            return False, "成交量均量为 0"
+        ratio = curr_vol / avg_vol
+        is_lte = str(condition.get("direction") or "gte").lower() == "lte"
+        matched = ratio <= target if is_lte else ratio >= target
+        return matched, f"量比 {ratio:.2f}x {'<=' if is_lte else '>='} {target:g}x"
+    if kind == "price_momentum_pct":
+        minutes = max(1, min(240, int(_number(condition.get("minutes")) or 5)))
+        curr_price = _number(current.get("price"))
+        curr_tm = _trading_minute(current.get("time"))
+        target = _number(condition.get("value"))
+        if curr_price is None or curr_price <= 0 or target is None:
+            return False, "价格动量数据无效"
+        prior_price: float | None = None
+        if curr_tm is not None:
+            target_tm = curr_tm - minutes
+            for candidate in reversed(points[:index]):
+                cand_tm = _trading_minute(candidate.get("time"))
+                cand_p = _number(candidate.get("price"))
+                if cand_tm is None or cand_p is None or cand_p <= 0:
+                    continue
+                prior_price = cand_p
+                if cand_tm <= target_tm:
+                    break
+        elif index - minutes >= 0:
+            prior_price = _number(points[index - minutes].get("price"))
+        if prior_price is None or prior_price <= 0:
+            return False, f"{minutes}分钟动量前值不足"
+        mom = (curr_price - prior_price) / prior_price * 100.0
+        is_lte = str(condition.get("direction") or "gte").lower() == "lte"
+        matched = mom <= target if is_lte else mom >= target
+        return matched, f"{minutes}分钟动量 {mom:+.3f}% {'<=' if is_lte else '>='} {target:g}%"
+    if kind == "brent_overnight_pct":
+        val = _number(current.get("brn_overnight_pct"))
+        target = _number(condition.get("value"))
+        if val is None or target is None:
+            return False, "布伦特隔夜涨跌幅数据或阈值无效"
+        is_lte = str(condition.get("direction") or "gte").lower() == "lte"
+        matched = val <= target if is_lte else val >= target
+        return matched, f"BRN0Y隔夜 {val:+.2f}% {'<=' if is_lte else '>='} {target:g}%"
+    if kind == "brent_change_pct":
+        anchor = str(condition.get("anchor") or "prev_1500").strip().lower()
+        field = "brn_intraday_pct" if anchor == "open_0930" else "brn_from_prev_close_pct"
+        val = _number(current.get(field))
+        target = _number(condition.get("value"))
+        if val is None or target is None:
+            return False, "布伦特累计涨跌幅数据或阈值无效"
+        is_lte = str(condition.get("direction") or "gte").lower() == "lte"
+        matched = val <= target if is_lte else val >= target
+        label = "BRN0Y盘中" if anchor == "open_0930" else "BRN0Y较昨15:00"
+        return matched, f"{label} {val:+.2f}% {'<=' if is_lte else '>='} {target:g}%"
+    if kind == "brent_momentum_pct":
+        minutes = max(1, min(240, int(_number(condition.get("minutes")) or 5)))
+        curr_b = _number(current.get("brn_price"))
+        curr_tm = _trading_minute(current.get("time"))
+        target = _number(condition.get("value"))
+        if curr_b is None or curr_b <= 0 or target is None:
+            return False, "布伦特动量数据无效"
+        prior_b: float | None = None
+        if curr_tm is not None:
+            target_tm = curr_tm - minutes
+            for candidate in reversed(points[:index]):
+                cand_tm = _trading_minute(candidate.get("time"))
+                cand_b = _number(candidate.get("brn_price"))
+                if cand_tm is None or cand_b is None or cand_b <= 0:
+                    continue
+                prior_b = cand_b
+                if cand_tm <= target_tm:
+                    break
+        elif index - minutes >= 0:
+            prior_b = _number(points[index - minutes].get("brn_price"))
+        if prior_b is None or prior_b <= 0:
+            return False, f"BRN0Y {minutes}分钟动量前值不足"
+        mom = (curr_b - prior_b) / prior_b * 100.0
+        is_lte = str(condition.get("direction") or "gte").lower() == "lte"
+        matched = mom <= target if is_lte else mom >= target
+        return matched, f"BRN0Y {minutes}m动量 {mom:+.3f}% {'<=' if is_lte else '>='} {target:g}%"
+    if kind == "brent_spread_pct":
+        val = _number(current.get("brn_spread_pct"))
+        target = _number(condition.get("value"))
+        if val is None or target is None:
+            return False, "布伦特跨市场价差数据或阈值无效"
+        is_lte = str(condition.get("direction") or "lte").lower() == "lte"
+        matched = val <= target if is_lte else val >= target
+        return matched, f"A股-BRN0Y价差 {val:+.2f}% {'<=' if is_lte else '>='} {target:g}%"
     return False, "未知条件"
 
 
@@ -610,6 +784,9 @@ def build_replay_markers(
         if not conditions:
             continue
         joiner = "or" if rule.get("joiner") == "or" else "and"
+        cooldown_minutes = max(0, int(_number(rule.get("cooldown_minutes")) or 0))
+        last_hit_tm: int | None = None
+        last_hit_index: int | None = None
         swing_lookups: dict[int, set[tuple[int, str]]] = {}
         for cond_idx, condition in enumerate(conditions):
             if condition.get("type") == "swing_reversal":
@@ -635,11 +812,20 @@ def build_replay_markers(
             price = _number(point.get("price"))
             if price is None or price <= 0:
                 continue
+            curr_tm = _trading_minute(point.get("time"))
+            if cooldown_minutes > 0:
+                if curr_tm is not None and last_hit_tm is not None:
+                    if curr_tm - last_hit_tm < cooldown_minutes:
+                        continue
+                elif last_hit_index is not None and index - last_hit_index < cooldown_minutes:
+                    continue
             side = "sell" if rule.get("side") == "sell" else "buy"
             key = (index, side, str(rule.get("id") or ""))
             if key in seen:
                 continue
             seen.add(key)
+            last_hit_tm = curr_tm
+            last_hit_index = index
             markers.append(
                 {
                     "index": index,

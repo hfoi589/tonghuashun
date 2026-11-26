@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import json
 import logging
 import re
@@ -33,11 +34,18 @@ from .device_lifecycle import (
     DeviceLifecycleError,
     DeviceLifecycleState,
 )
+from .etf_fund_flow import (
+    ETF_FLOW_PERIODS,
+    EtfFundFlowError,
+    TonghuashunEtfFundFlowService,
+    fetch_etf_flow_payload,
+)
+from .fund_flow_history import clip_unreached_fund_flow_points
 from .models import CaptureKind, CaptureStatus, TaskRecord, TaskStatus, ValueSource, utc_now
 from .goodluck_bridge import install_goodluck_routes
 from .market_api import install_market_routes
 from .vibe_api import install_vibe_routes
-from .market_data import is_china_market_open
+from .market_data import fixed_market_error_code, is_china_market_open
 from .parsed_values import (
     DirectRequestError,
     SymbolLookup,
@@ -421,6 +429,7 @@ def create_app(
     symbol_catalog_refresh_minute: int = 20,
     previous_trading_date: Callable[[str], str] | None = None,
     expected_intraday_trade_date: Callable[[], str | None] | None = None,
+    intraday_minute_cap: Callable[[str], str | None] | None = None,
     core_prewarmer: Callable[[str | None], None] | None = None,
     core_session_invalidator: Callable[[], None] | None = None,
     fund_session_invalidator: Callable[[], None] | None = None,
@@ -449,6 +458,15 @@ def create_app(
     request_log_store: RequestLogStore | None = None,
     workday_calendar: ChinaLegalWorkdayCalendar | None = None,
     goodluck_internal_token: str | None = None,
+    etf_flow_service: object | None = None,
+    etf_flow_monitor: object | None = None,
+    etf_flow_monitor_interval_seconds: float = 120.0,
+    trade_executor: object | None = None,
+    auto_trade_engine: object | None = None,
+    auto_trade_interval_seconds: float = 3.0,
+    quant_rule_store: object | None = None,
+    brent_monitor: object | None = None,
+    brent_monitor_interval_seconds: float = 20.0,
 ) -> FastAPI:
     """Build an isolated application instance for one service process."""
     if cleanup_interval_seconds <= 0:
@@ -463,6 +481,10 @@ def create_app(
         raise ValueError("premium_monitor_interval_seconds must be positive")
     if session_probe_interval_seconds <= 0:
         raise ValueError("session_probe_interval_seconds must be positive")
+    if etf_flow_monitor_interval_seconds <= 0:
+        raise ValueError("etf_flow_monitor_interval_seconds must be positive")
+    if auto_trade_interval_seconds <= 0:
+        raise ValueError("auto_trade_interval_seconds must be positive")
     if not 0 <= symbol_catalog_refresh_hour <= 23:
         raise ValueError("symbol_catalog_refresh_hour must be between 0 and 23")
     if not 0 <= symbol_catalog_refresh_minute <= 59:
@@ -597,15 +619,70 @@ def create_app(
                 except TimeoutError:
                     continue
 
+        async def etf_flow_loop() -> None:
+            while not stop.is_set():
+                try:
+                    await app.state.etf_flow_monitor.poll_once()
+                except Exception:
+                    logger.exception("etf fund flow prewarm failed")
+                try:
+                    await wait_for(stop.wait(), timeout=etf_flow_monitor_interval_seconds)
+                except TimeoutError:
+                    continue
+
         async def session_probe_loop() -> None:
             while not stop.is_set():
+                market_open_now = is_china_market_open()
                 try:
                     if app.state.session_probe is not None:
                         await app.state.session_probe.poll_once()
+                    prewarmer = app.state.core_prewarmer
+                    if market_open_now and callable(prewarmer):
+                        try:
+                            sig = inspect.signature(prewarmer)
+                            if "refresh_older_than_seconds" in sig.parameters:
+                                await to_thread(
+                                    lambda: prewarmer(None, refresh_older_than_seconds=14.0)
+                                )
+                            else:
+                                await to_thread(prewarmer, None)
+                        except (TypeError, ValueError):
+                            await to_thread(prewarmer, None)
                 except Exception:
                     logger.exception("preopen session probe failed")
+                loop_timeout = session_probe_interval_seconds
+                if market_open_now and callable(app.state.core_prewarmer):
+                    loop_timeout = min(loop_timeout, 15.0)
                 try:
-                    await wait_for(stop.wait(), timeout=session_probe_interval_seconds)
+                    await wait_for(stop.wait(), timeout=loop_timeout)
+                except TimeoutError:
+                    continue
+
+        async def auto_trade_loop() -> None:
+            while not stop.is_set():
+                started = time.monotonic()
+                try:
+                    if app.state.auto_trade_engine is not None:
+                        await app.state.auto_trade_engine.poll_once()
+                except Exception:
+                    logger.exception("auto trade poll failed")
+                remaining = max(1.0, auto_trade_interval_seconds - (time.monotonic() - started))
+                try:
+                    await wait_for(stop.wait(), timeout=remaining)
+                except TimeoutError:
+                    continue
+
+        async def brent_loop() -> None:
+            while not stop.is_set():
+                started = time.monotonic()
+                try:
+                    if app.state.brent_monitor is not None:
+                        await app.state.brent_monitor.poll_once()
+                except Exception:
+                    logger.exception("brent market poll failed")
+                remaining = max(5.0, brent_monitor_interval_seconds - (time.monotonic() - started))
+                try:
+                    await wait_for(stop.wait(), timeout=remaining)
                 except TimeoutError:
                     continue
 
@@ -683,8 +760,17 @@ def create_app(
         app.state.premium_task = (
             create_task(premium_loop()) if app.state.premium_monitor is not None else None
         )
+        app.state.etf_flow_task = (
+            create_task(etf_flow_loop()) if app.state.etf_flow_monitor is not None else None
+        )
         app.state.session_probe_task = (
             create_task(session_probe_loop()) if app.state.session_probe is not None else None
+        )
+        app.state.auto_trade_task = (
+            create_task(auto_trade_loop()) if app.state.auto_trade_engine is not None else None
+        )
+        app.state.brent_task = (
+            create_task(brent_loop()) if app.state.brent_monitor is not None else None
         )
         app.state.symbol_catalog_task = (
             create_task(symbol_catalog_loop())
@@ -707,8 +793,14 @@ def create_app(
                 await app.state.fund_flow_task
             if app.state.premium_task is not None:
                 await app.state.premium_task
+            if app.state.etf_flow_task is not None:
+                await app.state.etf_flow_task
             if app.state.session_probe_task is not None:
                 await app.state.session_probe_task
+            if app.state.auto_trade_task is not None:
+                await app.state.auto_trade_task
+            if app.state.brent_task is not None:
+                await app.state.brent_task
             if app.state.symbol_catalog_task is not None:
                 await app.state.symbol_catalog_task
             warmup_tasks = list(getattr(app.state, "goodluck_warmup_tasks", ()))
@@ -861,6 +953,17 @@ def create_app(
     app.state.account_session_refreshers = dict(account_session_refreshers or {})
     app.state.goodluck_internal_token = (goodluck_internal_token or "").strip() or None
     app.state.goodluck_warmup_tasks = set()
+    app.state.etf_flow_service = etf_flow_service or TonghuashunEtfFundFlowService()
+    app.state.etf_flow_monitor = etf_flow_monitor
+    app.state.trade_executor = trade_executor
+    app.state.auto_trade_engine = auto_trade_engine
+    app.state.brent_monitor = brent_monitor
+    if quant_rule_store is None and research_store is not None and hasattr(research_store, "path"):
+        from .quant_rules import SQLiteQuantRuleStore
+
+        quant_rule_store = SQLiteQuantRuleStore(research_store.path)
+        app.state.managed_resources = (*app.state.managed_resources, quant_rule_store)
+    app.state.quant_rule_store = quant_rule_store
     set_capture_root = getattr(app.state.store, "set_capture_root", None)
     if callable(set_capture_root):
         set_capture_root(app.state.capture_root)
@@ -1102,6 +1205,11 @@ def create_app(
         except LookupError:
             raise HTTPException(status_code=404, detail="fund flow history not found") from None
         points = history["periods"]["today"]["points"]
+        if callable(intraday_minute_cap) and history.get("trade_date"):
+            points = clip_unreached_fund_flow_points(
+                list(points),
+                intraday_minute_cap(str(history["trade_date"])),
+            )
         if not points and not market_open:
             for previous_date in history.get("available_dates", []):
                 if previous_date == history.get("trade_date"):
@@ -1111,6 +1219,11 @@ def create_app(
                 except LookupError:
                     continue
                 previous_points = previous_history["periods"]["today"]["points"]
+                if callable(intraday_minute_cap) and previous_history.get("trade_date"):
+                    previous_points = clip_unreached_fund_flow_points(
+                        list(previous_points),
+                        intraday_minute_cap(str(previous_history["trade_date"])),
+                    )
                 if previous_points:
                     history = previous_history
                     points = previous_points
@@ -1160,6 +1273,54 @@ def create_app(
             raise HTTPException(status_code=422, detail=str(error)) from None
         return {
             **daily,
+            "name": task.values.get("stock_name") or task.symbol,
+        }
+
+    @app.get("/api/v1/jobs/{public_id}/etf-flow")
+    async def get_task_etf_flow(public_id: str, period: str = Query("60d")):
+        if period not in ETF_FLOW_PERIODS:
+            raise HTTPException(status_code=422, detail="unsupported etf flow period")
+        task = app.state.store.get(public_id)
+        market_open = is_china_market_open()
+        can_use_closed_timeout_history = (
+            task is not None
+            and task.status == TaskStatus.FAILED
+            and task.error_code == "DIRECT_PROTOCOL_RESPONSE_TIMEOUT"
+            and not market_open
+        )
+        if task is None or (
+            task.status not in {
+                TaskStatus.COMPLETED,
+                TaskStatus.PARTIAL,
+                TaskStatus.MARKET_SNAPSHOT,
+            }
+            and not can_use_closed_timeout_history
+        ):
+            raise HTTPException(status_code=404, detail="etf fund flow not found")
+        service = getattr(app.state, "etf_flow_service", None)
+        if service is None:
+            raise HTTPException(status_code=503, detail="etf fund flow service is not configured")
+        try:
+            payload = await fetch_etf_flow_payload(
+                service,
+                app.state.market_data_broker,
+                task.symbol,
+                period,
+            )
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from None
+        except EtfFundFlowError as error:
+            raise HTTPException(
+                status_code=503,
+                detail=fixed_market_error_code(error, "ETF_FUND_FLOW_UNAVAILABLE"),
+            ) from None
+        except Exception as error:
+            raise HTTPException(
+                status_code=503,
+                detail=fixed_market_error_code(error, "ETF_FUND_FLOW_UNAVAILABLE"),
+            ) from None
+        return {
+            **payload,
             "name": task.values.get("stock_name") or task.symbol,
         }
 
@@ -1751,6 +1912,7 @@ def create_app(
         secure_cookies=secure_admin_cookies,
         previous_trading_date=previous_trading_date,
         expected_intraday_trade_date=expected_intraday_trade_date,
+        intraday_minute_cap=intraday_minute_cap,
     )
 
     install_goodluck_routes(
@@ -1758,6 +1920,7 @@ def create_app(
         resolve_symbol=resolve_symbol,
         previous_trading_date=previous_trading_date,
         expected_intraday_trade_date=expected_intraday_trade_date,
+        intraday_minute_cap=intraday_minute_cap,
     )
 
     install_vibe_routes(

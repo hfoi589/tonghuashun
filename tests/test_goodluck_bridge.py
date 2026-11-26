@@ -797,3 +797,283 @@ def test_bridge_quotes_and_history_isolate_cross_day_fund_flow_during_intraday(t
         assert hist_recovered.status_code == 200
         assert hist_recovered.json()["trade_date"] == "20261125"
         assert hist_recovered.json()["periods"]["today"]["points"][0]["main_hidden_inflow"] == "220.00"
+
+
+def test_bridge_premium_includes_brent_panel(tmp_path) -> None:
+    app, _, store = _build_app(tmp_path)
+    store.save_premium_snapshot(
+        {
+            "as_of": "2026-11-25 14:55:00",
+            "rows": [
+                {
+                    "symbol": "160723",
+                    "name": "嘉实原油LOF",
+                    "price": "1.250",
+                    "premium_rate": "1.20%",
+                }
+            ],
+            "valid_count": 1,
+            "errors": {},
+        }
+    )
+    with store._lock, store._connection:
+        store._connection.execute(
+            """INSERT INTO research_days(
+                   symbol, trade_date, name, market, source, pre_close,
+                   quote_price, quote_change_percent, quote_open, quote_high,
+                   quote_low, quote_volume, collected_at
+               ) VALUES('BRN0Y', '20261125', 'ICE布伦特原油连续', 'ICE', 'test', '72.000',
+                        '73.440', '+2.00%', '72.100', '73.800', '71.900', '5000',
+                        '2026-11-25T15:10:00+08:00')"""
+        )
+        store._connection.executemany(
+            """INSERT INTO research_points(
+                   symbol, trade_date, minute, price, average_price, volume, captured_at
+               ) VALUES('BRN0Y', '20261125', ?, ?, ?, '100', '2026-11-25T15:10:00+08:00')""",
+            [
+                ("09:30", "72.100", "72.100"),
+                ("15:00", "73.000", "72.600"),
+                ("15:10", "73.440", "72.700"),
+            ],
+        )
+        store._connection.execute(
+            """INSERT INTO research_days(
+                   symbol, trade_date, name, market, source, pre_close,
+                   quote_price, quote_change_percent, quote_open, quote_high,
+                   quote_low, quote_volume, collected_at
+               ) VALUES('160723', '20261125', '嘉实原油', 'SZ', 'test', '1.235',
+                        '1.250', '+1.21%', '1.240', '1.255', '1.235', '2000',
+                        '2026-11-25T15:00:00+08:00')"""
+        )
+        store._connection.execute(
+            """INSERT INTO research_days(
+                   symbol, trade_date, name, market, source, pre_close,
+                   quote_price, quote_change_percent, quote_open, quote_high,
+                   quote_low, quote_volume, collected_at
+               ) VALUES('513350', '20261125', '标普油气ETF富国', 'SH', 'test', '1.150',
+                        '1.210', '+5.22%', '1.160', '1.220', '1.150', '3000',
+                        '2026-11-25T15:00:00+08:00')"""
+        )
+        store._connection.executemany(
+            """INSERT INTO research_points(
+                   symbol, trade_date, minute, price, average_price, volume, captured_at
+               ) VALUES(?, '20261125', ?, ?, ?, '100', '2026-11-25T15:00:00+08:00')""",
+            [
+                ("160723", "09:30", "1.240", "1.240"),
+                ("160723", "15:00", "1.250", "1.245"),
+                ("513350", "09:30", "1.160", "1.160"),
+                ("513350", "15:00", "1.210", "1.190"),
+            ],
+        )
+
+    with TestClient(app) as client:
+        res = client.get("/api/internal/goodluck/premium", headers=_headers("uid:alice"))
+        assert res.status_code == 200
+        body = res.json()
+        assert len(body["rows"]) == 1
+        brent = body["brent"]
+        assert brent is not None
+        assert brent["symbol"] == "BRN0Y"
+        assert brent["price"] == 73.44
+        assert brent["ref_1500_price"] == 73.0
+        assert abs(brent["since_1500_pct"] - 0.6) < 0.05
+        assert len(brent["intraday_24h"]) >= 3
+        assert len(brent["series_5d"]) >= 3
+        assert len(brent["daily_july"]) >= 1
+        overlays = brent["fund_overlays"]
+        assert "160723" in overlays
+        assert "513350" in overlays
+        assert len(overlays["513350"]["daily_july"]) == 1
+        assert overlays["513350"]["intraday_24h"][-1]["fund_price"] == 1.21
+
+
+def test_bridge_trade_idempotency_50_symbols_and_sse_events(tmp_path) -> None:
+    import asyncio
+    from level2_service.auto_trade import AutoTradeEngine, SQLiteAutoTradeStore
+
+    accounts = SQLiteMarketAccountStore(tmp_path / "market.db")
+    rstore = SQLiteResearchStore(tmp_path / "research.db")
+    astore = SQLiteAutoTradeStore(tmp_path / "research.db")
+
+    place_calls = 0
+
+    class _FakeExec:
+        adb_serial = "emulator-5556"
+        active_tab = "buy"
+
+        def place_order(self, *, symbol: str, side: str, price: str, quantity: int, **_kwargs):
+            nonlocal place_calls
+            place_calls += 1
+            return {
+                "accepted": True,
+                "status": "SUBMITTED",
+                "entrust_no": f"HT-{place_calls}",
+                "symbol": symbol,
+                "side": side,
+                "price": price,
+                "quantity": quantity,
+                "timings_ms": {"total": 12},
+            }
+
+        def get_account_summary(self, **_kwargs):
+            return {"logged_in": True, "metrics": {"available_cash": "50000.00"}, "positions": []}
+
+        def get_today_orders(self, **_kwargs):
+            return {"orders": []}
+
+    executor = _FakeExec()
+    lookup = lambda sym: SymbolLookup(symbol=sym, name=f"证券{sym}", market="17" if sym.startswith(("6", "5")) else "36")
+    engine = AutoTradeEngine(
+        auto_store=astore,
+        research_store=rstore,
+        broker=None,
+        trade_executor=executor,
+        symbol_lookup=lookup,
+    )
+    app = create_app(
+        admin_password_hash=PasswordHasher().hash("admin-secret"),
+        secure_admin_cookies=False,
+        market_account_store=accounts,
+        research_store=rstore,
+        symbol_lookup=lookup,
+        goodluck_internal_token=TOKEN,
+        trade_executor=executor,
+        auto_trade_engine=engine,
+        auto_trade_interval_seconds=3600.0,
+    )
+
+    with TestClient(app) as client:
+        # 1. X-Idempotency-Key replay, 409 conflict, 422 format validation
+        bad = client.post(
+            "/api/internal/goodluck/trade/orders",
+            headers={**_headers("uid:admin", "admin"), "X-Idempotency-Key": "bad key!"},
+            json={"symbol": "160723", "side": "buy", "price": "2.100", "quantity": 100, "dry_run": True},
+        )
+        assert bad.status_code == 422
+
+        first = client.post(
+            "/api/internal/goodluck/trade/orders",
+            headers={**_headers("uid:admin", "admin"), "X-Idempotency-Key": "idem-ord-1"},
+            json={"symbol": "160723", "side": "buy", "price": "2.100", "quantity": 100, "dry_run": True},
+        )
+        assert first.status_code == 200
+        assert place_calls == 1
+        assert first.json()["entrust_no"] == "HT-1"
+
+        replay = client.post(
+            "/api/internal/goodluck/trade/orders",
+            headers={**_headers("uid:admin", "admin"), "X-Idempotency-Key": "idem-ord-1"},
+            json={"symbol": "160723", "side": "buy", "price": "2.100", "quantity": 100, "dry_run": True},
+        )
+        assert replay.status_code == 200
+        assert replay.json()["idempotent_replayed"] is True
+        assert place_calls == 1
+
+        conflict = client.post(
+            "/api/internal/goodluck/trade/orders",
+            headers={**_headers("uid:admin", "admin"), "X-Idempotency-Key": "idem-ord-1"},
+            json={"symbol": "160723", "side": "buy", "price": "2.100", "quantity": 200, "dry_run": True},
+        )
+        assert conflict.status_code == 409
+
+        # 2. Up to 50 symbols & rule_bindings validation; 51 symbols rejected with 422
+        syms_50 = [f"60{i:04d}" for i in range(50)]
+        cfg_ok = client.put(
+            "/api/internal/goodluck/trade/strategy",
+            headers=_headers("uid:admin", "admin"),
+            json={
+                "enabled": True,
+                "signal_source": "intraday_macd_flow",
+                "execution_mode": "semi_auto",
+                "symbols": syms_50,
+                "order_quantity": 100,
+                "pricing_mode": "counterparty_book",
+                "order_book_level": 3,
+                "slippage_ticks": 3,
+                "auto_cancel_seconds": 30,
+                "daily_max_buy_amount": 50000.0,
+                "block_non_continuous_session": True,
+                "symbol_profiles": {
+                    "600000": {
+                        "enabled": True,
+                        "rule_bindings": [
+                            {"signal_source": "quant_rule", "quant_rule_id": "rule-a", "enabled": True, "priority": 5, "weight_scale": 1.5},
+                            {"signal_source": "intraday_macd_flow", "enabled": True, "priority": 10, "weight_scale": 1.0},
+                        ],
+                    }
+                },
+            },
+        )
+        assert cfg_ok.status_code == 200
+        assert len(cfg_ok.json()["config"]["symbols"]) == 50
+        bindings = cfg_ok.json()["config"]["symbol_profiles"]["600000"]["rule_bindings"]
+        assert [b["priority"] for b in bindings] == [5, 10]
+
+        syms_51 = [f"60{i:04d}" for i in range(51)]
+        cfg_too_many = client.put(
+            "/api/internal/goodluck/trade/strategy",
+            headers=_headers("uid:admin", "admin"),
+            json={
+                "enabled": True,
+                "signal_source": "intraday_macd_flow",
+                "execution_mode": "semi_auto",
+                "symbols": syms_51,
+                "order_quantity": 100,
+                "slippage_ticks": 3,
+                "auto_cancel_seconds": 30,
+                "daily_max_buy_amount": 50000.0,
+                "block_non_continuous_session": True,
+            },
+        )
+        assert cfg_too_many.status_code == 422
+
+    # 3. Direct ASGI SSE test on /api/internal/goodluck/trade/events without blocking TestClient
+    async def _verify_sse() -> list[str]:
+        chunks: list[str] = []
+        disconnected = asyncio.Event()
+        sent_req = False
+
+        async def receive():
+            nonlocal sent_req
+            if not sent_req:
+                sent_req = True
+                return {"type": "http.request", "body": b"", "more_body": False}
+            await disconnected.wait()
+            return {"type": "http.disconnect"}
+
+        async def send(msg):
+            if msg["type"] == "http.response.body" and msg.get("body"):
+                chunks.append(msg["body"].decode("utf-8"))
+                if len(chunks) == 1:
+                    engine._publish_event("signal_pending", {"signal": {"id": "sig-sse-1", "symbol": "160723"}})
+                elif len(chunks) >= 2:
+                    disconnected.set()
+
+        scope = {
+            "type": "http",
+            "asgi": {"version": "3.0"},
+            "http_version": "1.1",
+            "method": "GET",
+            "scheme": "http",
+            "path": "/api/internal/goodluck/trade/events",
+            "raw_path": b"/api/internal/goodluck/trade/events",
+            "query_string": b"viewer_open=1",
+            "headers": [
+                (b"x-goodluck-internal-token", TOKEN.encode("utf-8")),
+                (b"x-goodluck-user", b"uid:admin"),
+                (b"x-goodluck-role", b"admin"),
+            ],
+            "client": ("127.0.0.1", 12345),
+            "server": ("test", 80),
+        }
+        await asyncio.wait_for(app(scope, receive, send), timeout=3.0)
+        return chunks
+
+    sse_chunks = asyncio.run(_verify_sse())
+    assert len(sse_chunks) >= 2
+    assert "event: snapshot" in sse_chunks[0]
+    assert "event: signal_pending" in sse_chunks[1]
+    assert "sig-sse-1" in sse_chunks[1]
+    assert len(engine._subscribers) == 0
+    astore.close()
+    rstore.close()

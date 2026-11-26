@@ -303,3 +303,36 @@ def test_failed_protocol_timeout_open_market_stays_hidden(tmp_path, monkeypatch)
     store.transition(public_id, TaskStatus.FAILED, error_code="DIRECT_PROTOCOL_RESPONSE_TIMEOUT")
 
     assert client.get(f"/api/v1/jobs/{public_id}/fund-flow-history").status_code == 404
+
+
+def test_task_fund_flow_history_clips_unreached_intraday_points(tmp_path):
+    accounts = SQLiteMarketAccountStore(tmp_path / "market.db")
+    user = accounts.create_user("trader", "temporary-123")
+    group = accounts.list_watchlists(user.id)[0]
+    accounts.add_symbol(user.id, group.id, SymbolLookup(symbol="601872", name="招商轮船", market="17"))
+    research = SQLiteResearchStore(tmp_path / "research.db")
+    for minute in ("09:30", "11:30", "15:00"):
+        research.record_fund_flow(
+            "601872",
+            trade_date="20261125",
+            minute=minute,
+            periods={"today": {"unit": "万元", "main_net_inflow": "10.00", "main_visible_inflow": "6.00", "main_hidden_inflow": "4.00", "retail_inflow": "-10.00"}},
+            captured_at=datetime(2026, 11, 25, 11, 30, tzinfo=ZoneInfo("Asia/Shanghai")),
+        )
+    store = InMemoryStreams()
+    app = create_app(
+        store=store,
+        market_account_store=accounts,
+        market_session_store=InMemoryMarketSessionStore(),
+        research_store=research,
+        intraday_minute_cap=lambda trade_date: "11:30" if trade_date == "20261125" else None,
+        symbol_lookup=lambda symbol: SymbolLookup(symbol=symbol, name="招商轮船", market="17"),
+    )
+    client = TestClient(app)
+    public_id = client.post("/api/v1/jobs", json={"symbol": "601872", "include_long_capture": False}).json()["public_id"]
+    store.transition(public_id, TaskStatus.RUNNING)
+    store.complete_result(public_id, _values(), None)
+
+    response = client.get(f"/api/v1/jobs/{public_id}/fund-flow-history")
+    assert response.status_code == 200
+    assert [pt["time"] for pt in response.json()["points"]] == ["09:30", "11:30"]

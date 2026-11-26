@@ -608,3 +608,302 @@
 .market-auth-card .market-kicker,
 .market-auth-card .market-form-notice,
 .market-auth-card .market-form-error { text-align: center; }
+
+/* ETF 资金与申购净流入明细 */
+.market-fund-tablist { overflow-x: auto; scrollbar-width: none; }
+.market-fund-tablist::-webkit-scrollbar { display: none; }
+.market-fund-tablist button { padding: 0 11px; font-size: 14.5px; }
+.market-chart-panel .etf-flow-panel,
+.market-chart-panel .etf-holdings-panel {
+  border: 0;
+  border-radius: 0;
+  box-shadow: none;
+  background: transparent;
+  padding: 10px 0 2px;
+}
+.etf-flow-panel,
+.etf-holdings-panel { min-width: 0; }
+.etf-flow-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  min-height: 36px;
+}
+.etf-flow-title-group {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  min-width: 0;
+}
+.etf-flow-head h3 {
+  margin: 0;
+  color: var(--market-ink);
+  font-size: 16px;
+  font-weight: 750;
+}
+.etf-flow-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 8px;
+  border-radius: 4px;
+  font: 700 11px/1.35 ui-monospace, SFMono-Regular, monospace;
+  white-space: nowrap;
+}
+.etf-flow-badge.etf-tone-up { background: #fff1f0; color: #e2232e; }
+.etf-flow-badge.etf-tone-down { background: #eaf8f0; color: #009c51; }
+.etf-flow-badge.etf-tone-flat { background: #f2f4f7; color: var(--market-muted); }
+.etf-holdings-count {
+  padding: 2px 7px;
+  border-radius: 4px;
+  background: #fff1f0;
+  color: #e2232e;
+  font-size: 11px;
+  font-weight: 650;
+  white-space: nowrap;
+}
+.etf-flow-more-link {
+  border: 0;
+  background: transparent;
+  padding: 4px 2px;
+  color: var(--market-muted);
+  font-size: 12px;
+  font-weight: 650;
+  white-space: nowrap;
+  cursor: pointer;
+}
+.etf-flow-more-link:hover { color: var(--market-red); }
+.etf-flow-summary-bar {
+  margin-top: 8px;
+  padding: 10px 8px;
+  border-radius: 10px;
+  background: #f5f6f8;
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 6px;
+  text-align: center;
+}
+.etf-flow-summary-item { min-width: 0; display: grid; gap: 4px; }
+.etf-flow-summary-item span {
+  color: var(--market-muted);
+  font-size: 11px;
+  white-space: nowrap;
+}
+.etf-flow-summary-item strong {
+  font: 700 14px/1.2 ui-monospace, SFMono-Regular, monospace;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.etf-tone-up { color: #e2232e; }
+.etf-tone-down { color: #009c51; }
+.etf-tone-flat { color: var(--market-ink); }
+.etf-flow-controls {
+  margin-top: 10px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+.etf-flow-legend {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 14px;
+  color: var(--market-muted);
+  font-size: 11px;
+}
+.etf-flow-legend span { display: inline-flex; align-items: center; gap: 5px; white-space: nowrap; }
+.etf-legend-cum,
+.etf-legend-price { width: 10px; height: 2.5px; border-radius: 2px; display: inline-block; }
+.etf-legend-cum { background: #3366ff; }
+.etf-legend-price { background: #ff9500; }
+.etf-flow-period-select {
+  min-height: 28px;
+  padding: 0 8px;
+  border: 1px solid #cfd2d6;
+  border-radius: 6px;
+  background: white;
+  color: var(--market-ink);
+  font-size: 11px;
+  font-weight: 650;
+}
+.etf-flow-loading-tag,
+.etf-flow-inline-warn,
+.etf-flow-status-note {
+  margin: 4px 0 0;
+  color: var(--market-muted);
+  font-size: 11px;
+}
+.etf-flow-inline-warn { color: var(--market-red); }
+.etf-flow-status-note {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 8px;
+  border-radius: 6px;
+  background: rgba(245, 158, 11, .12);
+  color: #b45309;
+}
+.etf-flow-readout {
+  margin-top: 6px;
+  display: grid;
+  grid-template-columns: auto repeat(3, minmax(0, 1fr));
+  align-items: baseline;
+  gap: 4px 12px;
+  font-size: 11px;
+}
+.etf-flow-readout time {
+  color: var(--market-ink);
+  font: 700 11px ui-monospace, SFMono-Regular, monospace;
+  white-space: nowrap;
+}
+.etf-flow-readout > span {
+  min-width: 0;
+  display: inline-flex;
+  align-items: baseline;
+  gap: 5px;
+  white-space: nowrap;
+}
+.etf-flow-readout small { color: var(--market-muted); font-size: 10px; }
+.etf-flow-readout strong { font: 700 12px ui-monospace, SFMono-Regular, monospace; font-variant-numeric: tabular-nums; }
+.etf-flow-svg {
+  display: block;
+  width: 100%;
+  height: auto;
+  min-width: 0;
+  margin-top: 4px;
+  outline: none;
+  touch-action: pan-y;
+}
+.etf-flow-grid { stroke: rgba(148, 163, 184, .24); stroke-width: 1; vector-effect: non-scaling-stroke; }
+.etf-flow-zero { stroke: #b9bec5; stroke-width: 1; stroke-dasharray: 3 3; vector-effect: non-scaling-stroke; }
+.etf-flow-axis-text { fill: #8c9199; font: 10px ui-monospace, SFMono-Regular, monospace; }
+.etf-flow-bar-title { fill: var(--market-muted); font-size: 11px; font-weight: 650; }
+.etf-flow-cum-line { fill: none; stroke: #3366ff; stroke-width: 2.2; stroke-linecap: round; stroke-linejoin: round; vector-effect: non-scaling-stroke; }
+.etf-flow-price-line { fill: none; stroke: #ff9500; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; vector-effect: non-scaling-stroke; }
+.etf-flow-cursor { stroke: #94a3b8; stroke-width: 1; vector-effect: non-scaling-stroke; }
+.etf-flow-dot-cum { fill: #3366ff; stroke: white; stroke-width: 1.5; vector-effect: non-scaling-stroke; }
+.etf-flow-dot-price { fill: #ff9500; stroke: white; stroke-width: 1.5; vector-effect: non-scaling-stroke; }
+.etf-flow-bar-up { fill: #fa3b32; }
+.etf-flow-bar-down { fill: #00b650; }
+.etf-flow-empty { margin: 10px 0 4px; color: var(--market-muted); font-size: 12px; }
+.etf-flow-footnote {
+  margin: 8px 0 0;
+  color: var(--market-muted);
+  font-size: 11px;
+  text-align: right;
+}
+
+.etf-holdings-table-wrap { width: 100%; min-width: 0; overflow: hidden; margin-top: 6px; }
+.etf-holdings-table {
+  width: 100%;
+  border-collapse: collapse;
+  table-layout: fixed;
+  font-size: 13px;
+}
+.etf-holdings-table th:nth-child(1) { width: 34%; text-align: left; }
+.etf-holdings-table th:nth-child(2) { width: 24%; text-align: right; }
+.etf-holdings-table th:nth-child(3) { width: 22%; text-align: right; }
+.etf-holdings-table th:nth-child(4) { width: 20%; text-align: right; }
+.etf-holdings-table th,
+.etf-holdings-table td {
+  padding: 9px 4px;
+  border-bottom: 1px solid #eff0f2;
+  vertical-align: middle;
+}
+.etf-holdings-table thead th {
+  color: var(--market-muted);
+  font-size: 11px;
+  font-weight: 600;
+}
+.etf-holdings-table tbody td {
+  text-align: right;
+  font: 700 13px ui-monospace, SFMono-Regular, monospace;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.etf-holding-name { min-width: 0; display: grid; gap: 2px; text-align: left; }
+.etf-holding-name strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--market-ink);
+  font-size: 13px;
+  font-weight: 650;
+}
+.etf-holding-name small {
+  color: var(--market-muted);
+  font: 500 11px ui-monospace, SFMono-Regular, monospace;
+}
+.etf-sort-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 3px;
+  width: 100%;
+  padding: 2px 0;
+  border: 0;
+  background: transparent;
+  color: var(--market-muted);
+  font: inherit;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.etf-sort-button.active { color: var(--market-ink); font-weight: 700; }
+.etf-sort-button i { font-style: normal; font-size: 10px; opacity: .65; }
+.etf-sort-button.active i { color: #e2232e; opacity: 1; }
+
+@media (max-width: 520px) {
+  .etf-flow-summary-bar { gap: 4px; padding: 8px 4px; }
+  .etf-flow-summary-item span { font-size: 10px; }
+  .etf-flow-summary-item strong { font-size: 12px; }
+  .etf-flow-readout { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 3px 8px; }
+  .etf-flow-readout time { grid-column: 1 / -1; }
+  .etf-holdings-table th:nth-child(1) { width: 32%; }
+  .etf-holdings-table th:nth-child(2) { width: 25%; }
+  .etf-holdings-table th:nth-child(3) { width: 23%; }
+  .etf-holdings-table th:nth-child(4) { width: 20%; }
+  .etf-holdings-table th,
+  .etf-holdings-table td { padding: 8px 2px; }
+  .etf-holding-name strong { font-size: 12px; }
+  .etf-holding-name small { font-size: 10px; }
+  .etf-holdings-table tbody td { font-size: 12px; }
+  .etf-sort-button { font-size: 10.5px; gap: 2px; }
+}
+
+.market-brand-cluster { display: inline-flex; align-items: center; gap: 8px; }
+.ths-split-brand-btn {
+  width: 30px;
+  height: 30px;
+  min-height: 30px;
+  padding: 0;
+  border-radius: 8px;
+  display: inline-grid;
+  place-items: center;
+  flex: 0 0 auto;
+  font-size: 14px;
+  font-weight: 900;
+  line-height: 1;
+  color: #fff;
+  border: 1.5px solid rgba(255, 255, 255, .45);
+  background: linear-gradient(135deg, #0c1322 0%, #152136 48%, rgba(255, 255, 255, .92) 49.3%, rgba(255, 255, 255, .92) 50.7%, #e23232 52%, #ff4d4f 100%);
+  text-shadow: 0 1px 2px rgba(0, 0, 0, .75);
+  cursor: pointer;
+}
+.market-quote-band { margin-bottom: 10px; }
+.market-quote-identity { display: flex; align-items: baseline; flex-wrap: wrap; gap: 8px; min-width: 0; }
+.market-ths-board { display: grid; grid-template-columns: 148px minmax(0, 1fr); gap: 14px; align-items: center; }
+.market-last-deltas { display: flex; align-items: baseline; gap: 6px; font: 700 12px ui-monospace, SFMono-Regular, monospace; font-variant-numeric: tabular-nums; }
+.market-last-deltas em { font-style: normal; }
+.market-quote-l2-strip { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 6px 10px; margin-top: 8px; padding-top: 8px; border-top: 1px solid var(--market-line); }
+.market-quote-l2-strip div { display: grid; gap: 2px; min-width: 0; }
+.market-quote-l2-strip span { color: var(--market-muted); font-size: 10.5px; }
+.market-quote-l2-strip strong { font: 700 12.5px ui-monospace, SFMono-Regular, monospace; font-variant-numeric: tabular-nums; }
+.fund-flow-history-toolbar-merged { min-height: 30px; padding: 0 0 6px; display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.fund-flow-history-toolbar-merged .fund-flow-history-periods { margin-bottom: 0; }
+.fund-flow-history-meta-right { display: inline-flex; align-items: center; gap: 6px; }
+@media (max-width: 880px) {
+  .market-ths-board { grid-template-columns: 114px minmax(0, 1fr); gap: 10px; }
+}

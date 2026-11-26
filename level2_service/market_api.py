@@ -15,6 +15,7 @@ import secrets
 from fastapi import Depends, FastAPI, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel, Field
 
+from .etf_fund_flow import ETF_FLOW_PERIODS, EtfFundFlowError, fetch_etf_flow_payload
 from .fund_flow_history import read_fund_flow_history_for_view
 from .market_accounts import (
     DuplicateUserError,
@@ -214,6 +215,7 @@ def install_market_routes(
     secure_cookies: bool,
     previous_trading_date: Callable[[str], str] | None = None,
     expected_intraday_trade_date: Callable[[], str | None] | None = None,
+    intraday_minute_cap: Callable[[str], str | None] | None = None,
 ) -> None:
     """Install routes after the parent app has constructed its shared dependencies."""
 
@@ -1436,6 +1438,7 @@ def install_market_routes(
                 normalized,
                 trade_date.strip() if trade_date else None,
                 expected_intraday_trade_date=expected_intraday_trade_date,
+                intraday_minute_cap=intraday_minute_cap,
             )
         except LookupError:
             raise HTTPException(status_code=404, detail="fund flow history not found") from None
@@ -1469,6 +1472,56 @@ def install_market_routes(
             raise HTTPException(status_code=503, detail="research monitoring is not configured")
         return {
             **store.read_fund_flow_daily(normalized, limit, previous_trading_date),
+            "name": watchlist_item.name,
+        }
+
+    @app.get("/api/v1/market/symbols/{symbol}/etf-flow")
+    async def market_etf_flow(
+        symbol: str,
+        period: str = "60d",
+        user=Depends(require_ready_user),
+    ):
+        normalized = symbol.strip()
+        if not re.fullmatch(r"[0-9]{6}", normalized):
+            raise HTTPException(status_code=422, detail="symbol must be a six-digit stock code")
+        if period not in ETF_FLOW_PERIODS:
+            raise HTTPException(status_code=422, detail="unsupported etf flow period")
+        accounts, _sessions = stores()
+        watchlist_item = next(
+            (
+                item
+                for group in accounts.list_watchlists(user.id)
+                for item in group.items
+                if item.symbol == normalized
+            ),
+            None,
+        )
+        if watchlist_item is None:
+            raise HTTPException(status_code=404, detail="watchlist symbol not found")
+        service = getattr(app.state, "etf_flow_service", None)
+        if service is None:
+            raise HTTPException(status_code=503, detail="etf fund flow service is not configured")
+        try:
+            payload = await fetch_etf_flow_payload(
+                service,
+                app.state.market_data_broker,
+                normalized,
+                period,
+            )
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from None
+        except EtfFundFlowError as error:
+            raise HTTPException(
+                status_code=503,
+                detail=fixed_market_error_code(error, "ETF_FUND_FLOW_UNAVAILABLE"),
+            ) from None
+        except Exception as error:
+            raise HTTPException(
+                status_code=503,
+                detail=fixed_market_error_code(error, "ETF_FUND_FLOW_UNAVAILABLE"),
+            ) from None
+        return {
+            **payload,
             "name": watchlist_item.name,
         }
 
@@ -1526,7 +1579,26 @@ def install_market_routes(
                         detail_symbols=detail,
                     )
                     for detail_symbol in detail_refresh:
-                        await broker.refresh(detail_symbol, detail=True, max_age_seconds=1.5)
+                        try:
+                            await broker.refresh(
+                                detail_symbol,
+                                detail=True,
+                                max_age_seconds=1.5,
+                            )
+                        except (WebSocketDisconnect, asyncio.CancelledError):
+                            raise
+                        except Exception as error:
+                            await websocket.send_json(
+                                {
+                                    "type": "source_status",
+                                    "symbol": detail_symbol,
+                                    "status": "OFFLINE",
+                                    "error_code": fixed_market_error_code(
+                                        error,
+                                        "MARKET_QUOTE_UNAVAILABLE",
+                                    ),
+                                }
+                            )
                 elif event is not None and event in done:
                     await websocket.send_json(event.result())
         except (WebSocketDisconnect, asyncio.CancelledError):

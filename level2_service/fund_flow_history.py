@@ -30,12 +30,87 @@ def extract_quote_trade_date(source_time: object) -> str | None:
     return "".join(matched.groups())
 
 
+def settled_fund_flow_minute(trade_date: str, now: datetime) -> str | None:
+    """Return the latest valid fund-flow timestamp reached for trade_date at now."""
+    local = now.astimezone(SHANGHAI)
+    today = local.strftime("%Y%m%d")
+    if trade_date < today:
+        return "15:00"
+    if trade_date > today:
+        return None
+    hhmm = local.strftime("%H%M")
+    if hhmm < "0929":
+        return None
+    if hhmm < "0930":
+        return "09:30"
+    if hhmm <= "1130":
+        return f"{hhmm[:2]}:{hhmm[2:]}"
+    if hhmm < "1300":
+        return "11:30"
+    if hhmm < "1500":
+        return f"{hhmm[:2]}:{hhmm[2:]}"
+    return "15:00"
+
+
+def intraday_fund_flow_cap_minute(trade_date: str, now: datetime) -> str | None:
+    """Return the upper minute cap for viewing trade_date at now, or None when uncapped."""
+    local = now.astimezone(SHANGHAI)
+    today = local.strftime("%Y%m%d")
+    if trade_date < today:
+        return None
+    if trade_date > today:
+        return "09:29"
+    if local.strftime("%H%M") >= "1500":
+        return None
+    return settled_fund_flow_minute(trade_date, local) or "09:29"
+
+
+def clip_unreached_fund_flow_points(
+    points: list[dict[str, Any]],
+    max_minute: str | None,
+) -> list[dict[str, Any]]:
+    """Drop intraday fund-flow points strictly after max_minute."""
+    if not max_minute:
+        return list(points)
+    cap_compact = max_minute.replace(":", "").strip()
+    return [
+        point
+        for point in points
+        if str(point.get("time") or "").replace(":", "").strip() <= cap_compact
+    ]
+
+
+def _apply_intraday_minute_cap(
+    history: dict[str, Any],
+    intraday_minute_cap: Callable[[str], str | None] | None,
+) -> dict[str, Any]:
+    if not callable(intraday_minute_cap) or not history.get("trade_date"):
+        return history
+    cap = intraday_minute_cap(str(history["trade_date"]))
+    if cap is None:
+        return history
+    clipped = dict(history)
+    raw_periods = history.get("periods") or {}
+    clipped["periods"] = {
+        period_name: {
+            **period_data,
+            "points": clip_unreached_fund_flow_points(
+                list(period_data.get("points") or []),
+                cap,
+            ),
+        }
+        for period_name, period_data in raw_periods.items()
+    }
+    return clipped
+
+
 def read_fund_flow_history_for_view(
     store: Any,
     symbol: str,
     trade_date: str | None = None,
     *,
     expected_intraday_trade_date: Callable[[], str | None] | None = None,
+    intraday_minute_cap: Callable[[str], str | None] | None = None,
 ) -> dict[str, Any]:
     """Read fund-flow history without falling back to yesterday during today's session."""
     requested_date = trade_date.strip() if trade_date else None
@@ -46,7 +121,8 @@ def read_fund_flow_history_for_view(
     )
     if expected_today and (requested_date is None or requested_date == expected_today):
         try:
-            return store.read_fund_flow_history(symbol, expected_today)
+            history = store.read_fund_flow_history(symbol, expected_today)
+            return _apply_intraday_minute_cap(history, intraday_minute_cap)
         except LookupError:
             avail = list(store.available_fund_flow_dates(symbol))
             merged_avail = [expected_today, *[d for d in avail if d != expected_today]]
@@ -69,7 +145,7 @@ def read_fund_flow_history_for_view(
         avail = list(history.get("available_dates") or [])
         if expected_today not in avail:
             history["available_dates"] = [expected_today, *avail]
-    return history
+    return _apply_intraday_minute_cap(history, intraday_minute_cap)
 
 
 FUND_FLOW_VALUE_FIELDS = (

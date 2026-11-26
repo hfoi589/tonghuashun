@@ -58,12 +58,50 @@ export function formatFundFlowAxisTick(value: number, maxAbs: number): string {
   return value.toFixed(Math.abs(maxAbs) >= 100 ? 0 : 2)
 }
 
-export function FundFlowHistoryChart({ period }: { period: FundFlowHistoryPeriod }) {
-  const points = period.points.filter((point) => intradayTimeRatio(point.time) !== null)
+export function shanghaiReachedIntradayTime(
+  tradeDate?: string | null,
+  now: Date = new Date(),
+): string | undefined {
+  const cleanDate = tradeDate?.replaceAll('-', '').trim()
+  if (!cleanDate || !/^\d{8}$/.test(cleanDate)) return undefined
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Asia/Shanghai',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+  }).formatToParts(now)
+  const partMap = Object.fromEntries(parts.map((part) => [part.type, part.value]))
+  const todayYmd = `${partMap.year}${partMap.month}${partMap.day}`
+  if (cleanDate < todayYmd) return undefined
+  if (cleanDate > todayYmd) return '09:29'
+  const hour = partMap.hour === '24' ? '00' : partMap.hour
+  const hhmm = `${hour}${partMap.minute}`
+  if (hhmm >= '1500') return undefined
+  if (hhmm > '1130' && hhmm < '1300') return '11:30'
+  if (hhmm < '0930') return '09:29'
+  return `${hour}:${partMap.minute}`
+}
+
+export function FundFlowHistoryChart({
+  period,
+  tradeDate,
+}: {
+  period: FundFlowHistoryPeriod
+  tradeDate?: string | null
+}) {
+  const maxTime = shanghaiReachedIntradayTime(tradeDate)
+  const maxCompact = maxTime?.replace(':', '')
+  const points = period.points.filter((point) => (
+    intradayTimeRatio(point.time) !== null
+    && (!maxCompact || point.time.replace(':', '').trim() <= maxCompact)
+  ))
   const [selectedIndex, setSelectedIndex] = useState(Math.max(0, points.length - 1))
   useEffect(() => {
     setSelectedIndex(Math.max(0, points.length - 1))
-  }, [points.length, points.at(-1)?.time])
+  }, [points.length, points.at(-1)?.time, maxCompact])
   const width = 900
   const height = 320
   const pad = { top: 24, right: 18, bottom: 42, left: 62 }

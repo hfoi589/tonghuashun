@@ -1091,4 +1091,98 @@ describe('MarketApp', () => {
     expect(await screen.findByRole('img', { name: '招商轮船前复权日K图' })).toBeInTheDocument()
     expect(seriesCalls).toBe(2)
   })
+
+  it('lazy-loads ETF fund flow and holdings tabs without affecting initial dark-pool requests', async () => {
+    let etfCalls = 0
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url === '/api/v1/session') return jsonResponse({ id: 7, username: 'wilson', enabled: true, must_change_password: false, created_at: '2026-08-23T00:00:00+00:00' })
+      if (url === '/api/v1/watchlists') return jsonResponse({ groups: [{ id: 1, name: '自选', sort_order: 0, is_primary: true, items: [{ symbol: '601872', name: '招商轮船', market: '17' }] }] })
+      if (url.includes('/snapshot')) return jsonResponse({
+        symbol: '601872', name: '招商轮船', market: '17', sequence: 1, source_time: '15:00', collected_at: '2026-11-24T07:00:00+00:00',
+        source: 'TENCENT_PUBLIC', price_precision: 2, stale: false, age_seconds: 0.2,
+        quote: { price: '15.53', change_percent: '+0.65%' }, timeshare: [], intraday_series: {}, order_book: [], trades: [],
+        main_fund_flow: { today: { unit: '万元', main_net_inflow: '100', main_visible_inflow: '60', main_hidden_inflow: '40', retail_inflow: '-100' } },
+        capabilities: { l2: { available: true }, kline: { available: true } }, source_errors: {},
+      })
+      if (url.endsWith('/fund-flow/history')) return jsonResponse({
+        symbol: '601872', name: '招商轮船', trade_date: '20261124', available_dates: ['20261124'], latest_sync_at: null, last_error: null,
+        periods: {
+          today: { points: [{ time: '15:00', unit: '万元', main_net_inflow: '100', main_visible_inflow: '60', main_hidden_inflow: '40', retail_inflow: '-100' }] },
+          three_day: { points: [] },
+          five_day: { points: [] },
+        },
+      })
+      if (url.includes('/fund-flow/daily')) return jsonResponse({
+        symbol: '601872', name: '招商轮船', limit: 30,
+        points: [
+          {
+            trade_date: '20261123', time: '15:00', unit: '万元', main_net_inflow: '8', main_visible_inflow: '5', main_hidden_inflow: '3', retail_inflow: '-8',
+            periods: { today: { unit: '万元', main_net_inflow: '801', main_visible_inflow: '81', main_hidden_inflow: '82', retail_inflow: '-801' }, three_day: null, five_day: null },
+          },
+        ],
+      })
+      if (url.includes('/etf-flow?period=')) {
+        etfCalls += 1
+        const period = url.includes('period=120d') ? '120d' : '60d'
+        return jsonResponse({
+          symbol: '601872',
+          name: '招商轮船',
+          market: '17',
+          period,
+          available: true,
+          summary: {
+            latest_badge: { date: '11-24', full_date: '2026-11-24', value_text: '-1933.76万', text: '11-24 净流入 -1933.76万', tone: 'down' },
+            metrics: [
+              { key: period, label: period === '120d' ? '120日净流入' : '60日净流入', value_text: period === '120d' ? '10.20亿' : '8.16亿', tone: 'up' },
+              { key: '20d', label: '20日净流入', value_text: '3.97亿', tone: 'up' },
+              { key: '5d', label: '5日净流入', value_text: '1.10亿', tone: 'up' },
+              { key: '3d', label: '3日净流入', value_text: '3810.92万', tone: 'up' },
+            ],
+          },
+          chart: {
+            cumulative_unit: '亿',
+            daily_unit: '亿',
+            points: [
+              { date: '2026-11-23', short_date: '11-23', cumulative_value: 8.35, cumulative_text: '8.35亿', daily_value: 0.25, daily_text: '2500.00万', close_price: 15.43, price_change: 0.1 },
+              { date: '2026-11-24', short_date: '11-24', cumulative_value: 8.16, cumulative_text: '8.16亿', daily_value: -0.19, daily_text: '-1933.76万', close_price: 15.53, price_change: 0.1 },
+            ],
+          },
+          holdings: {
+            total_count: 1,
+            items: [
+              { symbol: '510330', market: '20', name: '沪深300ETF华夏', net_inflow_raw: 6304019.53, net_inflow_text: '630.4万', tone: 'up', streak_days: 7, hold_rate: 0.25, hold_rate_text: '0.25%' },
+            ],
+          },
+        })
+      }
+      throw new Error(`unexpected request: ${url}`)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    vi.stubGlobal('WebSocket', undefined)
+
+    render(<MarketApp />)
+
+    expect(await screen.findByRole('tab', { name: '当天资金曲线' })).toHaveAttribute('aria-selected', 'true')
+    expect(etfCalls).toBe(0)
+
+    await userEvent.click(screen.getByRole('tab', { name: '近30日资金流向' }))
+    const fundSection = screen.getByRole('heading', { name: '主力流向' }).closest('section')!
+    const netRow = within(fundSection).getByRole('row', { name: /主力净流入/ })
+    await waitFor(() => expect(within(netRow).getAllByRole('cell')[0]).toHaveTextContent('801.00'))
+
+    await userEvent.click(screen.getByRole('tab', { name: 'ETF资金' }))
+    expect(await screen.findByRole('img', { name: 'ETF累计申购净流入与收盘价双轴走势图' })).toBeInTheDocument()
+    expect(etfCalls).toBe(1)
+    await waitFor(() => expect(within(netRow).getAllByRole('cell')[0]).toHaveTextContent('100.00'))
+
+    await userEvent.click(screen.getByRole('tab', { name: 'ETF申购明细' }))
+    expect(await screen.findByText('沪深300ETF华夏')).toBeInTheDocument()
+    expect(etfCalls).toBe(1)
+
+    await userEvent.click(screen.getByRole('tab', { name: 'ETF资金' }))
+    await userEvent.selectOptions(screen.getByRole('combobox', { name: '选择ETF资金区间' }), '120d')
+    expect(await screen.findByText('120日净流入')).toBeInTheDocument()
+    expect(etfCalls).toBe(2)
+  })
 })

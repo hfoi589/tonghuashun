@@ -225,3 +225,44 @@ def test_admin_market_health_reports_broker_cadence_and_cache(tmp_path) -> None:
         "refresh_timeout_seconds": 12.0,
         "closed_interval_seconds": None,
     }
+
+
+def test_market_stream_survives_detail_refresh_error_and_emits_source_status(tmp_path) -> None:
+    class PartialFailureSource(ApiMarketSource):
+        def read_market_snapshot(self, symbol: str, *, detail: bool) -> MarketSnapshot:
+            if symbol == "160723":
+                raise DirectRequestError("DIRECT_PROTOCOL_RESPONSE_INVALID")
+            return super().read_market_snapshot(symbol, detail=detail)
+
+    accounts = SQLiteMarketAccountStore(tmp_path / "market.db")
+    user = accounts.create_user("trader", "temporary-123")
+    accounts.change_password(user.id, "temporary-123", "permanent-456")
+    app = create_app(
+        secure_admin_cookies=False,
+        market_account_store=accounts,
+        market_session_store=InMemoryMarketSessionStore(),
+        market_data_broker=MarketDataBroker(PartialFailureSource(), is_market_open=lambda: True),
+        symbol_lookup=lambda symbol: SymbolLookup(symbol=symbol, name="招商轮船", market="17"),
+    )
+
+    with TestClient(app) as client:
+        assert client.post("/api/v1/session", json={"username": "trader", "password": "permanent-456"}).status_code == 200
+        with client.websocket_connect("/api/v1/market/stream") as websocket:
+            websocket.send_json({"type": "subscribe", "watchlist": ["601872", "160723"], "detail": "160723"})
+            first_sub = websocket.receive_json()
+            status_event = websocket.receive_json()
+
+            websocket.send_json({"type": "subscribe", "watchlist": ["601872", "160723"], "detail": "601872"})
+            second_sub = websocket.receive_json()
+            snapshot = websocket.receive_json()
+
+    assert first_sub == {"type": "subscribed", "watchlist": ["160723", "601872"], "detail": "160723"}
+    assert status_event == {
+        "type": "source_status",
+        "symbol": "160723",
+        "status": "OFFLINE",
+        "error_code": "DIRECT_PROTOCOL_RESPONSE_INVALID",
+    }
+    assert second_sub == {"type": "subscribed", "watchlist": ["160723", "601872"], "detail": "601872"}
+    assert snapshot["type"] == "snapshot"
+    assert snapshot["data"]["symbol"] == "601872"

@@ -1889,7 +1889,7 @@ def test_mandatory_100_share_retention_and_push_reliability(
             "captured_at": "2026-11-26T13:55:00+08:00",
         }
         guard_exec._last_account_at = 1_800_000_000.0
-        guard_exec._last_account_date = "20261126"
+        guard_exec._last_account_date = guard_exec._today_shanghai_compact()
 
     with pytest.raises(TradeExecutionError) as err_floor:
         guard_exec.place_order(symbol="160723", expected_name="嘉实原油", side="sell", price="2.190", quantity=100, precision=3)
@@ -2470,44 +2470,31 @@ def test_compute_ashare_price_cage_by_board_and_fund_exemption() -> None:
     assert bse_label == "北交所5%价格笼子"
 
 
-def test_coalesce_multi_rule_and_self_trade_precancel(tmp_path: Path) -> None:
-    from level2_service.auto_trade import coalesce_symbol_candidates
-
-    same_side = coalesce_symbol_candidates(
-        [
-            {"rule_id": "r1", "side": "buy", "binding_priority": 10, "qty_override": 200, "rule_summary": "规则一"},
-            {"rule_id": "r2", "side": "buy", "binding_priority": 5, "qty_override": 300, "rule_summary": "规则二"},
-        ]
-    )
-    assert len(same_side) == 1
-    assert same_side[0]["rule_id"] == "r2"
-    assert same_side[0]["qty_override"] == 300
-    assert same_side[0]["coalesced_rules"] == ["r2", "r1"]
-    assert "[多规则共振×2]" in same_side[0]["rule_summary"]
-
-    full_net = coalesce_symbol_candidates(
-        [
-            {"rule_id": "rb", "side": "buy", "qty_override": 200},
-            {"rule_id": "rs", "side": "sell", "qty_override": 200},
-        ]
-    )
-    assert full_net == []
-
-    partial_net = coalesce_symbol_candidates(
-        [
-            {"rule_id": "rb", "side": "buy", "qty_override": 300, "rule_summary": "买信号"},
-            {"rule_id": "rs", "side": "sell", "qty_override": 100, "rule_summary": "卖信号"},
-        ]
-    )
-    assert len(partial_net) == 1
-    assert partial_net[0]["side"] == "buy"
-    assert partial_net[0]["qty_override"] == 200
-    assert "同标的对冲净额 200股" in partial_net[0]["rule_summary"]
-
+def test_single_rule_per_symbol_and_self_trade_precancel(tmp_path: Path) -> None:
     db_path = tmp_path / "research.db"
     rstore = SQLiteResearchStore(db_path)
     astore = SQLiteAutoTradeStore(db_path)
-    astore.update_config({"enabled": True, "pricing_mode": "fixed_ticks", "block_non_continuous_session": False})
+    legacy_cfg = astore.update_config(
+        {
+            "enabled": True,
+            "symbols": ["160723"],
+            "pricing_mode": "fixed_ticks",
+            "block_non_continuous_session": False,
+            "symbol_profiles": {
+                "160723": {
+                    "enabled": True,
+                    "rule_bindings": [
+                        {"signal_source": "quant_rule", "quant_rule_id": "rule-primary", "priority": 10},
+                        {"signal_source": "intraday_macd_flow", "priority": 20},
+                    ],
+                }
+            },
+        }
+    )
+    prof_160723 = legacy_cfg["symbol_profiles"]["160723"]
+    assert prof_160723["signal_source"] == "quant_rule"
+    assert prof_160723["quant_rule_id"] == "rule-primary"
+    assert "rule_bindings" not in prof_160723
 
     events: list[str] = []
 
@@ -2591,4 +2578,791 @@ def test_coalesce_multi_rule_and_self_trade_precancel(tmp_path: Path) -> None:
     assert astore.get_signal(opp_sell["id"])["status"] == "SUPERSEDED_CANCELLED"
     rstore.close()
     astore.close()
+
+
+def test_standard_cash_pool_rolling_t0_recycles_net_cap_and_buy_entry_quota(tmp_path: Path) -> None:
+    db_path = tmp_path / "std_t0_recycle.db"
+    rstore = SQLiteResearchStore(db_path)
+    qstore = SQLiteQuantRuleStore(db_path)
+    astore = SQLiteAutoTradeStore(db_path)
+
+    qstore.upsert_rule(
+        {
+            "id": "ext-std-t0-pool",
+            "name": "标准资金池T+0测试",
+            "source": "ai",
+            "symbols": ["160723"],
+            "buy_rule": {"title": "买", "joiner": "and", "conditions": [{"type": "macd_signal", "signal": "red"}]},
+            "sell_rule": {"title": "卖", "joiner": "and", "conditions": [{"type": "macd_signal", "signal": "green"}]},
+            "position_sizing": {
+                "mode": "cash_pool_rolling",
+                "engine_profile": "standard",
+                "default_weight_pct": 100.0,
+                "max_position_pct": 100.0,
+                "max_daily_entries": 2,
+                "allow_same_day_turnaround": "auto",
+            },
+        }
+    )
+    qstore.upsert_rule(
+        {
+            "id": "ext-std-t1-pool",
+            "name": "标准资金池T+1对照",
+            "source": "ai",
+            "symbols": ["601872"],
+            "buy_rule": {"title": "买", "joiner": "and", "conditions": [{"type": "macd_signal", "signal": "red"}]},
+            "sell_rule": {"title": "卖", "joiner": "and", "conditions": [{"type": "macd_signal", "signal": "green"}]},
+            "position_sizing": {
+                "mode": "cash_pool_rolling",
+                "engine_profile": "standard",
+                "default_weight_pct": 100.0,
+                "max_position_pct": 100.0,
+                "max_daily_entries": 2,
+                "allow_same_day_turnaround": "auto",
+            },
+        }
+    )
+    astore.update_config(
+        {
+            "enabled": True,
+            "signal_source": "quant_rule",
+            "quant_rule_id": "ext-std-t0-pool",
+            "execution_mode": "semi_auto",
+            "sizing_mode": "model_auto",
+            "pricing_mode": "fixed_ticks",
+            "slippage_ticks": 0,
+            "symbols": ["160723"],
+            "daily_max_buy_amount": 4000.0,
+            "block_non_continuous_session": True,
+        }
+    )
+
+    engine = AutoTradeEngine(
+        auto_store=astore,
+        research_store=rstore,
+        broker=None,
+        trade_executor=None,
+        symbol_lookup=lambda s: CATALOG.get(s),
+        is_trading_day=lambda _d: True,
+        now_fn=lambda: datetime(2026, 11, 26, 10, 30, tzinfo=SHANGHAI_TZ),
+        quant_rule_store=qstore,
+    )
+    cfg = astore.get_config()
+    td = "20261126"
+
+    # 1. T+0 160723 Round 1 Buy @ 2.000 -> 2000 shares
+    q_b1, _, err_b1 = engine._resolve_signal_quantity(
+        symbol="160723", side="buy", limit_price="2.000", config=cfg, candidate=None, trade_date=td
+    )
+    assert err_b1 is None and q_b1 == 2000
+    assert astore.claim_and_insert_signal(
+        signal_key="160723:20261126:09:40:ext-std-t0-pool:buy",
+        trade_date=td, symbol="160723", name="嘉实原油", side="buy", signal_source="quant_rule",
+        rule_id="ext-std-t0-pool", rule_title="R1买", rule_summary="b1", minute="09:40",
+        signal_price="2.000", limit_price="2.000", precision=3, quantity=2000,
+        execution_mode="semi_auto", is_simulation=False, status="FILLED_OR_CLOSED",
+    ) is not None
+
+    # Round 1 T+0 Sell @ 2.020 -> 1900 shares (reserving 100 floor)
+    q_s1, _, err_s1 = engine._resolve_signal_quantity(
+        symbol="160723", side="sell", limit_price="2.020", config=cfg, candidate=None, trade_date=td
+    )
+    assert err_s1 is None and q_s1 == 1900
+    assert astore.claim_and_insert_signal(
+        signal_key="160723:20261126:10:05:ext-std-t0-pool:sell",
+        trade_date=td, symbol="160723", name="嘉实原油", side="sell", signal_source="quant_rule",
+        rule_id="ext-std-t0-pool", rule_title="R1卖", rule_summary="s1", minute="10:05",
+        signal_price="2.020", limit_price="2.020", precision=3, quantity=1900,
+        execution_mode="semi_auto", is_simulation=False, status="FILLED_OR_CLOSED",
+    ) is not None
+    act = astore.today_symbol_activity(td, "160723")
+    assert act["buy_entry_count"] == 1 and act["sell_entry_count"] == 1 and act["entry_count"] == 2
+
+    # Round 2 Buy @ 2.000 SAME DAY: sold proceeds recycle cap (4000 - 100*2.0 = 3800 -> 1900 shares)!
+    q_b2, _, err_b2 = engine._resolve_signal_quantity(
+        symbol="160723", side="buy", limit_price="2.000", config=cfg, candidate=None, trade_date=td
+    )
+    assert err_b2 is None and q_b2 == 1900
+    emitted = asyncio.run(
+        engine._emit_trade_signal(
+            symbol="160723",
+            item={
+                "rule_id": "ext-std-t0-pool",
+                "rule_title": "R2买",
+                "rule_summary": "r2",
+                "side": "buy",
+                "minute": "10:30",
+                "price": "2.000",
+                "name": "嘉实原油",
+                "market": "36",
+            },
+            config=cfg,
+            trade_date=td,
+            now_epoch=1_800_000_000.0,
+            local_iso="2026-11-26T10:30:00+08:00",
+            sig_key="160723:20261126:10:30:ext-std-t0-pool:buy",
+        )
+    )
+    assert emitted == 1
+    b2_sig = next(s for s in astore.list_pending_signals() if s["minute"] == "10:30")
+    assert b2_sig["quantity"] == 1900
+
+    # Round 2 T+0 Sell + Round 3 Buy blocked by max_daily_entries=2 on buy entries
+    assert astore.claim_and_insert_signal(
+        signal_key="160723:20261126:10:45:ext-std-t0-pool:sell",
+        trade_date=td, symbol="160723", name="嘉实原油", side="sell", signal_source="quant_rule",
+        rule_id="ext-std-t0-pool", rule_title="R2卖", rule_summary="s2", minute="10:45",
+        signal_price="2.030", limit_price="2.030", precision=3, quantity=1900,
+        execution_mode="semi_auto", is_simulation=False, status="FILLED_OR_CLOSED",
+    ) is not None
+    q_b3, _, err_b3 = engine._resolve_signal_quantity(
+        symbol="160723", side="buy", limit_price="2.000", config=cfg, candidate=None, trade_date=td
+    )
+    assert q_b3 == 0 and err_b3 == "已达模型单日最大买入次数(2)"
+
+    # 2. Contrast: Ordinary A-share T+1 symbol (601872) keeps T+1 freeze & gross daily buy cap
+    astore.update_config({"symbols": ["601872"], "quant_rule_id": "ext-std-t1-pool"})
+    cfg_t1 = astore.get_config()
+    # Overnight carry 200 shares + today's buy 200 shares @ 10.00
+    assert astore.claim_and_insert_signal(
+        signal_key="601872:20261125:10:00:ext-std-t1-pool:buy",
+        trade_date="20261125", symbol="601872", name="招商轮船", side="buy", signal_source="quant_rule",
+        rule_id="ext-std-t1-pool", rule_title="隔夜买", rule_summary="prev", minute="10:00",
+        signal_price="10.00", limit_price="10.00", precision=2, quantity=200,
+        execution_mode="semi_auto", is_simulation=False, status="FILLED_OR_CLOSED",
+    ) is not None
+    assert astore.claim_and_insert_signal(
+        signal_key="601872:20261126:09:40:ext-std-t1-pool:buy",
+        trade_date=td, symbol="601872", name="招商轮船", side="buy", signal_source="quant_rule",
+        rule_id="ext-std-t1-pool", rule_title="今日买", rule_summary="b_t1", minute="09:40",
+        signal_price="10.00", limit_price="10.00", precision=2, quantity=200,
+        execution_mode="semi_auto", is_simulation=False, status="FILLED_OR_CLOSED",
+    ) is not None
+    # Only yesterday's 200 shares are sellable (T+1 freeze blocks today's 200 shares; leaving 100 floor -> 200 sellable -> min(200, 400-100)=200)
+    q_s_t1, _, err_s_t1 = engine._resolve_signal_quantity(
+        symbol="601872", side="sell", limit_price="10.10", config=cfg_t1, candidate=None, trade_date=td
+    )
+    assert err_s_t1 is None and q_s_t1 == 200
+    assert astore.claim_and_insert_signal(
+        signal_key="601872:20261126:10:00:ext-std-t1-pool:sell",
+        trade_date=td, symbol="601872", name="招商轮船", side="sell", signal_source="quant_rule",
+        rule_id="ext-std-t1-pool", rule_title="卖昨仓", rule_summary="s_t1", minute="10:00",
+        signal_price="10.10", limit_price="10.10", precision=2, quantity=200,
+        execution_mode="semi_auto", is_simulation=False, status="FILLED_OR_CLOSED",
+    ) is not None
+    # Even after selling 200 shares today, T+1 gross daily buy limit only leaves 4000 - 2000 = 2000 -> 200 shares (not 3000)
+    q_b2_t1, _, err_b2_t1 = engine._resolve_signal_quantity(
+        symbol="601872", side="buy", limit_price="10.00", config=cfg_t1, candidate=None, trade_date=td
+    )
+    assert err_b2_t1 is None and q_b2_t1 == 200
+
+    qstore.close()
+    astore.close()
+    rstore.close()
+
+
+def _seed_xop_macro_cache(
+    rstore: SQLiteResearchStore,
+    *,
+    prev_us_date: str = "20261125",
+    cur_us_date: str = "20261125",
+    xop_prev: float = 160.0,
+    xop_last: float = 165.0,
+    nav_162411: float = 1.000,
+) -> None:
+    import json as _json
+    import time as _time
+    from datetime import timedelta as _td
+
+    now_ts = _time.time()
+    oil_rows = [
+        ["20251101", int(datetime(2025, 11, 2, 6, 0, tzinfo=SHANGHAI_TZ).timestamp()), 60.0],
+        ["20261101", int(datetime(2026, 11, 2, 6, 0, tzinfo=SHANGHAI_TZ).timestamp()), 100.0],
+    ]
+    xop_rows = [
+        ["20251101", int(datetime(2025, 11, 2, 6, 0, tzinfo=SHANGHAI_TZ).timestamp()), 120.0],
+        ["20251102", int(datetime(2025, 11, 3, 6, 0, tzinfo=SHANGHAI_TZ).timestamp()), 200.0],
+    ]
+    spy_rows = [["20251101", int(datetime(2025, 11, 2, 6, 0, tzinfo=SHANGHAI_TZ).timestamp()), 600.0]]
+    iwm_rows = [["20251101", int(datetime(2025, 11, 2, 6, 0, tzinfo=SHANGHAI_TZ).timestamp()), 220.0]]
+    xle_rows = [["20251101", int(datetime(2025, 11, 2, 6, 0, tzinfo=SHANGHAI_TZ).timestamp()), 90.0]]
+    ng_rows = [["20251101", int(datetime(2025, 11, 2, 6, 0, tzinfo=SHANGHAI_TZ).timestamp()), 3.0]]
+    cl_rows = [["20251101", int(datetime(2025, 11, 2, 6, 0, tzinfo=SHANGHAI_TZ).timestamp()), 68.0]]
+    ho_rows = [["20251101", int(datetime(2025, 11, 2, 6, 0, tzinfo=SHANGHAI_TZ).timestamp()), 2.25]]
+    nav_payload: dict[str, float] = {}
+    for idx in range(18):
+        us_d = (datetime(2026, 11, 5, tzinfo=SHANGHAI_TZ) + _td(days=idx)).strftime("%Y%m%d")
+        ts = int((datetime.strptime(us_d, "%Y%m%d").replace(tzinfo=SHANGHAI_TZ) + _td(days=1, hours=6)).timestamp())
+        x_val = xop_last if us_d == cur_us_date else xop_prev
+        xop_rows.append([us_d, ts, x_val])
+        spy_rows.append([us_d, ts, 600.0])
+        iwm_rows.append([us_d, ts, 220.0])
+        xle_rows.append([us_d, ts, 90.0])
+        ng_rows.append([us_d, ts, 3.0])
+        cl_rows.append([us_d, ts, 68.0])
+        ho_rows.append([us_d, ts, 2.25])
+        nav_payload[us_d] = nav_162411
+    nav_payload[prev_us_date] = nav_162411
+    nav_payload[cur_us_date] = nav_162411
+    ts_fut = int(datetime(2026, 11, 26, 14, 52, tzinfo=SHANGHAI_TZ).timestamp())
+    with rstore._lock, rstore._connection:
+        rstore._connection.execute(
+            "INSERT OR REPLACE INTO quant_macro_cache VALUES (?, ?, ?)",
+            ("nav_162411", _json.dumps(nav_payload), now_ts),
+        )
+        rstore._connection.execute(
+            "INSERT OR REPLACE INTO quant_macro_cache VALUES (?, ?, ?)",
+            ("oil_daily_2y", _json.dumps(oil_rows), now_ts),
+        )
+        rstore._connection.execute(
+            "INSERT OR REPLACE INTO quant_macro_cache VALUES (?, ?, ?)",
+            ("xop_daily_2y", _json.dumps(xop_rows), now_ts),
+        )
+        rstore._connection.execute(
+            "INSERT OR REPLACE INTO quant_macro_cache VALUES (?, ?, ?)",
+            ("spy_daily_2y", _json.dumps(spy_rows), now_ts),
+        )
+        rstore._connection.execute(
+            "INSERT OR REPLACE INTO quant_macro_cache VALUES (?, ?, ?)",
+            ("iwm_daily_2y", _json.dumps(iwm_rows), now_ts),
+        )
+        rstore._connection.execute(
+            "INSERT OR REPLACE INTO quant_macro_cache VALUES (?, ?, ?)",
+            ("xle_daily_2y", _json.dumps(xle_rows), now_ts),
+        )
+        rstore._connection.execute(
+            "INSERT OR REPLACE INTO quant_macro_cache VALUES (?, ?, ?)",
+            ("ng_daily_2y", _json.dumps(ng_rows), now_ts),
+        )
+        rstore._connection.execute(
+            "INSERT OR REPLACE INTO quant_macro_cache VALUES (?, ?, ?)",
+            ("cl_daily_2y", _json.dumps(cl_rows), now_ts),
+        )
+        rstore._connection.execute(
+            "INSERT OR REPLACE INTO quant_macro_cache VALUES (?, ?, ?)",
+            ("ho_daily_2y", _json.dumps(ho_rows), now_ts),
+        )
+        for fkey, fpx in (("fut_1m_cl", 68.0), ("fut_1m_ho", 2.25), ("fut_1m_ng", 3.0), ("fut_1m_es", 6000.0)):
+            rstore._connection.execute(
+                "INSERT OR REPLACE INTO quant_macro_cache VALUES (?, ?, ?)",
+                (fkey, _json.dumps({"ts": [ts_fut], "px": [fpx]}), now_ts),
+            )
+        rstore._connection.execute(
+            "INSERT OR REPLACE INTO quant_macro_cache VALUES (?, ?, ?)",
+            ("fx_usdcny_series", _json.dumps({"ts": [int(datetime(2026, 10, 1, 9, 0, tzinfo=SHANGHAI_TZ).timestamp())], "px": [6.70]}), now_ts),
+        )
+
+
+def test_route_d_shadow_preserves_static_execution_while_exposing_pool_telemetry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("THS_QUANT_OFFLINE", "1")
+    monkeypatch.setattr("level2_service.ths_trade.time.sleep", lambda _s: None)
+    ctx = _setup_v9_plus_fixture(
+        tmp_path / "route_d_shadow.db",
+        execution_mode="full_auto",
+        daily_max_buy_amount=30000.0,
+    )
+    rstore, qstore, astore, engine = ctx["rstore"], ctx["qstore"], ctx["astore"], ctx["engine"]
+    dev = ctx["dev"]
+    astore.update_config({"capital_policy_mode": "route_d_shadow", "pool_policy": {"sigma_cap_pct": 4.20}})
+
+    st = engine.get_status()
+    assert st["capital_policy_mode"] == "route_d_shadow"
+    assert st["capital_ledger"]["capital_policy_mode"] == "route_d_shadow"
+    assert st["capital_ledger"]["pool_allocation"]["shadow_only"] is True
+    assert "160723" in st["capital_ledger"]["pool_allocation"]["symbols"]
+    assert st["daily_usage"]["daily_max_buy_amount"] == pytest.approx(30000.0)
+
+    # Static execution remains strictly bounded by static cap (¥30,000 -> 15,100 shares @ 1.980)
+    res = asyncio.run(engine.poll_once())
+    assert res["triggered"] == 1
+    sig = astore.list_recent_signals(limit=3)[0]
+    assert sig["status"] == "SUBMITTED"
+    assert sig["quantity"] == 15100
+    assert dev.form_qty == "15100"
+
+    # Static per-row TRADE_CAP_BELOW_HOLDING guard stays intact under route_d_shadow
+    class _ShadowReconcileStub:
+        adb_serial = "emulator-5556"
+        snap = {
+            "logged_in": True,
+            "metrics": {"available_cash": "120000.00"},
+            "positions": [{"symbol": "160723", "name": "嘉实原油", "shares": 25000, "market_value": "50000.00"}],
+            "captured_at": "2026-11-26T10:15:00+08:00",
+        }
+
+        def _cached_account_snapshot(self, *_a: Any, **_k: Any) -> dict[str, Any]:
+            return dict(self.snap)
+
+        def get_account_summary(self, *_a: Any, **_k: Any) -> dict[str, Any]:
+            return dict(self.snap)
+
+    engine.trade_executor = _ShadowReconcileStub()
+    with pytest.raises(TradeExecutionError) as err_low:
+        engine.reconcile_and_update_config(
+            {"capital_policy_mode": "route_d_shadow", "daily_max_buy_amount": 30000.0},
+            reconcile_broker=True,
+        )
+    assert err_low.value.error_code == "TRADE_CAP_BELOW_HOLDING"
+
+    rstore.close()
+    qstore.close()
+    astore.close()
+
+
+def test_route_d_plus_reconcile_pool_conservation_and_two_wave_close_rebalance(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("THS_QUANT_OFFLINE", "1")
+    ctx = _setup_v9_plus_fixture(
+        tmp_path / "route_d_two_wave.db",
+        execution_mode="full_auto",
+        daily_max_buy_amount=140000.0,
+    )
+    rstore, qstore, astore, clock_dt = ctx["rstore"], ctx["qstore"], ctx["astore"], ctx["clock_dt"]
+    _seed_day_pts, brn_today, lof_today = ctx["seed_day_pts"], ctx["brn_today"], ctx["lof_today"]
+
+    # Configure 162411 with xop_us_ep anchor & static capital_cap=20k (< ¥89k dynamic solo target!)
+    _seed_xop_macro_cache(rstore, xop_prev=160.0, xop_last=166.0, nav_162411=1.020)
+    xop_bars_prev = [("09:30", 0.990), ("14:53", 0.990), ("15:00", 0.990)]
+    xop_bars_today = [("09:30", 0.990)] + [(t, 0.995) for t, _ in lof_today[:-6]] + [
+        ("10:00", 1.000), ("10:05", 1.000), ("14:53", 1.000)
+    ]
+    _seed_day_pts("162411", "20261125", 0.990, xop_bars_prev, market="36")
+    _seed_day_pts("162411", "20261126", 0.990, xop_bars_today, market="36")
+    qstore.upsert_rule(
+        {
+            "id": "ai-162411-v9-xop-aggressive",
+            "name": "162411 XOP 专版",
+            "source": "ai",
+            "symbols": ["162411", "BRN0Y"],
+            "macd_settings": {"short": 10, "long": 20, "signal": 5, "marker_threshold": 0.0002},
+            "buy_rule": {"title": "正T买", "joiner": "and", "conditions": [{"type": "brent_spread_pct", "direction": "lte", "value": -0.25}]},
+            "sell_rule": {"title": "反T卖", "joiner": "and", "conditions": [{"type": "brent_spread_pct", "direction": "gte", "value": 0.42}]},
+            "position_sizing": {
+                "mode": "cash_pool_rolling",
+                "engine_profile": "v9_plus_aggressive",
+                "cross_market_anchor": "xop_us_ep",
+                "max_daily_entries": 8,
+                "cooldown_minutes": 4,
+                "close_flatten_time": "14:53",
+            },
+        }
+    )
+
+    placed_orders: list[dict[str, Any]] = []
+    reject_160723_sell = {"flag": False}
+
+    class _PoolFakeExecutor:
+        adb_serial = "emulator-5556"
+        active_tab = "buy"
+
+        def __init__(self) -> None:
+            self.snap: dict[str, Any] = {
+                "logged_in": True,
+                "metrics": {"available_cash": "90000.00", "total_assets": "140000.00"},
+                "positions": [
+                    {"symbol": "162411", "name": "华宝油气", "shares": 50000, "available_shares": 50000, "market_value": "50000.00", "current_price": "1.000"},
+                ],
+                "captured_at": "2026-11-26T14:50:00+08:00",
+            }
+
+        def _cached_account_snapshot(self, *_a: Any, **_k: Any) -> dict[str, Any]:
+            import copy as _copy
+            return _copy.deepcopy(self.snap)
+
+        def get_account_summary(self, *_a: Any, **_k: Any) -> dict[str, Any]:
+            import copy as _copy
+            return _copy.deepcopy(self.snap)
+
+        def place_order(self, **kwargs: Any) -> dict[str, Any]:
+            placed_orders.append({"symbol": kwargs["symbol"], "side": kwargs["side"], "qty": kwargs["quantity"], "price": kwargs["price"]})
+            if reject_160723_sell["flag"] and kwargs["symbol"] == "160723" and kwargs["side"] == "sell":
+                return {"accepted": False, "status": "REJECTED", "dialog_message": "柜台拒单测试"}
+            return {"accepted": True, "status": "SUBMITTED", "entrust_no": f"HT{len(placed_orders):04d}", "dialog_message": "委托已提交"}
+
+    exec_stub = _PoolFakeExecutor()
+    cat = {**CATALOG, "162411": SymbolLookup(symbol="162411", name="华宝油气", market="36")}
+    engine = AutoTradeEngine(
+        auto_store=astore,
+        research_store=rstore,
+        broker=None,
+        trade_executor=exec_stub,
+        symbol_lookup=lambda s: cat.get(s),
+        is_trading_day=lambda _d: True,
+        now_fn=lambda: clock_dt["dt"],
+        epoch_fn=lambda: clock_dt["ep"],
+        quant_rule_store=qstore,
+    )
+
+    pool_patch = {
+        "enabled": True,
+        "signal_source": "quant_rule",
+        "quant_rule_id": "ai-160723-v9-plus-aggressive",
+        "execution_mode": "full_auto",
+        "sizing_mode": "model_auto",
+        "capital_policy_mode": "route_d_plus",
+        "daily_max_buy_amount": 140000.0,
+        "pool_policy": {"total_pool_cap": 140000.0, "sigma_cap_pct": 4.20},
+        "symbols": ["160723", "162411"],
+        "symbol_profiles": {
+            "160723": {"enabled": True, "signal_source": "quant_rule", "quant_rule_id": "ai-160723-v9-plus-aggressive", "sizing_mode": "model_auto", "capital_cap": 60000.0},
+            "162411": {"enabled": True, "signal_source": "quant_rule", "quant_rule_id": "ai-162411-v9-xop-aggressive", "sizing_mode": "model_auto", "capital_cap": 20000.0},
+        },
+    }
+    # 1) 162411 holds ¥50k (> static 20k) within ¥140k pool -> reconcile SUCCEEDS in route_d_plus mode!
+    st_ok = engine.reconcile_and_update_config(pool_patch, reconcile_broker=True)
+    assert st_ok["capital_ledger"]["capital_policy_mode"] == "route_d_plus"
+    assert st_ok["capital_ledger"]["conservation_ok"] is True
+    assert st_ok["capital_ledger"]["pool_allocation"]["shadow_only"] is False
+
+    # Reject only if total quant holding exceeds pool_cap (¥150k > ¥140k)
+    exec_stub.snap["positions"] = [
+        {"symbol": "160723", "name": "嘉实原油", "shares": 50000, "available_shares": 50000, "market_value": "100000.00", "current_price": "2.000"},
+        {"symbol": "162411", "name": "华宝油气", "shares": 50000, "available_shares": 50000, "market_value": "50000.00", "current_price": "1.000"},
+    ]
+    with pytest.raises(TradeExecutionError) as err_pool:
+        engine.reconcile_and_update_config({"pool_policy": {"total_pool_cap": 140000.0}}, reconcile_broker=True)
+    assert err_pool.value.error_code == "TRADE_CAP_BELOW_HOLDING"
+
+    # 2) At 14:53: BRN spikes to 89.0 (160723 target=0%, must keep 100 shares) while 162411 (xop_us_ep, discounted @ 1.000) is solo 100%!
+    # Holding 50,000 shares of 160723 (¥100,000) + ¥40,000 cash -> Wave 1 sells 49,900 shares of 160723 BEFORE Wave 2 buys 162411 (~¥89.4k > static 20k and > pre-sell ¥40k cash)!
+    _seed_day_pts("BRN0Y", "20261126", 70.0, brn_today + [("14:53", 89.0)], market="ICE")
+    _seed_day_pts("160723", "20261126", 2.000, lof_today + [("14:53", 1.980)])
+    exec_stub.snap = {
+        "logged_in": True,
+        "metrics": {"available_cash": "40000.00", "total_assets": "140000.00"},
+        "positions": [
+            {"symbol": "160723", "name": "嘉实原油", "shares": 50000, "available_shares": 50000, "market_value": "100000.00", "current_price": "2.000"},
+        ],
+        "captured_at": "2026-11-26T14:50:00+08:00",
+    }
+    clock_dt["dt"] = datetime(2026, 11, 26, 14, 53, tzinfo=SHANGHAI_TZ)
+    clock_dt["ep"] += 17280.0
+
+    res = asyncio.run(engine.poll_once())
+    assert res["triggered"] == 2
+    assert len(placed_orders) == 2
+    # Wave 1 SELL MUST execute strictly before Wave 2 BUY
+    assert placed_orders[0]["symbol"] == "160723" and placed_orders[0]["side"] == "sell"
+    assert placed_orders[0]["qty"] == 49900
+    assert placed_orders[1]["symbol"] == "162411" and placed_orders[1]["side"] == "buy"
+    assert placed_orders[1]["qty"] > 60000  # uses freed cash well beyond static 20k and pre-sell 40k!
+
+    # 3) If Wave 1 sell is REJECTED by broker, Wave 2 buy must clamp strictly to pre-existing ¥40,000 cash!
+    placed_orders.clear()
+    astore._connection.execute("DELETE FROM auto_trade_signals WHERE trade_date='20261126'")
+    astore._connection.commit()
+    reject_160723_sell["flag"] = True
+    res_rej = asyncio.run(engine.poll_once())
+    assert res_rej["triggered"] == 2
+    assert len(placed_orders) == 2
+    assert placed_orders[0]["symbol"] == "160723" and placed_orders[0]["side"] == "sell"
+    assert placed_orders[1]["symbol"] == "162411" and placed_orders[1]["side"] == "buy"
+    assert placed_orders[1]["qty"] * 1.000 <= 40000.0
+
+    rstore.close()
+    qstore.close()
+    astore.close()
+
+
+def test_route_d_plus_intraday_short_reserve_protects_cover_cash(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("THS_QUANT_OFFLINE", "1")
+    ctx = _setup_v9_plus_fixture(
+        tmp_path / "route_d_short_reserve.db",
+        execution_mode="full_auto",
+        daily_max_buy_amount=100000.0,
+    )
+    rstore, qstore, astore, clock_dt = ctx["rstore"], ctx["qstore"], ctx["astore"], ctx["clock_dt"]
+    _seed_day_pts, brn_today, _ = ctx["seed_day_pts"], ctx["brn_today"], ctx["lof_today"]
+
+    _seed_day_pts("BRN0Y", "20261126", 70.0, brn_today, market="ICE")
+    _seed_day_pts("160723", "20261126", 2.000, ctx["lof_today"] + [("10:12", 2.000)])
+    # Seed 501018 bars matching 160723 fixture
+    _seed_day_pts("501018", "20261125", 1.500, [("09:30", 1.500), ("15:00", 1.500)], market="17")
+    qstore.upsert_rule(
+        {
+            "id": "ai-501018-v9-plus-aggressive",
+            "name": "501018 V9+",
+            "source": "ai",
+            "symbols": ["501018", "BRN0Y"],
+            "macd_settings": {"short": 10, "long": 20, "signal": 5, "marker_threshold": 0.0002},
+            "buy_rule": {"title": "正T买", "joiner": "and", "conditions": [{"type": "brent_spread_pct", "direction": "lte", "value": -0.25}]},
+            "sell_rule": {"title": "反T卖", "joiner": "and", "conditions": [{"type": "brent_spread_pct", "direction": "gte", "value": 0.42}]},
+            "position_sizing": {
+                "mode": "cash_pool_rolling",
+                "engine_profile": "v9_plus_aggressive",
+                "cross_market_anchor": "brent",
+                "max_daily_entries": 8,
+                "cooldown_minutes": 4,
+                "close_flatten_time": "14:53",
+            },
+        }
+    )
+
+    placed_orders: list[dict[str, Any]] = []
+
+    class _ReserveExecutor:
+        adb_serial = "emulator-5556"
+        active_tab = "buy"
+
+        def __init__(self) -> None:
+            # 160723 holds 30,000 remaining shares (¥60k) after selling 20,000 shares @ 2.000; cash=¥80k -> reserve=¥40,002 -> free_cash=¥39,998!
+            self.snap = {
+                "logged_in": True,
+                "metrics": {"available_cash": "80000.00", "total_assets": "140000.00"},
+                "positions": [
+                    {"symbol": "160723", "name": "嘉实原油", "shares": 30000, "available_shares": 30000, "market_value": "60000.00", "current_price": "2.000"},
+                ],
+                "captured_at": "2026-11-26T10:12:00+08:00",
+            }
+
+        def _cached_account_snapshot(self, *_a: Any, **_k: Any) -> dict[str, Any]:
+            return dict(self.snap)
+
+        def get_account_summary(self, *_a: Any, **_k: Any) -> dict[str, Any]:
+            return dict(self.snap)
+
+        def place_order(self, **kwargs: Any) -> dict[str, Any]:
+            placed_orders.append({"symbol": kwargs["symbol"], "side": kwargs["side"], "qty": kwargs["quantity"], "price": kwargs["price"]})
+            return {"accepted": True, "status": "SUBMITTED", "entrust_no": f"HT{len(placed_orders):04d}", "dialog_message": "委托已提交"}
+
+    # Prior reverse-T short leg on 160723 (sold 20,000 shares @ 2.000 at 10:10)
+    assert astore.claim_and_insert_signal(
+        signal_key="160723:20261126:10:10:v9-entry:sell",
+        trade_date="20261126",
+        symbol="160723",
+        name="嘉实原油",
+        side="sell",
+        signal_source="quant_rule",
+        rule_id="ai-160723-v9-plus-aggressive",
+        rule_title="反T高抛",
+        rule_summary="sell 20000",
+        minute="10:10",
+        signal_price="2.000",
+        limit_price="2.000",
+        precision=3,
+        quantity=20000,
+        execution_mode="full_auto",
+        is_simulation=False,
+        status="FILLED_OR_CLOSED",
+        now_str="2026-11-26T10:10:00+08:00",
+    )
+
+    cat = {**CATALOG, "501018": SymbolLookup(symbol="501018", name="南方原油", market="17")}
+    engine = AutoTradeEngine(
+        auto_store=astore,
+        research_store=rstore,
+        broker=None,
+        trade_executor=_ReserveExecutor(),
+        symbol_lookup=lambda s: cat.get(s),
+        is_trading_day=lambda _d: True,
+        now_fn=lambda: clock_dt["dt"],
+        epoch_fn=lambda: clock_dt["ep"],
+        quant_rule_store=qstore,
+    )
+    astore.update_config(
+        {
+            "enabled": True,
+            "signal_source": "quant_rule",
+            "quant_rule_id": "ai-160723-v9-plus-aggressive",
+            "execution_mode": "full_auto",
+            "sizing_mode": "model_auto",
+            "capital_policy_mode": "route_d_plus",
+            "daily_max_buy_amount": 140000.0,
+            "pool_policy": {"total_pool_cap": 140000.0},
+            "symbols": ["160723", "501018"],
+            "symbol_profiles": {
+                "160723": {"enabled": True, "signal_source": "quant_rule", "quant_rule_id": "ai-160723-v9-plus-aggressive", "sizing_mode": "model_auto", "capital_cap": 60000.0},
+                "501018": {"enabled": True, "signal_source": "quant_rule", "quant_rule_id": "ai-501018-v9-plus-aggressive", "sizing_mode": "model_auto", "capital_cap": 20000.0},
+            },
+        }
+    )
+
+    pool_sum = engine.get_status()["capital_ledger"]["pool_allocation"]
+    assert pool_sum["total_short_reserve_cash"] == pytest.approx(40002.0)
+    assert pool_sum["free_pool_cash"] == pytest.approx(39998.0)
+
+    # 1) 501018 attempting a ¥60,000 buy must NEVER touch 160723's ¥40,002 short-cover reserve!
+    cfg_root = astore.get_config()
+    asyncio.run(
+        engine._emit_trade_signal(
+            symbol="501018",
+            item={
+                "rule_id": "ai-501018-v9-plus-aggressive",
+                "rule_title": "501018买",
+                "rule_summary": "test reserve lock",
+                "side": "buy",
+                "minute": "10:15",
+                "price": "1.500",
+                "name": "南方原油",
+                "market": "17",
+                "t0_net_cap_mode": True,
+            },
+            config=cfg_root,
+            trade_date="20261126",
+            now_epoch=clock_dt["ep"],
+            local_iso="2026-11-26T10:15:00+08:00",
+            sig_key="501018:20261126:10:15:v9-entry:buy",
+            qty_override=40000,  # wants ¥60,000 > free ¥39,998!
+        )
+    )
+    assert placed_orders[-1]["symbol"] == "501018"
+    assert placed_orders[-1]["qty"] * 1.500 <= 39998.0  # Reserve ¥40,002 for 160723 stays untouched!
+
+    # 2) Meanwhile 160723 covering its OWN short leg (:v9-exit:buy) CAN use the remaining + reserved cash cleanly!
+    asyncio.run(
+        engine._emit_trade_signal(
+            symbol="160723",
+            item={
+                "rule_id": "ai-160723-v9-plus-aggressive",
+                "rule_title": "反T回补",
+                "rule_summary": "short cover",
+                "side": "buy",
+                "minute": "10:16",
+                "price": "1.950",
+                "name": "嘉实原油",
+                "market": "36",
+                "signal_tag": "v9-exit",
+                "t0_net_cap_mode": True,
+            },
+            config=cfg_root,
+            trade_date="20261126",
+            now_epoch=clock_dt["ep"] + 60.0,
+            local_iso="2026-11-26T10:16:00+08:00",
+            sig_key="160723:20261126:10:16:v9-exit:buy",
+            qty_override=20000,  # ¥39,000 <= ¥40,002+ remaining cash!
+        )
+    )
+    assert placed_orders[-1]["symbol"] == "160723"
+    assert placed_orders[-1]["qty"] == 20000
+
+    del brn_today
+    rstore.close()
+    qstore.close()
+    astore.close()
+
+
+def test_bridge_put_strategy_accepts_capital_policy_mode_and_pool_policy(tmp_path: Path) -> None:
+    db_path = tmp_path / "bridge_pool_cfg.db"
+    rstore = SQLiteResearchStore(db_path)
+    qstore = SQLiteQuantRuleStore(db_path)
+    astore = SQLiteAutoTradeStore(db_path)
+    engine = AutoTradeEngine(
+        auto_store=astore,
+        research_store=rstore,
+        broker=None,
+        trade_executor=None,
+        symbol_lookup=lambda s: CATALOG.get(s),
+        quant_rule_store=qstore,
+    )
+    app = create_app(
+        admin_password_hash=PasswordHasher().hash("admin-pass-123"),
+        admin_session_secret="b" * 32,
+        symbol_lookup=lambda s: CATALOG.get(s),
+        market_account_store=SQLiteMarketAccountStore(tmp_path / "market.db"),
+        research_store=rstore,
+        goodluck_internal_token=TOKEN,
+        auto_trade_engine=engine,
+    )
+    client = TestClient(app)
+
+    res = client.put(
+        "/api/internal/goodluck/trade/strategy",
+        headers=_headers(role="admin"),
+        json={
+            "enabled": True,
+            "signal_source": "intraday_macd_flow",
+            "execution_mode": "semi_auto",
+            "sizing_mode": "model_auto",
+            "symbols": ["160723"],
+            "order_quantity": 100,
+            "pricing_mode": "counterparty_book",
+            "order_book_level": 3,
+            "slippage_ticks": 3,
+            "auto_cancel_seconds": 30,
+            "daily_max_buy_amount": 140000.0,
+            "block_non_continuous_session": True,
+            "capital_policy_mode": "route_d_shadow",
+            "pool_policy": {"sigma_cap_pct": 3.5, "equity_solo_anchors": ["xop_us_ep"]},
+        },
+    )
+    assert res.status_code == 200
+    body = res.json()
+    assert body["config"]["capital_policy_mode"] == "route_d_shadow"
+    assert body["config"]["pool_policy"]["sigma_cap_pct"] == pytest.approx(3.5)
+    assert body["config"]["pool_policy"]["equity_solo_anchors"] == ["xop_us_ep"]
+    assert body["capital_ledger"]["pool_allocation"]["shadow_only"] is True
+
+    qstore.close()
+    astore.close()
+    rstore.close()
+
+
+def test_evaluate_live_snapshot_offhours_falls_back_to_latest_close_and_computes_dynamic_pool_weights(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("THS_QUANT_OFFLINE", "1")
+    # Fixture seeds bars for 2026-11-26; clock at 2026-11-27 01:25 (next day before market open)
+    ctx = _setup_v9_plus_fixture(
+        tmp_path / "offhours_fallback.db",
+        execution_mode="semi_auto",
+        daily_max_buy_amount=140000.0,
+    )
+    rstore, qstore, astore, engine = ctx["rstore"], ctx["qstore"], ctx["astore"], ctx["engine"]
+    engine.now_fn = lambda: datetime(2026, 11, 27, 1, 25, 0, tzinfo=SHANGHAI_TZ)
+
+    engine.reconcile_and_update_config(
+        {
+            "capital_policy_mode": "route_d_sharpe_shield",
+            "pool_policy": {"total_pool_cap": 140000.0},
+        },
+        reconcile_broker=False,
+    )
+
+    # 1) Live evaluation should NOT error with "V9+ 日内布伦特/分时样本尚在初始化，请稍候重试"
+    snap = engine.evaluate_live_snapshot("160723")
+    assert snap["data_ready"] is True
+    assert snap["is_historical_close_snapshot"] is True
+    assert snap["snapshot_trade_date"] == "20261126"
+    assert "初始化" not in str(snap.get("note") or "")
+    assert "20261126" in str(snap.get("note") or "")
+
+    # 2) Dynamic position weight & capital allocation scale with total_pool_cap
+    st140 = engine.get_status()
+    assert st140["capital_policy_mode"] == "route_d_sharpe_shield"
+    assert st140["active_capital_policy"]["params"]["sigma_cap_pct"] == pytest.approx(2.40)
+    assert len(st140["available_capital_policies"]) >= 5
+    pa140 = st140["capital_ledger"]["pool_allocation"]
+    assert pa140["policy_id"] == "route_d_sharpe_shield"
+    assert pa140["pool_cap"] == pytest.approx(140000.0)
+    row140 = pa140["symbols"]["160723"]
+    assert row140["full_signal_position_pct"] > 0.0
+    assert row140["full_signal_capital_amount"] == pytest.approx(
+        round(140000.0 * row140["full_signal_position_pct"] / 100.0, 2)
+    )
+    assert row140["target_capital_amount"] == pytest.approx(
+        round(140000.0 * row140["target_position_pct"] / 100.0, 2)
+    )
+
+    engine.reconcile_and_update_config({"pool_policy": {"total_pool_cap": 200000.0}}, reconcile_broker=False)
+    st200 = engine.get_status()
+    assert st200["daily_usage"]["daily_max_buy_amount"] == pytest.approx(200000.0)
+    row200 = st200["capital_ledger"]["pool_allocation"]["symbols"]["160723"]
+    assert row200["full_signal_position_pct"] == pytest.approx(row140["full_signal_position_pct"])
+    assert row200["full_signal_capital_amount"] == pytest.approx(
+        round(200000.0 * row200["full_signal_position_pct"] / 100.0, 2)
+    )
+
+    rstore.close()
+    qstore.close()
+    astore.close()
+
 

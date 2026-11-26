@@ -976,7 +976,7 @@ def test_bridge_trade_idempotency_50_symbols_and_sse_events(tmp_path) -> None:
         )
         assert conflict.status_code == 409
 
-        # 2. Up to 50 symbols & rule_bindings validation; 51 symbols rejected with 422
+        # 2. Up to 50 symbols & strict single-rule profile; 51 symbols and multi-rule rule_bindings rejected with 422
         syms_50 = [f"60{i:04d}" for i in range(50)]
         cfg_ok = client.put(
             "/api/internal/goodluck/trade/strategy",
@@ -996,18 +996,46 @@ def test_bridge_trade_idempotency_50_symbols_and_sse_events(tmp_path) -> None:
                 "symbol_profiles": {
                     "600000": {
                         "enabled": True,
-                        "rule_bindings": [
-                            {"signal_source": "quant_rule", "quant_rule_id": "rule-a", "enabled": True, "priority": 5, "weight_scale": 1.5},
-                            {"signal_source": "intraday_macd_flow", "enabled": True, "priority": 10, "weight_scale": 1.0},
-                        ],
+                        "signal_source": "quant_rule",
+                        "quant_rule_id": "rule-a",
                     }
                 },
             },
         )
         assert cfg_ok.status_code == 200
         assert len(cfg_ok.json()["config"]["symbols"]) == 50
-        bindings = cfg_ok.json()["config"]["symbol_profiles"]["600000"]["rule_bindings"]
-        assert [b["priority"] for b in bindings] == [5, 10]
+        prof_600 = cfg_ok.json()["config"]["symbol_profiles"]["600000"]
+        assert prof_600["signal_source"] == "quant_rule"
+        assert prof_600["quant_rule_id"] == "rule-a"
+        assert "rule_bindings" not in prof_600
+
+        cfg_multi_rule = client.put(
+            "/api/internal/goodluck/trade/strategy",
+            headers=_headers("uid:admin", "admin"),
+            json={
+                "enabled": True,
+                "signal_source": "intraday_macd_flow",
+                "execution_mode": "semi_auto",
+                "symbols": ["600000"],
+                "order_quantity": 100,
+                "pricing_mode": "counterparty_book",
+                "order_book_level": 3,
+                "slippage_ticks": 3,
+                "auto_cancel_seconds": 30,
+                "daily_max_buy_amount": 50000.0,
+                "block_non_continuous_session": True,
+                "symbol_profiles": {
+                    "600000": {
+                        "enabled": True,
+                        "rule_bindings": [
+                            {"signal_source": "quant_rule", "quant_rule_id": "rule-a", "enabled": True, "priority": 5},
+                            {"signal_source": "intraday_macd_flow", "enabled": True, "priority": 10},
+                        ],
+                    }
+                },
+            },
+        )
+        assert cfg_multi_rule.status_code == 422
 
         syms_51 = [f"60{i:04d}" for i in range(51)]
         cfg_too_many = client.put(
@@ -1075,5 +1103,109 @@ def test_bridge_trade_idempotency_50_symbols_and_sse_events(tmp_path) -> None:
     assert "event: signal_pending" in sse_chunks[1]
     assert "sig-sse-1" in sse_chunks[1]
     assert len(engine._subscribers) == 0
+    astore.close()
+    rstore.close()
+
+
+def test_bridge_capital_policies_api_crud_activation_and_guards(tmp_path: Path) -> None:
+    from level2_service.auto_trade import AutoTradeEngine, SQLiteAutoTradeStore
+    from level2_service.quant_rules import SQLiteQuantRuleStore
+
+    db_path = tmp_path / "capital_policies_api.db"
+    rstore = SQLiteResearchStore(db_path)
+    qstore = SQLiteQuantRuleStore(db_path)
+    astore = SQLiteAutoTradeStore(db_path)
+    engine = AutoTradeEngine(
+        auto_store=astore,
+        research_store=rstore,
+        broker=None,
+        trade_executor=None,
+        symbol_lookup=lambda s: CATALOG.get(s),
+        quant_rule_store=qstore,
+    )
+    app = create_app(
+        admin_password_hash=PasswordHasher().hash("admin-pass-123"),
+        admin_session_secret="c" * 32,
+        symbol_lookup=lambda s: CATALOG.get(s),
+        market_account_store=SQLiteMarketAccountStore(tmp_path / "market.db"),
+        research_store=rstore,
+        goodluck_internal_token=TOKEN,
+        auto_trade_engine=engine,
+        quant_rule_store=qstore,
+    )
+    client = TestClient(app)
+    headers = {
+        "x-goodluck-internal-token": TOKEN,
+        "x-goodluck-user": "uid:admin",
+        "x-goodluck-role": "admin",
+    }
+
+    schema_res = client.get("/api/internal/goodluck/trade/capital-policies/schema", headers=headers)
+    assert schema_res.status_code == 200
+    assert any(e["id"] == "route_d_plus" for e in schema_res.json()["engines"])
+
+    list_res = client.get("/api/internal/goodluck/trade/capital-policies", headers=headers)
+    assert list_res.status_code == 200
+    assert any(p["id"] == "route_d_sharpe_shield" for p in list_res.json()["policies"])
+
+    create_res = client.post(
+        "/api/internal/goodluck/trade/capital-policies",
+        headers=headers,
+        json={
+            "id": "api-risk-parity-test",
+            "name": "API发布风险平价测试",
+            "description": "动态发布免发版策略",
+            "engine_type": "inverse_vol_risk_parity",
+            "params": {"sigma_cap_pct": 2.3, "max_total_budget_wt": 0.92},
+            "metrics_summary": {"sharpe_ratio": 5.51, "max_drawdown_pct": 6.4},
+        },
+    )
+    assert create_res.status_code == 200
+    assert create_res.json()["policy"]["id"] == "api-risk-parity-test"
+
+    # Activate custom strategy via strategy config API
+    put_res = client.put(
+        "/api/internal/goodluck/trade/strategy",
+        headers=headers,
+        json={
+            "enabled": True,
+            "signal_source": "intraday_macd_flow",
+            "execution_mode": "semi_auto",
+            "sizing_mode": "model_auto",
+            "symbols": ["160723", "161129"],
+            "order_quantity": 100,
+            "pricing_mode": "counterparty_book",
+            "order_book_level": 2,
+            "slippage_ticks": 3,
+            "auto_cancel_seconds": 30,
+            "daily_max_buy_amount": 140000.0,
+            "block_non_continuous_session": True,
+            "capital_policy_mode": "api-risk-parity-test",
+            "pool_policy": {"total_pool_cap": 140000.0},
+        },
+    )
+    assert put_res.status_code == 200
+    put_body = put_res.json()
+    assert put_body["capital_policy_mode"] == "api-risk-parity-test"
+    assert put_body["active_capital_policy"]["engine_type"] == "inverse_vol_risk_parity"
+    assert put_body["capital_ledger"]["pool_allocation"]["pool_cap"] == pytest.approx(140000.0)
+
+    # Active strategy cannot be deleted (409)
+    del_active = client.delete("/api/internal/goodluck/trade/capital-policies/api-risk-parity-test", headers=headers)
+    assert del_active.status_code == 409
+
+    # Switch to built-in shield strategy, then delete custom policy succeeds
+    put_shield = client.put(
+        "/api/internal/goodluck/trade/strategy",
+        headers=headers,
+        json={**put_body["config"], "capital_policy_mode": "route_d_sharpe_shield"},
+    )
+    assert put_shield.status_code == 200
+    assert put_shield.json()["capital_policy_mode"] == "route_d_sharpe_shield"
+
+    del_ok = client.delete("/api/internal/goodluck/trade/capital-policies/api-risk-parity-test", headers=headers)
+    assert del_ok.status_code == 204
+
+    qstore.close()
     astore.close()
     rstore.close()

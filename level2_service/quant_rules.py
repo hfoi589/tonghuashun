@@ -24,17 +24,38 @@ from zoneinfo import ZoneInfo
 from .daily_kline import DailyKlineSourceError, TonghuashunPublicDailyKlineProvider
 from .market_data import KlineBar
 from .parsed_values import is_exchange_fund_symbol
+from .quant_data_sources import (
+    QUANT_DATA_SOURCE_CATALOG,
+    derive_rule_data_sources,
+    normalize_and_validate_rule_data_sources,
+)
 from .research_premium import PREMIUM_NAMES
 from .research_replay import (
+    EXTENDED_QUANT_CONDITION_TYPES,
+    VALID_QUANT_CONDITION_TYPES,
     _number,
     _trading_minute,
     build_replay_markers,
     calculate_macd,
     calculate_replay_performance,
+    detect_rule_required_packs,
     evaluate_rule_detail,
     rule_uses_flow,
+    validate_dsl_condition,
 )
-from .v9_plus_engine import evaluate_v9_plus_backtest
+from .v9_fof_crude import (
+    load_dbo_daily_rows,
+    load_merged_fx_cnh_series,
+)
+from .v9_plus_engine import (
+    _MEMORY_MACRO_CACHE,
+    _causal_daily_ov_and_nd,
+    _parse_sh,
+    _val_at,
+    V9MacroDataStore,
+    build_v9_plus_days,
+    evaluate_v9_plus_backtest,
+)
 
 
 SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
@@ -51,7 +72,33 @@ _HORIZONS = (1, 3, 5, 10, 15, 30)
 
 VALID_SIZING_MODES = ("base_t0_close", "cash_pool_rolling")
 VALID_ENGINE_PROFILES = ("standard", "v9_plus_aggressive", "v9_plus_balanced")
-VALID_CROSS_MARKET_ANCHORS = ("brent", "xop_us_ep")
+VALID_CROSS_MARKET_ANCHORS = ("brent", "xop_us_ep", "uso_bno_sc_peer", "fof_crude_core", "fof_t0_multisource", "sp_oilgas_etf")
+VALID_QUANT_DATA_PACKS = (
+    "iopv_fx",
+    "xop_us_ep",
+    "uso_bno_sc_peer",
+    "l2_darkpool_flow",
+    "etf_redemption_flow",
+)
+MONITOR_SOURCE_TO_PACK: dict[str, str | None] = {
+    "ashare_intraday_1m": None,
+    "ashare_orderbook_l1": None,
+    "ice_brent_1m": None,
+    "ashare_l2_fund_flow": "l2_darkpool_flow",
+    "fx_usdcny_usdcnh": "iopv_fx",
+    "eastmoney_fund_nav": "iopv_fx",
+    "qdii_premium_panel_feed": "iopv_fx",
+    "us_ep_xop_crack_macro": "xop_us_ep",
+    "cme_energy_macro_futures": "xop_us_ep",
+    "us_oil_etf_uso_bno_dbo": "uso_bno_sc_peer",
+    "ine_sc0_futures": "uso_bno_sc_peer",
+    "ashare_peer_lof_quote": "uso_bno_sc_peer",
+    "ashare_etf_redemption": "etf_redemption_flow",
+}
+_OIL_PEER_SYMBOLS = ("160723", "161129", "501018", "162411")
+_OIL_QDII_NAV_SYMBOLS = frozenset(
+    {"160723", "161129", "501018", "162411", "160416", "162719", "163208", "159518", "513350"}
+)
 _T0_TURNAROUND_EXACT = frozenset(
     {"160723", "501018", "160416", "161129", "162411", "162719", "163208", "160216"}
 )
@@ -344,6 +391,8 @@ def _normalize_v9_tuning(raw: object) -> dict[str, Any]:
         ("bubble_prem_cap_pct", 5.0, 50.0, 2, "positive"),
         ("bubble_overnight_weight_pct", 0.0, 100.0, 2, "any"),
         ("bull_pullback_weight_pct", 0.0, 100.0, 2, "any"),
+        ("plunge_dd15_pct", -35.0, -4.0, 2, "any"),
+        ("high_oil_bull_cap_pct", 72.0, 95.0, 1, "any"),
     )
     for key, lo, hi, digits, mode in float_specs:
         raw_val = raw.get(key)
@@ -360,9 +409,12 @@ def _normalize_v9_tuning(raw: object) -> dict[str, Any]:
         if mode == "nonzero" and abs(fval) <= 1e-9:
             continue
         out[key] = round(max(lo, min(hi, fval)), digits)
-    for bool_key in ("bull_oil_surge_guard", "scalp_strict_mode", "strict_dip_scalp"):
+    for bool_key in ("bull_oil_surge_guard", "scalp_strict_mode", "strict_dip_scalp", "multi_oil_plunge_mode"):
         if _as_bool_flag(raw.get(bool_key)):
             out[bool_key] = True
+    raw_peer = str(raw.get("peer_symbol") or "").strip()
+    if _SYMBOL_RE.fullmatch(raw_peer):
+        out["peer_symbol"] = raw_peer
     return out
 
 
@@ -513,10 +565,152 @@ def _normalize_side_rule(
 def get_quant_rule_schema() -> dict[str, Any]:
     """Return self-describing schema for external AI rule synthesis and evaluation."""
     return {
-        "version": 3,
+        "version": 4,
         "target_default_symbol": "160723",
         "supported_special_symbols": ["BRN0Y"],
         "default_start_date": "20260701",
+        "data_sources_catalog": list(QUANT_DATA_SOURCE_CATALOG),
+        "monitor_source_to_pack": dict(MONITOR_SOURCE_TO_PACK),
+        "data_sources_contract": {
+            "summary": "所有存量及新增量化规则均须绑定并归集其依赖数据源 (data_sources)，自动进入好运器「数据源监控」中心巡检，并在盘中主/必选数据源异常时阻断误单。",
+            "required_fields": ["id", "role", "required_in_session"],
+            "optional_fields": ["symbols", "note"],
+            "valid_ids": [item["id"] for item in QUANT_DATA_SOURCE_CATALOG],
+            "auto_derivation": "保存规则时若未显式传递 data_sources，系统会基于 symbols/条件算子/position_sizing 自动推导并补全；显式传递 data_sources 时会校验全部 ID 合法性并与 AST 必选依赖合并，传入 strict_data_sources=true 时强制要求显式声明全部必选数据源。",
+        },
+        "data_packs": {
+            "iopv_fx": {
+                "title": "汇调净值与汇率折溢价/协整维度",
+                "scope": "油气QDII基金及宏观汇率锚定标的 (160723/161129/501018/162411/159518/513350/160416/162719/163208)",
+                "minute_fields": [
+                    "iopv_fx",
+                    "iopv_premium_pct",
+                    "sp_fx_pct",
+                    "coint10_pct",
+                    "usdcny",
+                    "usdcnh",
+                    "usdcny_change_pct",
+                    "fx_adjusted_nav_change_pct",
+                    "official_nav",
+                    "brent_q2y_pct",
+                ],
+                "daily_fields": [
+                    "iopv_fx_close",
+                    "iopv_premium_close_pct",
+                    "sp_fx_close_pct",
+                    "coint10_close_pct",
+                    "usdcny_close",
+                    "usdcnh_close",
+                    "official_nav",
+                    "official_nav_date",
+                    "brent_q2y_close_pct",
+                ],
+            },
+            "xop_us_ep": {
+                "title": "美股 XOP/XLE/SPY/IWM 与 WTI/裂解/天然气高频维度",
+                "scope": "162411 华宝油气及美股上游勘探映射标的",
+                "minute_fields": [
+                    "xop_change_pct",
+                    "xle_change_pct",
+                    "spy_change_pct",
+                    "iwm_change_pct",
+                    "cl_change_pct",
+                    "ho_crack_change_pct",
+                    "ng_change_pct",
+                    "es_change_pct",
+                    "xop_synthetic_premium_pct",
+                    "daytime_lead_pct",
+                    "daytime_crack_pct",
+                ],
+                "daily_fields": [
+                    "xop_ov_pct",
+                    "xle_ov_pct",
+                    "spy_ov_pct",
+                    "iwm_ov_pct",
+                    "cl_ov_pct",
+                    "ho_crack_ov_pct",
+                    "ng_ov_pct",
+                ],
+            },
+            "uso_bno_sc_peer": {
+                "title": "USO+BNO+DBO美油篮子 / 沪油SC0 / 同业油气价差联动维度",
+                "scope": "161129/501018/160723 等内盘-外盘-同业三锚联动",
+                "minute_fields": [
+                    "uso_bno_change_pct",
+                    "uso_change_pct",
+                    "bno_change_pct",
+                    "dbo_change_pct",
+                    "fof_3oil_change_pct",
+                    "dual_oil_premium_pct",
+                    "sc0_change_pct",
+                    "sc0_intraday_pct",
+                    "sc_brent_spread_pct",
+                    "peer_spread_pct",
+                    "peer_change_pct",
+                    "peer_premium_diff_pct",
+                    "peer_160723_spread_pct",
+                    "peer_161129_spread_pct",
+                    "peer_501018_spread_pct",
+                ],
+                "daily_fields": [
+                    "uso_bno_ov_pct",
+                    "uso_ov_pct",
+                    "bno_ov_pct",
+                    "dbo_ov_pct",
+                    "fof_3oil_ov_pct",
+                    "sc0_close_pct",
+                    "peer_close_spread_pct",
+                ],
+            },
+            "l2_darkpool_flow": {
+                "title": "A股个股 Level-2 主力明盘/暗盘/散户分钟资金流（当日/3日/5日）",
+                "scope": "A股及场内基金 L2 分钟资金流（统一归一化为万元）",
+                "minute_fields": [
+                    "l2_today_main_net_wan",
+                    "l2_today_visible_wan",
+                    "l2_today_hidden_wan",
+                    "l2_today_retail_wan",
+                    "l2_today_hidden_ratio_pct",
+                    "l2_3d_main_net_wan",
+                    "l2_3d_visible_wan",
+                    "l2_3d_hidden_wan",
+                    "l2_3d_retail_wan",
+                    "l2_5d_main_net_wan",
+                    "l2_5d_visible_wan",
+                    "l2_5d_hidden_wan",
+                    "l2_5d_retail_wan",
+                ],
+                "daily_fields": [
+                    "l2_today_main_net_wan",
+                    "l2_today_visible_wan",
+                    "l2_today_hidden_wan",
+                    "l2_today_retail_wan",
+                    "l2_3d_main_net_wan",
+                    "l2_5d_main_net_wan",
+                ],
+            },
+            "etf_redemption_flow": {
+                "title": "场内 ETF T+1 申赎净流入与基金规模维度（严格 T-1 无前瞻）",
+                "scope": "支持 THS 申赎数据的 ETF 与个股联结基金（单位：万元 / 亿元）",
+                "minute_fields": [
+                    "etf_net_buy_1d_wan",
+                    "etf_net_buy_3d_wan",
+                    "etf_net_buy_5d_wan",
+                    "etf_net_buy_20d_wan",
+                    "etf_share_scale_yi",
+                    "etf_net_buy_ratio_pct",
+                ],
+                "daily_fields": [
+                    "etf_flow_ref_date",
+                    "etf_net_buy_1d_wan",
+                    "etf_net_buy_3d_wan",
+                    "etf_net_buy_5d_wan",
+                    "etf_net_buy_20d_wan",
+                    "etf_share_scale_yi",
+                    "etf_net_buy_ratio_pct",
+                ],
+            },
+        },
         "evaluation_contract": {
             "primary_metric": "base_position_t0.net_cum_return_pct",
             "capital_sim_metric": "capital_sim.net_return_pct",
@@ -535,7 +729,7 @@ def get_quant_rule_schema() -> dict[str, Any]:
             "fields": {
                 "mode": "base_t0_close | cash_pool_rolling",
                 "engine_profile": "standard | v9_plus_aggressive | v9_plus_balanced（V9+ 支持汇调实时溢价、BRN0Y 2年分位三态收盘调仓与三档动态做T）",
-                "cross_market_anchor": "brent | xop_us_ep（可选，默认 brent；xop_us_ep 适配华宝油气 162411，融合美股 XOP 收盘重锚与天然气 NG/标普 ES/布油 BRN0Y 合成日内估值）",
+                "cross_market_anchor": "brent | xop_us_ep | uso_bno_sc_peer | fof_crude_core | fof_t0_multisource | sp_oilgas_etf（可选，默认 brent；xop_us_ep 适配华宝油气 162411；uso_bno_sc_peer 适配易方达原油 161129；fof_crude_core 适配嘉实原油 160723 原版；fof_t0_multisource 为嘉实原油 160723 专属 T+0 双池 10 源高频回转引擎，融合 85% 底仓+15% T+0 机动金、CME CL 1m、XOP 篮子与 501018/161129/162411 三同业共振；sp_oilgas_etf 适配标普油气 ETF 513350）",
                 "default_weight_pct": "5..100（默认 50.0）",
                 "max_position_pct": "10..100（默认 100.0，单日或总仓位相对可用金额上限的最大占比）",
                 "max_daily_entries": "1..20（默认 2）",
@@ -546,7 +740,7 @@ def get_quant_rule_schema() -> dict[str, Any]:
                 "allow_same_day_turnaround": "auto | true | false（auto 对 160723/501018/513xxx/1599xx 自动启用 T+0）",
                 "conviction_tiers": "[{\"label\": str, \"weight_pct\": float, \"joiner\": \"and|or\", \"conditions\": [...]}]",
                 "sell_conviction_tiers": "可选卖出/减仓分档比例列表；为空时卖出复用 conviction_tiers 或 default_weight_pct",
-                "v9_tuning": "可选 V9+ 标的微观结构微调参数（bear_high_prem_flat_pct / bull_oil_surge_guard / bull_oil_surge_tier_cap_pct / scalp_strict_mode / macd_price_anchor / buy_prem_offset_pct / bubble_prem_cap_pct / bubble_overnight_weight_pct / bull_pullback_weight_pct / strict_dip_scalp）",
+                "v9_tuning": "可选 V9+ 标的微观结构微调参数（bear_high_prem_flat_pct / bull_oil_surge_guard / bull_oil_surge_tier_cap_pct / scalp_strict_mode / macd_price_anchor / buy_prem_offset_pct / bubble_prem_cap_pct / bubble_overnight_weight_pct / bull_pullback_weight_pct / strict_dip_scalp / multi_oil_plunge_mode / plunge_dd15_pct / high_oil_bull_cap_pct / peer_symbol）",
             },
         },
         "cross_market_brent": {
@@ -634,6 +828,10 @@ def get_quant_rule_schema() -> dict[str, Any]:
                 "round_trip_fee_pct": 0.02,
                 "capital_cap": 20000.0,
             },
+            "data_sources": [
+                {"id": "ashare_intraday_1m", "role": "primary", "required_in_session": True, "symbols": ["160723"]},
+                {"id": "ice_brent_1m", "role": "anchor", "required_in_session": True, "symbols": ["BRN0Y"]},
+            ],
         },
         "condition_types": [
             {"type": "macd_signal", "fields": {"signal": "red | green | both"}, "note": "MACD DIFF/DEA 金叉红点或死叉绿点，受 marker_threshold 过滤"},
@@ -651,6 +849,13 @@ def get_quant_rule_schema() -> dict[str, Any]:
             {"type": "brent_change_pct", "fields": {"anchor": "prev_1500 | open_0930", "direction": "gte | lte", "value": "float (%)"}, "note": "当前分钟 BRN0Y 相对前日15:00或今日09:30的累计涨跌幅"},
             {"type": "brent_momentum_pct", "fields": {"minutes": "int (1..240)", "direction": "gte | lte", "value": "float (%)"}, "note": "当前分钟 BRN0Y 过去 N 分钟动量涨跌幅"},
             {"type": "brent_spread_pct", "fields": {"direction": "lte | gte", "value": "float (%)"}, "note": "跨市场偏离：A股当日涨跌幅% - BRN0Y较前日15:00涨跌幅%（负值代表A股滞涨折价）"},
+            {"type": "iopv_premium_pct", "data_pack": "iopv_fx", "fields": {"metric": "premium_pct | sp_fx_pct | coint10_pct | usdcny_change_pct | brent_q2y_pct", "direction": "lte | gte", "value": "float (%)"}, "note": "基于汇调IOPV的实时折溢价率、跨市场价差 sp_fx、10日协整偏离或布伦特2年分位数"},
+            {"type": "fx_spread_pct", "data_pack": "iopv_fx", "fields": {"metric": "sp_fx_pct | usdcny | usdcny_change_pct | fx_adjusted_nav_change_pct", "direction": "lte | gte", "value": "float"}, "note": "离岸汇率 USD/CNY 及汇调价差过滤算子"},
+            {"type": "xop_macro_pct", "data_pack": "xop_us_ep", "fields": {"metric": "xop_change_pct | xle_change_pct | spy_change_pct | iwm_change_pct | cl_change_pct | ho_crack_change_pct | ng_change_pct | es_change_pct | xop_synthetic_premium_pct | daytime_lead_pct | daytime_crack_pct", "direction": "lte | gte", "value": "float (%)"}, "note": "美股能源 ETF / WTI裂解 / 天然气 / ES期指高频代理条件"},
+            {"type": "sc_crude_pct", "data_pack": "uso_bno_sc_peer", "fields": {"metric": "sc0_change_pct | sc0_intraday_pct | uso_bno_change_pct | dual_oil_premium_pct | sc_brent_spread_pct", "direction": "lte | gte", "value": "float (%)"}, "note": "沪原油 SC0、USO+BNO双油锚与内外盘油价差条件"},
+            {"type": "peer_spread_pct", "data_pack": "uso_bno_sc_peer", "fields": {"peer": "auto | 160723 | 161129 | 501018 | 162411", "metric": "spread_pct | peer_change_pct | peer_premium_diff_pct", "direction": "lte | gte", "value": "float (%)"}, "note": "同业油气LOF日内相对价差或同业涨跌幅偏离"},
+            {"type": "l2_flow_level", "data_pack": "l2_darkpool_flow", "fields": {"period": "today | three_day | five_day", "flow": "main_net | main_visible | main_hidden | retail | hidden_ratio", "direction": "lte | gte", "value": "float (万元或%)"}, "note": "A股 Level-2 主力明盘/暗盘/散户资金流净额及暗盘占比（当日/3日/5日）"},
+            {"type": "etf_net_flow", "data_pack": "etf_redemption_flow", "fields": {"metric": "net_buy_1d_wan | net_buy_3d_wan | net_buy_5d_wan | net_buy_20d_wan | share_scale_yi | net_buy_ratio_pct", "direction": "lte | gte", "value": "float (万元/亿元/%)"}, "note": "严格 T-1 无前瞻场内 ETF 申赎净流入与基金规模过滤"},
         ],
     }
 
@@ -1174,6 +1379,8 @@ def backfill_intraday_history(
 
     tdx_loaded_days = 0
     tdx_points_written = 0
+    is_fund = is_exchange_fund_symbol(normalized, market)
+    precision = 3 if is_fund else 2
     if missing_or_partial:
         if fetch_tdx_fn is not None:
             tdx_map = fetch_tdx_fn(normalized, missing_or_partial)
@@ -1183,8 +1390,6 @@ def backfill_intraday_history(
                 tdx_map.update(
                     fetch_tdx_history_minute_data(normalized, missing_or_partial[chunk_start : chunk_start + 45])
                 )
-        is_fund = is_exchange_fund_symbol(normalized, market)
-        precision = 3 if is_fund else 2
         resolved_market = market or ("36" if normalized.startswith(("15", "16", "18")) else ("20" if normalized.startswith("5") else ("17" if normalized.startswith("6") else "33")))
         resolved_name = name or PREMIUM_NAMES.get(normalized, normalized)
         captured_at = _now_iso()
@@ -1197,6 +1402,12 @@ def backfill_intraday_history(
             tdx_loaded_days += 1
             bar = bar_by_date.get(td)
             pre = pre_close_map.get(td) or tdx_day.get("pre_close")
+            if pre and td not in pre_close_map:
+                try:
+                    if float(pre) > 0:
+                        pre_close_map[td] = f"{float(pre):.{precision}f}"
+                except (TypeError, ValueError):
+                    pass
             close_p = str(bar.close) if bar is not None else str(tdx_day["points"][-1]["price"])
             chg_pct = None
             if pre and float(pre) > 0:
@@ -1264,7 +1475,33 @@ def backfill_intraday_history(
                     )
                     tdx_points_written = len(pt_rows_to_write)
 
-    # Also backfill daily OHLCV / missing pre_close on existing days from 10jqka daily bars
+    # Derive missing pre_close from prior trading day's close when 10jqka daily bars are unavailable
+    with store._lock:
+        all_sym_days = store._connection.execute(
+            "SELECT trade_date, quote_price FROM research_days WHERE symbol=? ORDER BY trade_date ASC",
+            (normalized,),
+        ).fetchall()
+        prev_td_close: str | None = None
+        for row_td, row_close in all_sym_days:
+            td_s = str(row_td)
+            if prev_td_close and td_s not in pre_close_map:
+                try:
+                    if float(prev_td_close) > 0:
+                        pre_close_map[td_s] = f"{float(prev_td_close):.{precision}f}"
+                except (TypeError, ValueError):
+                    pass
+            cur_close = str(bar_by_date[td_s].close) if td_s in bar_by_date else (str(row_close) if row_close else None)
+            if not cur_close:
+                last_pt = store._connection.execute(
+                    "SELECT price FROM research_points WHERE symbol=? AND trade_date=? ORDER BY minute DESC LIMIT 1",
+                    (normalized, td_s),
+                ).fetchone()
+                if last_pt and last_pt[0] is not None:
+                    cur_close = str(last_pt[0])
+            if cur_close:
+                prev_td_close = cur_close
+
+    # Also backfill daily OHLCV / missing pre_close on existing days from 10jqka daily bars or prior-day close
     with store._lock, store._connection:
         for td in expected_dates:
             bar = bar_by_date.get(td)
@@ -1350,6 +1587,1092 @@ def get_symbol_coverage(
     }
 
 
+def normalize_requested_data_packs(
+    raw_packs: Sequence[str] | str | None,
+    *,
+    default_all: bool = False,
+) -> list[str]:
+    """Normalize data-pack selectors from query params or pack lists."""
+    if raw_packs is None:
+        return list(VALID_QUANT_DATA_PACKS) if default_all else []
+    if isinstance(raw_packs, str):
+        tokens = [tok.strip().lower() for tok in raw_packs.split(",") if tok.strip()]
+    else:
+        tokens = [str(tok).strip().lower() for tok in raw_packs if str(tok).strip()]
+    if not tokens:
+        return []
+    if "all" in tokens:
+        return list(VALID_QUANT_DATA_PACKS)
+    valid_set = set(VALID_QUANT_DATA_PACKS)
+    deduped: list[str] = []
+    for tok in tokens:
+        if tok in valid_set and tok not in deduped:
+            deduped.append(tok)
+    return deduped
+
+
+def normalize_requested_source_ids(
+    raw_sources: Sequence[str] | str | None,
+    *,
+    default_all: bool = False,
+) -> list[str]:
+    """Normalize monitor data-source IDs from query params or sequence inputs."""
+    all_ids = [str(item["id"]) for item in QUANT_DATA_SOURCE_CATALOG]
+    if raw_sources is None:
+        return all_ids if default_all else []
+    if isinstance(raw_sources, str):
+        tokens = [tok.strip() for tok in raw_sources.split(",") if tok.strip()]
+    else:
+        tokens = [str(tok).strip() for tok in raw_sources if str(tok).strip()]
+    if not tokens:
+        return []
+    if any(t.lower() == "all" for t in tokens):
+        return all_ids
+    valid_set = set(MONITOR_SOURCE_TO_PACK.keys())
+    deduped: list[str] = []
+    for tok in tokens:
+        if tok in valid_set and tok not in deduped:
+            deduped.append(tok)
+    return deduped
+
+
+def resolve_packs_from_sources_and_packs(
+    raw_packs: Sequence[str] | str | None,
+    raw_sources: Sequence[str] | str | None = None,
+    *,
+    default_all: bool = False,
+) -> tuple[list[str], list[str]]:
+    """Resolve union of selected packs & requested 13-catalog monitor source IDs."""
+    has_packs_arg = raw_packs is not None and (
+        bool(raw_packs.strip()) if isinstance(raw_packs, str) else bool(list(raw_packs))
+    )
+    has_sources_arg = raw_sources is not None and (
+        bool(raw_sources.strip()) if isinstance(raw_sources, str) else bool(list(raw_sources))
+    )
+    if not has_packs_arg and not has_sources_arg:
+        selected_packs = list(VALID_QUANT_DATA_PACKS) if (default_all and raw_packs is None and raw_sources is None) else []
+        all_ids = [str(item["id"]) for item in QUANT_DATA_SOURCE_CATALOG]
+        if selected_packs:
+            return selected_packs, all_ids
+        base_sources = [sid for sid, pk in MONITOR_SOURCE_TO_PACK.items() if pk is None]
+        return [], base_sources
+
+    pack_list = normalize_requested_data_packs(raw_packs, default_all=False)
+    src_list = normalize_requested_source_ids(raw_sources, default_all=False)
+    combined_packs: list[str] = list(pack_list)
+    for sid in src_list:
+        pk = MONITOR_SOURCE_TO_PACK.get(sid)
+        if pk and pk not in combined_packs:
+            combined_packs.append(pk)
+
+    if has_sources_arg and not has_packs_arg:
+        final_sources = src_list
+    else:
+        pack_set = set(combined_packs)
+        final_sources = list(src_list)
+        for item in QUANT_DATA_SOURCE_CATALOG:
+            sid = str(item["id"])
+            pk = MONITOR_SOURCE_TO_PACK.get(sid)
+            if (pk is None or pk in pack_set) and sid not in final_sources:
+                final_sources.append(sid)
+    return combined_packs, final_sources
+
+
+def validate_quant_rule_spec(
+    buy_rule: Mapping[str, Any] | None,
+    sell_rule: Mapping[str, Any] | None,
+    position_sizing: Mapping[str, Any] | None = None,
+) -> None:
+    """Strictly validate all buy/sell/tier conditions in a quant rule spec."""
+    for side_name, rule_obj in (("buy_rule", buy_rule), ("sell_rule", sell_rule)):
+        if rule_obj is None:
+            continue
+        if not isinstance(rule_obj, Mapping):
+            raise ValueError(f"{side_name} must be an object or null")
+        for idx, cond in enumerate(rule_obj.get("conditions") or []):
+            validate_dsl_condition(cond, prefix=f"{side_name}.conditions[{idx}]")
+    if isinstance(position_sizing, Mapping):
+        for tiers_key in ("conviction_tiers", "sell_conviction_tiers"):
+            for t_idx, tier in enumerate(position_sizing.get(tiers_key) or []):
+                if not isinstance(tier, Mapping):
+                    continue
+                for c_idx, cond in enumerate(tier.get("conditions") or []):
+                    validate_dsl_condition(
+                        cond,
+                        prefix=f"position_sizing.{tiers_key}[{t_idx}].conditions[{c_idx}]",
+                    )
+
+
+def _parse_flow_to_wan(raw: Any, unit: Any = None) -> float | None:
+    """Normalize THS fund flow numbers into 万元 (ten-thousand CNY)."""
+    val = _number(raw)
+    if val is None:
+        return None
+    u = str(unit or "").strip()
+    if "亿" in u or u == "100000000":
+        return round(val * 10000.0, 4)
+    if u == "元" or u == "1":
+        return round(val / 10000.0, 4)
+    return round(val, 4)
+
+
+def _compute_l2_flow_fields(
+    ff_today: Mapping[str, Any] | None,
+    ff_3d: Mapping[str, Any] | None,
+    ff_5d: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for prefix, row in (
+        ("l2_today", ff_today),
+        ("l2_3d", ff_3d),
+        ("l2_5d", ff_5d),
+    ):
+        src = row if isinstance(row, Mapping) else {}
+        unit = src.get("unit") if src.get("unit") is not None else src.get("fund_unit")
+        main_net = _parse_flow_to_wan(src.get("main_net_inflow"), unit)
+        visible = _parse_flow_to_wan(src.get("main_visible_inflow"), unit)
+        hidden = _parse_flow_to_wan(src.get("main_hidden_inflow"), unit)
+        retail = _parse_flow_to_wan(src.get("retail_inflow"), unit)
+        out[f"{prefix}_main_net_wan"] = main_net
+        out[f"{prefix}_visible_wan"] = visible
+        out[f"{prefix}_hidden_wan"] = hidden
+        out[f"{prefix}_retail_wan"] = retail
+        denom = abs(visible or 0.0) + abs(hidden or 0.0)
+        out[f"{prefix}_hidden_ratio_pct"] = (
+            round(hidden / denom * 100.0, 2)
+            if hidden is not None and denom > 0
+            else None
+        )
+    return out
+
+
+def _read_l2_period_maps(
+    store: Any,
+    symbol: str,
+    trade_date: str | None,
+) -> dict[str, dict[str, dict[str, Any]]]:
+    maps: dict[str, dict[str, dict[str, Any]]] = {
+        "today": {},
+        "three_day": {},
+        "five_day": {},
+    }
+    read_ff = getattr(store, "read_fund_flow_history", None)
+    if not callable(read_ff):
+        return maps
+    try:
+        ff_hist = read_ff(symbol, trade_date) if trade_date else read_ff(symbol)
+    except Exception:
+        return maps
+    periods = ff_hist.get("periods") if isinstance(ff_hist, Mapping) else None
+    if not isinstance(periods, Mapping):
+        return maps
+    for key in ("today", "three_day", "five_day"):
+        pts = ((periods.get(key) or {}).get("points") or []) if isinstance(periods.get(key), Mapping) else []
+        for pt in pts:
+            if isinstance(pt, Mapping) and pt.get("time"):
+                maps[key][str(pt["time"])] = dict(pt)
+    return maps
+
+
+def enrich_points_with_l2_periods(
+    store: Any,
+    symbol: str,
+    trade_date: str | None,
+    points: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Attach unit-normalized today/3d/5d L2 main/visible/hidden/retail fields onto minute points."""
+    if not points:
+        return points
+    period_maps = _read_l2_period_maps(store, symbol, trade_date)
+    t_map = period_maps["today"]
+    d3_map = period_maps["three_day"]
+    d5_map = period_maps["five_day"]
+    out: list[dict[str, Any]] = []
+    for pt in points:
+        tm = str(pt.get("time") or "")
+        today_row = t_map.get(tm)
+        if not today_row and any(
+            pt.get(k) is not None
+            for k in ("main_net_inflow", "main_visible_inflow", "main_hidden_inflow", "retail_inflow")
+        ):
+            today_row = {
+                "unit": pt.get("fund_unit") or pt.get("unit"),
+                "main_net_inflow": pt.get("main_net_inflow"),
+                "main_visible_inflow": pt.get("main_visible_inflow"),
+                "main_hidden_inflow": pt.get("main_hidden_inflow"),
+                "retail_inflow": pt.get("retail_inflow"),
+            }
+        l2_fields = _compute_l2_flow_fields(today_row, d3_map.get(tm), d5_map.get(tm))
+        merged = {**pt, **l2_fields}
+        if today_row:
+            merged.setdefault("main_net_inflow", today_row.get("main_net_inflow"))
+            merged.setdefault("main_visible_inflow", today_row.get("main_visible_inflow"))
+            merged.setdefault("main_hidden_inflow", today_row.get("main_hidden_inflow"))
+            merged.setdefault("retail_inflow", today_row.get("retail_inflow"))
+        out.append(merged)
+    return out
+
+
+def _resolve_etf_flow_db_path(
+    store: Any,
+    explicit_path: Path | str | None = None,
+) -> Path | None:
+    if explicit_path is not None:
+        p = Path(explicit_path).expanduser()
+        return p if p.exists() else None
+    attr_path = getattr(store, "etf_flow_db_path", None)
+    if attr_path:
+        p = Path(attr_path).expanduser()
+        if p.exists():
+            return p
+    store_path = getattr(store, "path", None)
+    if store_path:
+        p = Path(store_path).expanduser().parent / "etf-fund-flow.db"
+        if p.exists():
+            return p
+    return None
+
+
+def _load_etf_flow_cache(db_path: Path | None, symbol: str) -> dict[str, Any]:
+    """Read-only lookup of summary, cumulative line series, and holdings from etf-fund-flow.db."""
+    if db_path is None or not db_path.exists():
+        return {}
+    clean_sym = str(symbol or "").strip().upper()
+    keys = [
+        f"summary:{clean_sym}",
+        f"line:{clean_sym}:250d",
+        f"line:{clean_sym}:120d",
+        f"line:{clean_sym}:60d",
+        f"holdings:{clean_sym}",
+    ]
+    conn: sqlite3.Connection | None = None
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=2.0)
+        conn.row_factory = sqlite3.Row
+        placeholders = ",".join("?" for _ in keys)
+        rows = conn.execute(
+            f"SELECT cache_key, data_date, updated_at, payload_json FROM etf_flow_cache WHERE cache_key IN ({placeholders})",
+            tuple(keys),
+        ).fetchall()
+    except sqlite3.Error:
+        try:
+            conn = sqlite3.connect(db_path, timeout=2.0)
+            conn.row_factory = sqlite3.Row
+            placeholders = ",".join("?" for _ in keys)
+            rows = conn.execute(
+                f"SELECT cache_key, data_date, updated_at, payload_json FROM etf_flow_cache WHERE cache_key IN ({placeholders})",
+                tuple(keys),
+            ).fetchall()
+        except sqlite3.Error:
+            return {}
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except sqlite3.Error:
+                pass
+
+    by_key: dict[str, Any] = {}
+    for row in rows:
+        try:
+            by_key[str(row["cache_key"])] = {
+                "data_date": str(row["data_date"] or "").strip() or None,
+                "payload": json.loads(row["payload_json"]),
+            }
+        except Exception:
+            continue
+
+    line_rows: list[tuple[str, float, float | None]] = []
+    for suffix in ("250d", "120d", "60d"):
+        entry = by_key.get(f"line:{clean_sym}:{suffix}")
+        payload = entry.get("payload") if isinstance(entry, dict) else None
+        if isinstance(payload, list) and payload:
+            for item in payload:
+                if not isinstance(item, Sequence) or isinstance(item, (str, bytes)) or len(item) < 3:
+                    continue
+                d_str = str(item[0] or "").replace("-", "").strip()[:8]
+                flow_v = _number(item[2])
+                scale_v = _number(item[3]) if len(item) >= 4 else None
+                if _DATE_RE.fullmatch(d_str) and flow_v is not None:
+                    line_rows.append((d_str, float(flow_v), float(scale_v) if scale_v is not None else None))
+            if line_rows:
+                break
+    line_rows.sort(key=lambda r: r[0])
+
+    summary_entry = by_key.get(f"summary:{clean_sym}")
+    summary_payload = summary_entry.get("payload") if isinstance(summary_entry, dict) and isinstance(summary_entry.get("payload"), dict) else {}
+
+    holdings_entry = by_key.get(f"holdings:{clean_sym}")
+    holdings_raw = holdings_entry.get("payload") if isinstance(holdings_entry, dict) and isinstance(holdings_entry.get("payload"), list) else []
+    top_holdings: list[dict[str, Any]] = []
+    for h in holdings_raw[:8]:
+        if not isinstance(h, Mapping):
+            continue
+        raw_net = _number(h.get("net_inflow_raw"))
+        top_holdings.append(
+            {
+                "etf_code": str(h.get("etf_code") or "").strip(),
+                "name": str(h.get("name") or "").strip(),
+                "net_inflow_wan": round(raw_net / 10000.0, 2) if raw_net is not None else None,
+                "streak_days": h.get("streak_days"),
+                "hold_rate": h.get("hold_rate"),
+            }
+        )
+
+    return {
+        "symbol": clean_sym,
+        "summary": summary_payload,
+        "line": line_rows,
+        "holdings": top_holdings,
+    }
+
+
+def _causal_etf_flow_metrics(
+    cache_data: Mapping[str, Any],
+    target_td: str,
+) -> dict[str, Any]:
+    """Return strictly T-1 causal ETF net-buy inflow metrics (< target_td)."""
+    clean_td = str(target_td or "").replace("-", "").strip()[:8]
+    if not clean_td:
+        return {}
+    line_rows = [
+        item for item in (cache_data.get("line") or [])
+        if str(item[0]) < clean_td
+    ]
+    summary = cache_data.get("summary") if isinstance(cache_data.get("summary"), Mapping) else {}
+    sum_date = str(summary.get("stockEtfNetBuyFlowDate") or "").replace("-", "").strip()[:8]
+    use_summary = bool(sum_date and sum_date < clean_td)
+
+    ref_date: str | None = None
+    f1d_yuan: float | None = None
+    f3d_yuan: float | None = None
+    f5d_yuan: float | None = None
+    f20d_yuan: float | None = None
+    scale_yuan: float | None = None
+
+    if line_rows:
+        ref_date = line_rows[-1][0]
+        f1d_yuan = line_rows[-1][1]
+        scale_yuan = next((r[2] for r in reversed(line_rows) if r[2] is not None and r[2] > 0), None)
+        if len(line_rows) >= 3:
+            f3d_yuan = sum(r[1] for r in line_rows[-3:])
+        if len(line_rows) >= 5:
+            f5d_yuan = sum(r[1] for r in line_rows[-5:])
+        if len(line_rows) >= 20:
+            f20d_yuan = sum(r[1] for r in line_rows[-20:])
+
+    if use_summary:
+        if ref_date is None or sum_date >= ref_date:
+            ref_date = sum_date
+            if f1d_yuan is None:
+                f1d_yuan = _number(summary.get("stockEtfNetBuyFlow"))
+        if f3d_yuan is None:
+            f3d_yuan = _number(summary.get("stockEtfNetBuyFlow3d"))
+        if f5d_yuan is None:
+            f5d_yuan = _number(summary.get("stockEtfNetBuyFlow5d"))
+        if f20d_yuan is None:
+            f20d_yuan = _number(summary.get("stockEtfNetBuyFlow20d"))
+        if scale_yuan is None:
+            scale_yuan = (
+                _number(summary.get("stockEtfScale"))
+                or _number(summary.get("stockEtfFundScale"))
+                or _number(summary.get("stock_etf_fund_scale"))
+                or _number(summary.get("fundScale"))
+            )
+
+    ratio_pct = (
+        round((f1d_yuan / scale_yuan) * 100.0, 4)
+        if (f1d_yuan is not None and scale_yuan is not None and scale_yuan > 0)
+        else None
+    )
+    return {
+        "etf_flow_ref_date": ref_date,
+        "etf_net_buy_1d_wan": round(f1d_yuan / 10000.0, 2) if f1d_yuan is not None else None,
+        "etf_net_buy_3d_wan": round(f3d_yuan / 10000.0, 2) if f3d_yuan is not None else None,
+        "etf_net_buy_5d_wan": round(f5d_yuan / 10000.0, 2) if f5d_yuan is not None else None,
+        "etf_net_buy_20d_wan": round(f20d_yuan / 10000.0, 2) if f20d_yuan is not None else None,
+        "etf_share_scale_yi": round(scale_yuan / 100000000.0, 4) if (scale_yuan is not None and scale_yuan > 0) else None,
+        "etf_net_buy_ratio_pct": ratio_pct,
+    }
+
+
+def _causal_us_macro_day_fields(
+    macro: V9MacroDataStore,
+    td: str,
+    prev_td: str | None,
+) -> dict[str, Any]:
+    """Fallback causal daily return computation from cached US/futures series."""
+    out: dict[str, Any] = {}
+    try:
+        from .v9_plus_engine import _causal_daily_ov_and_nd, _parse_sh
+    except Exception:
+        return out
+    has_prev = bool(prev_td and prev_td != td)
+    t0930_ts = int(_parse_sh(td, "09:30").timestamp())
+    prev0930_ts = int(_parse_sh(prev_td or td, "09:30").timestamp())
+    series_loaders = (
+        ("xop_change_pct", macro.load_xop_daily_rows),
+        ("xle_change_pct", macro.load_xle_daily_rows),
+        ("spy_change_pct", macro.load_spy_daily_rows),
+        ("iwm_change_pct", macro.load_iwm_daily_rows),
+        ("cl_change_pct", macro.load_cl_daily_rows),
+        ("ng_change_pct", macro.load_ng_daily_rows),
+    )
+    cl_ov_val: float | None = None
+    cl_ok = False
+    ho_rows: list[list[Any]] = []
+    for field_name, loader in series_loaders:
+        try:
+            rows = loader()
+            if not rows:
+                continue
+            ts = [int(r[1]) for r in rows]
+            ov, _, ci = _causal_daily_ov_and_nd(rows, ts, t0930_ts, prev0930_ts, has_prev)
+            if ci >= 0:
+                out[field_name] = round(float(ov), 3)
+                if field_name == "cl_change_pct":
+                    cl_ov_val = float(ov)
+                    cl_ok = True
+        except Exception:
+            continue
+    try:
+        ho_rows = macro.load_ho_daily_rows()
+        if ho_rows and cl_ok and cl_ov_val is not None:
+            ho_ts = [int(r[1]) for r in ho_rows]
+            ho_ov, _, ho_ci = _causal_daily_ov_and_nd(ho_rows, ho_ts, t0930_ts, prev0930_ts, has_prev)
+            if ho_ci >= 0:
+                out["ho_crack_change_pct"] = round(float(ho_ov) - cl_ov_val, 3)
+    except Exception:
+        pass
+    return out
+
+
+def _align_bar_for_minute(
+    bars_by_time: Mapping[str, Mapping[str, Any]],
+    sorted_times: Sequence[str],
+    tm: str,
+) -> Mapping[str, Any] | None:
+    exact = bars_by_time.get(tm)
+    if exact is not None:
+        return exact
+    if not sorted_times:
+        return None
+    pos = bisect_right(sorted_times, tm) - 1
+    if pos >= 0:
+        return bars_by_time.get(sorted_times[pos])
+    return bars_by_time.get(sorted_times[0])
+
+
+def _load_peer_intraday_lookup(
+    store: Any,
+    target_symbol: str,
+    start_td: str,
+    end_td: str | None,
+) -> dict[str, dict[str, Any]]:
+    peers = [sym for sym in _OIL_PEER_SYMBOLS if sym != target_symbol]
+    if not peers:
+        return {}
+    out: dict[str, dict[str, Any]] = {}
+    placeholders = ",".join("?" for _ in peers)
+    with store._lock:
+        d_sql = f"SELECT symbol, trade_date, pre_close FROM research_days WHERE symbol IN ({placeholders}) AND trade_date>=?"
+        d_params: list[Any] = [*peers, start_td]
+        if end_td:
+            d_sql += " AND trade_date<=?"
+            d_params.append(end_td)
+        pre_map: dict[tuple[str, str], float] = {}
+        for r in store._connection.execute(d_sql, tuple(d_params)).fetchall():
+            pv = _number(r["pre_close"])
+            if pv and pv > 0:
+                pre_map[(str(r["symbol"]), str(r["trade_date"]))] = float(pv)
+
+        p_sql = (
+            f"SELECT symbol, trade_date, minute, price FROM research_points WHERE symbol IN ({placeholders}) AND trade_date>=?"
+            + (" AND trade_date<=?" if end_td else "")
+            + " ORDER BY trade_date ASC, REPLACE(minute, ':', '') ASC"
+        )
+        for r in store._connection.execute(p_sql, tuple(d_params)).fetchall():
+            sym = str(r["symbol"])
+            td = str(r["trade_date"])
+            px = _number(r["price"])
+            if px is None or px <= 0:
+                continue
+            slot = out.setdefault(td, {}).setdefault(sym, {"pre": pre_map.get((sym, td)), "pts": []})
+            slot["pts"].append((str(r["minute"]), float(px)))
+    return out
+
+
+class QuantPackEnricher:
+    """Precomputed causal enricher attaching 5 data packs onto day/minute points."""
+
+    def __init__(
+        self,
+        store: Any,
+        symbol: str,
+        *,
+        packs: Sequence[str],
+        start_date: str,
+        end_date: str | None = None,
+        allow_network: bool | None = None,
+        etf_flow_db_path: Path | str | None = None,
+    ) -> None:
+        self.store = store
+        self.symbol = symbol
+        self.packs = set(normalize_requested_data_packs(packs))
+        env_offline = os.environ.get("THS_QUANT_OFFLINE", "").strip() in {"1", "true", "TRUE", "yes"}
+        self.allow_network = False if env_offline else bool(allow_network)
+        self.macro: V9MacroDataStore | None = None
+        self.brent_days_by_td: dict[str, dict[str, Any]] = {}
+        self.xop_days_by_td: dict[str, dict[str, Any]] = {}
+        self.dual_days_by_td: dict[str, dict[str, Any]] = {}
+        self.es_series: tuple[list[int], list[float]] = ([], [])
+        self.sc_daily: list[list[Any]] = []
+        self.sc_min: tuple[list[int], list[float]] = ([], [])
+        self.peer_lookup: dict[str, dict[str, Any]] = {}
+        self.etf_cache: dict[str, Any] = {}
+        self.nav_map: dict[str, float] = {}
+        self.nav_dates: list[str] = []
+        self.cnh_series: tuple[list[int], list[float]] = ([], [])
+        self.us_oil_rows: dict[str, list[list[Any]]] = {}
+        self.trade_dates_ordered: list[str] = []
+        self._prev_fx: float | None = None
+
+        if symbol != "BRN0Y" and self.packs & {"iopv_fx", "uso_bno_sc_peer"}:
+            try:
+                with store._lock:
+                    d_rows = store._connection.execute(
+                        "SELECT trade_date FROM research_days WHERE symbol=? ORDER BY trade_date ASC",
+                        (symbol,),
+                    ).fetchall()
+                self.trade_dates_ordered = [str(r["trade_date"]) for r in d_rows if r["trade_date"]]
+            except Exception:
+                self.trade_dates_ordered = []
+
+        if symbol != "BRN0Y" and self.packs & {"iopv_fx", "xop_us_ep", "uso_bno_sc_peer"}:
+            try:
+                self.macro = V9MacroDataStore(store, allow_network=self.allow_network)
+            except Exception:
+                self.macro = None
+
+        if symbol != "BRN0Y" and "iopv_fx" in self.packs:
+            try:
+                v9_days, _ = build_v9_plus_days(
+                    store,
+                    symbol=symbol,
+                    start_date=start_date,
+                    end_date=end_date,
+                    allow_network=self.allow_network,
+                    cross_market_anchor="brent",
+                )
+                self.brent_days_by_td = {str(d["td"]): d for d in v9_days if d.get("td")}
+            except Exception:
+                self.brent_days_by_td = {}
+            if self.macro is not None:
+                try:
+                    self.nav_map = self.macro.load_nav_map(symbol)
+                    self.nav_dates = sorted(str(k) for k in self.nav_map)
+                except Exception:
+                    self.nav_map, self.nav_dates = {}, []
+                try:
+                    self.cnh_series = load_merged_fx_cnh_series(self.macro)
+                except Exception:
+                    self.cnh_series = ([], [])
+
+        if symbol != "BRN0Y" and "xop_us_ep" in self.packs:
+            try:
+                xop_days, _ = build_v9_plus_days(
+                    store,
+                    symbol=symbol,
+                    start_date=start_date,
+                    end_date=end_date,
+                    allow_network=self.allow_network,
+                    cross_market_anchor="xop_us_ep",
+                )
+                self.xop_days_by_td = {str(d["td"]): d for d in xop_days if d.get("td")}
+            except Exception:
+                self.xop_days_by_td = {}
+            if self.macro is not None:
+                try:
+                    self.es_series = self.macro.load_fut_1m_series("ES")
+                except Exception:
+                    self.es_series = ([], [])
+
+        if symbol != "BRN0Y" and "uso_bno_sc_peer" in self.packs:
+            try:
+                dual_days, _ = build_v9_plus_days(
+                    store,
+                    symbol=symbol,
+                    start_date=start_date,
+                    end_date=end_date,
+                    allow_network=self.allow_network,
+                    cross_market_anchor="uso_bno_sc_peer",
+                )
+                self.dual_days_by_td = {str(d["td"]): d for d in dual_days if d.get("td")}
+            except Exception:
+                self.dual_days_by_td = {}
+            if self.macro is not None:
+                try:
+                    self.sc_daily = self.macro.load_sc_daily_rows()
+                    self.sc_min = self.macro.load_sc_min_series()
+                except Exception:
+                    self.sc_daily, self.sc_min = [], ([], [])
+                for oil_k, loader_fn in (
+                    ("uso", self.macro.load_uso_daily_rows),
+                    ("bno", self.macro.load_bno_daily_rows),
+                    ("dbo", lambda: load_dbo_daily_rows(self.macro)),
+                ):
+                    try:
+                        self.us_oil_rows[oil_k] = loader_fn()
+                    except Exception:
+                        self.us_oil_rows[oil_k] = []
+            try:
+                self.peer_lookup = _load_peer_intraday_lookup(store, symbol, start_date, end_date)
+            except Exception:
+                self.peer_lookup = {}
+
+        if "etf_redemption_flow" in self.packs:
+            db_p = _resolve_etf_flow_db_path(store, etf_flow_db_path)
+            self.etf_cache = _load_etf_flow_cache(db_p, symbol)
+
+    def _causal_official_nav_for_day(
+        self,
+        td: str,
+        prev_td: str | None,
+        prev_prev_td: str | None = None,
+    ) -> tuple[float | None, str | None]:
+        if not self.nav_dates or not self.nav_map:
+            return None, None
+        eff_prev = prev_td
+        if eff_prev is None and td in self.trade_dates_ordered:
+            pos = self.trade_dates_ordered.index(td)
+            if pos >= 1:
+                eff_prev = self.trade_dates_ordered[pos - 1]
+        if self.symbol in _OIL_QDII_NAV_SYMBOLS:
+            cutoff = prev_prev_td
+            if cutoff is None and td in self.trade_dates_ordered:
+                pos = self.trade_dates_ordered.index(td)
+                if pos >= 2:
+                    cutoff = self.trade_dates_ordered[pos - 2]
+                elif pos == 1:
+                    cutoff = self.trade_dates_ordered[0]
+            if cutoff is None:
+                cutoff = eff_prev
+        else:
+            cutoff = eff_prev or (datetime.strptime(td, "%Y%m%d") - timedelta(days=1)).strftime("%Y%m%d")
+        if not cutoff:
+            return None, None
+        nav_td = next((k for k in reversed(self.nav_dates) if k <= cutoff), None)
+        if not nav_td:
+            return None, None
+        raw_v = _number(self.nav_map.get(nav_td))
+        return (round(raw_v, 4) if raw_v and raw_v > 0 else None), nav_td
+
+    def _causal_us_oil_ov_for_day(self, td: str, prev_td: str | None) -> dict[str, float | None]:
+        out: dict[str, float | None] = {}
+        eff_prev = prev_td
+        if eff_prev is None and td in self.trade_dates_ordered:
+            pos = self.trade_dates_ordered.index(td)
+            if pos >= 1:
+                eff_prev = self.trade_dates_ordered[pos - 1]
+        has_prev = bool(eff_prev and eff_prev != td)
+        try:
+            t0930_ts = int(_parse_sh(td, "09:30").timestamp())
+            prev0930_ts = int(_parse_sh(eff_prev or td, "09:30").timestamp())
+        except Exception:
+            return out
+        ov_vals: dict[str, float] = {}
+        for key in ("uso", "bno", "dbo"):
+            rows = self.us_oil_rows.get(key) or []
+            if not rows:
+                continue
+            try:
+                ts = [int(r[1]) for r in rows]
+                ov, _, ci = _causal_daily_ov_and_nd(rows, ts, t0930_ts, prev0930_ts, has_prev)
+                if ci >= 0:
+                    rounded = round(float(ov), 3)
+                    out[f"{key}_ov_pct"] = rounded
+                    ov_vals[key] = float(ov)
+            except Exception:
+                continue
+        if all(k in ov_vals for k in ("uso", "bno", "dbo")):
+            out["fof_3oil_ov_pct"] = round(
+                0.35 * ov_vals["uso"] + 0.35 * ov_vals["bno"] + 0.30 * ov_vals["dbo"], 3
+            )
+        return out
+
+    def _sc_fallback_for_day(
+        self,
+        td: str,
+        pts: Sequence[Mapping[str, Any]],
+        brent_bars_by_tm: Mapping[str, Mapping[str, Any]],
+        brent_tms: Sequence[str],
+    ) -> dict[str, dict[str, Any]]:
+        res_by_tm: dict[str, dict[str, Any]] = {}
+        sc_min_ts, sc_min_px = self.sc_min
+        if not self.sc_daily and not sc_min_ts:
+            return res_by_tm
+        sc_prev = None
+        for row in self.sc_daily:
+            rd = str(row[0]).replace("-", "")[:8]
+            if rd < td:
+                sc_prev = _number(row[2])
+        if sc_min_ts:
+            sc_prev = sc_prev or _val_at(sc_min_ts, sc_min_px, _parse_sh(td, "09:29"))
+        sc_open = _val_at(sc_min_ts, sc_min_px, _parse_sh(td, "09:30")) if sc_min_ts else None
+        for pt in pts:
+            tm = str(pt.get("time") or "")
+            if not tm:
+                continue
+            sc_now = _val_at(sc_min_ts, sc_min_px, _parse_sh(td, tm)) if sc_min_ts else None
+            if sc_now is None and self.sc_daily:
+                # fallback to causal prior SC daily close
+                for row in reversed(self.sc_daily):
+                    if str(row[0]).replace("-", "")[:8] < td:
+                        sc_now = _number(row[2])
+                        break
+            if sc_now is None:
+                continue
+            sc_vs_prev = round((sc_now / sc_prev - 1.0) * 100.0, 3) if (sc_prev and sc_prev > 0) else 0.0
+            base_open = sc_open or sc_prev or sc_now
+            sc_intra = round((sc_now / base_open - 1.0) * 100.0, 3) if base_open > 0 else 0.0
+            b_bar = _align_bar_for_minute(brent_bars_by_tm, brent_tms, tm)
+            brn_chg = _number(b_bar.get("brn_chg")) if b_bar else _number(pt.get("brn_from_prev_close_pct"))
+            item: dict[str, Any] = {
+                "sc0_change_pct": sc_vs_prev,
+                "sc0_intraday_pct": sc_intra,
+            }
+            if brn_chg is not None:
+                item["sc_brent_spread_pct"] = round(sc_vs_prev - brn_chg, 3)
+            res_by_tm[tm] = item
+        return res_by_tm
+
+    def enrich_day(
+        self,
+        td: str,
+        prev_td: str | None,
+        points: list[dict[str, Any]],
+        *,
+        pre_close: float | None = None,
+        prev_prev_td: str | None = None,
+    ) -> dict[str, Any]:
+        """Mutate points in place with selected pack fields and return day-level summary."""
+        daily_summary: dict[str, Any] = {}
+        if not points:
+            return daily_summary
+
+        # 1. iopv_fx
+        brent_day = self.brent_days_by_td.get(td) or {}
+        brent_bars = {str(b["time"]): b for b in (brent_day.get("bars") or []) if b.get("time")}
+        brent_tms = sorted(brent_bars)
+        day_pre = pre_close if (pre_close and pre_close > 0) else _number(brent_day.get("pre"))
+        if "iopv_fx" in self.packs:
+            official_nav, official_nav_date = self._causal_official_nav_for_day(td, prev_td, prev_prev_td)
+            cnh_ts, cnh_px = self.cnh_series
+            if official_nav is not None:
+                for pt in points:
+                    pt["official_nav"] = official_nav
+                daily_summary["official_nav"] = official_nav
+                daily_summary["official_nav_date"] = official_nav_date
+            if cnh_ts and cnh_px:
+                for pt in points:
+                    tm = str(pt.get("time") or "")
+                    if not tm:
+                        continue
+                    try:
+                        cnh_v = _val_at(cnh_ts, cnh_px, _parse_sh(td, tm))
+                        if cnh_v and cnh_v > 0:
+                            pt["usdcnh"] = round(float(cnh_v), 5)
+                    except Exception:
+                        pass
+                if points[-1].get("usdcnh") is not None:
+                    daily_summary["usdcnh_close"] = points[-1].get("usdcnh")
+
+        if "iopv_fx" in self.packs and brent_bars:
+            first_bar = brent_bars[brent_tms[0]]
+            fx_base = self._prev_fx if (self._prev_fx and self._prev_fx > 0) else (_number(first_bar.get("fx")) or 0.0)
+            last_bar = brent_bars[brent_tms[-1]]
+            last_fx = _number(last_bar.get("fx"))
+            if last_fx and last_fx > 0:
+                self._prev_fx = last_fx
+            for pt in points:
+                tm = str(pt.get("time") or "")
+                bar = _align_bar_for_minute(brent_bars, brent_tms, tm)
+                if not bar:
+                    continue
+                px_pt = _number(pt.get("price"))
+                iopv_val = _number(bar.get("iopv"))
+                fx_val = _number(bar.get("fx"))
+                prem_val = (
+                    round((px_pt / iopv_val - 1.0) * 100.0, 3)
+                    if (px_pt and px_pt > 0 and iopv_val and iopv_val > 0)
+                    else (round(float(bar["prem"]), 3) if _number(bar.get("prem")) is not None else None)
+                )
+                pt["iopv_fx"] = round(iopv_val, 4) if iopv_val is not None else None
+                pt["iopv_premium_pct"] = prem_val
+                pt["sp_fx_pct"] = round(float(bar["sp_fx"]), 3) if bar.get("sp_fx") is not None else None
+                pt["coint10_pct"] = round(float(bar["coint10"]), 3) if bar.get("coint10") is not None else None
+                pt["usdcny"] = round(fx_val, 5) if fx_val is not None else None
+                if pt.get("usdcnh") is None and fx_val is not None:
+                    pt["usdcnh"] = round(fx_val, 5)
+                pt["usdcny_change_pct"] = (
+                    round((fx_val - fx_base) / fx_base * 100.0, 3)
+                    if (fx_val is not None and fx_base > 0)
+                    else None
+                )
+                pt["fx_adjusted_nav_change_pct"] = (
+                    round((iopv_val - day_pre) / day_pre * 100.0, 3)
+                    if (iopv_val is not None and day_pre and day_pre > 0)
+                    else None
+                )
+                pt["brent_q2y_pct"] = (
+                    round(float(bar["brn_pos"]) * 100.0, 2)
+                    if bar.get("brn_pos") is not None
+                    else None
+                )
+            close_pt = points[-1]
+            daily_summary.update(
+                {
+                    "iopv_fx_close": close_pt.get("iopv_fx"),
+                    "iopv_premium_close_pct": close_pt.get("iopv_premium_pct"),
+                    "sp_fx_close_pct": close_pt.get("sp_fx_pct"),
+                    "coint10_close_pct": close_pt.get("coint10_pct"),
+                    "usdcny_close": close_pt.get("usdcny"),
+                    "usdcnh_close": daily_summary.get("usdcnh_close") or close_pt.get("usdcnh"),
+                    "brent_q2y_close_pct": close_pt.get("brent_q2y_pct"),
+                }
+            )
+
+        # 2. xop_us_ep
+        if "xop_us_ep" in self.packs:
+            xop_day = self.xop_days_by_td.get(td) or {}
+            xop_bars = {str(b["time"]): b for b in (xop_day.get("bars") or []) if b.get("time")}
+            xop_tms = sorted(xop_bars)
+            day_macro_fallback = (
+                _causal_us_macro_day_fields(self.macro, td, prev_td)
+                if (not xop_day and self.macro is not None)
+                else {}
+            )
+            ov_fields = {
+                "xop_change_pct": round(float(xop_day["xop_ov"]), 3) if xop_day.get("xop_ov") is not None else day_macro_fallback.get("xop_change_pct"),
+                "xle_change_pct": round(float(xop_day["xle_ov"]), 3) if xop_day.get("xle_ov") is not None else day_macro_fallback.get("xle_change_pct"),
+                "spy_change_pct": round(float(xop_day["spy_ov"]), 3) if xop_day.get("spy_ov") is not None else day_macro_fallback.get("spy_change_pct"),
+                "iwm_change_pct": round(float(xop_day["iwm_ov"]), 3) if xop_day.get("iwm_ov") is not None else day_macro_fallback.get("iwm_change_pct"),
+                "cl_change_pct": round(float(xop_day["cl_ov"]), 3) if xop_day.get("cl_ov") is not None else day_macro_fallback.get("cl_change_pct"),
+                "ho_crack_change_pct": round(float(xop_day["crack_ov"]), 3) if xop_day.get("crack_ov") is not None else day_macro_fallback.get("ho_crack_change_pct"),
+                "ng_change_pct": round(float(xop_day["ng_ov"]), 3) if xop_day.get("ng_ov") is not None else day_macro_fallback.get("ng_change_pct"),
+            }
+            es_ts, es_px = self.es_series
+            es_prev_px: float | None = None
+            if es_ts:
+                try:
+                    ref_dt = _parse_sh(prev_td, "15:00") if prev_td else _parse_sh(td, "09:30")
+                    es_prev_px = _val_at(es_ts, es_px, ref_dt)
+                except Exception:
+                    es_prev_px = None
+            for pt in points:
+                tm = str(pt.get("time") or "")
+                for fk, fv in ov_fields.items():
+                    if fv is not None:
+                        pt[fk] = fv
+                bar = _align_bar_for_minute(xop_bars, xop_tms, tm)
+                if bar:
+                    px_pt = _number(pt.get("price"))
+                    x_iopv = _number(bar.get("iopv"))
+                    pt["xop_synthetic_premium_pct"] = (
+                        round((px_pt / x_iopv - 1.0) * 100.0, 3)
+                        if (px_pt and px_pt > 0 and x_iopv and x_iopv > 0)
+                        else (_number(bar.get("prem")) and round(float(bar["prem"]), 3))
+                    )
+                    if bar.get("daytime_lead_pct") is not None:
+                        pt["daytime_lead_pct"] = round(float(bar["daytime_lead_pct"]), 3)
+                    if bar.get("daytime_crack_pct") is not None:
+                        pt["daytime_crack_pct"] = round(float(bar["daytime_crack_pct"]), 3)
+                if es_ts and es_prev_px and es_prev_px > 0:
+                    try:
+                        es_now = _val_at(es_ts, es_px, _parse_sh(td, tm))
+                        if es_now is not None:
+                            pt["es_change_pct"] = round((es_now - es_prev_px) / es_prev_px * 100.0, 3)
+                    except Exception:
+                        pass
+            daily_summary.update(
+                {
+                    "xop_ov_pct": ov_fields["xop_change_pct"],
+                    "xle_ov_pct": ov_fields["xle_change_pct"],
+                    "spy_ov_pct": ov_fields["spy_change_pct"],
+                    "iwm_ov_pct": ov_fields["iwm_change_pct"],
+                    "cl_ov_pct": ov_fields["cl_change_pct"],
+                    "ho_crack_ov_pct": ov_fields["ho_crack_change_pct"],
+                    "ng_ov_pct": ov_fields["ng_change_pct"],
+                }
+            )
+
+        # 3. uso_bno_sc_peer
+        if "uso_bno_sc_peer" in self.packs:
+            dual_day = self.dual_days_by_td.get(td) or {}
+            dual_bars = {str(b["time"]): b for b in (dual_day.get("bars") or []) if b.get("time")}
+            dual_tms = sorted(dual_bars)
+            sc_fallback = (
+                {}
+                if dual_bars
+                else self._sc_fallback_for_day(td, points, brent_bars, brent_tms)
+            )
+            peers_day = self.peer_lookup.get(td) or {}
+            peer_cursors: dict[str, dict[str, Any]] = {
+                sym: {"pre": info.get("pre"), "pts": info.get("pts") or [], "idx": 0, "last": None}
+                for sym, info in peers_day.items()
+            }
+            dual_ov = _number(dual_day.get("dual_ov"))
+            us_oil_ov = self._causal_us_oil_ov_for_day(td, prev_td)
+            for pt in points:
+                tm = str(pt.get("time") or "")
+                if dual_ov is not None:
+                    pt["uso_bno_change_pct"] = round(dual_ov, 3)
+                if us_oil_ov.get("uso_ov_pct") is not None:
+                    pt["uso_change_pct"] = us_oil_ov["uso_ov_pct"]
+                if us_oil_ov.get("bno_ov_pct") is not None:
+                    pt["bno_change_pct"] = us_oil_ov["bno_ov_pct"]
+                if us_oil_ov.get("dbo_ov_pct") is not None:
+                    pt["dbo_change_pct"] = us_oil_ov["dbo_ov_pct"]
+                if us_oil_ov.get("fof_3oil_ov_pct") is not None:
+                    pt["fof_3oil_change_pct"] = us_oil_ov["fof_3oil_ov_pct"]
+                dbar = _align_bar_for_minute(dual_bars, dual_tms, tm)
+                if dbar:
+                    px_pt = _number(pt.get("price"))
+                    d_iopv = _number(dbar.get("dual_iopv") or dbar.get("iopv"))
+                    pt["dual_oil_premium_pct"] = (
+                        round((px_pt / d_iopv - 1.0) * 100.0, 3)
+                        if (px_pt and px_pt > 0 and d_iopv and d_iopv > 0)
+                        else (_number(dbar.get("dual_prem")) and round(float(dbar["dual_prem"]), 3))
+                    )
+                    if dbar.get("sc_vs_prev") is not None:
+                        pt["sc0_change_pct"] = round(float(dbar["sc_vs_prev"]), 3)
+                    if dbar.get("sc_intra") is not None:
+                        pt["sc0_intraday_pct"] = round(float(dbar["sc_intra"]), 3)
+                    sc_v = _number(dbar.get("sc_vs_prev"))
+                    brn_v = _number(dbar.get("brn_chg"))
+                    if sc_v is not None and brn_v is not None:
+                        pt["sc_brent_spread_pct"] = round(sc_v - brn_v, 3)
+                    if dbar.get("peer_chg") is not None:
+                        pt["peer_change_pct"] = round(float(dbar["peer_chg"]), 3)
+                    if dbar.get("peer_sp") is not None:
+                        pt["peer_spread_pct"] = round(float(dbar["peer_sp"]), 3)
+                    if dbar.get("rel_prem") is not None:
+                        pt["peer_premium_diff_pct"] = round(float(dbar["rel_prem"]), 3)
+                elif tm in sc_fallback:
+                    for k, v in sc_fallback[tm].items():
+                        pt[k] = v
+
+                # Causal per-peer spread (from research_points)
+                self_chg = _number(pt.get("change_pct"))
+                if self_chg is None and day_pre and day_pre > 0 and _number(pt.get("price")) is not None:
+                    self_chg = (float(pt["price"]) - day_pre) / day_pre * 100.0
+                peer_chgs_here: list[float] = []
+                for p_sym, st in peer_cursors.items():
+                    p_pts = st["pts"]
+                    idx_p = st["idx"]
+                    while idx_p < len(p_pts) and p_pts[idx_p][0] <= tm:
+                        st["last"] = p_pts[idx_p][1]
+                        idx_p += 1
+                    st["idx"] = idx_p
+                    p_pre = _number(st.get("pre"))
+                    if st["last"] is not None and p_pre and p_pre > 0:
+                        p_chg = round((float(st["last"]) - p_pre) / p_pre * 100.0, 3)
+                        pt[f"peer_{p_sym}_change_pct"] = p_chg
+                        if self_chg is not None:
+                            pt[f"peer_{p_sym}_spread_pct"] = round(self_chg - p_chg, 3)
+                        peer_chgs_here.append(p_chg)
+                if peer_chgs_here and pt.get("peer_change_pct") is None:
+                    mean_peer = round(statistics.mean(peer_chgs_here), 3)
+                    pt["peer_change_pct"] = mean_peer
+                    if self_chg is not None:
+                        pt["peer_spread_pct"] = round(self_chg - mean_peer, 3)
+
+            last_pt = points[-1]
+            daily_summary.update(
+                {
+                    "uso_bno_ov_pct": round(dual_ov, 3) if dual_ov is not None else None,
+                    "uso_ov_pct": us_oil_ov.get("uso_ov_pct"),
+                    "bno_ov_pct": us_oil_ov.get("bno_ov_pct"),
+                    "dbo_ov_pct": us_oil_ov.get("dbo_ov_pct"),
+                    "fof_3oil_ov_pct": us_oil_ov.get("fof_3oil_ov_pct"),
+                    "sc0_close_pct": last_pt.get("sc0_change_pct"),
+                    "peer_close_spread_pct": last_pt.get("peer_spread_pct"),
+                }
+            )
+
+        # 4. l2_darkpool_flow summary
+        if "l2_darkpool_flow" in self.packs:
+            last_pt = points[-1]
+            daily_summary.update(
+                {
+                    "l2_today_main_net_wan": last_pt.get("l2_today_main_net_wan"),
+                    "l2_today_visible_wan": last_pt.get("l2_today_visible_wan"),
+                    "l2_today_hidden_wan": last_pt.get("l2_today_hidden_wan"),
+                    "l2_today_retail_wan": last_pt.get("l2_today_retail_wan"),
+                    "l2_3d_main_net_wan": last_pt.get("l2_3d_main_net_wan"),
+                    "l2_5d_main_net_wan": last_pt.get("l2_5d_main_net_wan"),
+                }
+            )
+
+        # 5. etf_redemption_flow (strict T-1)
+        if "etf_redemption_flow" in self.packs and self.etf_cache:
+            etf_meta = _causal_etf_flow_metrics(self.etf_cache, td)
+            for pt in points:
+                for k, v in etf_meta.items():
+                    if k != "etf_flow_ref_date":
+                        pt[k] = v
+            daily_summary.update(etf_meta)
+
+        return daily_summary
+
+
+def enrich_live_points_with_quant_packs(
+    store: Any,
+    symbol: str,
+    trade_date: str,
+    points: list[dict[str, Any]],
+    *,
+    packs: Sequence[str] | set[str],
+    allow_network: bool | None = None,
+    etf_flow_db_path: Path | str | None = None,
+) -> list[dict[str, Any]]:
+    """Enrich live intraday polling points symmetrically with historical backtest packs."""
+    eff_packs = set(normalize_requested_data_packs(list(packs)))
+    if not points or not eff_packs:
+        return points
+    working = [dict(pt) for pt in points]
+    if "l2_darkpool_flow" in eff_packs:
+        working = enrich_points_with_l2_periods(store, symbol, trade_date, working)
+    cross_or_etf = eff_packs & {"iopv_fx", "xop_us_ep", "uso_bno_sc_peer", "etf_redemption_flow"}
+    if cross_or_etf:
+        pre_close = None
+        try:
+            with store._lock:
+                row = store._connection.execute(
+                    "SELECT pre_close FROM research_days WHERE symbol=? AND trade_date=?",
+                    (symbol, trade_date),
+                ).fetchone()
+                prev_row = store._connection.execute(
+                    "SELECT MAX(trade_date) AS td FROM research_days WHERE symbol=? AND trade_date<?",
+                    (symbol, trade_date),
+                ).fetchone()
+            pre_close = _number(row["pre_close"]) if row else None
+            prev_td = str(prev_row["td"]) if (prev_row and prev_row["td"]) else None
+        except Exception:
+            prev_td = None
+        enricher = QuantPackEnricher(
+            store,
+            symbol,
+            packs=sorted(cross_or_etf),
+            start_date=trade_date,
+            end_date=trade_date,
+            allow_network=allow_network,
+            etf_flow_db_path=etf_flow_db_path,
+        )
+        enricher.enrich_day(trade_date, prev_td, working, pre_close=pre_close)
+    return working
+
+
 def _enrich_day_points(
     store: Any,
     symbol: str,
@@ -1360,20 +2683,21 @@ def _enrich_day_points(
 ) -> tuple[list[dict[str, Any]], bool]:
     prices = [float(r["price"]) if r["price"] is not None else 0.0 for r in raw_rows]
     macd_rows = calculate_macd(prices, macd_settings)
-    ff_by_time: dict[str, dict[str, Any]] = {}
-    try:
-        ff_hist = store.read_fund_flow_history(symbol, trade_date)
-        for pt in ((ff_hist.get("periods") or {}).get("today") or {}).get("points") or []:
-            if isinstance(pt, dict) and pt.get("time"):
-                ff_by_time[str(pt["time"])] = pt
-    except Exception:
-        ff_by_time = {}
+    period_maps = _read_l2_period_maps(store, symbol, trade_date)
+    ff_by_time = period_maps["today"]
+    ff_3d_by_time = period_maps["three_day"]
+    ff_5d_by_time = period_maps["five_day"]
 
     flow_count = 0
     points: list[dict[str, Any]] = []
     for idx, r in enumerate(raw_rows):
         t = str(r["minute"])
         ff = ff_by_time.get(t, {})
+        l2_fields = _compute_l2_flow_fields(
+            ff_by_time.get(t),
+            ff_3d_by_time.get(t),
+            ff_5d_by_time.get(t),
+        )
         p_val = prices[idx]
         chg_pct = (
             round((p_val - pre_close) / pre_close * 100.0, 4)
@@ -1384,6 +2708,9 @@ def _enrich_day_points(
             r["large_order_net"] is not None
             or r["large_order_amount"] is not None
             or ff.get("main_net_inflow") is not None
+            or ff.get("main_visible_inflow") is not None
+            or ff.get("main_hidden_inflow") is not None
+            or ff.get("retail_inflow") is not None
         )
         if has_flow_here:
             flow_count += 1
@@ -1398,10 +2725,12 @@ def _enrich_day_points(
                 "large_order_amount": r["large_order_amount"],
                 "retail_count": r["retail_count"],
                 "macdfs": r["macdfs"],
+                "fund_unit": ff.get("unit"),
                 "main_net_inflow": ff.get("main_net_inflow"),
                 "main_visible_inflow": ff.get("main_visible_inflow"),
                 "main_hidden_inflow": ff.get("main_hidden_inflow"),
                 "retail_inflow": ff.get("retail_inflow"),
+                **l2_fields,
                 **macd_rows[idx],
             }
         )
@@ -1724,6 +3053,11 @@ def evaluate_quant_strategy(
             rules.append({**sell_r, "enabled": True})
     if not rules:
         raise ValueError("strategy must contain at least one buy_rule or sell_rule")
+    validate_quant_rule_spec(
+        rule_spec.get("buy_rule"),
+        rule_spec.get("sell_rule"),
+        pos_sizing,
+    )
 
     if pos_sizing.get("engine_profile") in {"v9_plus_aggressive", "v9_plus_balanced"} and target_symbol != "BRN0Y":
         return evaluate_v9_plus_backtest(
@@ -1774,6 +3108,22 @@ def evaluate_quant_strategy(
         if target_symbol != "BRN0Y"
         else None
     )
+    required_packs = detect_rule_required_packs(rules, pos_sizing)
+    pack_enricher: QuantPackEnricher | None = None
+    ext_pack_needed = required_packs & {
+        "iopv_fx",
+        "xop_us_ep",
+        "uso_bno_sc_peer",
+        "etf_redemption_flow",
+    }
+    if ext_pack_needed:
+        pack_enricher = QuantPackEnricher(
+            store,
+            target_symbol,
+            packs=sorted(ext_pack_needed),
+            start_date=criteria["start_date"],
+            end_date=cleaned_end,
+        )
 
     evaluated_dates: list[str] = []
     skipped_no_flow_dates: list[str] = []
@@ -1852,6 +3202,8 @@ def evaluate_quant_strategy(
             store, target_symbol, td, raw_pts, pre_close, macd_settings
         )
         brent_meta = enrich_points_with_brent(points, td, prev_candidate_date, brent_index)
+        if pack_enricher is not None:
+            pack_enricher.enrich_day(td, prev_candidate_date, points, pre_close=pre_close)
         prev_candidate_date = td
         if effective_scope == "flow_only" and not has_flow:
             skipped_no_flow_dates.append(td)
@@ -2483,11 +3835,15 @@ def evaluate_quant_strategy(
             "sell_t_days": item["sell_t_days"],
             "gross_return_pct": round(item["gross_return_pct"], 4),
             "net_return_pct": round(item["net_return_pct"], 4),
+            "overnight_days": 0,
+            "overnight_return_pct": 0.0,
+            "intraday_t0_return_pct": round(item["net_return_pct"], 4),
             "base_hold_pct": round((item["base_nav"] - 1.0) * 100.0, 4),
         }
         for item in sorted(t0_monthly_map.values(), key=lambda x: x["month"])
     ]
     base_position_t0 = {
+        "accounting_mode": "pure_t0",
         "start_date": evaluated_dates[0] if evaluated_dates else criteria["start_date"],
         "end_date": evaluated_dates[-1] if evaluated_dates else None,
         "morning_window": f"{criteria['morning_start']}-{criteria['morning_end']}",
@@ -2498,6 +3854,7 @@ def evaluate_quant_strategy(
         "buy_t_days": t0_buy_days,
         "sell_t_days": t0_sell_days,
         "hold_days": t0_hold_days,
+        "overnight_hold_days": 0,
         "daily_win_rate_pct": (
             round(len(pos_t0) / t0_traded_days * 100.0, 2) if t0_traded_days > 0 else None
         ),
@@ -2506,6 +3863,8 @@ def evaluate_quant_strategy(
         ),
         "gross_cum_return_pct": round(t0_cum_gross_pct, 4),
         "net_cum_return_pct": round(t0_cum_net_pct, 4),
+        "overnight_return_pct": 0.0,
+        "intraday_t0_return_pct": round(t0_cum_net_pct, 4),
         "compound_net_return_pct": round(compound_net_pct, 4),
         "buy_t_net_return_pct": round(t0_buy_net_pct, 4),
         "sell_t_net_return_pct": round(t0_sell_net_pct, 4),
@@ -2617,6 +3976,176 @@ def evaluate_quant_strategy(
     }
 
 
+def _build_orderbook_l1_snapshot(
+    store: Any,
+    symbol: str,
+    auto_trade_engine: Any = None,
+) -> dict[str, Any] | None:
+    """Return latest L1 5-level orderbook / price-cage snapshot without triggering external IO."""
+    if symbol == "BRN0Y":
+        return None
+    book: dict[str, Any] | None = None
+    source_tag = "ORDERBOOK_CACHE"
+    ob_cache = getattr(auto_trade_engine, "_order_book_cache", None) if auto_trade_engine is not None else None
+    if isinstance(ob_cache, Mapping):
+        entry = ob_cache.get(symbol)
+        if isinstance(entry, tuple) and len(entry) >= 2 and isinstance(entry[1], Mapping):
+            book = dict(entry[1])
+    if book is None:
+        mem_probe = _MEMORY_MACRO_CACHE.get(("global", "probe_orderbook_l1"))
+        if isinstance(mem_probe, tuple) and len(mem_probe) >= 2 and isinstance(mem_probe[1], Mapping):
+            probe_bk = mem_probe[1].get(symbol)
+            if isinstance(probe_bk, Mapping):
+                book = dict(probe_bk)
+                source_tag = "ORDERBOOK_PROBE_CACHE"
+    if book is not None:
+        return {
+            "symbol": symbol,
+            "name": book.get("name") or PREMIUM_NAMES.get(symbol, symbol),
+            "last_price": book.get("last_price"),
+            "previous_close": book.get("previous_close"),
+            "limit_up": book.get("limit_up"),
+            "limit_down": book.get("limit_down"),
+            "bids": list(book.get("bids") or []),
+            "asks": list(book.get("asks") or []),
+            "source_time": book.get("source_time"),
+            "source": source_tag,
+        }
+    snap_fn = getattr(store, "latest_market_snapshot", None)
+    if callable(snap_fn):
+        try:
+            ms = snap_fn(symbol)
+            if ms is not None:
+                q = getattr(ms, "quote", None) or {}
+                return {
+                    "symbol": symbol,
+                    "name": getattr(ms, "name", None) or PREMIUM_NAMES.get(symbol, symbol),
+                    "last_price": _number(q.get("price")),
+                    "previous_close": _number(q.get("previous_close")),
+                    "open": _number(q.get("open")),
+                    "high": _number(q.get("high")),
+                    "low": _number(q.get("low")),
+                    "volume": _number(q.get("volume")),
+                    "limit_up": None,
+                    "limit_down": None,
+                    "bids": [],
+                    "asks": [],
+                    "source_time": getattr(ms, "source_time", None),
+                    "source": getattr(ms, "source", "MARKET_DATABASE"),
+                }
+        except Exception:
+            return None
+    return None
+
+
+def _build_qdii_panel_snapshot(store: Any, symbol: str) -> dict[str, Any] | None:
+    """Extract sanitized QDII real-time valuation/premium row for `symbol`."""
+    if symbol == "BRN0Y":
+        return None
+    snap_fn = getattr(store, "premium_snapshot", None)
+    if not callable(snap_fn):
+        return None
+    try:
+        snap = snap_fn()
+    except Exception:
+        return None
+    if not isinstance(snap, Mapping):
+        return None
+    rows = snap.get("rows")
+    if not isinstance(rows, Sequence) or isinstance(rows, (str, bytes)):
+        return None
+    for row in rows:
+        if not isinstance(row, Mapping):
+            continue
+        code = str(row.get("code") or "").strip().upper()
+        if code != symbol:
+            continue
+        prem_rate = _number(row.get("premium_rate"))
+        return {
+            "code": code,
+            "name": row.get("name") or PREMIUM_NAMES.get(code, code),
+            "current_price": _number(row.get("current_price")),
+            "estimated_price": _number(row.get("estimated_price")),
+            "premium_rate": prem_rate,
+            "premium_pct": round(prem_rate * 100.0, 3) if prem_rate is not None else None,
+            "estimate_source": row.get("estimate_source"),
+            "estimate_date": row.get("estimate_date"),
+            "stale": bool(row.get("stale")),
+            "error": row.get("error"),
+            "as_of": snap.get("as_of"),
+        }
+    return None
+
+
+def _build_monitored_data_sources_summary(
+    *,
+    symbol: str,
+    coverage: Mapping[str, Any],
+    available_packs: Mapping[str, Mapping[str, Any]],
+    macro_keys: set[str],
+    orderbook_snap: Mapping[str, Any] | None,
+    qdii_panel_snap: Mapping[str, Any] | None,
+) -> list[dict[str, Any]]:
+    """Build sanitized 13-catalog data source readiness descriptors (no internal rule/live bindings)."""
+    brent_cov = coverage.get("brent_coverage") if isinstance(coverage.get("brent_coverage"), Mapping) else {}
+    brent_days = int((coverage if symbol == "BRN0Y" else brent_cov).get("total_days") or 0)
+    base_days = int(coverage.get("total_days") or 0)
+    out: list[dict[str, Any]] = []
+    for meta in QUANT_DATA_SOURCE_CATALOG:
+        sid = str(meta["id"])
+        pack_id = MONITOR_SOURCE_TO_PACK.get(sid)
+        avail = True
+        latest_time: str | None = str(coverage.get("last_date") or "") or None
+        latest_note: str | None = None
+        if sid == "ashare_intraday_1m":
+            avail = base_days > 0
+            latest_note = f"{base_days} 日 1m 已入库"
+        elif sid == "ashare_orderbook_l1":
+            avail = orderbook_snap is not None
+            latest_time = str((orderbook_snap or {}).get("source_time") or latest_time or "") or None
+            latest_note = (orderbook_snap or {}).get("source") or "待采集盘口快照"
+        elif sid == "ice_brent_1m":
+            avail = brent_days > 0
+            latest_time = str((brent_cov or coverage).get("last_date") or latest_time or "") or None
+            latest_note = f"{brent_days} 日 BRN0Y 已入库"
+        elif sid == "fx_usdcny_usdcnh":
+            avail = bool((available_packs.get("iopv_fx") or {}).get("available"))
+            latest_note = "fx_usdcnh" if "fx_usdcnh_series" in macro_keys else "fx_usdcny"
+        elif sid == "eastmoney_fund_nav":
+            avail = symbol != "BRN0Y" and (f"nav_{symbol}" in macro_keys or bool((available_packs.get("iopv_fx") or {}).get("available")))
+            latest_note = f"nav_{symbol}" if f"nav_{symbol}" in macro_keys else "按需拉取天天基金净值"
+        elif sid == "qdii_premium_panel_feed":
+            avail = qdii_panel_snap is not None or symbol in _OIL_QDII_NAV_SYMBOLS
+            latest_time = str((qdii_panel_snap or {}).get("as_of") or latest_time or "") or None
+            latest_note = (
+                f"溢价 {(qdii_panel_snap or {}).get('premium_pct')}%"
+                if (qdii_panel_snap and qdii_panel_snap.get("premium_pct") is not None)
+                else "9只油气基金估值面板"
+            )
+        elif pack_id is not None:
+            p_info = available_packs.get(pack_id) or {}
+            avail = bool(p_info.get("available"))
+            if sid == "ashare_l2_fund_flow":
+                latest_note = f"{p_info.get('l2_days', 0)} 日 L2 资金流"
+            elif sid == "ashare_etf_redemption":
+                latest_note = f"{p_info.get('line_days', 0)} 日申赎流"
+        out.append(
+            {
+                "id": sid,
+                "name": str(meta["name"]),
+                "category": str(meta["category"]),
+                "category_label": str(meta["category_label"]),
+                "pack_id": pack_id,
+                "fetch_frequency": str(meta.get("fetch_frequency") or ""),
+                "trading_hours_cst": str(meta.get("trading_hours_cst") or ""),
+                "available": bool(avail),
+                "latest_time": latest_time,
+                "latest_note": latest_note,
+            }
+        )
+    return out
+
+
 def export_quant_dataset(
     store: Any,
     symbol: str = "160723",
@@ -2626,9 +4155,25 @@ def export_quant_dataset(
     mode: str = "summary",
     limit_days: int = 30,
     macd_settings: Mapping[str, Any] | None = None,
+    packs: Sequence[str] | str | None = None,
+    sources: Sequence[str] | str | None = None,
+    allow_network: bool | None = None,
+    etf_flow_db_path: Path | str | None = None,
+    auto_trade_engine: Any = None,
 ) -> dict[str, Any]:
     """Export structured dataset for external AI research (summary / daily / minutes)."""
     normalized = _normalize_quant_symbol(symbol)
+    explicit_selector = packs is not None or sources is not None
+    selected_packs, requested_sources = resolve_packs_from_sources_and_packs(
+        packs,
+        sources,
+        default_all=not explicit_selector,
+    )
+    eff_allow_network = (
+        allow_network
+        if allow_network is not None
+        else (True if explicit_selector else False)
+    )
     clean_start = str(start_date or "20260701").replace("-", "").strip()
     if not _DATE_RE.fullmatch(clean_start):
         clean_start = "20260701"
@@ -2651,11 +4196,86 @@ def export_quant_dataset(
         sql += " ORDER BY trade_date ASC"
         day_rows = store._connection.execute(sql, tuple(params)).fetchall()
 
-        prev_row = store._connection.execute(
-            "SELECT MAX(trade_date) AS td FROM research_days WHERE symbol=? AND trade_date<?",
+        prev_rows = store._connection.execute(
+            "SELECT trade_date FROM research_days WHERE symbol=? AND trade_date<? ORDER BY trade_date DESC LIMIT 2",
             (normalized, clean_start),
-        ).fetchone()
-        initial_prev_td = str(prev_row["td"]) if prev_row and prev_row["td"] else None
+        ).fetchall()
+        initial_prev_td = str(prev_rows[0]["trade_date"]) if len(prev_rows) >= 1 and prev_rows[0]["trade_date"] else None
+        initial_prev_prev_td = str(prev_rows[1]["trade_date"]) if len(prev_rows) >= 2 and prev_rows[1]["trade_date"] else initial_prev_td
+
+        l2_days_cnt = 0
+        try:
+            l2_row = store._connection.execute(
+                "SELECT COUNT(DISTINCT trade_date) AS cnt FROM fund_flow_history_points WHERE symbol=? AND trade_date>=?",
+                (normalized, clean_start),
+            ).fetchone()
+            l2_days_cnt = int(l2_row["cnt"] or 0) if l2_row else 0
+        except sqlite3.Error:
+            l2_days_cnt = 0
+
+        macro_keys: set[str] = set()
+        try:
+            m_rows = store._connection.execute(
+                "SELECT cache_key FROM quant_macro_cache"
+            ).fetchall()
+            macro_keys = {str(r["cache_key"]) for r in m_rows}
+        except sqlite3.Error:
+            macro_keys = set()
+
+        etf_cache_meta = _load_etf_flow_cache(
+            _resolve_etf_flow_db_path(store, etf_flow_db_path),
+            normalized,
+        )
+        brent_ok = bool((coverage.get("brent_coverage") or {}).get("total_days"))
+        available_packs_summary = {
+            "iopv_fx": {
+                "available": normalized != "BRN0Y" and (
+                    brent_ok
+                    or f"nav_{normalized}" in macro_keys
+                    or "fx_usdcny_series" in macro_keys
+                    or "fx_usdcnh_series" in macro_keys
+                ),
+            },
+            "xop_us_ep": {
+                "available": normalized != "BRN0Y" and ("xop_daily_2y" in macro_keys or normalized == "162411"),
+            },
+            "uso_bno_sc_peer": {
+                "available": normalized != "BRN0Y" and (
+                    "sc0_daily_all" in macro_keys
+                    or "uso_daily_2y" in macro_keys
+                    or "dbo_daily_2y" in macro_keys
+                    or normalized in _OIL_PEER_SYMBOLS
+                ),
+            },
+            "l2_darkpool_flow": {
+                "available": l2_days_cnt > 0,
+                "l2_days": l2_days_cnt,
+            },
+            "etf_redemption_flow": {
+                "available": bool(etf_cache_meta.get("line") or etf_cache_meta.get("summary")),
+                "line_days": len(etf_cache_meta.get("line") or []),
+                "holdings_count": len(etf_cache_meta.get("holdings") or []),
+            },
+        }
+
+        orderbook_snap = (
+            _build_orderbook_l1_snapshot(store, normalized, auto_trade_engine)
+            if "ashare_orderbook_l1" in requested_sources
+            else None
+        )
+        qdii_panel_snap = (
+            _build_qdii_panel_snapshot(store, normalized)
+            if ("iopv_fx" in selected_packs and "qdii_premium_panel_feed" in requested_sources)
+            else None
+        )
+        monitored_sources_summary = _build_monitored_data_sources_summary(
+            symbol=normalized,
+            coverage=coverage,
+            available_packs=available_packs_summary,
+            macro_keys=macro_keys,
+            orderbook_snap=orderbook_snap,
+            qdii_panel_snap=qdii_panel_snap,
+        )
 
         if mode == "summary":
             sum_sql = (
@@ -2679,13 +4299,22 @@ def export_quant_dataset(
                 m["points"] += pt_cnt
                 if flow_cnt >= 50:
                     m["flow_days"] += 1
-            return {
+            res_summary: dict[str, Any] = {
                 "mode": "summary",
                 "symbol": normalized,
                 "coverage": coverage,
+                "available_data_packs": available_packs_summary,
+                "requested_packs": selected_packs,
+                "requested_sources": requested_sources,
+                "monitored_data_sources": monitored_sources_summary,
                 "monthly_breakdown": list(monthly.values()),
                 "schema": get_quant_rule_schema(),
             }
+            if orderbook_snap is not None:
+                res_summary["orderbook_l1_snapshot"] = orderbook_snap
+            if qdii_panel_snap is not None:
+                res_summary["qdii_panel_snapshot"] = qdii_panel_snap
+            return res_summary
 
         pt_sql = (
             "SELECT * FROM research_points WHERE symbol=? AND trade_date>=?"
@@ -2701,10 +4330,24 @@ def export_quant_dataset(
         if normalized != "BRN0Y" and mode in {"daily", "minutes"}
         else None
     )
+    pack_enricher: QuantPackEnricher | None = (
+        QuantPackEnricher(
+            store,
+            normalized,
+            packs=selected_packs,
+            start_date=clean_start,
+            end_date=clean_end,
+            allow_network=eff_allow_network,
+            etf_flow_db_path=etf_flow_db_path,
+        )
+        if selected_packs and mode in {"daily", "minutes"}
+        else None
+    )
 
     if mode == "daily":
         daily_out: list[dict[str, Any]] = []
         prev_td: str | None = initial_prev_td
+        prev_prev_td: str | None = initial_prev_prev_td
         for d in day_rows:
             td = str(d["trade_date"])
             raw_pts = points_by_day.get(td, [])
@@ -2718,6 +4361,23 @@ def export_quant_dataset(
                 1 for r in raw_pts if r["large_order_net"] is not None or r["large_order_amount"] is not None
             )
             b_meta = enrich_points_with_brent([], td, prev_td, brent_index)
+            pack_daily_meta: dict[str, Any] = {}
+            if pack_enricher is not None:
+                if raw_pts:
+                    pts_enriched, ff_has_flow = _enrich_day_points(store, normalized, td, raw_pts, pre, eff_macd)
+                    enrich_points_with_brent(pts_enriched, td, prev_td, brent_index)
+                    pack_daily_meta = pack_enricher.enrich_day(
+                        td,
+                        prev_td,
+                        pts_enriched,
+                        pre_close=pre,
+                        prev_prev_td=prev_prev_td,
+                    )
+                    if ff_has_flow:
+                        flow_cnt = max(flow_cnt, 50)
+                elif "etf_redemption_flow" in pack_enricher.packs and pack_enricher.etf_cache:
+                    pack_daily_meta = _causal_etf_flow_metrics(pack_enricher.etf_cache, td)
+            prev_prev_td = prev_td or prev_prev_td
             prev_td = td
             b_prev = b_meta.get("prev_1500")
             b_c15 = b_meta.get("close_1500")
@@ -2726,34 +4386,44 @@ def export_quant_dataset(
                 if b_c15 and b_prev and b_prev > 0
                 else None
             )
-            daily_out.append(
-                {
-                    "trade_date": td,
-                    "source": d["source"],
-                    "point_count": len(raw_pts),
-                    "has_flow": flow_cnt >= 50,
-                    "pre_close": pre,
-                    "open": open_p,
-                    "high": high_p,
-                    "low": low_p,
-                    "close": close_p,
-                    "open_gap_pct": round((open_p - pre) / pre * 100.0, 3) if pre and open_p and pre > 0 else None,
-                    "close_vs_open_pct": round((close_p - open_p) / open_p * 100.0, 3) if open_p and close_p and open_p > 0 else None,
-                    "intraday_amp_pct": round((high_p - low_p) / pre * 100.0, 3) if pre and high_p and low_p and pre > 0 else None,
-                    "day_return_pct": round((close_p - pre) / pre * 100.0, 3) if pre and close_p and pre > 0 else None,
-                    "brn_prev_1500": b_prev,
-                    "brn_open_0930": b_meta.get("open_0930"),
-                    "brn_close_1500": b_c15,
-                    "brn_overnight_pct": b_meta.get("overnight_pct"),
-                    "brn_day_pct": b_day_pct,
-                }
-            )
-        return {
+            daily_item = {
+                "trade_date": td,
+                "source": d["source"],
+                "point_count": len(raw_pts),
+                "has_flow": flow_cnt >= 50,
+                "pre_close": pre,
+                "open": open_p,
+                "high": high_p,
+                "low": low_p,
+                "close": close_p,
+                "open_gap_pct": round((open_p - pre) / pre * 100.0, 3) if pre and open_p and pre > 0 else None,
+                "close_vs_open_pct": round((close_p - open_p) / open_p * 100.0, 3) if open_p and close_p and open_p > 0 else None,
+                "intraday_amp_pct": round((high_p - low_p) / pre * 100.0, 3) if pre and high_p and low_p and pre > 0 else None,
+                "day_return_pct": round((close_p - pre) / pre * 100.0, 3) if pre and close_p and pre > 0 else None,
+                "brn_prev_1500": b_prev,
+                "brn_open_0930": b_meta.get("open_0930"),
+                "brn_close_1500": b_c15,
+                "brn_overnight_pct": b_meta.get("overnight_pct"),
+                "brn_day_pct": b_day_pct,
+                **pack_daily_meta,
+            }
+            daily_out.append(daily_item)
+        res_daily: dict[str, Any] = {
             "mode": "daily",
             "symbol": normalized,
             "coverage": coverage,
+            "data_packs_included": selected_packs,
+            "requested_sources": requested_sources,
+            "monitored_data_sources": monitored_sources_summary,
             "days": daily_out,
         }
+        if orderbook_snap is not None:
+            res_daily["orderbook_l1_snapshot"] = orderbook_snap
+        if qdii_panel_snap is not None:
+            res_daily["qdii_panel_snapshot"] = qdii_panel_snap
+        if pack_enricher is not None and "etf_redemption_flow" in pack_enricher.packs:
+            res_daily["etf_top_holdings"] = pack_enricher.etf_cache.get("holdings") or []
+        return res_daily
 
     # mode == "minutes"
     cap_days = max(1, min(200, int(limit_days)))
@@ -2761,6 +4431,83 @@ def export_quant_dataset(
     selected_set = {str(d["trade_date"]) for d in selected_days}
     all_dates_ordered = [str(d["trade_date"]) for d in day_rows]
     minute_days: list[dict[str, Any]] = []
+    pack_field_groups: dict[str, tuple[str, ...]] = {
+        "iopv_fx": (
+            "iopv_fx",
+            "iopv_premium_pct",
+            "sp_fx_pct",
+            "coint10_pct",
+            "usdcny",
+            "usdcnh",
+            "usdcny_change_pct",
+            "fx_adjusted_nav_change_pct",
+            "official_nav",
+            "brent_q2y_pct",
+        ),
+        "xop_us_ep": (
+            "xop_change_pct",
+            "xle_change_pct",
+            "spy_change_pct",
+            "iwm_change_pct",
+            "cl_change_pct",
+            "ho_crack_change_pct",
+            "ng_change_pct",
+            "es_change_pct",
+            "xop_synthetic_premium_pct",
+            "daytime_lead_pct",
+            "daytime_crack_pct",
+        ),
+        "uso_bno_sc_peer": (
+            "uso_bno_change_pct",
+            "uso_change_pct",
+            "bno_change_pct",
+            "dbo_change_pct",
+            "fof_3oil_change_pct",
+            "dual_oil_premium_pct",
+            "sc0_change_pct",
+            "sc0_intraday_pct",
+            "sc_brent_spread_pct",
+            "peer_spread_pct",
+            "peer_change_pct",
+            "peer_premium_diff_pct",
+            "peer_160723_change_pct",
+            "peer_160723_spread_pct",
+            "peer_161129_change_pct",
+            "peer_161129_spread_pct",
+            "peer_501018_change_pct",
+            "peer_501018_spread_pct",
+            "peer_162411_change_pct",
+            "peer_162411_spread_pct",
+        ),
+        "l2_darkpool_flow": (
+            "l2_today_main_net_wan",
+            "l2_today_visible_wan",
+            "l2_today_hidden_wan",
+            "l2_today_retail_wan",
+            "l2_today_hidden_ratio_pct",
+            "l2_3d_main_net_wan",
+            "l2_3d_visible_wan",
+            "l2_3d_hidden_wan",
+            "l2_3d_retail_wan",
+            "l2_3d_hidden_ratio_pct",
+            "l2_5d_main_net_wan",
+            "l2_5d_visible_wan",
+            "l2_5d_hidden_wan",
+            "l2_5d_retail_wan",
+            "l2_5d_hidden_ratio_pct",
+        ),
+        "etf_redemption_flow": (
+            "etf_net_buy_1d_wan",
+            "etf_net_buy_3d_wan",
+            "etf_net_buy_5d_wan",
+            "etf_net_buy_20d_wan",
+            "etf_share_scale_yi",
+            "etf_net_buy_ratio_pct",
+        ),
+    }
+    allowed_extra_keys = [
+        k for p_name in selected_packs for k in pack_field_groups.get(p_name, ())
+    ]
     for idx_d, d in enumerate(day_rows):
         td = str(d["trade_date"])
         if td not in selected_set:
@@ -2769,9 +4516,25 @@ def export_quant_dataset(
         if not raw_pts:
             continue
         prev_td = all_dates_ordered[idx_d - 1] if idx_d > 0 else initial_prev_td
+        prev_prev_td = (
+            all_dates_ordered[idx_d - 2]
+            if idx_d >= 2
+            else (initial_prev_td if idx_d == 1 else initial_prev_prev_td)
+        )
         pre = _number(d["pre_close"])
         points, has_flow = _enrich_day_points(store, normalized, td, raw_pts, pre, eff_macd)
         enrich_points_with_brent(points, td, prev_td, brent_index)
+        day_pack_meta = (
+            pack_enricher.enrich_day(
+                td,
+                prev_td,
+                points,
+                pre_close=pre,
+                prev_prev_td=prev_prev_td,
+            )
+            if pack_enricher is not None
+            else {}
+        )
         prices = [float(_number(p["price"]) or 0.0) for p in points]
         close_p = next((p for p in reversed(prices) if p > 0), 0.0)
         vols = [_number(p.get("volume")) for p in points]
@@ -2796,47 +4559,60 @@ def export_quant_dataset(
             ret_5m = round((prices[i + 5] - p) / p * 100.0, 4) if i + 5 < len(prices) and p > 0 and prices[i + 5] > 0 else None
             ret_15m = round((prices[i + 15] - p) / p * 100.0, 4) if i + 15 < len(prices) and p > 0 and prices[i + 15] > 0 else None
             to_close_ret = round((close_p - p) / p * 100.0, 4) if p > 0 and close_p > 0 else None
-            rows_out.append(
-                {
-                    "time": pt["time"],
-                    "price": p,
-                    "avg_price": avg,
-                    "vwap_dev_pct": vwap_dev,
-                    "volume": vols[i],
-                    "vol_ratio_20m": vr,
-                    "diff": pt["diff"],
-                    "dea": pt["dea"],
-                    "macd": pt["macd"],
-                    "flow_wan": flow_v,
-                    "flow_1m_chg_pct": flow_1m_chg,
-                    "brn_price": pt.get("brn_price"),
-                    "brn_overnight_pct": pt.get("brn_overnight_pct"),
-                    "brn_from_prev_close_pct": pt.get("brn_from_prev_close_pct"),
-                    "brn_intraday_pct": pt.get("brn_intraday_pct"),
-                    "brn_mom_5m_pct": pt.get("brn_mom_5m_pct"),
-                    "brn_mom_15m_pct": pt.get("brn_mom_15m_pct"),
-                    "brn_spread_pct": pt.get("brn_spread_pct"),
-                    "fwd_ret_5m_pct": ret_5m,
-                    "fwd_ret_15m_pct": ret_15m,
-                    "to_close_ret_pct": to_close_ret,
-                }
-            )
+            pt_row = {
+                "time": pt["time"],
+                "price": p,
+                "avg_price": avg,
+                "vwap_dev_pct": vwap_dev,
+                "volume": vols[i],
+                "vol_ratio_20m": vr,
+                "diff": pt["diff"],
+                "dea": pt["dea"],
+                "macd": pt["macd"],
+                "flow_wan": flow_v,
+                "flow_1m_chg_pct": flow_1m_chg,
+                "brn_price": pt.get("brn_price"),
+                "brn_overnight_pct": pt.get("brn_overnight_pct"),
+                "brn_from_prev_close_pct": pt.get("brn_from_prev_close_pct"),
+                "brn_intraday_pct": pt.get("brn_intraday_pct"),
+                "brn_mom_5m_pct": pt.get("brn_mom_5m_pct"),
+                "brn_mom_15m_pct": pt.get("brn_mom_15m_pct"),
+                "brn_spread_pct": pt.get("brn_spread_pct"),
+                "fwd_ret_5m_pct": ret_5m,
+                "fwd_ret_15m_pct": ret_15m,
+                "to_close_ret_pct": to_close_ret,
+            }
+            for ek in allowed_extra_keys:
+                if ek in pt:
+                    pt_row[ek] = pt.get(ek)
+            rows_out.append(pt_row)
         minute_days.append(
             {
                 "trade_date": td,
                 "pre_close": pre,
                 "has_flow": has_flow,
+                "day_pack_summary": day_pack_meta,
                 "points": rows_out,
             }
         )
-    return {
+    res_min: dict[str, Any] = {
         "mode": "minutes",
         "symbol": normalized,
         "coverage": coverage,
         "macd_settings": eff_macd,
+        "data_packs_included": selected_packs,
+        "requested_sources": requested_sources,
+        "monitored_data_sources": monitored_sources_summary,
         "returned_days": len(minute_days),
         "days": minute_days,
     }
+    if orderbook_snap is not None:
+        res_min["orderbook_l1_snapshot"] = orderbook_snap
+    if qdii_panel_snap is not None:
+        res_min["qdii_panel_snapshot"] = qdii_panel_snap
+    if pack_enricher is not None and "etf_redemption_flow" in pack_enricher.packs:
+        res_min["etf_top_holdings"] = pack_enricher.etf_cache.get("holdings") or []
+    return res_min
 
 
 class SQLiteQuantRuleStore:
@@ -2874,6 +4650,7 @@ class SQLiteQuantRuleStore:
                     position_sizing_json TEXT,
                     eval_criteria_json TEXT NOT NULL,
                     latest_eval_json TEXT,
+                    meta_json TEXT,
                     enabled INTEGER NOT NULL DEFAULT 1,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
@@ -2888,6 +4665,8 @@ class SQLiteQuantRuleStore:
             }
             if "position_sizing_json" not in cols:
                 self._connection.execute("ALTER TABLE quant_strategy_rules ADD COLUMN position_sizing_json TEXT")
+            if "meta_json" not in cols:
+                self._connection.execute("ALTER TABLE quant_strategy_rules ADD COLUMN meta_json TEXT")
 
     def close(self) -> None:
         with self._lock:
@@ -2903,12 +4682,17 @@ class SQLiteQuantRuleStore:
                 ).fetchone()
                 if existing is not None:
                     continue
+                derived_ds = derive_rule_data_sources(item)
+                meta_payload = {
+                    "target_symbol": (item.get("symbols") or ["160723"])[0],
+                    "data_sources": derived_ds,
+                }
                 self._connection.execute(
                     """INSERT INTO quant_strategy_rules(
                            id, name, description, source, symbols_json, macd_json,
                            buy_rule_json, sell_rule_json, eval_criteria_json,
-                           latest_eval_json, enabled, created_at, updated_at
-                       ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)""",
+                           latest_eval_json, meta_json, enabled, created_at, updated_at
+                       ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?)""",
                     (
                         item["id"],
                         item["name"],
@@ -2919,10 +4703,36 @@ class SQLiteQuantRuleStore:
                         json.dumps(item["buy_rule"], ensure_ascii=False),
                         json.dumps(item["sell_rule"], ensure_ascii=False),
                         json.dumps(item["eval_criteria"], ensure_ascii=False),
+                        json.dumps(meta_payload, ensure_ascii=False),
                         1 if item["enabled"] else 0,
                         now,
                         now,
                     ),
+                )
+            # Backfill or upgrade auto-derived data_sources manifest in meta_json when catalog schema advances
+            data_sources_schema_rev = 3
+            all_rows = self._connection.execute("SELECT * FROM quant_strategy_rules").fetchall()
+            for row in all_rows:
+                rule_dict = self._row_to_dict(row)
+                raw_meta: dict[str, Any] = dict(rule_dict.get("meta") or {})
+                cur_ds = raw_meta.get("data_sources")
+                has_custom_ds = isinstance(cur_ds, list) and any(
+                    isinstance(d, Mapping) and d.get("auto_derived") is False for d in cur_ds
+                )
+                cur_rev = int(raw_meta.get("data_sources_schema_rev") or 0)
+                if cur_rev >= data_sources_schema_rev and isinstance(cur_ds, list) and cur_ds:
+                    continue
+                raw_meta.setdefault("target_symbol", rule_dict["target_symbol"])
+                if has_custom_ds and isinstance(cur_ds, list) and cur_ds:
+                    raw_meta["data_sources"] = normalize_and_validate_rule_data_sources(
+                        cur_ds, rule_dict, strict_declared=False
+                    )
+                else:
+                    raw_meta["data_sources"] = derive_rule_data_sources(rule_dict)
+                raw_meta["data_sources_schema_rev"] = data_sources_schema_rev
+                self._connection.execute(
+                    "UPDATE quant_strategy_rules SET meta_json=? WHERE id=?",
+                    (json.dumps(raw_meta, ensure_ascii=False), rule_dict["id"]),
                 )
 
     @staticmethod
@@ -2933,16 +4743,54 @@ class SQLiteQuantRuleStore:
                 raw_ps = json.loads(row["position_sizing_json"])
             except Exception:
                 raw_ps = None
+        raw_meta: dict[str, Any] = {}
+        if "meta_json" in row.keys() and row["meta_json"]:
+            try:
+                parsed_meta = json.loads(row["meta_json"])
+                if isinstance(parsed_meta, dict):
+                    raw_meta = parsed_meta
+            except Exception:
+                raw_meta = {}
+        symbols = json.loads(row["symbols_json"])
+        primary_sym = str(raw_meta.get("target_symbol") or (symbols[0] if symbols else "160723")).strip().upper()
+        pos_sizing = normalize_position_sizing(raw_ps)
+        buy_rule = json.loads(row["buy_rule_json"]) if row["buy_rule_json"] else None
+        sell_rule = json.loads(row["sell_rule_json"]) if row["sell_rule_json"] else None
+        rule_skeleton = {
+            "symbols": symbols,
+            "target_symbol": primary_sym,
+            "buy_rule": buy_rule,
+            "sell_rule": sell_rule,
+            "position_sizing": pos_sizing,
+        }
+        try:
+            normalized_ds = normalize_and_validate_rule_data_sources(
+                raw_meta.get("data_sources"),
+                rule_skeleton,
+                strict_declared=False,
+            )
+        except ValueError:
+            normalized_ds = derive_rule_data_sources(rule_skeleton)
         return {
             "id": str(row["id"]),
             "name": str(row["name"]),
             "description": str(row["description"]),
             "source": str(row["source"]),
-            "symbols": json.loads(row["symbols_json"]),
+            "symbols": symbols,
+            "target_symbol": primary_sym,
+            "stock_name": raw_meta.get("stock_name"),
+            "raw_strategy_name": raw_meta.get("raw_strategy_name"),
+            "submitter_id": raw_meta.get("submitter_id"),
+            "submitter_name": raw_meta.get("submitter_name"),
+            "submission_id": raw_meta.get("submission_id"),
+            "approved_by": raw_meta.get("approved_by"),
+            "approved_at": raw_meta.get("approved_at"),
+            "data_sources": normalized_ds,
+            "meta": raw_meta,
             "macd_settings": json.loads(row["macd_json"]),
-            "buy_rule": json.loads(row["buy_rule_json"]) if row["buy_rule_json"] else None,
-            "sell_rule": json.loads(row["sell_rule_json"]) if row["sell_rule_json"] else None,
-            "position_sizing": normalize_position_sizing(raw_ps),
+            "buy_rule": buy_rule,
+            "sell_rule": sell_rule,
+            "position_sizing": pos_sizing,
             "eval_criteria": json.loads(row["eval_criteria_json"]),
             "latest_eval": json.loads(row["latest_eval_json"]) if row["latest_eval_json"] else None,
             "enabled": bool(row["enabled"]),
@@ -2950,13 +4798,22 @@ class SQLiteQuantRuleStore:
             "updated_at": str(row["updated_at"]),
         }
 
-    def list_rules(self) -> list[dict[str, Any]]:
+    def list_rules(self, *, symbol: str | None = None) -> list[dict[str, Any]]:
         with self._lock:
             rows = self._connection.execute(
                 """SELECT * FROM quant_strategy_rules
                    ORDER BY CASE WHEN source='builtin' THEN 0 ELSE 1 END, updated_at DESC"""
             ).fetchall()
-        return [self._row_to_dict(r) for r in rows]
+        items = [self._row_to_dict(r) for r in rows]
+        if symbol:
+            clean_sym = _normalize_quant_symbol(symbol)
+            items = [
+                item
+                for item in items
+                if clean_sym in {str(s).strip().upper() for s in (item.get("symbols") or [])}
+                or str(item.get("target_symbol") or "").strip().upper() == clean_sym
+            ]
+        return items
 
     def get_rule(self, rule_id: str) -> dict[str, Any] | None:
         with self._lock:
@@ -2978,8 +4835,8 @@ class SQLiteQuantRuleStore:
             raise ValueError("rule id must be 2-64 alphanumeric/._- characters")
         existing = self.get_rule(rid)
         name = str(payload.get("name") or (existing["name"] if existing else "")).strip()
-        if not name or len(name) > 80:
-            raise ValueError("name must be 1-80 characters")
+        if not name or len(name) > 120:
+            raise ValueError("name must be 1-120 characters")
         description = str(
             payload.get("description") if "description" in payload else (existing["description"] if existing else "")
         ).strip()
@@ -3022,7 +4879,48 @@ class SQLiteQuantRuleStore:
         pos_sizing = normalize_position_sizing(
             payload.get("position_sizing") if "position_sizing" in payload else (existing.get("position_sizing") if existing else None)
         )
+        validate_quant_rule_spec(buy_rule, sell_rule, pos_sizing)
         enabled = bool(payload.get("enabled", existing["enabled"] if existing else True))
+
+        merged_meta: dict[str, Any] = dict((existing or {}).get("meta") or {})
+        if isinstance(payload.get("meta"), Mapping):
+            merged_meta.update(dict(payload["meta"]))
+        for meta_key in (
+            "target_symbol",
+            "stock_name",
+            "raw_strategy_name",
+            "submitter_id",
+            "submitter_name",
+            "submission_id",
+            "approved_by",
+            "approved_at",
+        ):
+            if meta_key in payload and payload.get(meta_key) is not None:
+                merged_meta[meta_key] = payload.get(meta_key)
+        merged_meta.setdefault("target_symbol", symbols[0])
+        rule_skeleton = {
+            "id": rid,
+            "symbols": symbols,
+            "target_symbol": merged_meta["target_symbol"],
+            "buy_rule": buy_rule,
+            "sell_rule": sell_rule,
+            "position_sizing": pos_sizing,
+        }
+        raw_ds_input = (
+            payload.get("data_sources")
+            if "data_sources" in payload
+            else (
+                payload.get("meta", {}).get("data_sources")
+                if isinstance(payload.get("meta"), Mapping) and "data_sources" in payload["meta"]
+                else (existing.get("data_sources") if existing and not any(k in payload for k in ("symbols", "buy_rule", "sell_rule", "position_sizing")) else None)
+            )
+        )
+        normalized_ds = normalize_and_validate_rule_data_sources(
+            raw_ds_input,
+            rule_skeleton,
+            strict_declared=_as_bool_flag(payload.get("strict_data_sources")),
+        )
+        merged_meta["data_sources"] = normalized_ds
 
         latest_eval = existing["latest_eval"] if existing else None
         if research_store is not None:
@@ -3049,8 +4947,8 @@ class SQLiteQuantRuleStore:
                 """INSERT INTO quant_strategy_rules(
                        id, name, description, source, symbols_json, macd_json,
                        buy_rule_json, sell_rule_json, position_sizing_json, eval_criteria_json,
-                       latest_eval_json, enabled, created_at, updated_at
-                   ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                       latest_eval_json, meta_json, enabled, created_at, updated_at
+                   ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(id) DO UPDATE SET
                        name=excluded.name,
                        description=excluded.description,
@@ -3062,6 +4960,7 @@ class SQLiteQuantRuleStore:
                        position_sizing_json=excluded.position_sizing_json,
                        eval_criteria_json=excluded.eval_criteria_json,
                        latest_eval_json=excluded.latest_eval_json,
+                       meta_json=excluded.meta_json,
                        enabled=excluded.enabled,
                        updated_at=excluded.updated_at""",
                 (
@@ -3076,6 +4975,7 @@ class SQLiteQuantRuleStore:
                     json.dumps(pos_sizing, ensure_ascii=False),
                     json.dumps(criteria, ensure_ascii=False),
                     json.dumps(latest_eval, ensure_ascii=False) if latest_eval is not None else None,
+                    json.dumps(merged_meta, ensure_ascii=False) if merged_meta else None,
                     1 if enabled else 0,
                     created_at,
                     now,
@@ -3175,6 +5075,9 @@ def compact_quant_rule_record(rule: Mapping[str, Any]) -> dict[str, Any]:
         compact_t0 = dict(base_t0)
         compact_t0["daily_ledger"] = []
         compact_t0["equity_curve"] = []
+        compact_t0["account_events"] = []
+        if base_t0.get("account_events"):
+            compact_t0["account_events_truncated"] = True
         compact_eval["base_position_t0"] = compact_t0
 
     cap_sim = latest_eval.get("capital_sim")

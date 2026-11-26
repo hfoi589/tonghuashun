@@ -465,6 +465,7 @@ def create_app(
     auto_trade_engine: object | None = None,
     auto_trade_interval_seconds: float = 3.0,
     quant_rule_store: object | None = None,
+    portfolio_policy_store: object | None = None,
     brent_monitor: object | None = None,
     brent_monitor_interval_seconds: float = 20.0,
 ) -> FastAPI:
@@ -971,6 +972,20 @@ def create_app(
         quant_rule_store = SQLiteQuantRuleStore(research_store.path)
         app.state.managed_resources = (*app.state.managed_resources, quant_rule_store)
     app.state.quant_rule_store = quant_rule_store
+    if portfolio_policy_store is None and auto_trade_engine is not None:
+        portfolio_policy_store = getattr(auto_trade_engine, "portfolio_policy_store", None)
+    if portfolio_policy_store is None and research_store is not None and hasattr(research_store, "path"):
+        from .portfolio_allocator import SQLitePortfolioPolicyStore
+
+        portfolio_policy_store = SQLitePortfolioPolicyStore(research_store.path)
+        app.state.managed_resources = (*app.state.managed_resources, portfolio_policy_store)
+    if (
+        auto_trade_engine is not None
+        and portfolio_policy_store is not None
+        and getattr(auto_trade_engine, "portfolio_policy_store", None) is None
+    ):
+        auto_trade_engine.portfolio_policy_store = portfolio_policy_store
+    app.state.portfolio_policy_store = portfolio_policy_store
     set_capture_root = getattr(app.state.store, "set_capture_root", None)
     if callable(set_capture_root):
         set_capture_root(app.state.capture_root)

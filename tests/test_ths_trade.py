@@ -1535,3 +1535,312 @@ def test_maybe_background_keepalive_window_and_fresh_skip(monkeypatch: pytest.Mo
     assert fresh["ok"] is False and fresh["skipped"] == "fresh_gateway"
 
 
+def test_delayed_night_receipt_modal_triggers_fast_reconcile_and_single_ack(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("level2_service.ths_trade.time.sleep", lambda _s: None)
+
+    class _DelayedNightReceiptDevice(_FakeU2Device):
+        def __init__(self) -> None:
+            super().__init__(screen="buy", form_code="501018", form_price="2.000", form_qty="100")
+            self.confirm_taps = 0
+            self.night_ack_taps = 0
+            self.night_stay_taps = 0
+            self.post_confirm_polls = 0
+
+        def click(self, x: int, y: int) -> None:
+            self.events.append(("click", x, y))
+            if self.screen == "buy" and 195 <= x <= 702 and 1007 <= y <= 1130:
+                self.screen = "confirm"
+            elif self.screen == "confirm":
+                if 600 <= x <= 900:
+                    self.confirm_taps += 1
+                    self.order_open = True
+                    self.screen = "night_delay"
+                else:
+                    self.screen = "buy"
+            elif self.screen == "night_receipt":
+                if 600 <= x <= 900:
+                    # Tapping 确认 on 夜市委托提示 jumps to 当日委托 subpage
+                    self.night_ack_taps += 1
+                    self.screen = "orders"
+                elif 100 <= x <= 400:
+                    # Tapping 取消 keeps screen cleanly on 买入 tab
+                    self.night_stay_taps += 1
+                    self.screen = "buy"
+
+        def dump_hierarchy(self, compressed: bool = False) -> str:
+            if self.screen == "night_delay":
+                self.post_confirm_polls += 1
+                if self.post_confirm_polls <= 2:
+                    # Simulate empty frames right after submit while gateway responds
+                    return _buy_form_xml(self.form_code, self.form_price, self.form_qty)
+                self.screen = "night_receipt"
+                return """<hierarchy>
+                  <node package="com.hexin.plat.android" resource-id="com.hexin.plat.android:id/frame_layout">
+                    <node resource-id="com.hexin.plat.android:id/page_title_view" text="国泰海通证券" />
+                  </node>
+                  <node package="com.hexin.plat.android">
+                    <node text="夜市委托提示" />
+                    <node text="委托已提交,因夜市委托订单处理机制 ,请稍后在当日委托中查询委托是否成功!" />
+                    <node text="取消" clickable="true" bounds="[100,1200][400,1300]" />
+                    <node text="确认" clickable="true" bounds="[600,1200][900,1300]" />
+                  </node>
+                </hierarchy>"""
+            return super().dump_hierarchy(compressed=compressed)
+
+    dev = _DelayedNightReceiptDevice()
+    executor = TonghuashunTradeExecutor(
+        adb_serial="emulator-5556",
+        u2_factory=lambda _s: dev,
+        name_to_symbol=lambda n: "501018" if "南方原油" in n else None,
+    )
+    res = executor.place_order(
+        symbol="501018",
+        expected_name="南方原油LOF",
+        side="buy",
+        price="2.000",
+        quantity=100,
+        precision=3,
+        dry_run=False,
+        auto_cancel=False,
+    )
+    assert res["status"] == "SUBMITTED"
+    assert res["accepted"] is True
+    assert res["reconcile_mode"] == "fast"
+    assert res["timings_ms"]["reconcile_ms"] == 0
+    assert "委托已提交" in res["dialog_message"]
+    assert dev.confirm_taps == 1
+    assert dev.night_stay_taps == 1
+    assert dev.night_ack_taps == 0
+    assert dev.screen == "buy"
+
+    # Follow-up order stays on hot Buy tab without needing any "back" navigation
+    res2 = executor.place_order(
+        symbol="501018",
+        expected_name="南方原油LOF",
+        side="buy",
+        price="2.000",
+        quantity=100,
+        precision=3,
+        dry_run=False,
+        auto_cancel=False,
+    )
+    assert res2["reconcile_mode"] == "fast"
+    assert [ev for ev in dev.events if ev[0] == "press"] == []
+
+
+def test_hot_tab_fast_navigation_skips_redundant_qty_and_resolves_duplicate_etf_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("level2_service.ths_trade.time.sleep", lambda _s: None)
+
+    class _HotSequentialDevice(_FakeU2Device):
+        def __init__(self) -> None:
+            super().__init__(screen="buy", form_code="160723", form_price="2.065", form_qty="100")
+            self.names_by_code = {
+                "160723": "嘉实原油",
+                "513350": "油气ETF",
+            }
+            self.dump_count = 0
+
+        def dump_hierarchy(self, compressed: bool = False) -> str:
+            self.dump_count += 1
+            if self.screen == "buy":
+                cur_name = self.names_by_code.get(self.form_code, "嘉实原油")
+                return (
+                    _buy_form_xml(self.form_code, self.form_price, self.form_qty)
+                    .replace('text="嘉实原油LOF"', f'text="{cur_name}"')
+                    .replace('text="1.898"', 'text="0.900"')
+                )
+            return super().dump_hierarchy(compressed=compressed)
+
+    dev = _HotSequentialDevice()
+    executor = TonghuashunTradeExecutor(
+        adb_serial="emulator-5556",
+        u2_factory=lambda _s: dev,
+        name_to_symbol=lambda n: "159697" if n == "油气ETF" else ("160723" if "嘉实原油" in n else None),
+    )
+
+    first = executor.place_order(
+        symbol="160723",
+        expected_name="嘉实原油",
+        side="buy",
+        price="2.065",
+        quantity=100,
+        precision=3,
+        dry_run=False,
+    )
+    assert first["reconcile_mode"] == "fast"
+    assert dev.screen == "buy"
+
+    dumps_before_second = dev.dump_count
+    events_before_second = len(dev.events)
+    second = executor.place_order(
+        symbol="513350",
+        expected_name="油气ETF",
+        side="buy",
+        price="1.145",
+        quantity=100,
+        precision=3,
+        dry_run=False,
+    )
+    assert second["reconcile_mode"] == "fast"
+    # Second order keeps quantity=100 from form readback and skips redundant stockvolume set_text + widget_click
+    second_events = dev.events[events_before_second:]
+    assert [ev for ev in second_events if ev[0] == "widget_click"] == []
+    assert [ev for ev in second_events if ev[0] == "set_text"] == [
+        ("set_text", "com.hexin.plat.android:id/auto_stockcode", "513350"),
+        ("set_text", "com.hexin.plat.android:id/stockprice", "1.145"),
+    ]
+    assert dev.dump_count - dumps_before_second <= 8
+    # Duplicate short-name ETF lookup resolves back to newly traded 513350 rather than 159697
+    assert executor._resolve_row_symbol("油气ETF") == "513350"
+
+
+def test_duplicate_code_autocomplete_popup_selects_expected_name_even_with_edittext_first(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("level2_service.ths_trade.time.sleep", lambda _s: None)
+
+    class _Duplicate501018PopupDevice(_FakeU2Device):
+        def __init__(self) -> None:
+            super().__init__(screen="buy", form_code="160723", form_price="2.065", form_qty="100")
+            self.suggestion_taps = 0
+            self.popup_active = False
+
+        def __call__(self, **kwargs):
+            parent = self
+
+            class _CodeWidget(_FakeWidget):
+                def set_text(self, value: str) -> None:
+                    super().set_text(value)
+                    if self.selector.get("resourceId") == "com.hexin.plat.android:id/auto_stockcode" and value == "501018":
+                        parent.popup_active = True
+
+            return _CodeWidget(self, kwargs)
+
+        def click(self, x: int, y: int) -> None:
+            self.events.append(("click", x, y))
+            if self.popup_active and 138 <= x <= 431 and 715 <= y <= 790:
+                self.suggestion_taps += 1
+                self.popup_active = False
+                self.form_code = "501018"
+                return
+            super().click(x, y)
+
+        def dump_hierarchy(self, compressed: bool = False) -> str:
+            if self.screen == "buy" and self.popup_active:
+                return (
+                    '<hierarchy>'
+                    '<node package="com.hexin.plat.android" resource-id="com.hexin.plat.android:id/dialogplus_outmost_container" bounds="[0,0][1080,1920]">'
+                    '<node resource-id="com.hexin.plat.android:id/auto_stockcode" class="android.widget.EditText" text="501018" bounds="[72,471][817,579]" />'
+                    '<node resource-id="com.hexin.plat.android:id/stockname_tv" text="南方原油LOF" bounds="[138,715][431,790]" />'
+                    '<node resource-id="com.hexin.plat.android:id/stockcode_tv" text="501018" bounds="[138,796][282,851]" />'
+                    '<node resource-id="com.hexin.plat.android:id/stockname_tv" text="奇消23B" bounds="[138,871][330,946]" />'
+                    '<node resource-id="com.hexin.plat.android:id/stockcode_tv" text="501018" bounds="[138,952][282,1007]" />'
+                    '</node>'
+                    + _buy_form_xml("160723", self.form_price, self.form_qty).replace("<hierarchy>", "").replace("</hierarchy>", "")
+                    + '</hierarchy>'
+                )
+            if self.screen == "buy" and self.form_code == "501018":
+                return (
+                    _buy_form_xml("501018", self.form_price, self.form_qty)
+                    .replace('text="嘉实原油LOF"', 'text="南方原油LOF"')
+                    .replace('text="1.898"', 'text="1.500"')
+                )
+            return super().dump_hierarchy(compressed=compressed)
+
+    dev = _Duplicate501018PopupDevice()
+    executor = TonghuashunTradeExecutor(
+        adb_serial="emulator-5556",
+        u2_factory=lambda _s: dev,
+        name_to_symbol=lambda n: "501018" if "南方原油" in n else None,
+    )
+    res = executor.place_order(
+        symbol="501018",
+        expected_name="南方原油LOF",
+        side="buy",
+        price="1.824",
+        quantity=100,
+        precision=3,
+        dry_run=False,
+    )
+    assert res["status"] == "SUBMITTED"
+    assert res["accepted"] is True
+    assert dev.suggestion_taps == 1
+
+
+def test_single_candidate_auto_closing_popup_does_not_tap_and_pierce_stockvolume(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("level2_service.ths_trade.time.sleep", lambda _s: None)
+
+    class _AutoClosingPopupDevice(_FakeU2Device):
+        def __init__(self) -> None:
+            super().__init__(screen="buy", form_code="162411", form_price="0.833", form_qty="100")
+            self.popup_polls = 0
+            self.popup_active = False
+            self.pierced = False
+
+        def __call__(self, **kwargs):
+            parent = self
+
+            class _CodeWidget(_FakeWidget):
+                def set_text(self, value: str) -> None:
+                    super().set_text(value)
+                    if self.selector.get("resourceId") == "com.hexin.plat.android:id/auto_stockcode" and value == "161129":
+                        parent.popup_active = True
+                        parent.popup_polls = 0
+
+            return _CodeWidget(self, kwargs)
+
+        def click(self, x: int, y: int) -> None:
+            self.events.append(("click", x, y))
+            if self.screen == "buy" and 138 <= x <= 594 and 715 <= y <= 844:
+                self.pierced = True
+            super().click(x, y)
+
+        def dump_hierarchy(self, compressed: bool = False) -> str:
+            if self.screen == "buy" and self.popup_active:
+                self.popup_polls += 1
+                if self.popup_polls <= 2:
+                    return (
+                        '<hierarchy>'
+                        '<node package="com.hexin.plat.android" resource-id="com.hexin.plat.android:id/dialogplus_outmost_container" bounds="[0,0][1080,1920]">'
+                        '<node resource-id="com.hexin.plat.android:id/auto_stockcode" class="android.widget.EditText" text="161129" bounds="[72,471][817,579]" />'
+                        '<node resource-id="com.hexin.plat.android:id/stockname_tv" text="原油LOF易方达" bounds="[138,715][482,790]" />'
+                        '<node resource-id="com.hexin.plat.android:id/stockcode_tv" text="161129" bounds="[138,796][282,851]" />'
+                        '</node>'
+                        + _buy_form_xml("162411", self.form_price, self.form_qty).replace("<hierarchy>", "").replace("</hierarchy>", "")
+                        + '</hierarchy>'
+                    )
+                self.popup_active = False
+            if self.screen == "buy" and self.form_code == "161129":
+                return (
+                    _buy_form_xml("161129", self.form_price, self.form_qty)
+                    .replace('text="嘉实原油LOF"', 'text="原油LOF易方达"')
+                    .replace('text="1.898"', 'text="1.500"')
+                )
+            return super().dump_hierarchy(compressed=compressed)
+
+    dev = _AutoClosingPopupDevice()
+    executor = TonghuashunTradeExecutor(
+        adb_serial="emulator-5556",
+        u2_factory=lambda _s: dev,
+        name_to_symbol=lambda n: "161129" if "原油" in n else None,
+    )
+    res = executor.place_order(
+        symbol="161129",
+        expected_name="原油基金",
+        side="buy",
+        price="1.725",
+        quantity=100,
+        precision=3,
+        dry_run=False,
+    )
+    assert res["status"] == "SUBMITTED"
+    assert res["accepted"] is True
+    assert dev.pierced is False
+
+

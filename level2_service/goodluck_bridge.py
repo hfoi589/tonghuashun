@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Mapping, Sequence
 from datetime import datetime
 import hashlib
 import hmac
@@ -17,7 +18,7 @@ from zoneinfo import ZoneInfo
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from .brent_market import (
     BRENT_SYMBOL,
@@ -28,6 +29,11 @@ from .etf_fund_flow import ETF_FLOW_PERIODS, EtfFundFlowError, fetch_etf_flow_pa
 from .fund_flow_history import extract_quote_trade_date, read_fund_flow_history_for_view
 from .market_accounts import MarketUser
 from .market_data import fixed_market_error_code
+from .portfolio_allocator import (
+    SQLitePortfolioPolicyStore,
+    get_portfolio_policy_schema,
+)
+from .quant_data_sources import build_quant_data_sources_report
 from .quant_rules import (
     backfill_intraday_history,
     compact_quant_rule_record,
@@ -149,14 +155,6 @@ class BridgeTradeDeviceActionRequest(BaseModel):
     action: Literal["start", "shutdown"]
 
 
-class BridgeSymbolRuleBinding(BaseModel):
-    signal_source: Literal["intraday_macd_flow", "lof_premium", "combo_confirm", "quant_rule"] = "quant_rule"
-    quant_rule_id: str | None = None
-    enabled: bool = True
-    priority: int = Field(default=10, ge=1, le=100)
-    weight_scale: float = Field(default=1.0, ge=0.1, le=2.0)
-
-
 class BridgeSymbolQuantProfileRequest(BaseModel):
     enabled: bool = True
     signal_source: Literal["intraday_macd_flow", "lof_premium", "combo_confirm", "quant_rule"] | None = None
@@ -165,7 +163,23 @@ class BridgeSymbolQuantProfileRequest(BaseModel):
     capital_cap: float | None = Field(default=None, ge=100.0, le=10000000.0)
     order_quantity: int | None = Field(default=None, ge=100, le=1000000)
     order_book_level: int | None = Field(default=None, ge=1, le=5)
-    rule_bindings: list[BridgeSymbolRuleBinding] | None = Field(default=None, max_length=8)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _reject_multi_rule_bindings(cls, data: Any) -> Any:
+        if isinstance(data, Mapping) and "rule_bindings" in data and data["rule_bindings"] is not None:
+            rb = data["rule_bindings"]
+            if not isinstance(rb, Sequence) or isinstance(rb, (str, bytes, bytearray)) or len(rb) > 1:
+                raise ValueError("单只股票仅允许绑定唯一策略规则，已移除多规则协同 (rule_bindings)")
+            copied = dict(data)
+            copied.pop("rule_bindings", None)
+            if len(rb) == 1 and isinstance(rb[0], Mapping):
+                if "signal_source" not in copied and rb[0].get("signal_source"):
+                    copied["signal_source"] = rb[0].get("signal_source")
+                if "quant_rule_id" not in copied and "quant_rule_id" in rb[0]:
+                    copied["quant_rule_id"] = rb[0].get("quant_rule_id")
+            return copied
+        return data
 
 
 class BridgeUpsertSymbolStrategyRequest(BridgeSymbolQuantProfileRequest):
@@ -188,6 +202,8 @@ class BridgeAutoTradeConfigRequest(BaseModel):
     auto_cancel_seconds: int = Field(ge=0, le=600)
     daily_max_buy_amount: float = Field(ge=100.0, le=10000000.0)
     block_non_continuous_session: bool = True
+    capital_policy_mode: str | None = None
+    pool_policy: dict[str, Any] | None = None
     symbol_profiles: dict[str, BridgeSymbolQuantProfileRequest] | None = None
     reconcile_broker: bool = False
 
@@ -221,7 +237,7 @@ class BridgeQuantEvaluateRequest(BaseModel):
 
 class BridgeQuantRuleUpsertRequest(BaseModel):
     id: str | None = None
-    name: str = Field(min_length=1, max_length=80)
+    name: str = Field(min_length=1, max_length=120)
     description: str = ""
     source: Literal["ai", "manual", "builtin"] = "ai"
     symbols: list[str] = Field(default_factory=lambda: ["160723"])
@@ -230,6 +246,35 @@ class BridgeQuantRuleUpsertRequest(BaseModel):
     sell_rule: dict[str, Any] | None = None
     position_sizing: dict[str, Any] | None = None
     eval_criteria: dict[str, Any] | None = None
+    enabled: bool = True
+    target_symbol: str | None = None
+    stock_name: str | None = None
+    raw_strategy_name: str | None = None
+    submitter_id: str | None = None
+    submitter_name: str | None = None
+    submission_id: str | None = None
+    approved_by: str | None = None
+    approved_at: str | None = None
+    data_sources: list[Any] | None = None
+    strict_data_sources: bool = False
+    meta: dict[str, Any] | None = None
+
+
+class BridgePortfolioPolicyUpsertRequest(BaseModel):
+    id: str | None = None
+    name: str = Field(min_length=1, max_length=120)
+    description: str = ""
+    source: str = "api"
+    engine_type: Literal[
+        "route_d_plus",
+        "inverse_vol_risk_parity",
+        "signal_proportional",
+        "equal_weight",
+        "shadow_route_d",
+        "static_cap",
+    ] = "route_d_plus"
+    params: dict[str, Any] = Field(default_factory=dict)
+    metrics_summary: dict[str, Any] | None = None
     enabled: bool = True
 
 
@@ -2277,6 +2322,10 @@ def install_goodluck_routes(
         }
         if payload.sizing_mode is not None:
             patch["sizing_mode"] = payload.sizing_mode
+        if payload.capital_policy_mode is not None:
+            patch["capital_policy_mode"] = payload.capital_policy_mode
+        if payload.pool_policy is not None:
+            patch["pool_policy"] = payload.pool_policy
         if payload.symbol_profiles is not None:
             norm_profiles: dict[str, dict[str, Any]] = {}
             for raw_sym, prof in payload.symbol_profiles.items():
@@ -2494,9 +2543,147 @@ def install_goodluck_routes(
             raise HTTPException(status_code=503, detail="量化规则复盘库未配置")
         return research_store, quant_store
 
+    def _require_portfolio_policy_store() -> SQLitePortfolioPolicyStore:
+        policy_store = getattr(app.state, "portfolio_policy_store", None)
+        engine = getattr(app.state, "auto_trade_engine", None)
+        if policy_store is None and engine is not None:
+            policy_store = getattr(engine, "portfolio_policy_store", None)
+        if policy_store is None:
+            rstore = getattr(app.state, "research_store", None)
+            if rstore is not None and hasattr(rstore, "path"):
+                policy_store = SQLitePortfolioPolicyStore(rstore.path)
+                app.state.portfolio_policy_store = policy_store
+                existing_res = tuple(getattr(app.state, "managed_resources", ()) or ())
+                app.state.managed_resources = (*existing_res, policy_store)
+                if engine is not None and getattr(engine, "portfolio_policy_store", None) is None:
+                    engine.portfolio_policy_store = policy_store
+        if policy_store is None:
+            raise HTTPException(status_code=503, detail="组合资金策略库未配置")
+        return policy_store
+
+    @app.get(f"{prefix}/trade/capital-policies/schema")
+    def bridge_trade_capital_policy_schema(
+        _admin=Depends(require_goodluck_admin),
+    ) -> dict[str, Any]:
+        return get_portfolio_policy_schema()
+
+    @app.get(f"{prefix}/trade/capital-policies")
+    async def bridge_trade_list_capital_policies(
+        include_disabled: bool = Query(default=False),
+        _admin=Depends(require_goodluck_admin),
+    ) -> dict[str, Any]:
+        policy_store = _require_portfolio_policy_store()
+        policies = await asyncio.to_thread(policy_store.list_policies, include_disabled=include_disabled)
+        engine = getattr(app.state, "auto_trade_engine", None)
+        active_id: str | None = None
+        if engine is not None and getattr(engine, "auto_store", None) is not None:
+            try:
+                cfg = await asyncio.to_thread(engine.auto_store.get_config)
+                active_id = str(cfg.get("capital_policy_mode") or "static_cap")
+            except Exception:
+                active_id = None
+        return {
+            "policies": policies,
+            "active_policy_id": active_id,
+        }
+
+    @app.get(f"{prefix}/trade/capital-policies/{{policy_id}}")
+    async def bridge_trade_get_capital_policy(
+        policy_id: str,
+        _admin=Depends(require_goodluck_admin),
+    ) -> dict[str, Any]:
+        policy_store = _require_portfolio_policy_store()
+        policy = await asyncio.to_thread(policy_store.get_policy, policy_id)
+        if policy is None:
+            raise HTTPException(status_code=404, detail="未找到指定组合资金策略")
+        return {"policy": policy}
+
+    @app.post(f"{prefix}/trade/capital-policies")
+    async def bridge_trade_create_capital_policy(
+        payload: BridgePortfolioPolicyUpsertRequest,
+        _admin=Depends(require_goodluck_admin),
+    ) -> dict[str, Any]:
+        policy_store = _require_portfolio_policy_store()
+        try:
+            saved = await asyncio.to_thread(
+                policy_store.upsert_policy,
+                payload.model_dump(),
+                policy_id=payload.id,
+            )
+            return {"policy": saved}
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from None
+
+    @app.put(f"{prefix}/trade/capital-policies/{{policy_id}}")
+    async def bridge_trade_update_capital_policy(
+        policy_id: str,
+        payload: BridgePortfolioPolicyUpsertRequest,
+        _admin=Depends(require_goodluck_admin),
+    ) -> dict[str, Any]:
+        policy_store = _require_portfolio_policy_store()
+        try:
+            saved = await asyncio.to_thread(
+                policy_store.upsert_policy,
+                payload.model_dump(),
+                policy_id=policy_id,
+            )
+            return {"policy": saved}
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from None
+
+    @app.delete(f"{prefix}/trade/capital-policies/{{policy_id}}", status_code=204)
+    async def bridge_trade_delete_capital_policy(
+        policy_id: str,
+        _admin=Depends(require_goodluck_admin),
+    ) -> None:
+        policy_store = _require_portfolio_policy_store()
+        clean_id = policy_id.strip()
+        engine = getattr(app.state, "auto_trade_engine", None)
+        if engine is not None and getattr(engine, "auto_store", None) is not None:
+            cfg = await asyncio.to_thread(engine.auto_store.get_config)
+            if str(cfg.get("capital_policy_mode") or "").strip() == clean_id:
+                raise HTTPException(status_code=409, detail="当前正在实盘运行的资金策略不可删除，请先切换策略")
+        try:
+            await asyncio.to_thread(policy_store.delete_policy, clean_id)
+        except LookupError:
+            raise HTTPException(status_code=404, detail="未找到指定组合资金策略") from None
+        except ValueError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from None
+
     @app.get(f"{prefix}/quant/schema")
     def bridge_quant_schema(_admin=Depends(require_goodluck_admin)) -> dict[str, Any]:
         return get_quant_rule_schema()
+
+    @app.get(f"{prefix}/quant/data-sources")
+    async def bridge_quant_data_sources(
+        probe: bool = Query(default=False),
+        _admin=Depends(require_goodluck_admin),
+    ) -> dict[str, Any]:
+        research_store, quant_store = _require_quant_stores()
+        return await asyncio.to_thread(
+            build_quant_data_sources_report,
+            research_store,
+            quant_store,
+            auto_trade_engine=getattr(app.state, "auto_trade_engine", None),
+            research_monitor=getattr(app.state, "research_monitor", None),
+            brent_monitor=getattr(app.state, "brent_monitor", None),
+            probe=probe,
+        )
+
+    @app.post(f"{prefix}/quant/data-sources/probe")
+    async def bridge_quant_probe_data_sources(
+        _admin=Depends(require_goodluck_admin),
+    ) -> dict[str, Any]:
+        research_store, quant_store = _require_quant_stores()
+        return await asyncio.to_thread(
+            build_quant_data_sources_report,
+            research_store,
+            quant_store,
+            auto_trade_engine=getattr(app.state, "auto_trade_engine", None),
+            research_monitor=getattr(app.state, "research_monitor", None),
+            brent_monitor=getattr(app.state, "brent_monitor", None),
+            probe=True,
+        )
 
     @app.get(f"{prefix}/quant/dataset")
     async def bridge_quant_dataset(
@@ -2509,6 +2696,8 @@ def install_goodluck_routes(
         long: int = Query(default=20, ge=3, le=200),
         signal: int = Query(default=5, ge=1, le=100),
         marker_threshold: float = Query(default=0.00001, ge=0.0, le=1.0),
+        packs: str | None = Query(default=None),
+        sources: str | None = Query(default=None),
         _admin=Depends(require_goodluck_admin),
     ) -> dict[str, Any]:
         research_store, _ = _require_quant_stores()
@@ -2529,6 +2718,10 @@ def install_goodluck_routes(
                 "signal": signal,
                 "marker_threshold": marker_threshold,
             },
+            packs=packs,
+            sources=sources,
+            auto_trade_engine=getattr(app.state, "auto_trade_engine", None),
+            etf_flow_db_path=research_store.path.parent / "etf-fund-flow.db",
         )
 
     @app.post(f"{prefix}/quant/backfill-history")
@@ -2618,10 +2811,12 @@ def install_goodluck_routes(
     @app.get(f"{prefix}/quant/rules")
     async def bridge_quant_list_rules(
         compact: bool = Query(default=False),
+        symbol: str | None = Query(default=None),
         _admin=Depends(require_goodluck_admin),
     ) -> dict[str, Any]:
         research_store, quant_store = _require_quant_stores()
-        rules = await asyncio.to_thread(quant_store.list_rules)
+        clean_symbol = _validate_quant_symbol(symbol) if symbol else None
+        rules = await asyncio.to_thread(quant_store.list_rules, symbol=clean_symbol)
         for idx, item in enumerate(rules):
             if item.get("latest_eval") is None:
                 res = await asyncio.to_thread(

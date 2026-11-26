@@ -73,6 +73,7 @@ from .runner import ADBDeviceBridge, DailyCheckState, Level2Navigator, Level2Run
 from .ths_trade import TonghuashunTradeExecutor
 from .auto_trade import AutoTradeEngine, SQLiteAutoTradeStore
 from .brent_market import BrentMarketMonitor
+from .portfolio_allocator import SQLitePortfolioPolicyStore
 from .quant_rules import SQLiteQuantRuleStore, enrich_store_with_line_funds
 from .security import persist_password_hash
 from .symbol_catalog import SinaSymbolCatalogSource, SQLiteSymbolCatalog
@@ -1188,6 +1189,7 @@ def create_production_app(
     )
     auto_trade_store = SQLiteAutoTradeStore(config.research_database_path)
     quant_rule_store = SQLiteQuantRuleStore(config.research_database_path)
+    portfolio_policy_store = SQLitePortfolioPolicyStore(config.research_database_path)
     brent_monitor = BrentMarketMonitor(
         research_store,
         auto_backfill=True,
@@ -1217,6 +1219,7 @@ def create_production_app(
         symbol_lookup=symbol_catalog.lookup,
         is_trading_day=trading_calendar.is_trading_day,
         quant_rule_store=quant_rule_store,
+        portfolio_policy_store=portfolio_policy_store,
         order_book_fetcher=lambda sym, _mkt=None: order_book_provider.read_order_book(
             symbol_catalog.lookup(sym)
         ),
@@ -1268,6 +1271,7 @@ def create_production_app(
                     research_store,
                     auto_trade_store,
                     quant_rule_store,
+                    portfolio_policy_store,
                 )
                 if resource is not None and callable(getattr(resource, "close", None))
             }.values()
@@ -1294,6 +1298,7 @@ def create_production_app(
         trade_executor=trade_executor,
         auto_trade_engine=auto_trade_engine,
         quant_rule_store=quant_rule_store,
+        portfolio_policy_store=portfolio_policy_store,
         brent_monitor=brent_monitor,
     )
     app.state.deployment_settings = config

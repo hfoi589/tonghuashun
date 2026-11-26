@@ -333,6 +333,32 @@ _UNSUPPORTED_AUTH_KEYWORDS = (
     "手势密码",
     "人脸识别",
 )
+_ORDER_SUCCESS_WORDS = ("委托成功", "申报成功", "委托已提交", "已申报", "隔夜委托已", "预埋")
+_ORDER_REJECTED_WORDS = (
+    "非交易时间",
+    "非委托时间",
+    "清算",
+    "休市",
+    "闭市",
+    "网关开关关闭",
+    "网关关闭",
+    "开关关闭",
+    "通道关闭",
+    "夜市未开",
+    "停用",
+    "维护",
+    "不足",
+    "失败",
+    "错误",
+    "超过",
+    "禁止",
+    "无法",
+    "不允许",
+    "不能",
+    "未开通",
+    "无效",
+    "不支持",
+)
 
 
 def detect_modal_dialog(root: ElementTree.Element) -> DialogInfo | None:
@@ -904,6 +930,8 @@ class TonghuashunTradeExecutor:
     _last_verified_at: float = field(default=0.0, init=False, repr=False)
     _prestaged_state: dict[str, Any] | None = field(default=None, init=False, repr=False)
     _active_tab: str | None = field(default=None, init=False, repr=False)
+    _last_hot_tab_at: float = field(default=0.0, init=False, repr=False)
+    _recent_symbol_by_name: dict[str, str] = field(default_factory=dict, init=False, repr=False)
     _last_gateway_touch_at: float = field(default=0.0, init=False, repr=False)
     _auto_login_halted_reason: str | None = field(default=None, init=False, repr=False)
     _auto_login_cooldown_until: float = field(default=0.0, init=False, repr=False)
@@ -942,6 +970,17 @@ class TonghuashunTradeExecutor:
                 self._last_orders_at = 0.0
             if trades:
                 self._last_trades_at = 0.0
+
+    def _resolve_row_symbol(self, name: str | None) -> str | None:
+        cleaned = str(name or "").strip()
+        if cleaned:
+            with self._cache_lock:
+                recent = self._recent_symbol_by_name.get(cleaned)
+            if recent:
+                return recent
+        if callable(self.name_to_symbol):
+            return self.name_to_symbol(cleaned)
+        return None
 
     def __post_init__(self) -> None:
         serial = (self.adb_serial or "").strip()
@@ -1631,6 +1670,46 @@ class TonghuashunTradeExecutor:
         )
 
     def _switch_main_tab(self, device: Any, label: str) -> ElementTree.Element:
+        target_key = _TAB_KEY_MAP.get(label)
+        if target_key in {"buy", "sell"}:
+            with self._cache_lock:
+                is_hot = (
+                    self._active_tab == target_key
+                    and self._last_hot_tab_at > 0.0
+                    and (time.monotonic() - self._last_hot_tab_at) < 15.0
+                )
+            if is_hot:
+                fast_root = self._dump_root(device, compressed=True)
+                if detect_modal_dialog(fast_root) is not None:
+                    time.sleep(0.08)
+                    fast_root = self._dump_root(device, compressed=True)
+                elif self._find_node(fast_root, resource_id="com.hexin.plat.android:id/close_click") is not None:
+                    if self._click_node(device, fast_root, resource_id="com.hexin.plat.android:id/close_click"):
+                        time.sleep(0.08)
+                        fast_root = self._dump_root(device, compressed=True)
+                has_guide = (
+                    self._find_node(fast_root, resource_id="com.hexin.plat.android:id/fenshi_mmdl_popupview") is not None
+                    or self._find_node(fast_root, resource_id="com.hexin.plat.android:id/bubble_guide_content") is not None
+                )
+                btn = self._find_node(fast_root, resource_id="com.hexin.plat.android:id/btn", text=label)
+                title_node = self._find_node(fast_root, resource_id="com.hexin.plat.android:id/page_title_view")
+                title_text = (title_node.attrib.get("text") or "").strip() if title_node is not None else ""
+                if (
+                    not has_guide
+                    and not self._is_broker_password_prompt(fast_root)
+                    and detect_auth_blocking(fast_root) is None
+                    and detect_modal_dialog(fast_root) is None
+                    and self._find_node(fast_root, resource_id="com.hexin.plat.android:id/close_click") is None
+                    and btn is not None
+                    and btn.attrib.get("selected") == "true"
+                    and "模拟" not in title_text
+                    and self._find_node(fast_root, resource_id="com.hexin.plat.android:id/auto_stockcode") is not None
+                ):
+                    with self._cache_lock:
+                        self._active_tab = target_key
+                        self._last_hot_tab_at = time.monotonic()
+                    return fast_root
+
         root = self._ensure_trade_workspace(device, prefer_tab=label)
         btn = self._find_node(root, resource_id="com.hexin.plat.android:id/btn", text=label)
         if btn is None:
@@ -1651,9 +1730,10 @@ class TonghuashunTradeExecutor:
                     break
             self._check_auth_gate(root)
             root = self._dismiss_guide_overlays(device, root)
-        if label in _TAB_KEY_MAP:
+        if target_key is not None:
             with self._cache_lock:
-                self._active_tab = _TAB_KEY_MAP[label]
+                self._active_tab = target_key
+                self._last_hot_tab_at = time.monotonic() if target_key in {"buy", "sell"} else 0.0
         return root
 
     def _tap_refresh(self, device: Any, root: ElementTree.Element) -> ElementTree.Element:
@@ -1668,6 +1748,8 @@ class TonghuashunTradeExecutor:
         return root
 
     def _open_query_subpage(self, device: Any, sub_label: Literal["当日委托", "当日成交"]) -> ElementTree.Element:
+        with self._cache_lock:
+            self._last_hot_tab_at = 0.0
         # Check if already on query subpage
         root = self._dump_root(device)
         self._check_auth_gate(root)
@@ -1795,7 +1877,7 @@ class TonghuashunTradeExecutor:
         positions = self._collect_scrolled_rows(
             device,
             root,
-            lambda r: parse_holdings_xml(r, name_to_symbol=self.name_to_symbol),
+            lambda r: parse_holdings_xml(r, name_to_symbol=self._resolve_row_symbol),
             lambda row: (row["name"], row["market_value"], row["shares"]),
             max_swipes=3,
         )
@@ -1846,7 +1928,7 @@ class TonghuashunTradeExecutor:
                 max_y = b[1]
         return parse_orders_xml(
             root,
-            name_to_symbol=self.name_to_symbol,
+            name_to_symbol=self._resolve_row_symbol,
             max_y=max_y,
             force_cancellable=True,
         )
@@ -1856,7 +1938,7 @@ class TonghuashunTradeExecutor:
         orders = self._collect_scrolled_rows(
             device,
             root,
-            lambda r: parse_orders_xml(r, name_to_symbol=self.name_to_symbol),
+            lambda r: parse_orders_xml(r, name_to_symbol=self._resolve_row_symbol),
             lambda row: (row["name"], row["time"], row["side"], row["price"], row["quantity"]),
             max_swipes=3,
         )
@@ -1876,7 +1958,7 @@ class TonghuashunTradeExecutor:
         trades = self._collect_scrolled_rows(
             device,
             root,
-            lambda r: parse_trades_xml(r, name_to_symbol=self.name_to_symbol),
+            lambda r: parse_trades_xml(r, name_to_symbol=self._resolve_row_symbol),
             lambda row: (
                 row["name"],
                 row["time"],
@@ -1949,11 +2031,64 @@ class TonghuashunTradeExecutor:
                 "cached": False,
             }
 
+    @staticmethod
+    def _count_stock_suggestion_matches(root: ElementTree.Element, *, symbol: str) -> int:
+        count = 0
+        for node in root.iter():
+            rid = node.attrib.get("resource-id") or ""
+            if rid == "com.hexin.plat.android:id/auto_stockcode":
+                continue
+            if node.attrib.get("class") == "android.widget.EditText":
+                continue
+            if (node.attrib.get("text") or "").strip() == symbol:
+                count += 1
+        return count
+
+    @staticmethod
+    def _find_stock_suggestion_bounds(
+        root: ElementTree.Element,
+        *,
+        symbol: str,
+        expected_name: str | None = None,
+    ) -> tuple[int, int, int, int] | None:
+        exp_clean = str(expected_name or "").strip()
+        if exp_clean:
+            exp_prefix = exp_clean[:2] if len(exp_clean) >= 2 else ""
+            for node in root.iter():
+                if (node.attrib.get("resource-id") or "") != "com.hexin.plat.android:id/stockname_tv":
+                    continue
+                txt = (node.attrib.get("text") or "").strip()
+                if not txt:
+                    continue
+                if exp_clean in txt or txt in exp_clean or (exp_prefix and exp_prefix in txt):
+                    bounds = _parse_bounds(node.attrib.get("bounds"))
+                    if bounds is not None:
+                        return bounds
+
+        fallback_bounds: tuple[int, int, int, int] | None = None
+        for node in root.iter():
+            rid = node.attrib.get("resource-id") or ""
+            if rid == "com.hexin.plat.android:id/auto_stockcode":
+                continue
+            if node.attrib.get("class") == "android.widget.EditText":
+                continue
+            if (node.attrib.get("text") or "").strip() != symbol:
+                continue
+            bounds = _parse_bounds(node.attrib.get("bounds"))
+            if bounds is None:
+                continue
+            if rid == "com.hexin.plat.android:id/stockcode_tv":
+                return bounds
+            if fallback_bounds is None:
+                fallback_bounds = bounds
+        return fallback_bounds
+
     def _fill_order_form(
         self,
         device: Any,
         *,
         symbol: str,
+        expected_name: str | None = None,
         side: Literal["buy", "sell"],
         price_str: str,
         quantity: int,
@@ -1966,6 +2101,8 @@ class TonghuashunTradeExecutor:
         t_fill0 = time.monotonic()
         initial_rb = parse_form_readback(root)
         target_price = float(price_str)
+        prev_symbol = str(initial_rb.get("symbol") or "").strip()
+        prev_name = str(initial_rb.get("name") or "").strip()
         same_symbol_ready = (
             initial_rb.get("symbol") == symbol
             and bool(initial_rb.get("name"))
@@ -1980,45 +2117,83 @@ class TonghuashunTradeExecutor:
                 resourceId="com.hexin.plat.android:id/auto_stockcode",
                 className="android.widget.EditText",
             )
-            if (
-                self._find_node(root, resource_id="com.hexin.plat.android:id/auto_stockcode") is None
-                and not code_box.exists
-            ):
+            code_node = self._find_node(root, resource_id="com.hexin.plat.android:id/auto_stockcode")
+            code_bounds = _parse_bounds(code_node.attrib.get("bounds")) if code_node is not None else None
+            if code_node is None and not code_box.exists:
                 raise TradeExecutionError("TRADE_NAVIGATION_FAILED", "未找到证券代码输入框", 503)
-            code_box.click()
-            time.sleep(0.05)
-            device(
-                resourceId="com.hexin.plat.android:id/auto_stockcode",
-                className="android.widget.EditText",
-            ).set_text(symbol)
+            code_box.set_text(symbol)
 
             # Wait for Tonghuashun to resolve symbol name and populate auto-price
             resolved = False
             readback = {}
-            deadline = time.monotonic() + 5.0
-            for _ in range(45):
+            t_wait_sym0 = time.monotonic()
+            deadline = t_wait_sym0 + 5.0
+            last_suggestion_tap_at = 0.0
+            for poll_idx in range(80):
                 if time.monotonic() >= deadline:
                     break
-                time.sleep(0.08)
+                time.sleep(0.03)
                 root = self._dump_root(device, compressed=True)
                 self._check_auth_gate(root)
                 readback = parse_form_readback(root)
+                name_ready = bool(readback["name"]) and (
+                    not prev_symbol
+                    or prev_symbol == symbol
+                    or not prev_name
+                    or readback["name"] != prev_name
+                    or poll_idx >= 3
+                    or (time.monotonic() - t_wait_sym0) >= 0.45
+                )
                 if (
                     readback["symbol"] == symbol
-                    and readback["name"]
+                    and name_ready
                     and not readback["keyboard_open"]
                     and readback["has_submit_button"]
                 ):
                     resolved = True
                     break
-                # If autocomplete suggestion row appeared with exact code, tap it
+                # Tap suggestion ONLY for multi-match duplicate codes (e.g. 501018) or if single-match popup stays open >= 0.95s
                 if readback["keyboard_open"]:
-                    exact = self._find_node(root, text=symbol)
-                    if exact is not None and exact.attrib.get("class") != "android.widget.EditText":
-                        b = _parse_bounds(exact.attrib.get("bounds"))
-                        if b:
-                            self._tap_bounds(device, b)
-                            time.sleep(0.10)
+                    has_search_dialog = (
+                        self._find_node(root, resource_id="com.hexin.plat.android:id/dialogplus_outmost_container") is not None
+                        or self._find_node(root, resource_id="com.hexin.plat.android:id/stock_search") is not None
+                    )
+                    if has_search_dialog:
+                        now_m = time.monotonic()
+                        match_count = self._count_stock_suggestion_matches(root, symbol=symbol)
+                        should_tap_multi = match_count >= 2
+                        should_tap_stuck_single = (
+                            match_count == 1
+                            and ((now_m - t_wait_sym0) >= 0.95 or poll_idx >= 12)
+                        )
+                        if (should_tap_multi or should_tap_stuck_single) and (
+                            last_suggestion_tap_at <= 0.0 or (now_m - last_suggestion_tap_at) >= 0.35
+                        ):
+                            sug_bounds = self._find_stock_suggestion_bounds(
+                                root,
+                                symbol=symbol,
+                                expected_name=expected_name,
+                            )
+                            if sug_bounds is not None:
+                                self._tap_bounds(device, sug_bounds)
+                                last_suggestion_tap_at = time.monotonic()
+                                time.sleep(0.08)
+                    else:
+                        if self._click_node(device, root, resource_id="com.hexin.plat.android:id/image_close") or self._click_node(
+                            device, root, resource_id="com.hexin.plat.android:id/input_close"
+                        ):
+                            time.sleep(0.04)
+                        elif readback["symbol"] == symbol and name_ready and readback["has_submit_button"]:
+                            device.press("back")
+                            time.sleep(0.05)
+                elif poll_idx == 4 and readback.get("symbol") != symbol:
+                    # Fallback if direct set_text did not focus input on this screen
+                    if code_bounds is not None:
+                        self._tap_bounds(device, code_bounds)
+                    elif code_box.exists:
+                        code_box.click()
+                    time.sleep(0.05)
+                    code_box.set_text(symbol)
 
             if not resolved:
                 raise TradeExecutionError(
@@ -2045,8 +2220,8 @@ class TonghuashunTradeExecutor:
 
         cur_price = _parse_float(readback.get("price"))
         cur_qty = _parse_int(readback.get("quantity"))
-        need_price = (not same_symbol_ready) or cur_price is None or abs(cur_price - target_price) > 1e-4
-        need_qty = (not same_symbol_ready) or cur_qty != quantity
+        need_price = cur_price is None or abs(cur_price - target_price) > 1e-4
+        need_qty = cur_qty != quantity
         prestaged_hit = 1 if (same_symbol_ready and not need_price and not need_qty) else 0
 
         if need_price or need_qty:
@@ -2069,7 +2244,7 @@ class TonghuashunTradeExecutor:
             fill_ms = round((time.monotonic() - t_fill0) * 1000)
 
             t_rb0 = time.monotonic()
-            time.sleep(0.04)
+            time.sleep(0.02)
             final_root = self._dump_root(device, compressed=True)
             final_root = self._dismiss_guide_overlays(device, final_root)
             final_readback = parse_form_readback(final_root)
@@ -2113,6 +2288,11 @@ class TonghuashunTradeExecutor:
                 ),
                 409,
             )
+
+        clean_form_name = str(final_readback.get("name") or "").strip()
+        if clean_form_name:
+            with self._cache_lock:
+                self._recent_symbol_by_name[clean_form_name] = symbol
 
         return final_readback, final_root, {
             "nav_ms": nav_ms,
@@ -2254,6 +2434,7 @@ class TonghuashunTradeExecutor:
             readback, _, form_timings = self._fill_order_form(
                 device,
                 symbol=symbol,
+                expected_name=expected_name,
                 side=side,
                 price_str=price_str,
                 quantity=quantity,
@@ -2451,6 +2632,7 @@ class TonghuashunTradeExecutor:
             readback, final_root, form_timings = self._fill_order_form(
                 device,
                 symbol=symbol,
+                expected_name=expected_name,
                 side=side,
                 price_str=price_str,
                 quantity=quantity,
@@ -2524,19 +2706,19 @@ class TonghuashunTradeExecutor:
                     dialog_message = "演练模式：已校验下单确认弹窗并取消，未向柜台发送报单"
                 else:
                     assert modal.confirm_button is not None
-                    t_gw0 = time.monotonic()
+                    t_gw_start = time.monotonic()
+                    stage_tap_at = t_gw_start
                     last_confirm_msg = modal.message
-                    last_confirm_tap_at = t_gw0
                     self._tap_bounds(device, modal.confirm_button[1])
-                    self._last_gateway_touch_at = t_gw0
+                    self._last_gateway_touch_at = t_gw_start
                     submitted = True
                     self._prestaged_state = None
                     post_messages: list[str] = []
-                    gw_deadline = t_gw0 + 3.5
-                    for poll_idx in range(36):
+                    gw_deadline = stage_tap_at + 3.5
+                    for poll_idx in range(40):
                         if time.monotonic() >= gw_deadline:
                             break
-                        time.sleep(0.06)
+                        time.sleep(0.04)
                         post_root = self._dump_root(device, compressed=True)
                         self._check_auth_gate(post_root)
                         post_modal = detect_modal_dialog(post_root)
@@ -2545,7 +2727,7 @@ class TonghuashunTradeExecutor:
                             try:
                                 toast_obj = getattr(device, "toast", None)
                                 if toast_obj is not None:
-                                    toast_msg = str(toast_obj.get_message(0.05, 0.08, "") or "").strip()
+                                    toast_msg = str(toast_obj.get_message(0.02, 0.04, "") or "").strip()
                                     if toast_msg:
                                         post_messages.append(f"Toast: {toast_msg}")
                                         m_toast = _ENTRUST_NO_RE.search(toast_msg)
@@ -2554,15 +2736,16 @@ class TonghuashunTradeExecutor:
                                         toast_hit = True
                             except Exception:
                                 pass
-                            if toast_hit:
+                            if toast_hit or post_messages:
                                 break
-                            if (time.monotonic() - t_gw0) < 0.18 and poll_idx < 2:
+                            # Keep polling up to ~2.2s while waiting for slow gateway receipt modal
+                            if (time.monotonic() - stage_tap_at) < 2.20 and poll_idx < 20:
                                 continue
                             break
                         if (
                             post_modal.kind == "confirm"
                             and post_modal.message == last_confirm_msg
-                            and (time.monotonic() - last_confirm_tap_at) < 0.75
+                            and (time.monotonic() - stage_tap_at) < 0.75
                         ):
                             # Same confirm dialog is still dismissing
                             continue
@@ -2571,7 +2754,12 @@ class TonghuashunTradeExecutor:
                         m = _ENTRUST_NO_RE.search(post_modal.message)
                         if m and not entrust_no:
                             entrust_no = m.group(1)
-                        if post_modal.kind == "confirm" and post_modal.confirm_button:
+                        is_terminal_receipt = (
+                            bool(entrust_no)
+                            or any(w in post_modal.message for w in _ORDER_SUCCESS_WORDS)
+                            or any(w in post_modal.message for w in _ORDER_REJECTED_WORDS)
+                        )
+                        if post_modal.kind == "confirm" and post_modal.confirm_button and not is_terminal_receipt:
                             if not _is_confirm_dialog_symbol_safe(post_modal.message, symbol, name_prefix):
                                 if post_modal.cancel_button:
                                     self._tap_bounds(device, post_modal.cancel_button[1])
@@ -2580,23 +2768,37 @@ class TonghuashunTradeExecutor:
                                     "二次确认弹窗标的与目标证券不一致，已自动取消",
                                     409,
                                 )
-                            t_gw0 = time.monotonic()
+                            stage_tap_at = time.monotonic()
                             last_confirm_msg = post_modal.message
-                            last_confirm_tap_at = t_gw0
-                            gw_deadline = t_gw0 + 3.5
+                            gw_deadline = stage_tap_at + 3.5
                             self._tap_bounds(device, post_modal.confirm_button[1])
                             continue
-                        btn = post_modal.ack_button or post_modal.confirm_button or post_modal.cancel_button
+                        is_jump_to_orders_prompt = (
+                            post_modal.kind == "confirm"
+                            and post_modal.cancel_button is not None
+                            and (bool(entrust_no) or any(w in post_modal.message for w in _ORDER_SUCCESS_WORDS))
+                            and not any(w in post_modal.message for w in _ORDER_REJECTED_WORDS)
+                            and any(w in post_modal.message for w in ("当日委托", "查看委托", "查询委托"))
+                        )
+                        btn = (
+                            post_modal.cancel_button
+                            if is_jump_to_orders_prompt
+                            else (post_modal.ack_button or post_modal.confirm_button or post_modal.cancel_button)
+                        )
                         if btn is not None:
                             self._tap_bounds(device, btn[1])
-                            time.sleep(0.04)
+                            for _ in range(5):
+                                time.sleep(0.03)
+                                clear_root = self._dump_root(device, compressed=True)
+                                if detect_modal_dialog(clear_root) is None:
+                                    break
                         break
 
                     if not post_messages:
                         try:
                             toast_obj = getattr(device, "toast", None)
                             if toast_obj is not None:
-                                toast_msg = str(toast_obj.get_message(0.2, 0.35, "") or "").strip()
+                                toast_msg = str(toast_obj.get_message(0.10, 0.20, "") or "").strip()
                                 if toast_msg:
                                     post_messages.append(f"Toast: {toast_msg}")
                                     m_toast = _ENTRUST_NO_RE.search(toast_msg)
@@ -2606,7 +2808,7 @@ class TonghuashunTradeExecutor:
                             pass
 
                     dialog_message = " ; ".join(post_messages)
-                    gateway_reply_ms = round((time.monotonic() - t_gw0) * 1000)
+                    gateway_reply_ms = round((time.monotonic() - t_gw_start) * 1000)
             elif modal is not None and modal.kind == "alert":
                 dialog_message = modal.message
                 submitted = True
@@ -2630,32 +2832,8 @@ class TonghuashunTradeExecutor:
             matching_open: list[dict[str, Any]] = []
             actual_reconcile_mode = "full"
 
-            rejected_words = (
-                "非交易时间",
-                "非委托时间",
-                "清算",
-                "休市",
-                "闭市",
-                "网关开关关闭",
-                "网关关闭",
-                "开关关闭",
-                "通道关闭",
-                "夜市未开",
-                "停用",
-                "维护",
-                "不足",
-                "失败",
-                "错误",
-                "超过",
-                "禁止",
-                "无法",
-                "不允许",
-                "不能",
-                "未开通",
-                "无效",
-                "不支持",
-            )
-            success_words = ("委托成功", "申报成功", "委托已提交", "已申报", "隔夜委托已", "预埋")
+            rejected_words = _ORDER_REJECTED_WORDS
+            success_words = _ORDER_SUCCESS_WORDS
             is_fast_reject = (modal is not None and modal.kind == "alert") or (
                 not entrust_no
                 and any(w in dialog_message for w in rejected_words)
@@ -2711,6 +2889,9 @@ class TonghuashunTradeExecutor:
                     self._last_orders_date = self._today_shanghai_compact()
                     self._last_account_at = 0.0
                     self._last_trades_at = 0.0
+                    if side in {"buy", "sell"}:
+                        self._active_tab = side
+                        self._last_hot_tab_at = now_m
                     orders = [dict(item) for item in self._last_orders]
                     trades = [dict(item) for item in self._last_trades]
             else:

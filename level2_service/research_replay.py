@@ -159,6 +159,200 @@ def _trading_minute(value: object) -> int | None:
     return None
 
 
+BASE_QUANT_CONDITION_TYPES: tuple[str, ...] = (
+    "macd_signal",
+    "vwap_deviation_pct",
+    "macd_state",
+    "time_window",
+    "volume_ratio",
+    "price_momentum_pct",
+    "flow_change_pct",
+    "change_pct",
+    "price_threshold",
+    "swing_reversal",
+    "code_filter",
+    "brent_overnight_pct",
+    "brent_change_pct",
+    "brent_momentum_pct",
+    "brent_spread_pct",
+)
+
+EXTENDED_QUANT_CONDITION_TYPES: tuple[str, ...] = (
+    "iopv_premium_pct",
+    "fx_spread_pct",
+    "xop_macro_pct",
+    "sc_crude_pct",
+    "peer_spread_pct",
+    "l2_flow_level",
+    "etf_net_flow",
+)
+
+VALID_QUANT_CONDITION_TYPES: frozenset[str] = frozenset(
+    (*BASE_QUANT_CONDITION_TYPES, *EXTENDED_QUANT_CONDITION_TYPES)
+)
+
+CONDITION_TYPE_TO_PACK: dict[str, str] = {
+    "iopv_premium_pct": "iopv_fx",
+    "fx_spread_pct": "iopv_fx",
+    "xop_macro_pct": "xop_us_ep",
+    "sc_crude_pct": "uso_bno_sc_peer",
+    "peer_spread_pct": "uso_bno_sc_peer",
+    "l2_flow_level": "l2_darkpool_flow",
+    "etf_net_flow": "etf_redemption_flow",
+}
+
+_REQUIRED_NUMERIC_VALUE_CONDITIONS: frozenset[str] = frozenset(
+    {
+        "vwap_deviation_pct",
+        "macd_state",
+        "volume_ratio",
+        "price_momentum_pct",
+        "flow_change_pct",
+        "change_pct",
+        "price_threshold",
+        "brent_overnight_pct",
+        "brent_change_pct",
+        "brent_momentum_pct",
+        "brent_spread_pct",
+        *EXTENDED_QUANT_CONDITION_TYPES,
+    }
+)
+
+_EXTENDED_ALLOWED_METRICS: dict[str, frozenset[str]] = {
+    "iopv_premium_pct": frozenset(
+        {"premium_pct", "sp_fx_pct", "coint10_pct", "usdcny_change_pct", "brent_q2y_pct"}
+    ),
+    "fx_spread_pct": frozenset(
+        {"sp_fx_pct", "usdcny", "usdcny_change_pct", "fx_adjusted_nav_change_pct"}
+    ),
+    "xop_macro_pct": frozenset(
+        {
+            "xop_change_pct",
+            "xle_change_pct",
+            "spy_change_pct",
+            "iwm_change_pct",
+            "cl_change_pct",
+            "ho_crack_change_pct",
+            "ng_change_pct",
+            "es_change_pct",
+            "xop_synthetic_premium_pct",
+            "daytime_lead_pct",
+            "daytime_crack_pct",
+        }
+    ),
+    "sc_crude_pct": frozenset(
+        {
+            "sc0_change_pct",
+            "sc0_intraday_pct",
+            "uso_bno_change_pct",
+            "dual_oil_premium_pct",
+            "sc_brent_spread_pct",
+        }
+    ),
+    "peer_spread_pct": frozenset(
+        {"spread_pct", "peer_change_pct", "peer_premium_diff_pct"}
+    ),
+    "etf_net_flow": frozenset(
+        {
+            "net_buy_1d_wan",
+            "net_buy_3d_wan",
+            "net_buy_5d_wan",
+            "net_buy_20d_wan",
+            "share_scale_yi",
+            "net_buy_ratio_pct",
+        }
+    ),
+}
+
+
+def validate_dsl_condition(
+    condition: Mapping[str, Any],
+    *,
+    prefix: str = "condition",
+) -> None:
+    """Validate one DSL condition dict and raise ValueError on unknown operators or malformed fields."""
+    if not isinstance(condition, Mapping):
+        raise ValueError(f"{prefix} must be an object")
+    ctype = str(condition.get("type") or "").strip()
+    if not ctype:
+        raise ValueError(f"{prefix}.type is required")
+    if ctype not in VALID_QUANT_CONDITION_TYPES:
+        raise ValueError(f"{prefix}.type '{ctype}' is not supported")
+    if ctype in _REQUIRED_NUMERIC_VALUE_CONDITIONS and _number(condition.get("value")) is None:
+        raise ValueError(f"{prefix} ({ctype}) requires numeric value")
+    direction = condition.get("direction")
+    if direction is not None and ctype != "flow_change_pct":
+        if str(direction).strip().lower() not in {"lte", "gte"}:
+            raise ValueError(f"{prefix} ({ctype}).direction must be 'lte' or 'gte'")
+    if ctype in _EXTENDED_ALLOWED_METRICS:
+        metric = str(condition.get("metric") or "").strip()
+        if metric and metric not in _EXTENDED_ALLOWED_METRICS[ctype]:
+            raise ValueError(f"{prefix} ({ctype}).metric '{metric}' is not supported")
+    if ctype == "l2_flow_level":
+        period = str(condition.get("period") or "today").strip()
+        if period not in {"today", "three_day", "five_day"}:
+            raise ValueError(f"{prefix} (l2_flow_level).period '{period}' must be today|three_day|five_day")
+        flow = str(condition.get("flow") or "main_net").strip().lower()
+        if flow not in {"main_net", "main_visible", "main_hidden", "retail", "hidden_ratio"}:
+            raise ValueError(
+                f"{prefix} (l2_flow_level).flow '{flow}' must be main_net|main_visible|main_hidden|retail|hidden_ratio"
+            )
+    if ctype == "peer_spread_pct":
+        peer = str(condition.get("peer") or "auto").strip().upper()
+        if peer and peer != "AUTO" and not (len(peer) == 6 and peer.isdigit()):
+            raise ValueError(f"{prefix} (peer_spread_pct).peer must be 'auto' or a 6-digit symbol")
+    if ctype == "time_window":
+        windows = condition.get("windows")
+        has_windows = (
+            isinstance(windows, Sequence)
+            and not isinstance(windows, (str, bytes))
+            and len(windows) > 0
+        )
+        has_start_end = bool(condition.get("start") or condition.get("end"))
+        if not has_windows and not has_start_end:
+            raise ValueError(f"{prefix} (time_window) requires windows or start/end")
+
+
+def detect_rule_required_packs(
+    rules: Sequence[Mapping[str, Any]],
+    position_sizing: Mapping[str, Any] | None = None,
+) -> set[str]:
+    """Return external/extended data packs needed to evaluate the given rules and conviction tiers."""
+    required: set[str] = set()
+    candidates: list[Mapping[str, Any]] = []
+    for rule in rules:
+        if isinstance(rule, Mapping):
+            candidates.append(rule)
+    if isinstance(position_sizing, Mapping):
+        for key in ("conviction_tiers", "sell_conviction_tiers"):
+            for tier in position_sizing.get(key) or []:
+                if isinstance(tier, Mapping):
+                    candidates.append(tier)
+        profile = str(position_sizing.get("engine_profile") or "").strip().lower()
+        anchor = str(position_sizing.get("cross_market_anchor") or "").strip().lower()
+        if profile in {"v9_plus_aggressive", "v9_plus_balanced"}:
+            required.add("iopv_fx")
+        if anchor == "xop_us_ep":
+            required.update({"iopv_fx", "xop_us_ep"})
+        elif anchor == "fof_t0_multisource":
+            required.update({"iopv_fx", "uso_bno_sc_peer", "xop_us_ep"})
+        elif anchor in {"uso_bno_sc_peer", "fof_crude_core"}:
+            required.update({"iopv_fx", "uso_bno_sc_peer"})
+    for container in candidates:
+        for cond in container.get("conditions") or []:
+            if not isinstance(cond, Mapping):
+                continue
+            ctype = str(cond.get("type") or "").strip()
+            pack = CONDITION_TYPE_TO_PACK.get(ctype)
+            if pack:
+                required.add(pack)
+            elif ctype == "flow_change_pct":
+                flow = str(cond.get("flow") or "big").strip().lower()
+                if flow in {"visible", "main_visible", "hidden", "main_hidden", "retail", "small"}:
+                    required.add("l2_darkpool_flow")
+    return required
+
+
 def rule_uses_flow(rules: Sequence[Mapping[str, Any]]) -> bool:
     """Return True when any rule condition depends on intraday fund/large-order flow."""
     for rule in rules:
@@ -168,7 +362,7 @@ def rule_uses_flow(rules: Sequence[Mapping[str, Any]]) -> bool:
             if not isinstance(cond, Mapping):
                 continue
             ctype = str(cond.get("type") or "")
-            if ctype == "flow_change_pct":
+            if ctype in {"flow_change_pct", "l2_flow_level"}:
                 return True
             if ctype == "swing_reversal" and str(cond.get("flowFilter") or "off") in {
                 "increase",
@@ -201,20 +395,30 @@ def _macd_signal(
 def _resolve_flow_value(point: Mapping[str, object], flow: str) -> float | None:
     kind = str(flow or "big").strip().lower()
     if kind in {"retail", "small"}:
-        for key in ("retail_count", "small_net_wan", "retail_inflow"):
+        for key in ("l2_today_retail_wan", "retail_count", "small_net_wan", "retail_inflow"):
             val = _number(point.get(key))
             if val is not None:
                 return val
         return None
     if kind in {"hidden", "main_hidden"}:
-        return _number(point.get("main_hidden_inflow"))
+        for key in ("l2_today_hidden_wan", "main_hidden_inflow"):
+            val = _number(point.get(key))
+            if val is not None:
+                return val
+        return None
+    if kind in {"visible", "main_visible"}:
+        for key in ("l2_today_visible_wan", "main_visible_inflow"):
+            val = _number(point.get(key))
+            if val is not None:
+                return val
+        return None
     if kind == "mid":
         for key in ("mid_order_net", "mid_net_wan"):
             val = _number(point.get(key))
             if val is not None:
                 return val
         return None
-    for key in ("large_order_net", "large_order_amount", "big_net_wan", "main_net_inflow"):
+    for key in ("large_order_net", "large_order_amount", "big_net_wan", "l2_today_main_net_wan", "main_net_inflow"):
         val = _number(point.get(key))
         if val is not None:
             return val
@@ -705,6 +909,158 @@ def _condition_matches(
         is_lte = str(condition.get("direction") or "lte").lower() == "lte"
         matched = val <= target if is_lte else val >= target
         return matched, f"A股-BRN0Y价差 {val:+.2f}% {'<=' if is_lte else '>='} {target:g}%"
+    if kind == "iopv_premium_pct":
+        metric = str(condition.get("metric") or "premium_pct").strip()
+        field_map = {
+            "premium_pct": ("iopv_premium_pct", "汇调IOPV溢价率", "%"),
+            "sp_fx_pct": ("sp_fx_pct", "汇调跨市场价差sp_fx", "%"),
+            "coint10_pct": ("coint10_pct", "10日协整偏离coint10", "%"),
+            "usdcny_change_pct": ("usdcny_change_pct", "离岸汇率波动", "%"),
+            "brent_q2y_pct": ("brent_q2y_pct", "布油2年分位", "%"),
+        }
+        field, label, unit = field_map.get(metric, field_map["premium_pct"])
+        val = _number(current.get(field))
+        target = _number(condition.get("value"))
+        if val is None or target is None:
+            return False, f"{label}数据或阈值无效"
+        is_lte = str(condition.get("direction") or "lte").lower() == "lte"
+        matched = val <= target if is_lte else val >= target
+        return matched, f"{label} {val:+.2f}{unit} {'<=' if is_lte else '>='} {target:g}{unit}"
+    if kind == "fx_spread_pct":
+        metric = str(condition.get("metric") or "sp_fx_pct").strip()
+        field_map = {
+            "sp_fx_pct": ("sp_fx_pct", "汇调价差sp_fx", "%"),
+            "usdcny": ("usdcny", "离岸汇率USD/CNY", ""),
+            "usdcny_change_pct": ("usdcny_change_pct", "汇率日波动", "%"),
+            "fx_adjusted_nav_change_pct": ("fx_adjusted_nav_change_pct", "汇调估值涨跌", "%"),
+        }
+        field, label, unit = field_map.get(metric, field_map["sp_fx_pct"])
+        val = _number(current.get(field))
+        target = _number(condition.get("value"))
+        if val is None or target is None:
+            return False, f"{label}数据或阈值无效"
+        is_lte = str(condition.get("direction") or "lte").lower() == "lte"
+        matched = val <= target if is_lte else val >= target
+        fmt = f"{val:.4f}" if metric == "usdcny" else f"{val:+.2f}"
+        return matched, f"{label} {fmt}{unit} {'<=' if is_lte else '>='} {target:g}{unit}"
+    if kind == "xop_macro_pct":
+        metric = str(condition.get("metric") or "xop_change_pct").strip()
+        field_map = {
+            "xop_change_pct": ("xop_change_pct", "美股XOP涨跌幅"),
+            "xle_change_pct": ("xle_change_pct", "美股XLE涨跌幅"),
+            "spy_change_pct": ("spy_change_pct", "美股SPY涨跌幅"),
+            "iwm_change_pct": ("iwm_change_pct", "美股IWM涨跌幅"),
+            "cl_change_pct": ("cl_change_pct", "WTI原油涨跌幅"),
+            "ho_crack_change_pct": ("ho_crack_change_pct", "取暖油裂解价差"),
+            "ng_change_pct": ("ng_change_pct", "天然气NG涨跌幅"),
+            "es_change_pct": ("es_change_pct", "标普期货ES涨跌幅"),
+            "xop_synthetic_premium_pct": ("xop_synthetic_premium_pct", "XOP合成净值溢价率"),
+            "daytime_lead_pct": ("daytime_lead_pct", "美股能源日盘领先指标"),
+            "daytime_crack_pct": ("daytime_crack_pct", "日盘裂解价差变化"),
+        }
+        field, label = field_map.get(metric, field_map["xop_change_pct"])
+        val = _number(current.get(field))
+        target = _number(condition.get("value"))
+        if val is None or target is None:
+            return False, f"{label}数据或阈值无效"
+        is_lte = str(condition.get("direction") or "gte").lower() == "lte"
+        matched = val <= target if is_lte else val >= target
+        return matched, f"{label} {val:+.2f}% {'<=' if is_lte else '>='} {target:g}%"
+    if kind == "sc_crude_pct":
+        metric = str(condition.get("metric") or "sc0_change_pct").strip()
+        field_map = {
+            "sc0_change_pct": ("sc0_change_pct", "沪油SC0较前收"),
+            "sc0_intraday_pct": ("sc0_intraday_pct", "沪油SC0日内涨跌"),
+            "uso_bno_change_pct": ("uso_bno_change_pct", "USO+BNO双油隔夜"),
+            "dual_oil_premium_pct": ("dual_oil_premium_pct", "双油合成溢价率"),
+            "sc_brent_spread_pct": ("sc_brent_spread_pct", "沪油-布油价差"),
+        }
+        field, label = field_map.get(metric, field_map["sc0_change_pct"])
+        val = _number(current.get(field))
+        target = _number(condition.get("value"))
+        if val is None or target is None:
+            return False, f"{label}数据或阈值无效"
+        is_lte = str(condition.get("direction") or "gte").lower() == "lte"
+        matched = val <= target if is_lte else val >= target
+        return matched, f"{label} {val:+.2f}% {'<=' if is_lte else '>='} {target:g}%"
+    if kind == "peer_spread_pct":
+        peer = str(condition.get("peer") or "auto").strip().upper()
+        metric = str(condition.get("metric") or "spread_pct").strip()
+        candidate_fields: list[str] = []
+        if peer and peer != "AUTO":
+            if metric == "peer_change_pct":
+                candidate_fields.append(f"peer_{peer}_change_pct")
+            elif metric == "peer_premium_diff_pct":
+                candidate_fields.append(f"peer_{peer}_premium_diff_pct")
+            else:
+                candidate_fields.append(f"peer_{peer}_spread_pct")
+        default_field_map = {
+            "spread_pct": ("peer_spread_pct", "同业相对价差"),
+            "peer_change_pct": ("peer_change_pct", "同业标的涨跌幅"),
+            "peer_premium_diff_pct": ("peer_premium_diff_pct", "同业汇调溢价差"),
+        }
+        fallback_field, label = default_field_map.get(metric, default_field_map["spread_pct"])
+        candidate_fields.append(fallback_field)
+        val = None
+        for key in candidate_fields:
+            val = _number(current.get(key))
+            if val is not None:
+                break
+        target = _number(condition.get("value"))
+        if val is None or target is None:
+            return False, f"{label}数据或阈值无效"
+        is_lte = str(condition.get("direction") or "lte").lower() == "lte"
+        matched = val <= target if is_lte else val >= target
+        peer_tag = f"[{peer}]" if peer and peer != "AUTO" else ""
+        return matched, f"{label}{peer_tag} {val:+.2f}% {'<=' if is_lte else '>='} {target:g}%"
+    if kind == "l2_flow_level":
+        period = str(condition.get("period") or "today").strip()
+        flow = str(condition.get("flow") or "main_net").strip().lower()
+        period_prefix = {"today": "today", "three_day": "3d", "five_day": "5d"}.get(period, "today")
+        period_label = {"today": "当日", "three_day": "3日", "five_day": "5日"}.get(period, "当日")
+        flow_meta = {
+            "main_net": ("main_net_wan", "主力净流入", "万"),
+            "main_visible": ("visible_wan", "主力明盘", "万"),
+            "main_hidden": ("hidden_wan", "主力暗盘", "万"),
+            "retail": ("retail_wan", "散户净流入", "万"),
+            "hidden_ratio": ("hidden_ratio_pct", "暗盘占比", "%"),
+        }
+        suffix_key, flow_label, unit = flow_meta.get(flow, flow_meta["main_net"])
+        field = f"l2_{period_prefix}_{suffix_key}"
+        val = _number(current.get(field))
+        if val is None and period == "today":
+            raw_fallback = {
+                "main_net": "main_net_inflow",
+                "main_visible": "main_visible_inflow",
+                "main_hidden": "main_hidden_inflow",
+                "retail": "retail_inflow",
+            }.get(flow)
+            if raw_fallback:
+                val = _number(current.get(raw_fallback))
+        target = _number(condition.get("value"))
+        if val is None or target is None:
+            return False, f"L2 {period_label}{flow_label}数据或阈值无效"
+        is_lte = str(condition.get("direction") or "gte").lower() == "lte"
+        matched = val <= target if is_lte else val >= target
+        return matched, f"L2 {period_label}{flow_label} {val:+.2f}{unit} {'<=' if is_lte else '>='} {target:g}{unit}"
+    if kind == "etf_net_flow":
+        metric = str(condition.get("metric") or "net_buy_1d_wan").strip()
+        field_map = {
+            "net_buy_1d_wan": ("etf_net_buy_1d_wan", "ETF前1日净申购", "万"),
+            "net_buy_3d_wan": ("etf_net_buy_3d_wan", "ETF近3日净申购", "万"),
+            "net_buy_5d_wan": ("etf_net_buy_5d_wan", "ETF近5日净申购", "万"),
+            "net_buy_20d_wan": ("etf_net_buy_20d_wan", "ETF近20日净申购", "万"),
+            "share_scale_yi": ("etf_share_scale_yi", "ETF基金规模", "亿"),
+            "net_buy_ratio_pct": ("etf_net_buy_ratio_pct", "ETF申赎净流入率", "%"),
+        }
+        field, label, unit = field_map.get(metric, field_map["net_buy_1d_wan"])
+        val = _number(current.get(field))
+        target = _number(condition.get("value"))
+        if val is None or target is None:
+            return False, f"{label}数据或阈值无效"
+        is_lte = str(condition.get("direction") or "gte").lower() == "lte"
+        matched = val <= target if is_lte else val >= target
+        return matched, f"{label} {val:+.2f}{unit} {'<=' if is_lte else '>='} {target:g}{unit}"
     return False, "未知条件"
 
 

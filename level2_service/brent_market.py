@@ -952,7 +952,7 @@ def backfill_oil_funds_to_research_store(
 
         if include_intraday:
             try:
-                min_url = f"https://web.ifzq.gtimg.cn/appstock/app/minute/query?code={fq_sym}"
+                min_url = f"https://ifzq.gtimg.cn/appstock/app/minute/query?code={fq_sym}"
                 m_payload = json.loads(getter(min_url, referer="https://gu.qq.com/", timeout=8.0))
                 m_block = (((m_payload.get("data") or {}).get(fq_sym)) or {}).get("data") or {}
                 m_date = str(m_block.get("date") or "").replace("-", "").strip()

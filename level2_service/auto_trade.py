@@ -26,8 +26,11 @@ import uuid
 from zoneinfo import ZoneInfo
 
 from .parsed_values import is_exchange_fund_symbol
+from .quant_data_sources import check_rule_live_data_guard, resolve_rule_same_day_t0
 from .quant_rules import (
     compute_lot_shares_from_budget,
+    detect_rule_required_packs,
+    enrich_live_points_with_quant_packs,
     enrich_points_with_brent,
     enrich_store_with_line_funds,
     is_t0_turnaround_symbol,
@@ -44,6 +47,18 @@ from .research_monitor import (
 from .research_premium import PREMIUM_NAMES, calculate_premium_rate
 from .research_replay import build_replay_markers, calculate_macd, evaluate_rule_detail
 from .ths_trade import TradeExecutionError
+from .portfolio_allocator import (
+    CAPITAL_POLICY_MODE_LABELS,
+    DEFAULT_POOL_POLICY,
+    RouteDPlusAllocator,
+    SHARED_POOL_EXECUTION_ENGINES,
+    SQLitePortfolioPolicyStore,
+    VALID_CAPITAL_POLICY_MODES,
+    _resolve_cross_market_anchor,
+    is_valid_policy_id,
+    normalize_pool_policy,
+    scale_buy_orders_to_cash,
+)
 from .v9_plus_engine import evaluate_v9_plus_live_decision, evaluate_v9_plus_live_indicators
 
 
@@ -148,6 +163,8 @@ DEFAULT_AUTO_TRADE_CONFIG: dict[str, Any] = {
     "refresh_book_on_confirm": True,
     "auto_cancel_seconds": 30,
     "daily_max_buy_amount": 50000.0,
+    "capital_policy_mode": "static_cap",
+    "pool_policy": copy.deepcopy(DEFAULT_POOL_POLICY),
     "block_non_continuous_session": True,
     "poll_interval_seconds": 3.0,
     "confirm_ttl_seconds": 180,
@@ -377,105 +394,6 @@ def compute_ashare_price_cage(
     return max(tick, limit), label
 
 
-def coalesce_symbol_candidates(
-    candidates: Sequence[Mapping[str, Any]],
-    *,
-    default_qty: int = 100,
-) -> list[dict[str, Any]]:
-    """Coalesce multiple rule triggers on one symbol: merge same-side, net opposite-side."""
-    if len(candidates) <= 1:
-        return [dict(item) for item in candidates]
-
-    closing_items: list[dict[str, Any]] = []
-    intraday: list[tuple[int, dict[str, Any]]] = []
-    for idx, item in enumerate(candidates):
-        row = dict(item)
-        if row.get("signal_tag") in {"t0-flatten", "v9-close"}:
-            closing_items.append(row)
-        else:
-            intraday.append((idx, row))
-
-    if len(intraday) <= 1:
-        return closing_items + [row for _, row in intraday]
-
-    base_qty = max(100, (int(default_qty) // 100) * 100)
-
-    def _est_shares(row: Mapping[str, Any]) -> int:
-        if row.get("qty_override") is not None:
-            try:
-                q = int(row["qty_override"])
-                if q >= 100:
-                    return (q // 100) * 100
-            except (TypeError, ValueError):
-                pass
-        scale = float(row.get("weight_scale") or 1.0)
-        scaled = int(round((base_qty * scale) / 100.0)) * 100
-        return max(100, scaled)
-
-    def _merge_side(items: list[tuple[int, dict[str, Any]]]) -> dict[str, Any] | None:
-        if not items:
-            return None
-        ordered = sorted(
-            items,
-            key=lambda pair: (int(pair[1].get("binding_priority") or 10), pair[0]),
-        )
-        primary = dict(ordered[0][1])
-        if len(ordered) == 1:
-            return primary
-        summaries: list[str] = []
-        max_shares = 0
-        has_qty_override = False
-        max_weight: float | None = None
-        rule_ids: list[str] = []
-        for _, row in ordered:
-            rid = str(row.get("rule_id") or "").strip()
-            if rid and rid not in rule_ids:
-                rule_ids.append(rid)
-            sm = str(row.get("rule_summary") or "").strip()
-            if sm and sm not in summaries:
-                summaries.append(sm)
-            if row.get("qty_override") is not None or float(row.get("weight_scale") or 1.0) != 1.0:
-                has_qty_override = True
-            max_shares = max(max_shares, _est_shares(row))
-            if row.get("weight_pct") is not None:
-                try:
-                    w = float(row["weight_pct"])
-                    max_weight = w if max_weight is None else max(max_weight, w)
-                except (TypeError, ValueError):
-                    pass
-        if has_qty_override and max_shares >= 100:
-            primary["qty_override"] = max_shares
-        if max_weight is not None:
-            primary["weight_pct"] = max_weight
-        primary["coalesced_rules"] = rule_ids
-        joined = "；".join(summaries)
-        primary["rule_summary"] = f"[多规则共振×{len(ordered)}] {joined}" if joined else f"[多规则共振×{len(ordered)}]"
-        return primary
-
-    buys = [(idx, r) for idx, r in intraday if r.get("side") != "sell"]
-    sells = [(idx, r) for idx, r in intraday if r.get("side") == "sell"]
-    merged_buy = _merge_side(buys)
-    merged_sell = _merge_side(sells)
-
-    if merged_buy is not None and merged_sell is not None:
-        net = _est_shares(merged_buy) - _est_shares(merged_sell)
-        if abs(net) < 100:
-            return closing_items
-        winner = dict(merged_buy if net > 0 else merged_sell)
-        net_qty = (abs(net) // 100) * 100
-        winner["qty_override"] = net_qty
-        base_sm = str(winner.get("rule_summary") or "").strip()
-        winner["rule_summary"] = f"{base_sm}；[同标的对冲净额 {net_qty}股]" if base_sm else f"[同标的对冲净额 {net_qty}股]"
-        return closing_items + [winner]
-
-    out = list(closing_items)
-    if merged_buy is not None:
-        out.append(merged_buy)
-    if merged_sell is not None:
-        out.append(merged_sell)
-    return out
-
-
 def resolve_order_limit_price(
     symbol: str,
     market: str | None,
@@ -643,76 +561,39 @@ def _normalize_symbol_cooldowns(raw: object) -> dict[str, dict[str, Any]]:
     return out
 
 
-def _normalize_rule_bindings(
-    raw_bindings: object,
-    fallback_source: str,
-    fallback_rule_id: str | None,
-) -> list[dict[str, Any]]:
-    parsed: list[tuple[int, int, dict[str, Any]]] = []
-    if isinstance(raw_bindings, Sequence) and not isinstance(raw_bindings, (str, bytes, bytearray)):
-        for idx, item in enumerate(raw_bindings[:8]):
-            if not isinstance(item, Mapping):
-                continue
-            b_src = str(item.get("signal_source") or fallback_source).strip()
-            if b_src not in VALID_SIGNAL_SOURCES:
-                continue
-            q_raw = item.get("quant_rule_id")
-            q_id: str | None = None
-            if q_raw is not None and str(q_raw).strip():
-                cleaned = str(q_raw).strip()
-                if re.fullmatch(r"[A-Za-z0-9._-]{2,64}", cleaned):
-                    q_id = cleaned
-            if b_src == "quant_rule" and q_id is None:
-                q_id = fallback_rule_id
-            try:
-                prio = max(1, min(100, int(item.get("priority", 10 + idx))))
-            except (TypeError, ValueError):
-                prio = 10 + idx
-            try:
-                scale = round(max(0.1, min(2.0, float(item.get("weight_scale", 1.0)))), 2)
-            except (TypeError, ValueError):
-                scale = 1.0
-            parsed.append(
-                (
-                    prio,
-                    idx,
-                    {
-                        "signal_source": b_src,
-                        "quant_rule_id": q_id if b_src == "quant_rule" else None,
-                        "enabled": bool(item.get("enabled", True)),
-                        "priority": prio,
-                        "weight_scale": scale,
-                    },
-                )
-            )
-    if not parsed:
-        return [
-            {
-                "signal_source": fallback_source,
-                "quant_rule_id": fallback_rule_id if fallback_source == "quant_rule" else None,
-                "enabled": True,
-                "priority": 10,
-                "weight_scale": 1.0,
-            }
-        ]
-    parsed.sort(key=lambda row: (row[0], row[1]))
-    return [row[2] for row in parsed]
-
-
 def _normalize_symbol_profile(
     symbol: str,
     raw_profile: Mapping[str, Any] | None,
     fallback_cfg: Mapping[str, Any],
 ) -> dict[str, Any]:
     raw_p = raw_profile if isinstance(raw_profile, Mapping) else {}
-    qrid_raw = raw_p.get("quant_rule_id", fallback_cfg.get("quant_rule_id"))
+    legacy_b0: Mapping[str, Any] = {}
+    if "signal_source" not in raw_p and "quant_rule_id" not in raw_p:
+        raw_bindings = raw_p.get("rule_bindings")
+        if (
+            isinstance(raw_bindings, Sequence)
+            and not isinstance(raw_bindings, (str, bytes, bytearray))
+            and len(raw_bindings) > 0
+            and isinstance(raw_bindings[0], Mapping)
+        ):
+            legacy_b0 = raw_bindings[0]
+
+    qrid_raw = raw_p.get(
+        "quant_rule_id",
+        legacy_b0.get("quant_rule_id", fallback_cfg.get("quant_rule_id")) if legacy_b0 else fallback_cfg.get("quant_rule_id"),
+    )
     qrid: str | None = None
     if qrid_raw is not None and str(qrid_raw).strip():
         cleaned_qrid = str(qrid_raw).strip()
         if re.fullmatch(r"[A-Za-z0-9._-]{2,64}", cleaned_qrid):
             qrid = cleaned_qrid
 
-    sig_src = str(raw_p.get("signal_source") or fallback_cfg.get("signal_source") or "intraday_macd_flow").strip()
+    sig_src = str(
+        raw_p.get("signal_source")
+        or (legacy_b0.get("signal_source") if legacy_b0 else None)
+        or fallback_cfg.get("signal_source")
+        or "intraday_macd_flow"
+    ).strip()
     if sig_src not in VALID_SIGNAL_SOURCES:
         sig_src = str(fallback_cfg.get("signal_source") or "intraday_macd_flow")
 
@@ -757,20 +638,6 @@ def _normalize_symbol_profile(
             pass
 
     rec_at = str(raw_p.get("reconciled_at") or "").strip() or None
-    has_explicit_bindings = (
-        isinstance(raw_p.get("rule_bindings"), Sequence)
-        and not isinstance(raw_p.get("rule_bindings"), (str, bytes, bytearray))
-        and len(raw_p.get("rule_bindings") or []) > 0
-    )
-    rule_bindings = _normalize_rule_bindings(
-        raw_p.get("rule_bindings") if has_explicit_bindings else None,
-        sig_src,
-        qrid,
-    )
-    if has_explicit_bindings:
-        primary_binding = next((b for b in rule_bindings if b.get("enabled", True)), rule_bindings[0])
-        sig_src = str(primary_binding["signal_source"])
-        qrid = primary_binding.get("quant_rule_id")
     return {
         "symbol": symbol,
         "enabled": bool(raw_p["enabled"]) if "enabled" in raw_p else True,
@@ -780,7 +647,6 @@ def _normalize_symbol_profile(
         "capital_cap": round(cap_val, 2),
         "order_quantity": qty_val,
         "order_book_level": book_lvl,
-        "rule_bindings": rule_bindings,
         "reconciled_at": rec_at,
         "reconciled_shares": rec_shares,
     }
@@ -883,6 +749,13 @@ def _normalize_config(raw: Mapping[str, Any] | None) -> dict[str, Any]:
                 cfg["daily_max_buy_amount"] = round(cap, 2)
         except (TypeError, ValueError):
             pass
+
+    cap_pol_mode = str(raw.get("capital_policy_mode") or cfg["capital_policy_mode"]).strip()
+    if cap_pol_mode in VALID_CAPITAL_POLICY_MODES or is_valid_policy_id(cap_pol_mode):
+        cfg["capital_policy_mode"] = cap_pol_mode
+
+    if isinstance(raw.get("pool_policy"), Mapping):
+        cfg["pool_policy"] = normalize_pool_policy(raw.get("pool_policy"))
 
     if "block_non_continuous_session" in raw:
         cfg["block_non_continuous_session"] = bool(raw["block_non_continuous_session"])
@@ -1054,7 +927,17 @@ class SQLiteAutoTradeStore:
     def _build_merged_candidate(current: Mapping[str, Any], patch: Mapping[str, Any]) -> dict[str, Any]:
         patch_dict = dict(patch)
         merged = {**current, **patch_dict}
+        if isinstance(patch_dict.get("pool_policy"), Mapping):
+            cur_pol = current.get("pool_policy") if isinstance(current.get("pool_policy"), Mapping) else {}
+            merged["pool_policy"] = {**cur_pol, **dict(patch_dict["pool_policy"])}
         pre_norm = _normalize_config(merged)
+        pool_tpc = (
+            (pre_norm.get("pool_policy") or {}).get("total_pool_cap")
+            if isinstance(pre_norm.get("pool_policy"), Mapping)
+            else None
+        )
+        mode_cand = str(pre_norm.get("capital_policy_mode") or "static_cap")
+        is_legacy_static = mode_cand in {"static_cap", "route_d_shadow"}
         # Keep single-symbol legacy callers in sync with symbol_profiles when caller omitted symbol_profiles
         if "symbol_profiles" not in patch_dict and len(pre_norm["symbols"]) == 1:
             sole_sym = pre_norm["symbols"][0]
@@ -1064,8 +947,7 @@ class SQLiteAutoTradeStore:
                 else {}
             )
             prof_patch: dict[str, Any] = dict(existing_p) if isinstance((existing_p := existing_prof), Mapping) else {}
-            if "signal_source" in patch_dict or "quant_rule_id" in patch_dict:
-                prof_patch.pop("rule_bindings", None)
+            prof_patch.pop("rule_bindings", None)
             if "signal_source" in patch_dict:
                 prof_patch["signal_source"] = pre_norm["signal_source"]
             if "quant_rule_id" in patch_dict:
@@ -1080,13 +962,32 @@ class SQLiteAutoTradeStore:
                 prof_patch["order_book_level"] = pre_norm["order_book_level"]
             pre_norm["symbol_profiles"][sole_sym] = _normalize_symbol_profile(sole_sym, prof_patch, pre_norm)
         elif "symbol_profiles" in patch_dict:
-            enabled_caps = [
-                float(p["capital_cap"])
-                for p in pre_norm["symbol_profiles"].values()
-                if p.get("enabled", True)
-            ]
-            if enabled_caps:
-                pre_norm["daily_max_buy_amount"] = round(min(10_000_000.0, sum(enabled_caps)), 2)
+            if not is_legacy_static and ("daily_max_buy_amount" in patch_dict or pool_tpc is not None):
+                pass
+            else:
+                enabled_caps = [
+                    float(p["capital_cap"])
+                    for p in pre_norm["symbol_profiles"].values()
+                    if p.get("enabled", True)
+                ]
+                if enabled_caps:
+                    pre_norm["daily_max_buy_amount"] = round(min(10_000_000.0, sum(enabled_caps)), 2)
+        if not is_legacy_static and pool_tpc is not None:
+            cur_tpc = (
+                (current.get("pool_policy") or {}).get("total_pool_cap")
+                if isinstance(current.get("pool_policy"), Mapping)
+                else None
+            )
+            if (
+                "daily_max_buy_amount" not in patch_dict
+                or (
+                    isinstance(patch_dict.get("pool_policy"), Mapping)
+                    and "total_pool_cap" in patch_dict["pool_policy"]
+                    and pool_tpc != cur_tpc
+                    and float(patch_dict.get("daily_max_buy_amount") or 0.0) == float(current.get("daily_max_buy_amount") or 0.0)
+                )
+            ):
+                pre_norm["daily_max_buy_amount"] = round(min(10_000_000.0, float(pool_tpc)), 2)
         return pre_norm
 
     def update_config(self, patch: Mapping[str, Any]) -> dict[str, Any]:
@@ -1585,18 +1486,26 @@ class SQLiteAutoTradeStore:
         buy_amount = 0.0
         sell_amount = 0.0
         entry_count = 0
+        buy_entry_count = 0
+        sell_entry_count = 0
         for row in rows:
             qty = int(row["quantity"] or 0)
             amt = float(row["estimated_amount"] or 0.0)
-            is_flatten = ":t0-flatten:" in str(row["signal_key"] or "")
+            sig_k = str(row["signal_key"] or "")
+            is_flatten = ":t0-flatten:" in sig_k or ":t0-guard-stop:" in sig_k
+            is_closing = is_flatten or ":v9-close:" in sig_k or ":v9-exit:" in sig_k
             if not is_flatten:
                 entry_count += 1
             if str(row["side"]) == "buy":
                 buy_shares += qty
                 buy_amount += amt
+                if not is_closing:
+                    buy_entry_count += 1
             else:
                 sell_shares += qty
                 sell_amount += amt
+                if not is_closing:
+                    sell_entry_count += 1
         return {
             "buy_shares": buy_shares,
             "sell_shares": sell_shares,
@@ -1604,6 +1513,8 @@ class SQLiteAutoTradeStore:
             "buy_amount": round(buy_amount, 2),
             "sell_amount": round(sell_amount, 2),
             "entry_count": entry_count,
+            "buy_entry_count": buy_entry_count,
+            "sell_entry_count": sell_entry_count,
         }
 
     def rolling_symbol_position(
@@ -1924,6 +1835,7 @@ class AutoTradeEngine:
         now_fn: Callable[[], datetime] | None = None,
         epoch_fn: Callable[[], float] | None = None,
         quant_rule_store: object | None = None,
+        portfolio_policy_store: SQLitePortfolioPolicyStore | None = None,
         order_book_fetcher: Callable[[str, str | None], Mapping[str, Any] | None] | None = None,
         batch_order_book_fetcher: Callable[[Sequence[str]], Mapping[str, Mapping[str, Any]]] | None = None,
     ) -> None:
@@ -1937,6 +1849,12 @@ class AutoTradeEngine:
         self.now_fn = now_fn
         self.epoch_fn = epoch_fn or time.time
         self.quant_rule_store = quant_rule_store
+        store_path = getattr(auto_store, "path", None)
+        self.portfolio_policy_store: SQLitePortfolioPolicyStore | None = (
+            portfolio_policy_store
+            if portfolio_policy_store is not None
+            else (SQLitePortfolioPolicyStore(store_path) if store_path is not None else None)
+        )
         self.order_book_fetcher = order_book_fetcher
         self.batch_order_book_fetcher = batch_order_book_fetcher
         self._order_book_cache: dict[str, tuple[float, dict[str, Any]]] = {}
@@ -1957,6 +1875,9 @@ class AutoTradeEngine:
         self.account_sync_interval_seconds: float = 45.0
         self._bg_tasks: set[asyncio.Task[Any]] = set()
         self._subscribers: set[asyncio.Queue[dict[str, Any]]] = set()
+        self._last_data_guard_by_symbol: dict[str, dict[str, Any]] = {}
+        self._pool_allocator = RouteDPlusAllocator()
+        self._live_weight_cache: dict[str, tuple[float, dict[str, Any]]] = {}
 
     def subscribe(self, *, maxsize: int = 128) -> asyncio.Queue[dict[str, Any]]:
         q: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=max(16, int(maxsize)))
@@ -2023,6 +1944,12 @@ class AutoTradeEngine:
                 "name": r["name"],
                 "source": r["source"],
                 "symbols": r.get("symbols") or ["160723"],
+                "target_symbol": r.get("target_symbol") or (r.get("symbols") or ["160723"])[0],
+                "stock_name": r.get("stock_name"),
+                "raw_strategy_name": r.get("raw_strategy_name"),
+                "submitter_id": r.get("submitter_id"),
+                "submitter_name": r.get("submitter_name"),
+                "submission_id": r.get("submission_id"),
                 "enabled": bool(r.get("enabled", True)),
                 "position_sizing": ps,
                 "overall_win_rate_pct": sm.get("overall_win_rate_pct"),
@@ -2098,19 +2025,639 @@ class AutoTradeEngine:
             eff["daily_max_buy_amount"] = float(prof.get("capital_cap") or eff.get("daily_max_buy_amount") or 50000.0)
             eff["order_quantity"] = int(prof.get("order_quantity") or eff.get("order_quantity") or 100)
             eff["order_book_level"] = int(prof.get("order_book_level") or eff.get("order_book_level") or 3)
-            eff["rule_bindings"] = _normalize_rule_bindings(
-                prof.get("rule_bindings"),
-                str(eff["signal_source"]),
-                eff.get("quant_rule_id"),
-            )
         else:
             eff["symbol_enabled"] = True
-            eff["rule_bindings"] = _normalize_rule_bindings(
-                None,
-                str(eff.get("signal_source") or "intraday_macd_flow"),
-                eff.get("quant_rule_id"),
-            )
+        eff.pop("rule_bindings", None)
         return eff
+
+    def _effective_pool_cap(self, config: Mapping[str, Any]) -> float:
+        pp = normalize_pool_policy(config.get("pool_policy"))
+        raw_tpc = pp.get("total_pool_cap")
+        if raw_tpc is not None:
+            return round(float(raw_tpc), 2)
+        if "symbol_enabled" in config and getattr(self, "auto_store", None) is not None:
+            try:
+                root_cfg = self.auto_store.get_config()
+                return round(float(root_cfg.get("daily_max_buy_amount") or 50000.0), 2)
+            except Exception:
+                pass
+        return round(float(config.get("daily_max_buy_amount") or 50000.0), 2)
+
+    def _resolve_active_capital_policy(self, config: Mapping[str, Any]) -> dict[str, Any]:
+        mode = str(config.get("capital_policy_mode") or "static_cap").strip() or "static_cap"
+        raw_cfg_pp = normalize_pool_policy(config.get("pool_policy"))
+        policy_row: dict[str, Any] | None = None
+        store = getattr(self, "portfolio_policy_store", None)
+        if store is not None:
+            try:
+                policy_row = store.get_policy(mode)
+            except Exception:
+                policy_row = None
+
+        if policy_row is not None:
+            engine_type = str(policy_row.get("engine_type") or "route_d_plus").strip()
+            stored_params = normalize_pool_policy(policy_row.get("params"))
+            if mode in {"route_d_plus", "route_d_shadow"}:
+                merged_params = {**stored_params, **raw_cfg_pp}
+            else:
+                merged_params = {**stored_params}
+                merged_params["total_pool_cap"] = raw_cfg_pp.get("total_pool_cap")
+            effective_policy = normalize_pool_policy(merged_params)
+            is_shared = engine_type in SHARED_POOL_EXECUTION_ENGINES
+            return {
+                "id": str(policy_row["id"]),
+                "policy_id": str(policy_row["id"]),
+                "name": str(policy_row.get("name") or mode),
+                "description": str(policy_row.get("description") or ""),
+                "source": str(policy_row.get("source") or "builtin"),
+                "engine_type": engine_type,
+                "is_shared_pool": is_shared,
+                "is_shadow": engine_type == "shadow_route_d",
+                "is_builtin": bool(policy_row.get("is_builtin", True)),
+                "enabled": bool(policy_row.get("enabled", True)),
+                "metrics_summary": policy_row.get("metrics_summary"),
+                "params": effective_policy,
+            }
+
+        if mode == "static_cap":
+            engine_type = "static_cap"
+        elif mode == "route_d_shadow":
+            engine_type = "shadow_route_d"
+        else:
+            engine_type = "route_d_plus"
+        return {
+            "id": mode,
+            "policy_id": mode,
+            "name": CAPITAL_POLICY_MODE_LABELS.get(mode, mode),
+            "description": "",
+            "source": "builtin",
+            "engine_type": engine_type,
+            "is_shared_pool": engine_type in SHARED_POOL_EXECUTION_ENGINES,
+            "is_shadow": engine_type == "shadow_route_d",
+            "is_builtin": mode in VALID_CAPITAL_POLICY_MODES,
+            "enabled": True,
+            "metrics_summary": None,
+            "params": raw_cfg_pp,
+        }
+
+    def _is_shared_pool_mode(self, config: Mapping[str, Any]) -> bool:
+        return bool(self._resolve_active_capital_policy(config)["is_shared_pool"])
+
+    def _list_available_capital_policies(self) -> list[dict[str, Any]]:
+        store = getattr(self, "portfolio_policy_store", None)
+        if store is None:
+            return []
+        try:
+            return store.list_policies(include_disabled=False)
+        except Exception:
+            return []
+
+    def _resolve_live_raw_close_weights(
+        self,
+        *,
+        symbols: Sequence[str],
+        sym_cfgs: Mapping[str, Mapping[str, Any]],
+        rules_by_sym: Mapping[str, Mapping[str, Any] | None],
+        ps_by_sym: Mapping[str, Mapping[str, Any]],
+        trade_date: str,
+        held_shares: Mapping[str, int],
+    ) -> tuple[dict[str, float], dict[str, str], dict[str, str]]:
+        raw_weights: dict[str, float] = {}
+        reasons: dict[str, str] = {}
+        ref_dates: dict[str, str] = {}
+        now_ep = self.epoch_fn()
+        in_session, _ = is_in_continuous_auction(self._local_now(), self.is_trading_day)
+        read_series = getattr(self.research_store, "read_series", None)
+
+        for sym in symbols:
+            sym_cfg = sym_cfgs.get(sym) or {}
+            q_rule = rules_by_sym.get(sym)
+            ps = ps_by_sym.get(sym) or {}
+            profile = str(ps.get("engine_profile") or "standard")
+            sh_now = int(held_shares.get(sym) or 0)
+
+            if profile not in {"v9_plus_aggressive", "v9_plus_balanced"} or q_rule is None or not callable(read_series):
+                raw_weights[sym] = 1.0 if sh_now >= 100 else 0.0
+                reasons[sym] = "按当前持仓状态映射" if sh_now >= 100 else "非V9+多因子模型，待信号触发"
+                ref_dates[sym] = trade_date
+                continue
+
+            series_obj: Mapping[str, Any] | None = None
+            eval_hhmm = self._local_now().strftime("%H:%M") if in_session else "15:00"
+            try:
+                series_obj = read_series(sym, trade_date)
+            except Exception:
+                series_obj = None
+            if (not isinstance(series_obj, Mapping) or not series_obj.get("points")) and not in_session:
+                try:
+                    series_obj = read_series(sym)
+                    eval_hhmm = "15:00"
+                except Exception:
+                    series_obj = None
+
+            if not isinstance(series_obj, Mapping) or not series_obj.get("points"):
+                raw_weights[sym] = 0.0
+                reasons[sym] = "暂无可用分时与跨市场样本"
+                ref_dates[sym] = trade_date
+                continue
+
+            actual_td = str(series_obj.get("trade_date") or trade_date)
+            latest_pt_time = str((series_obj.get("points") or [{}])[-1].get("time") or "")
+            cache_key = f"{sym}|{actual_td}|{latest_pt_time}|{q_rule.get('id') or ''}|{eval_hhmm}|{sh_now}"
+            cached = self._live_weight_cache.get(cache_key)
+            if cached is not None and (now_ep - cached[0]) <= 20.0:
+                c_val = cached[1]
+                raw_weights[sym] = float(c_val["raw_weight"])
+                reasons[sym] = str(c_val["reason"])
+                ref_dates[sym] = str(c_val["ref_date"])
+                continue
+
+            wt_val = 0.0
+            reason_txt = "空仓观察"
+            try:
+                today_sigs = self.auto_store.list_today_symbol_signals(actual_td, sym)
+                net_sh, eff_cash, expected_sh = self._v9_live_context_args(sym, sym_cfg, actual_td)
+                v9_ind = evaluate_v9_plus_live_indicators(
+                    self.research_store,
+                    symbol=sym,
+                    trade_date=actual_td,
+                    now_hhmm=eval_hhmm,
+                    cap_limit=float(sym_cfg.get("daily_max_buy_amount") or 50000.0),
+                    rule_spec=q_rule,
+                    pos_sizing=ps,
+                    today_signals=today_sigs,
+                    rolling_shares=net_sh,
+                    broker_available_cash=eff_cash,
+                    expected_ledger_shares=expected_sh,
+                )
+                if isinstance(v9_ind, Mapping):
+                    diag = v9_ind.get("diagnostics") if isinstance(v9_ind.get("diagnostics"), Mapping) else {}
+                    if diag.get("close_target_weight_pct") is not None:
+                        wt_val = max(0.0, float(diag["close_target_weight_pct"]) / 100.0)
+                        reason_txt = str(diag.get("close_target_reason") or "V9+尾盘三态目标权重")
+                    else:
+                        buy_blk = v9_ind.get("buy") if isinstance(v9_ind.get("buy"), Mapping) else {}
+                        if buy_blk.get("matched") and buy_blk.get("target_weight_pct") is not None:
+                            wt_val = max(0.0, float(buy_blk["target_weight_pct"]) / 100.0)
+                            reason_txt = str(buy_blk.get("tier_label") or buy_blk.get("summary") or "V9+日内买点目标权重")
+            except Exception:
+                wt_val = 0.0
+                reason_txt = "信号评估未就绪"
+
+            if len(self._live_weight_cache) > 64:
+                self._live_weight_cache.clear()
+            self._live_weight_cache[cache_key] = (
+                now_ep,
+                {"raw_weight": wt_val, "reason": reason_txt, "ref_date": actual_td},
+            )
+            raw_weights[sym] = wt_val
+            reasons[sym] = reason_txt
+            ref_dates[sym] = actual_td
+
+        return raw_weights, reasons, ref_dates
+
+    def _reconstruct_open_intraday_short_sell(
+        self,
+        *,
+        symbol: str,
+        trade_date: str,
+        config: Mapping[str, Any],
+        pos_sizing: Mapping[str, Any],
+        mark_price: float = 0.0,
+        exclude_signal_id: str | None = None,
+        rolling_shares: int | None = None,
+        has_authoritative_broker: bool = False,
+    ) -> dict[str, Any] | None:
+        """Reconstruct any open intraday V9+ reverse-T short leg needing cash reservation."""
+        engine_profile = str(pos_sizing.get("engine_profile") or "standard")
+        if engine_profile not in {"v9_plus_aggressive", "v9_plus_balanced"}:
+            return None
+        today_sigs = self.auto_store.list_today_symbol_signals(trade_date, symbol)
+        open_leg: dict[str, Any] | None = None
+        for sig in today_sigs:
+            if exclude_signal_id and str(sig.get("id") or "") == exclude_signal_id:
+                continue
+            skey = str(sig.get("signal_key") or "")
+            s_side = str(sig.get("side") or "")
+            s_qty = int(sig.get("quantity") or 0)
+            s_min = str(sig.get("minute") or "")
+            s_px = float(sig.get("limit_price") or sig.get("signal_price") or 0.0)
+            if ":v9-entry:" in skey or ":v9-scalp:" in skey:
+                open_leg = {"side": s_side, "qty": s_qty, "minute": s_min, "signal_price": s_px}
+            elif ":v9-addon:" in skey and open_leg is not None and open_leg["side"] == s_side:
+                prev_q = max(0, int(open_leg["qty"]))
+                add_q = max(0, s_qty)
+                tot_q = prev_q + add_q
+                if tot_q > 0 and open_leg["signal_price"] > 0 and s_px > 0:
+                    open_leg["signal_price"] = (open_leg["signal_price"] * prev_q + s_px * add_q) / tot_q
+                elif s_px > 0:
+                    open_leg["signal_price"] = s_px
+                open_leg["qty"] = tot_q
+            elif ":v9-exit:" in skey or ":v9-close:" in skey or ":t0-flatten:" in skey or ":t0-guard-stop:" in skey:
+                open_leg = None
+
+        if open_leg is None or open_leg["side"] != "sell":
+            return None
+
+        qty = int(open_leg["qty"])
+        if has_authoritative_broker and rolling_shares is not None:
+            profiles = config.get("symbol_profiles")
+            prof = profiles.get(symbol) if isinstance(profiles, Mapping) else None
+            has_rec_base = isinstance(prof, Mapping) and prof.get("reconciled_shares") is not None
+            roll_base = self.auto_store.rolling_symbol_position(
+                symbol,
+                trade_date=trade_date,
+                same_day_turnaround=True,
+                exclude_signal_id=exclude_signal_id,
+            )
+            if has_rec_base or int(roll_base["net_shares"]) > 0:
+                expected_sh = self._expected_symbol_ledger_shares(
+                    symbol,
+                    config,
+                    trade_date,
+                    exclude_signal_id=exclude_signal_id,
+                )
+                ext_delta = int(rolling_shares) - int(expected_sh)
+                if ext_delta > 0:
+                    qty = (max(0, qty - ext_delta) // 100) * 100
+        if qty < 100:
+            return None
+        px = float(mark_price) if mark_price > 0 else float(open_leg["signal_price"] or 0.0)
+        if px <= 0.0:
+            px = self._resolve_symbol_latest_price(symbol, trade_date)
+        reserve_amt = round(qty * px * 1.00005, 2) if px > 0.0 else 0.0
+        return {
+            "qty": qty,
+            "mark_price": round(px, 4) if px > 0.0 else 0.0,
+            "reserve_amount": reserve_amt,
+            "minute": str(open_leg["minute"]),
+        }
+
+    def _gather_pool_state(
+        self,
+        root_config: Mapping[str, Any],
+        trade_date: str,
+        *,
+        exclude_signal_id: str | None = None,
+        broker_acct: Mapping[str, Any] | None = None,
+        include_causal: bool = True,
+    ) -> dict[str, Any]:
+        """Collect consistent per-symbol holdings, short reserves, pool cash, and causal stats."""
+        active_cap = self._resolve_active_capital_policy(root_config)
+        pp = active_cap["params"]
+        pool_cap = self._effective_pool_cap(root_config)
+        symbols: list[str] = []
+        sym_cfgs: dict[str, dict[str, Any]] = {}
+        rules_by_sym: dict[str, Mapping[str, Any] | None] = {}
+        ps_by_sym: dict[str, dict[str, Any]] = {}
+        anchors: dict[str, str] = {}
+
+        raw_syms = [str(s).strip() for s in (root_config.get("symbols") or ["160723"]) if str(s).strip()]
+        for sym in raw_syms:
+            sym_cfg = self._effective_symbol_config(root_config, sym)
+            if not sym_cfg.get("symbol_enabled", True):
+                continue
+            symbols.append(sym)
+            sym_cfgs[sym] = sym_cfg
+            q_rule = self._get_active_quant_rule(sym_cfg) if sym_cfg.get("signal_source") == "quant_rule" else None
+            rules_by_sym[sym] = q_rule
+            ps = normalize_position_sizing(q_rule.get("position_sizing") if q_rule else None)
+            ps_by_sym[sym] = ps
+            anchors[sym] = _resolve_cross_market_anchor(ps)
+
+        explicit_broker = isinstance(broker_acct, Mapping) and bool(broker_acct.get("logged_in"))
+        broker_cash: float | None = None
+        if explicit_broker:
+            metrics = broker_acct.get("metrics") if isinstance(broker_acct.get("metrics"), Mapping) else {}
+            avail_raw = self._parse_opt_float(metrics.get("available_cash"))
+            if avail_raw is not None:
+                captured_at = str(broker_acct.get("captured_at") or "").strip()
+                cash_delta = (
+                    self.auto_store.net_cash_delta_since(since_iso=captured_at, exclude_signal_id=exclude_signal_id)
+                    if captured_at
+                    else 0.0
+                )
+                broker_cash = round(max(0.0, float(avail_raw) + cash_delta), 2)
+        else:
+            broker_cash = self._effective_broker_available_cash(exclude_signal_id=exclude_signal_id)
+
+        held_shares: dict[str, int] = {}
+        prices: dict[str, float] = {}
+        held_mvs: dict[str, float] = {}
+        reserves: dict[str, float] = {}
+
+        for sym in symbols:
+            if explicit_broker:
+                broker_pos = self._find_broker_position_for_symbol(sym, broker_acct)
+                b_sh = max(0, int(self._parse_pos_float(broker_pos.get("shares")))) if broker_pos is not None else 0
+                captured_at = str(broker_acct.get("captured_at") or "").strip()
+                sh_delta = (
+                    self.auto_store.net_signal_delta_since(sym, since_iso=captured_at, exclude_signal_id=exclude_signal_id)
+                    if captured_at
+                    else 0
+                )
+                sh = max(0, b_sh + sh_delta)
+                px = self._resolve_symbol_latest_price(sym, trade_date, broker_pos)
+                if sh <= 0:
+                    mv = 0.0
+                elif broker_pos is not None and sh_delta == 0 and self._parse_pos_float(broker_pos.get("market_value")) > 0:
+                    mv = round(self._parse_pos_float(broker_pos.get("market_value")), 2)
+                    if px <= 0 and sh > 0:
+                        px = round(mv / sh, 4)
+                else:
+                    mv = round(sh * px, 2) if px > 0 else 0.0
+                has_auth = True
+            else:
+                pos = self._effective_symbol_position(
+                    sym,
+                    trade_date=trade_date,
+                    same_day_turnaround=True,
+                    exclude_signal_id=exclude_signal_id,
+                )
+                sh = int(pos["net_shares"])
+                px = float(pos.get("price") or 0.0)
+                mv = round(float(pos["market_value"]), 2)
+                has_auth = pos.get("source") == "broker_account"
+
+            held_shares[sym] = sh
+            prices[sym] = px
+            held_mvs[sym] = mv
+            short_info = self._reconstruct_open_intraday_short_sell(
+                symbol=sym,
+                trade_date=trade_date,
+                config=root_config,
+                pos_sizing=ps_by_sym[sym],
+                mark_price=px,
+                exclude_signal_id=exclude_signal_id,
+                rolling_shares=sh,
+                has_authoritative_broker=has_auth,
+            )
+            reserves[sym] = float(short_info["reserve_amount"]) if short_info is not None else 0.0
+
+        total_held = round(sum(held_mvs.values()), 2)
+        tot_res = round(sum(reserves.values()), 2)
+        pool_cash_left = max(0.0, pool_cap - total_held)
+        pool_avail_cash = min(float(broker_cash), pool_cash_left) if broker_cash is not None else pool_cash_left
+        free_pool_cash = max(0.0, pool_avail_cash - tot_res)
+        pool_equity = round(total_held + pool_avail_cash, 2)
+
+        causal_ctx: dict[str, Any] | None = None
+        if include_causal and symbols:
+            causal_ctx = self._pool_allocator.get_causal_context(
+                self.research_store,
+                rules_by_sym,
+                trade_date,
+                pp,
+            )
+            anchors = {sym: str((causal_ctx.get("anchors") or {}).get(sym) or anchors[sym]) for sym in symbols}
+
+        return {
+            "active_capital_policy": active_cap,
+            "engine_type": active_cap["engine_type"],
+            "policy": pp,
+            "pool_cap": pool_cap,
+            "pool_equity": pool_equity,
+            "symbols": symbols,
+            "sym_cfgs": sym_cfgs,
+            "rules_by_sym": rules_by_sym,
+            "ps_by_sym": ps_by_sym,
+            "anchors": anchors,
+            "held_shares": held_shares,
+            "prices": prices,
+            "held_mvs": held_mvs,
+            "reserves": reserves,
+            "total_held": total_held,
+            "total_reserve_short": tot_res,
+            "broker_cash": broker_cash,
+            "pool_cash_left": round(pool_cash_left, 2),
+            "available_pool_cash": round(pool_avail_cash, 2),
+            "free_pool_cash": round(free_pool_cash, 2),
+            "causal_ctx": causal_ctx,
+        }
+
+    def _compute_pool_allocation_summary(
+        self,
+        config: Mapping[str, Any],
+        trade_date: str,
+        *,
+        broker_acct: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        state = self._gather_pool_state(
+            config,
+            trade_date,
+            broker_acct=broker_acct,
+            include_causal=True,
+        )
+        active_cap = state["active_capital_policy"]
+        engine_type = str(active_cap["engine_type"])
+        is_shadow = bool(active_cap["is_shadow"])
+        is_shared = bool(active_cap["is_shared_pool"])
+        symbols = state["symbols"]
+        causal_ctx = state["causal_ctx"] or {}
+        pp = state["policy"]
+        pool_cap = float(state["pool_cap"])
+        static_caps = {
+            sym: float((state["sym_cfgs"].get(sym) or {}).get("daily_max_buy_amount") or 0.0)
+            for sym in symbols
+        }
+        if not symbols:
+            return {
+                "policy_id": active_cap["policy_id"],
+                "policy_name": active_cap["name"],
+                "engine_type": engine_type,
+                "is_shared_pool": is_shared,
+                "shadow_only": is_shadow,
+                "pool_cap": pool_cap,
+                "pool_equity": state["pool_equity"],
+                "total_held_market_value": 0.0,
+                "available_pool_cash": state["available_pool_cash"],
+                "total_short_reserve_cash": 0.0,
+                "free_pool_cash": state["free_pool_cash"],
+                "portfolio_sigma_cap_pct": pp.get("sigma_cap_pct"),
+                "equal_weight_sigma_pct": 0.0,
+                "current_portfolio_sigma_pct": 0.0,
+                "total_target_position_pct": 0.0,
+                "total_target_capital_amount": 0.0,
+                "unallocated_reserve_pct": 100.0,
+                "unallocated_reserve_amount": round(pool_cap, 2),
+                "cache_hit": False,
+                "symbols": {},
+            }
+
+        raw_live_wts, signal_reasons, ref_dates = self._resolve_live_raw_close_weights(
+            symbols=symbols,
+            sym_cfgs=state["sym_cfgs"],
+            rules_by_sym=state["rules_by_sym"],
+            ps_by_sym=state["ps_by_sym"],
+            trade_date=trade_date,
+            held_shares=state["held_shares"],
+        )
+        ov_full = self._pool_allocator.compute_overnight_weights(
+            symbols=symbols,
+            raw_weights={sym: 1.0 for sym in symbols},
+            anchors=state["anchors"],
+            causal_ctx=causal_ctx,
+            policy=pp,
+            engine_type=engine_type,
+            static_caps=static_caps,
+            pool_cap=pool_cap,
+        )
+        ov_cur = self._pool_allocator.compute_overnight_weights(
+            symbols=symbols,
+            raw_weights=raw_live_wts,
+            anchors=state["anchors"],
+            causal_ctx=causal_ctx,
+            policy=pp,
+            engine_type=engine_type,
+            static_caps=static_caps,
+            pool_cap=pool_cap,
+        )
+        target_pos_pcts = {
+            sym: round(float(ov_cur["alloc_weights"].get(sym) or 0.0) * 100.0, 2)
+            for sym in symbols
+        }
+        target_cap_amts = {
+            sym: round(pool_cap * float(ov_cur["alloc_weights"].get(sym) or 0.0), 2)
+            for sym in symbols
+        }
+        total_target_cap = round(sum(target_cap_amts.values()), 2)
+        total_target_pct = round(sum(target_pos_pcts.values()), 2)
+
+        sym_details: dict[str, Any] = {}
+        for sym in symbols:
+            cap_info = self._pool_allocator.compute_symbol_intraday_cap(
+                symbol=sym,
+                symbols=symbols,
+                held_mvs=state["held_mvs"],
+                pool_equity=state["pool_equity"],
+                anchors=state["anchors"],
+                causal_ctx=causal_ctx,
+                policy=pp,
+                engine_type=engine_type,
+                static_caps=static_caps,
+            )
+            full_pct = round(float(ov_full["alloc_weights"].get(sym) or 0.0) * 100.0, 2)
+            full_cap = round(pool_cap * float(ov_full["alloc_weights"].get(sym) or 0.0), 2)
+            held_mv = round(float(state["held_mvs"][sym]), 2)
+            tgt_pct = target_pos_pcts[sym]
+            tgt_amt = target_cap_amts[sym]
+            actual_pct = round((held_mv / pool_cap) * 100.0, 2) if pool_cap > 0 else 0.0
+            deployed_pct = round((tgt_amt / total_target_cap) * 100.0, 2) if total_target_cap > 0 else 0.0
+            sym_details[sym] = {
+                "anchor": state["anchors"][sym],
+                "holding_market_value": held_mv,
+                "actual_holding_pct": actual_pct,
+                "static_capital_cap": round(static_caps[sym], 2),
+                "dynamic_intraday_cap": cap_info["cap_amount"],
+                "dynamic_intraday_cap_pct": round(cap_info["r_max"] * 100.0, 2),
+                "intraday_room": cap_info["room_amount"],
+                "equal_weight_overnight_pct": full_pct,
+                "full_signal_position_pct": full_pct,
+                "full_signal_capital_amount": full_cap,
+                "raw_signal_weight_pct": round(float(raw_live_wts.get(sym) or 0.0) * 100.0, 2),
+                "target_position_pct": tgt_pct,
+                "target_capital_share_pct": tgt_pct,
+                "deployed_share_pct": deployed_pct,
+                "target_capital_amount": tgt_amt,
+                "signal_reason": signal_reasons.get(sym, ""),
+                "signal_reference_date": ref_dates.get(sym, trade_date),
+                "m_rec": cap_info["m_rec"],
+                "sentry": bool(cap_info["sentry"] > 0),
+                "ewma_vol_pct": round(float((causal_ctx.get("vols") or {}).get(sym, 3.20)), 2),
+                "reserve_short_cash": round(state["reserves"].get(sym, 0.0), 2),
+                "history_days": int((causal_ctx.get("history_days") or {}).get(sym, 0)),
+            }
+        return {
+            "policy_id": active_cap["policy_id"],
+            "policy_name": active_cap["name"],
+            "engine_type": engine_type,
+            "is_shared_pool": is_shared,
+            "shadow_only": is_shadow,
+            "pool_cap": round(pool_cap, 2),
+            "pool_equity": state["pool_equity"],
+            "total_held_market_value": state["total_held"],
+            "available_pool_cash": state["available_pool_cash"],
+            "total_short_reserve_cash": state["total_reserve_short"],
+            "free_pool_cash": state["free_pool_cash"],
+            "portfolio_sigma_cap_pct": pp.get("sigma_cap_pct"),
+            "equal_weight_sigma_pct": ov_full["portfolio_sigma_pct"],
+            "current_portfolio_sigma_pct": ov_cur["portfolio_sigma_pct"],
+            "total_target_position_pct": round(total_target_pct, 2),
+            "total_target_capital_amount": total_target_cap,
+            "unallocated_reserve_pct": round(max(0.0, 100.0 - total_target_pct), 2),
+            "unallocated_reserve_amount": round(max(0.0, pool_cap - total_target_cap), 2),
+            "cache_hit": bool(causal_ctx.get("cache_hit")),
+            "symbols": sym_details,
+        }
+
+    def _resolve_route_d_execution_budget(
+        self,
+        *,
+        symbol: str,
+        root_config: Mapping[str, Any],
+        trade_date: str,
+        exclude_signal_id: str | None = None,
+        is_short_cover: bool = False,
+        is_close_rebalance: bool = False,
+        dynamic_cap_hint: float | None = None,
+        pool_state: Mapping[str, Any] | None = None,
+    ) -> tuple[float, float, dict[str, Any]]:
+        """Resolve dynamic `(cap_limit, avail_cash, state)` for a Route D++ pool order."""
+        state = (
+            dict(pool_state)
+            if isinstance(pool_state, Mapping)
+            else self._gather_pool_state(
+                root_config,
+                trade_date,
+                exclude_signal_id=exclude_signal_id,
+                include_causal=True,
+            )
+        )
+        pool_cap = float(state["pool_cap"])
+        held_mvs = state["held_mvs"]
+        reserves = state["reserves"]
+        this_held = float(held_mvs.get(symbol, 0.0))
+        other_held = sum(float(v) for k, v in held_mvs.items() if k != symbol)
+        total_held = this_held + other_held
+        other_res = sum(float(v) for k, v in reserves.items() if k != symbol)
+        tot_res = float(state["total_reserve_short"])
+        res_to_deduct = other_res if (is_short_cover or is_close_rebalance) else tot_res
+
+        broker_cash = state["broker_cash"]
+        pool_cash_left = max(0.0, pool_cap - total_held - res_to_deduct)
+        if broker_cash is not None:
+            eff_avail_cash = min(max(0.0, float(broker_cash) - res_to_deduct), pool_cash_left)
+        else:
+            eff_avail_cash = pool_cash_left
+
+        pool_room_cap = max(0.0, pool_cap - other_held - res_to_deduct)
+        if is_short_cover:
+            sym_cap = pool_room_cap
+        elif dynamic_cap_hint is not None and float(dynamic_cap_hint) > 0.0:
+            sym_cap = min(pool_room_cap, float(dynamic_cap_hint))
+        elif is_close_rebalance:
+            sym_cap = pool_room_cap
+        else:
+            causal_ctx = state.get("causal_ctx")
+            if causal_ctx is None:
+                causal_ctx = self._pool_allocator.get_causal_context(
+                    self.research_store,
+                    state["rules_by_sym"],
+                    trade_date,
+                    state["policy"],
+                )
+            cap_info = self._pool_allocator.compute_symbol_intraday_cap(
+                symbol=symbol,
+                symbols=state["symbols"],
+                held_mvs=held_mvs,
+                pool_equity=float(state["pool_equity"]),
+                anchors=state["anchors"],
+                causal_ctx=causal_ctx,
+                policy=state["policy"],
+                engine_type=str(state.get("engine_type") or "route_d_plus"),
+            )
+            sym_cap = min(pool_room_cap, max(this_held, float(cap_info["cap_amount"]) * 1.03))
+        return round(sym_cap, 2), round(eff_avail_cash, 2), state
 
     def _build_capital_ledger(
         self,
@@ -2232,26 +2779,62 @@ class AutoTradeEngine:
             else None
         )
 
-        for r in rows:
-            other_occ = round(max(0.0, total_occ - float(r["occupied_cash"])), 2)
-            r["other_occupied_cash"] = other_occ
-            if available_cash is not None:
-                rem = round(max(0.0, float(available_cash) - other_occ), 2)
-                r["remaining_allocatable_cash"] = rem
-                r["max_allowed_cap"] = round(float(r["holding_market_value"]) + rem, 2)
-                r["over_allocated_amount"] = round(max(0.0, float(r["occupied_cash"]) - rem), 2)
+        active_cap = self._resolve_active_capital_policy(config)
+        cap_mode = active_cap["policy_id"]
+        pool_allocation = self._compute_pool_allocation_summary(
+            config,
+            trade_date,
+            broker_acct=acct if broker_connected else None,
+        )
+        enabled_hold_total = round(sum(float(r["holding_market_value"]) for r in rows if r["enabled"]), 2)
+        pool_below_holding = 0.0
 
-        unallocated_cash = (
-            round(float(available_cash) - total_occ, 2) if available_cash is not None else None
-        )
-        conservation_ok = (
-            (unallocated_cash >= -0.01 and all(r["below_holding_amount"] <= 0.01 for r in rows))
-            if unallocated_cash is not None
-            else all(r["below_holding_amount"] <= 0.01 for r in rows)
-        )
+        if active_cap["is_shared_pool"]:
+            pool_cap = self._effective_pool_cap(config)
+            has_enabled = any(r["enabled"] for r in rows)
+            total_cap = round(pool_cap, 2) if has_enabled else 0.0
+            total_occ = round(max(0.0, total_cap - enabled_hold_total), 2) if has_enabled else 0.0
+            pool_below_holding = round(max(0.0, enabled_hold_total - total_cap), 2) if has_enabled else 0.0
+            sym_dyn_map = (pool_allocation or {}).get("symbols") or {}
+            for r in rows:
+                sym_dyn = sym_dyn_map.get(r["symbol"]) or {}
+                r["static_capital_cap"] = r["capital_cap"]
+                r["dynamic_capital_cap"] = sym_dyn.get("dynamic_intraday_cap")
+                r["reserve_short_cash"] = sym_dyn.get("reserve_short_cash", 0.0)
+                r["below_holding_amount"] = 0.0
+                r["over_allocated_amount"] = 0.0
+                r["other_occupied_cash"] = 0.0
+                if available_cash is not None:
+                    r["remaining_allocatable_cash"] = round(max(0.0, float(available_cash) - total_occ), 2)
+                    r["max_allowed_cap"] = total_cap
+            unallocated_cash = (
+                round(float(available_cash) - total_occ, 2) if available_cash is not None else None
+            )
+            conservation_ok = (pool_below_holding <= 0.01) and (
+                unallocated_cash is None or unallocated_cash >= -0.01
+            )
+        else:
+            for r in rows:
+                other_occ = round(max(0.0, total_occ - float(r["occupied_cash"])), 2)
+                r["other_occupied_cash"] = other_occ
+                if available_cash is not None:
+                    rem = round(max(0.0, float(available_cash) - other_occ), 2)
+                    r["remaining_allocatable_cash"] = rem
+                    r["max_allowed_cap"] = round(float(r["holding_market_value"]) + rem, 2)
+                    r["over_allocated_amount"] = round(max(0.0, float(r["occupied_cash"]) - rem), 2)
+
+            unallocated_cash = (
+                round(float(available_cash) - total_occ, 2) if available_cash is not None else None
+            )
+            conservation_ok = (
+                (unallocated_cash >= -0.01 and all(r["below_holding_amount"] <= 0.01 for r in rows))
+                if unallocated_cash is not None
+                else all(r["below_holding_amount"] <= 0.01 for r in rows)
+            )
         return {
             "broker_connected": broker_connected,
             "captured_at": captured_at,
+            "capital_policy_mode": cap_mode,
             "total_assets": round(float(total_assets), 2) if total_assets is not None else None,
             "available_cash": round(float(available_cash), 2) if available_cash is not None else None,
             "total_market_value": round(float(total_market_value), 2) if total_market_value is not None else None,
@@ -2260,7 +2843,9 @@ class AutoTradeEngine:
             "total_capital_cap": total_cap,
             "total_occupied_cash": total_occ,
             "unallocated_cash": unallocated_cash,
+            "pool_below_holding_amount": pool_below_holding,
             "conservation_ok": conservation_ok,
+            "pool_allocation": pool_allocation,
             "rows": rows,
         }
 
@@ -2518,7 +3103,13 @@ class AutoTradeEngine:
         if config["signal_source"] == "quant_rule" and active_rule is not None:
             source_label = f"量化规则 · {active_rule['name']}"
         pos_usage = self._compute_portfolio_position_usage(config, trade_date)
-        cap_val = float(config["daily_max_buy_amount"])
+        active_cap = self._resolve_active_capital_policy(config)
+        cap_pol_mode = active_cap["policy_id"]
+        cap_val = (
+            self._effective_pool_cap(config)
+            if active_cap["is_shared_pool"]
+            else float(config["daily_max_buy_amount"])
+        )
         is_model_auto = str(config.get("sizing_mode") or "fixed_qty") == "model_auto"
         cfg_syms = [str(s).strip() for s in (config.get("symbols") or ["160723"]) if str(s).strip()]
         use_base_numerator = is_model_auto and (
@@ -2529,6 +3120,10 @@ class AutoTradeEngine:
         capital_ledger = self._build_capital_ledger(config, trade_date)
         return {
             "config": config,
+            "capital_policy_mode": cap_pol_mode,
+            "capital_policy_mode_label": active_cap["name"],
+            "active_capital_policy": active_cap,
+            "available_capital_policies": self._list_available_capital_policies(),
             "signal_source_label": source_label,
             "execution_mode_label": EXECUTION_MODE_LABELS.get(config["execution_mode"], config["execution_mode"]),
             "session": {
@@ -2559,6 +3154,7 @@ class AutoTradeEngine:
             "executor_available": self.trade_executor is not None,
             "last_poll_at": self.last_poll_at,
             "viewer_active": self.is_viewer_active(),
+            "data_guards": dict(self._last_data_guard_by_symbol),
         }
 
     def update_config(self, patch: Mapping[str, Any]) -> dict[str, Any]:
@@ -2604,6 +3200,36 @@ class AutoTradeEngine:
         target_symbol: str | None = None,
     ) -> dict[str, Any]:
         current = self.auto_store.get_config()
+        patch = dict(patch)
+        if "capital_policy_mode" in patch:
+            req_mode = str(patch.get("capital_policy_mode") or "").strip()
+            store = getattr(self, "portfolio_policy_store", None)
+            pol_row = store.get_policy(req_mode) if store is not None else None
+            if req_mode not in VALID_CAPITAL_POLICY_MODES and pol_row is None:
+                raise TradeExecutionError(
+                    "TRADE_INVALID_CAPITAL_POLICY",
+                    f"未找到资金配比策略: {req_mode}",
+                    422,
+                )
+            cur_mode = str(current.get("capital_policy_mode") or "static_cap").strip()
+            if pol_row is not None and req_mode != cur_mode:
+                patch_pool = patch.get("pool_policy") if isinstance(patch.get("pool_policy"), Mapping) else {}
+                cur_pool = current.get("pool_policy") if isinstance(current.get("pool_policy"), Mapping) else {}
+                is_target_shared = str(pol_row.get("engine_type") or "") in SHARED_POOL_EXECUTION_ENGINES
+                if "total_pool_cap" in patch_pool:
+                    kept_tpc = patch_pool.get("total_pool_cap")
+                elif cur_pool.get("total_pool_cap") is not None:
+                    kept_tpc = cur_pool.get("total_pool_cap")
+                elif is_target_shared:
+                    kept_tpc = round(float(patch.get("daily_max_buy_amount") or current.get("daily_max_buy_amount") or 50000.0), 2)
+                else:
+                    kept_tpc = None
+                synced_pp = normalize_pool_policy(pol_row.get("params"))
+                if req_mode in {"route_d_plus", "route_d_shadow"} and patch_pool:
+                    synced_pp = normalize_pool_policy({**synced_pp, **dict(patch_pool)})
+                synced_pp["total_pool_cap"] = float(kept_tpc) if kept_tpc is not None else None
+                patch["pool_policy"] = synced_pp
+
         candidate = SQLiteAutoTradeStore._build_merged_candidate(current, patch)
         acct_snapshot: Mapping[str, Any] | None = None
 
@@ -2622,26 +3248,41 @@ class AutoTradeEngine:
                 clean_target = target_symbol.strip()
                 rows.sort(key=lambda item: 0 if item["symbol"] == clean_target else 1)
 
-            for row in rows:
-                if row["enabled"] and float(row["below_holding_amount"]) > 0.01:
+            if self._is_shared_pool_mode(candidate):
+                pool_below = float(ledger.get("pool_below_holding_amount") or 0.0)
+                if pool_below > 0.01:
                     raise TradeExecutionError(
                         "TRADE_CAP_BELOW_HOLDING",
-                        f"{row['name']}({row['symbol']}) 柜台实盘持仓市值 ¥{row['holding_market_value']:,.2f}（{row['broker_shares']}股）高于所设总上限 ¥{row['capital_cap']:,.2f}，请至少设为 ¥{math.ceil(row['holding_market_value']):,}",
+                        f"量化组合实盘总持仓市值 ¥{ledger['quant_holding_market_value']:,.2f} 高于共享资金池总上限 ¥{ledger['total_capital_cap']:,.2f}，请至少设为 ¥{math.ceil(ledger['quant_holding_market_value']):,}",
                         409,
                     )
-            for row in rows:
-                if row["enabled"] and float(row["over_allocated_amount"]) > 0.01:
+                if float(ledger.get("unallocated_cash") or 0.0) < -0.01:
                     raise TradeExecutionError(
                         "TRADE_CASH_OVER_ALLOCATED",
-                        f"可用余额校验未通过：国泰海通实时可用 ¥{ledger['available_cash']:,.2f}，扣除其他量化已占 ¥{row['other_occupied_cash']:,.2f} 后 {row['symbol']} 最多可占现金 ¥{row['remaining_allocatable_cash']:,.2f}（最高总上限 ¥{row['max_allowed_cap']:,.2f}），当前拟占 ¥{row['occupied_cash']:,.2f} 超出 ¥{row['over_allocated_amount']:,.2f}",
+                        f"共享资金池占用可用余额合计 ¥{ledger['total_occupied_cash']:,.2f} 超出账户可用 ¥{ledger['available_cash']:,.2f}",
                         409,
                     )
-            if float(ledger.get("unallocated_cash") or 0.0) < -0.01:
-                raise TradeExecutionError(
-                    "TRADE_CASH_OVER_ALLOCATED",
-                    f"全部量化标的占用可用余额合计 ¥{ledger['total_occupied_cash']:,.2f} 超出账户可用 ¥{ledger['available_cash']:,.2f}",
-                    409,
-                )
+            else:
+                for row in rows:
+                    if row["enabled"] and float(row["below_holding_amount"]) > 0.01:
+                        raise TradeExecutionError(
+                            "TRADE_CAP_BELOW_HOLDING",
+                            f"{row['name']}({row['symbol']}) 柜台实盘持仓市值 ¥{row['holding_market_value']:,.2f}（{row['broker_shares']}股）高于所设总上限 ¥{row['capital_cap']:,.2f}，请至少设为 ¥{math.ceil(row['holding_market_value']):,}",
+                            409,
+                        )
+                for row in rows:
+                    if row["enabled"] and float(row["over_allocated_amount"]) > 0.01:
+                        raise TradeExecutionError(
+                            "TRADE_CASH_OVER_ALLOCATED",
+                            f"可用余额校验未通过：国泰海通实时可用 ¥{ledger['available_cash']:,.2f}，扣除其他量化已占 ¥{row['other_occupied_cash']:,.2f} 后 {row['symbol']} 最多可占现金 ¥{row['remaining_allocatable_cash']:,.2f}（最高总上限 ¥{row['max_allowed_cap']:,.2f}），当前拟占 ¥{row['occupied_cash']:,.2f} 超出 ¥{row['over_allocated_amount']:,.2f}",
+                            409,
+                        )
+                if float(ledger.get("unallocated_cash") or 0.0) < -0.01:
+                    raise TradeExecutionError(
+                        "TRADE_CASH_OVER_ALLOCATED",
+                        f"全部量化标的占用可用余额合计 ¥{ledger['total_occupied_cash']:,.2f} 超出账户可用 ¥{ledger['available_cash']:,.2f}",
+                        409,
+                    )
 
             captured_at = ledger.get("captured_at")
             next_profiles = copy.deepcopy(candidate.get("symbol_profiles") or {})
@@ -2676,11 +3317,7 @@ class AutoTradeEngine:
 
         existing_profiles = copy.deepcopy(current.get("symbol_profiles") or {})
         base_prof = dict(existing_profiles.get(clean_sym) or _normalize_symbol_profile(clean_sym, None, current))
-        if (
-            ("signal_source" in profile_patch or "quant_rule_id" in profile_patch)
-            and "rule_bindings" not in profile_patch
-        ):
-            base_prof.pop("rule_bindings", None)
+        base_prof.pop("rule_bindings", None)
         merged_prof = _normalize_symbol_profile(clean_sym, {**base_prof, **dict(profile_patch)}, current)
         existing_profiles[clean_sym] = merged_prof
 
@@ -2940,6 +3577,10 @@ class AutoTradeEngine:
             same_day_turnaround=True,
         )
         eff_cash = self._effective_broker_available_cash()
+        route_d_cash = config.get("_route_d_avail_cash")
+        if route_d_cash is not None:
+            rd_val = max(0.0, float(route_d_cash))
+            eff_cash = min(eff_cash, rd_val) if eff_cash is not None else rd_val
         expected_sh = (
             self._expected_symbol_ledger_shares(symbol, config, trade_date)
             if roll_pos["source"] == "broker_account"
@@ -2951,6 +3592,7 @@ class AutoTradeEngine:
         """Evaluate current market indicators and separated buy/sell checklist for Live Trade UI."""
         local_now = self._local_now()
         trade_date = local_now.strftime("%Y%m%d")
+        in_session, _ = is_in_continuous_auction(local_now, self.is_trading_day)
         config = self.auto_store.get_config()
 
         target_symbol = str(symbol or "").strip().upper()
@@ -2970,12 +3612,21 @@ class AutoTradeEngine:
         selected_rule = self._get_active_quant_rule(sym_cfg) if signal_source == "quant_rule" else None
 
         series: Mapping[str, Any] | None = None
+        using_historical_fallback = False
         read_series = getattr(self.research_store, "read_series", None)
         if callable(read_series):
             try:
                 series = read_series(target_symbol, trade_date)
             except Exception:
                 series = None
+            if (not isinstance(series, Mapping) or not series.get("points")) and not in_session:
+                try:
+                    fallback_series = read_series(target_symbol)
+                    if isinstance(fallback_series, Mapping) and fallback_series.get("points"):
+                        series = fallback_series
+                        using_historical_fallback = True
+                except Exception:
+                    pass
 
         name, market = self._resolve_symbol_meta(
             target_symbol,
@@ -2984,6 +3635,7 @@ class AutoTradeEngine:
         )
         points: list[dict[str, Any]] = []
         actual_td = str(series.get("trade_date") or trade_date) if isinstance(series, Mapping) else trade_date
+        eval_hhmm = "15:00" if using_historical_fallback else local_now.strftime("%H:%M")
         if isinstance(series, Mapping) and series.get("points"):
             points = _enrich_points_with_fund_flow(
                 self.research_store,
@@ -3011,6 +3663,8 @@ class AutoTradeEngine:
             "name": name,
             "market": market,
             "trade_date": actual_td,
+            "snapshot_trade_date": actual_td,
+            "is_historical_close_snapshot": using_historical_fallback,
             "evaluated_at": local_now.isoformat(timespec="seconds"),
             "latest_minute": str(points[-1].get("time") or "") if points else "",
             "signal_source": signal_source,
@@ -3018,7 +3672,11 @@ class AutoTradeEngine:
             "strategy_name": strategy_name,
             "engine_profile": engine_profile,
             "data_ready": bool(points),
-            "note": "" if points else "当前标的暂无分时采样数据",
+            "note": (
+                f"当前非连续竞价时段，展示最近交易日 {actual_td} 收盘快照指标"
+                if (points and using_historical_fallback)
+                else ("" if points else "当前标的暂无分时采样数据")
+            ),
             "market_indicators": [],
             "buy": {"matched": False, "summary": "暂未触发买点", "tier_label": None, "target_weight_pct": None, "conditions": []},
             "sell": {"matched": False, "summary": "暂未触发卖点", "tier_label": None, "target_weight_pct": None, "conditions": []},
@@ -3030,18 +3688,147 @@ class AutoTradeEngine:
                 base_resp["data_ready"] = False
                 base_resp["note"] = "未配置可用量化规则"
                 return base_resp
+            is_tday = self.is_trading_day(local_now.date()) if self.is_trading_day is not None else (local_now.weekday() < 5)
+            guard = check_rule_live_data_guard(
+                self.research_store,
+                selected_rule,
+                symbol=target_symbol,
+                trade_date=actual_td if using_historical_fallback else trade_date,
+                actual_trade_date=actual_td,
+                points=points,
+                now_dt=local_now,
+                is_trading_day=False if using_historical_fallback else is_tday,
+            )
+            self._last_data_guard_by_symbol[target_symbol] = guard
+            base_resp["data_guard"] = guard
+            base_resp["rule_data_sources"] = list(selected_rule.get("data_sources") or [])
             q_pos_sizing = normalize_position_sizing(selected_rule.get("position_sizing"))
             q_profile = str(q_pos_sizing.get("engine_profile") or "dsl_rule")
             base_resp["engine_profile"] = q_profile
+
+            def _apply_live_guard_block(resp_payload: dict[str, Any]) -> dict[str, Any]:
+                if not guard.get("blocked"):
+                    return resp_payload
+                enriched_payload = dict(resp_payload)
+                if not enriched_payload.get("market_indicators") and points:
+                    prem_row, prem_rate = self._lookup_premium_row(target_symbol)
+                    enriched_payload["market_indicators"] = self._build_point_market_indicators(
+                        points=points,
+                        prem_row=prem_row,
+                        prem_rate=prem_rate,
+                        series=series,
+                    )
+                guard_cond = {
+                    "id": "data-source-guard",
+                    "label": "盘中数据源完整性熔断门禁",
+                    "matched": False,
+                    "current_value": ", ".join(guard.get("blocking_sources") or []) or "数据源缺失",
+                    "target_rule": "规则依赖全部盘中必需数据源实时就绪",
+                    "detail": guard["reason"],
+                }
+                buy_blk = dict(enriched_payload.get("buy") or {})
+                sell_blk = dict(enriched_payload.get("sell") or {})
+                buy_blk["matched"] = False
+                buy_blk["summary"] = f"数据源缺失严禁新开仓：{guard['reason']}"
+                buy_blk["conditions"] = [guard_cond, *list(buy_blk.get("conditions") or [])]
+
+                if guard.get("allow_protective_exit"):
+                    now_hhmm = local_now.strftime("%H:%M")
+                    close_hhmm = str(q_pos_sizing.get("close_flatten_time") or "14:53")
+                    prot_item: dict[str, Any] | None = None
+                    if close_hhmm <= now_hhmm <= "14:55":
+                        prot_item = self._build_protective_close_flatten_item(
+                            symbol=target_symbol,
+                            selected_rule=selected_rule,
+                            pos_sizing=q_pos_sizing,
+                            guard=guard,
+                            trade_date=actual_td,
+                            now_hhmm=now_hhmm,
+                            config=sym_cfg,
+                            points=points,
+                        )
+                    if prot_item is None and points and len(points) >= 2:
+                        prot_cands = self._evaluate_protective_t0_exit_candidates(
+                            symbol=target_symbol,
+                            selected_rule=selected_rule,
+                            pos_sizing=q_pos_sizing,
+                            guard=guard,
+                            trade_date=actual_td,
+                            points=points,
+                            name=name,
+                            market=market,
+                            config=sym_cfg,
+                        )
+                        prot_item = prot_cands[0] if prot_cands else None
+                    if prot_item is not None:
+                        prot_cond = {
+                            "id": "t0-protective-exit",
+                            "label": "T+0 缺数保护平仓通道",
+                            "matched": True,
+                            "current_value": f"卖 {prot_item['qty_override']} 股 @ {prot_item['price']}",
+                            "target_rule": f"A股1m主源正常时允许已持日内仓位硬止损与{close_hhmm}平T避险",
+                            "detail": str(prot_item["rule_summary"]),
+                        }
+                        sell_blk["matched"] = True
+                        sell_blk["summary"] = str(prot_item["rule_summary"])
+                        sell_blk["tier_label"] = str(prot_item.get("sizing_tier") or "缺数保护平T")
+                        sell_blk["target_weight_pct"] = 100.0
+                        sell_blk["conditions"] = [prot_cond, guard_cond, *list(sell_blk.get("conditions") or [])]
+                    else:
+                        standby_cond = {
+                            "id": "t0-protective-exit-standby",
+                            "label": "T+0 缺数保护平仓通道",
+                            "matched": True,
+                            "current_value": "待命保护中",
+                            "target_rule": f"A股1m主源正常，持有日内T+0多仓时保留硬止损与{close_hhmm}平T通道",
+                            "detail": "当前未触发硬止损且未到尾盘平T时段",
+                        }
+                        sell_blk["matched"] = False
+                        sell_blk["summary"] = f"常规卖点已暂停（T+0硬止损与{close_hhmm}平T保护待命）：{guard['reason']}"
+                        sell_blk["conditions"] = [guard_cond, standby_cond, *list(sell_blk.get("conditions") or [])]
+                else:
+                    sell_blk["matched"] = False
+                    sell_blk["summary"] = f"数据源缺失保护暂停：{guard['reason']}"
+                    sell_blk["conditions"] = [guard_cond, *list(sell_blk.get("conditions") or [])]
+                return {
+                    **enriched_payload,
+                    "data_ready": False,
+                    "note": guard["reason"],
+                    "buy": buy_blk,
+                    "sell": sell_blk,
+                }
+
             if q_profile in {"v9_plus_aggressive", "v9_plus_balanced"}:
+                if guard.get("blocked"):
+                    base_resp["data_ready"] = False
+                    base_resp["note"] = guard["reason"]
+                    return _apply_live_guard_block(base_resp)
                 today_sigs = self.auto_store.list_today_symbol_signals(actual_td, target_symbol)
-                net_sh, eff_cash, expected_sh = self._v9_live_context_args(target_symbol, sym_cfg, actual_td)
+                eff_eval_cfg = dict(sym_cfg)
+                active_cap = self._resolve_active_capital_policy(config)
+                cap_pol_mode = active_cap["policy_id"]
+                is_shared_pool = bool(active_cap["is_shared_pool"])
+                pool_sym_meta: dict[str, Any] | None = None
+                if is_shared_pool or active_cap["is_shadow"]:
+                    pool_summary = self._compute_pool_allocation_summary(config, actual_td)
+                    if isinstance(pool_summary, Mapping):
+                        pool_sym_meta = (pool_summary.get("symbols") or {}).get(target_symbol)
+                    if is_shared_pool:
+                        dyn_cap, dyn_cash, _ = self._resolve_route_d_execution_budget(
+                            symbol=target_symbol,
+                            root_config=config,
+                            trade_date=actual_td,
+                            is_short_cover=bool(pool_sym_meta and float(pool_sym_meta.get("reserve_short_cash") or 0.0) > 0),
+                        )
+                        eff_eval_cfg["daily_max_buy_amount"] = dyn_cap
+                        eff_eval_cfg["_route_d_avail_cash"] = dyn_cash
+                net_sh, eff_cash, expected_sh = self._v9_live_context_args(target_symbol, eff_eval_cfg, actual_td)
                 v9_ind = evaluate_v9_plus_live_indicators(
                     self.research_store,
                     symbol=target_symbol,
                     trade_date=actual_td,
-                    now_hhmm=local_now.strftime("%H:%M"),
-                    cap_limit=float(sym_cfg.get("daily_max_buy_amount") or 50000.0),
+                    now_hhmm=eval_hhmm,
+                    cap_limit=float(eff_eval_cfg.get("daily_max_buy_amount") or 50000.0),
                     rule_spec=selected_rule,
                     pos_sizing=q_pos_sizing,
                     today_signals=today_sigs,
@@ -3051,19 +3838,55 @@ class AutoTradeEngine:
                 )
                 if v9_ind is None:
                     base_resp["data_ready"] = False
-                    base_resp["note"] = "V9+ 日内布伦特/分时样本尚在初始化，请稍候重试"
-                    return base_resp
-                return {**base_resp, **v9_ind}
+                    if guard.get("blocked"):
+                        base_resp["note"] = guard["reason"]
+                    elif not points and not in_session:
+                        base_resp["note"] = "非交易时段且暂无历史分时样本，请稍候或执行历史数据回补"
+                    else:
+                        base_resp["note"] = "V9+ 日内布伦特/分时样本尚在初始化，请稍候重试"
+                    return _apply_live_guard_block(base_resp)
+                if isinstance(v9_ind.get("diagnostics"), dict):
+                    diag_mut = dict(v9_ind["diagnostics"])
+                    diag_mut["capital_policy_mode"] = cap_pol_mode
+                    diag_mut["capital_policy_engine"] = active_cap["engine_type"]
+                    diag_mut["is_historical_close_snapshot"] = using_historical_fallback
+                    if isinstance(pool_sym_meta, Mapping):
+                        diag_mut["dynamic_capital_cap"] = pool_sym_meta.get("dynamic_intraday_cap")
+                        diag_mut["dynamic_capital_cap_pct"] = pool_sym_meta.get("dynamic_intraday_cap_pct")
+                        diag_mut["target_position_pct"] = pool_sym_meta.get("target_position_pct")
+                        diag_mut["target_capital_amount"] = pool_sym_meta.get("target_capital_amount")
+                        diag_mut["m_rec"] = pool_sym_meta.get("m_rec")
+                        diag_mut["reserve_short_cash"] = pool_sym_meta.get("reserve_short_cash")
+                    v9_ind = {**v9_ind, "diagnostics": diag_mut}
+                if using_historical_fallback:
+                    hist_prefix = f"当前非连续竞价时段，展示最近交易日 {actual_td} 收盘快照（15:00）指标与目标权重"
+                    cur_note = str(v9_ind.get("note") or "").strip()
+                    v9_ind = {**v9_ind, "note": f"{hist_prefix}；{cur_note}" if cur_note else hist_prefix}
+                return _apply_live_guard_block({**base_resp, **v9_ind})
 
             # Standard DSL quant rule
             rule_macd = selected_rule.get("macd_settings") or {}
             threshold = float(rule_macd.get("marker_threshold", 0.00001))
             prem_row, prem_rate = self._lookup_premium_row(target_symbol)
             if not points:
-                return base_resp
+                return _apply_live_guard_block(base_resp)
             prices = [float(p.get("price") or 0.0) for p in points]
             macd_rows = calculate_macd(prices, rule_macd)
             recalc_points = [{**pt, **macd_rows[idx]} for idx, pt in enumerate(points)]
+            q_dsl_rules = [
+                r
+                for r in (selected_rule.get("buy_rule"), selected_rule.get("sell_rule"))
+                if isinstance(r, Mapping)
+            ]
+            req_packs = detect_rule_required_packs(q_dsl_rules, q_pos_sizing)
+            if req_packs:
+                recalc_points = enrich_live_points_with_quant_packs(
+                    self.research_store,
+                    target_symbol,
+                    actual_td,
+                    recalc_points,
+                    packs=req_packs,
+                )
             base_resp["market_indicators"] = self._build_point_market_indicators(
                 points=recalc_points,
                 prem_row=prem_row,
@@ -3084,7 +3907,7 @@ class AutoTradeEngine:
                 marker_threshold=threshold,
                 default_title="卖点指标",
             )
-            return base_resp
+            return _apply_live_guard_block(base_resp)
 
         prem_row, prem_rate = self._lookup_premium_row(target_symbol)
         base_resp["market_indicators"] = self._build_point_market_indicators(
@@ -3768,12 +4591,12 @@ class AutoTradeEngine:
             return False
         if str(config.get("signal_source") or "") != "quant_rule":
             return False
-        if not is_t0_turnaround_symbol(symbol):
-            return False
         active_rule = self._get_active_quant_rule(config)
         if active_rule is None:
             return False
         ps = normalize_position_sizing(active_rule.get("position_sizing"))
+        if not resolve_rule_same_day_t0(symbol, ps):
+            return False
         return ps["mode"] == "cash_pool_rolling" or ps.get("engine_profile") in {
             "v9_plus_aggressive",
             "v9_plus_balanced",
@@ -3842,6 +4665,9 @@ class AutoTradeEngine:
             if side == "buy" and not is_simulation:
                 avail = min(avail, max(0.0, cap - float(self.auto_store.today_symbol_buy_usage(trade_date, symbol)["buy_amount"])))
                 eff_cash = self._effective_broker_available_cash()
+                if config.get("_route_d_avail_cash") is not None:
+                    rd_cash = max(0.0, float(config["_route_d_avail_cash"]))
+                    eff_cash = min(eff_cash, rd_cash) if eff_cash is not None else rd_cash
                 if eff_cash is not None:
                     avail = min(avail, max(0.0, eff_cash * 0.9995))
             alloc = min(avail, cap * (eff_w / 100.0))
@@ -3860,20 +4686,27 @@ class AutoTradeEngine:
             return qty, note, None
 
         # cash_pool_rolling mode
-        turnaround_raw = ps["allow_same_day_turnaround"]
-        same_day_t0 = is_t0_turnaround_symbol(symbol) if turnaround_raw == "auto" else bool(turnaround_raw)
+        same_day_t0 = resolve_rule_same_day_t0(symbol, ps)
         pos = self._effective_symbol_position(symbol, trade_date=trade_date, same_day_turnaround=same_day_t0)
         if side == "buy":
             if not is_simulation:
                 act = self.auto_store.today_symbol_activity(trade_date, symbol)
-                if act["entry_count"] >= int(ps["max_daily_entries"]):
+                buy_entries = int(act.get("buy_entry_count", act["entry_count"]))
+                if buy_entries >= int(ps["max_daily_entries"]):
                     return 0, None, f"已达模型单日最大买入次数({ps['max_daily_entries']})"
             deployed = float(pos["net_shares"]) * price_f
             max_pos_avail = max(0.0, cap * (float(ps["max_position_pct"]) / 100.0) - deployed)
             eff_cash = None if is_simulation else self._effective_broker_available_cash()
+            if not is_simulation and config.get("_route_d_avail_cash") is not None:
+                rd_cash = max(0.0, float(config["_route_d_avail_cash"]))
+                eff_cash = min(eff_cash, rd_cash) if eff_cash is not None else rd_cash
             if not is_simulation:
-                daily_rem = max(0.0, cap - float(self.auto_store.today_symbol_buy_usage(trade_date, symbol)["buy_amount"]))
-                avail_cash = min(max_pos_avail, daily_rem)
+                if same_day_t0:
+                    net_cap_rem = max(0.0, cap - deployed)
+                    avail_cash = min(max_pos_avail, net_cap_rem)
+                else:
+                    daily_rem = max(0.0, cap - float(self.auto_store.today_symbol_buy_usage(trade_date, symbol)["buy_amount"]))
+                    avail_cash = min(max_pos_avail, daily_rem)
                 if eff_cash is not None:
                     avail_cash = min(avail_cash, max(0.0, eff_cash * 0.9995))
             else:
@@ -3913,41 +4746,309 @@ class AutoTradeEngine:
         config: Mapping[str, Any],
         trade_date: str,
     ) -> list[dict[str, Any]]:
-        bindings = _normalize_rule_bindings(
-            config.get("rule_bindings"),
-            str(config.get("signal_source") or "intraday_macd_flow"),
-            config.get("quant_rule_id"),
-        )
-        enabled_bindings = [b for b in bindings if b.get("enabled", True)]
-        if not enabled_bindings:
+        if not bool(config.get("symbol_enabled", True)):
             return []
-        all_candidates: list[dict[str, Any]] = []
-        for binding in enabled_bindings:
-            b_cfg = {
-                **dict(config),
-                "signal_source": binding["signal_source"],
-                "quant_rule_id": binding.get("quant_rule_id"),
-            }
-            sub_items = self._evaluate_single_rule_candidates(
-                symbol=symbol,
-                config=b_cfg,
-                trade_date=trade_date,
-            )
-            scale = float(binding.get("weight_scale") or 1.0)
-            prio = int(binding.get("priority") or 10)
-            for item in sub_items:
-                item["binding_priority"] = prio
-                item["weight_scale"] = scale
-                if scale != 1.0:
-                    if item.get("qty_override") is not None:
-                        item["qty_override"] = max(100, int(round((int(item["qty_override"]) * scale) / 100.0)) * 100)
-                    elif item.get("weight_pct") is not None:
-                        item["weight_pct"] = round(max(1.0, min(100.0, float(item["weight_pct"]) * scale)), 1)
-            all_candidates.extend(sub_items)
-        return coalesce_symbol_candidates(
-            all_candidates,
-            default_qty=int(config.get("order_quantity") or 100),
+        return self._evaluate_single_rule_candidates(
+            symbol=symbol,
+            config=config,
+            trade_date=trade_date,
         )
+
+    def _reconstruct_open_intraday_t0_buy(
+        self,
+        *,
+        symbol: str,
+        trade_date: str,
+        config: Mapping[str, Any],
+        pos_sizing: Mapping[str, Any],
+    ) -> dict[str, Any] | None:
+        """Reconstruct any open intraday T+0 buy leg above the 100-share retained floor."""
+        try:
+            cfg_min = int(pos_sizing.get("min_retained_shares")) if pos_sizing.get("min_retained_shares") is not None else MIN_RETAINED_SHARES
+        except (TypeError, ValueError):
+            cfg_min = MIN_RETAINED_SHARES
+        min_hold = max(MIN_RETAINED_SHARES, cfg_min)
+        pos = self._effective_symbol_position(symbol, trade_date=trade_date, same_day_turnaround=True)
+        net_sh = int(pos["net_shares"])
+        sellable_above_floor = (max(0, min(int(pos["sellable_shares"]), net_sh - min_hold)) // 100) * 100
+        if sellable_above_floor < 100:
+            return None
+
+        today_sigs = self.auto_store.list_today_symbol_signals(trade_date, symbol)
+        engine_profile = str(pos_sizing.get("engine_profile") or "standard")
+        if engine_profile in {"v9_plus_aggressive", "v9_plus_balanced"}:
+            open_leg: dict[str, Any] | None = None
+            close_done = False
+            for sig in today_sigs:
+                skey = str(sig.get("signal_key") or "")
+                s_side = str(sig.get("side") or "")
+                s_qty = int(sig.get("quantity") or 0)
+                s_min = str(sig.get("minute") or "")
+                s_px = float(sig.get("limit_price") or sig.get("signal_price") or 0.0)
+                if ":v9-entry:" in skey or ":v9-scalp:" in skey:
+                    open_leg = {
+                        "side": s_side,
+                        "qty": s_qty,
+                        "minute": s_min,
+                        "last_leg_minute": s_min,
+                        "mode": "scalp" if ":v9-scalp:" in skey else "entry",
+                        "signal_price": s_px,
+                    }
+                elif ":v9-addon:" in skey and open_leg is not None and open_leg["side"] == s_side:
+                    prev_q = max(0, int(open_leg["qty"]))
+                    add_q = max(0, s_qty)
+                    tot_q = prev_q + add_q
+                    if tot_q > 0 and open_leg["signal_price"] > 0 and s_px > 0:
+                        open_leg["signal_price"] = (open_leg["signal_price"] * prev_q + s_px * add_q) / tot_q
+                    elif s_px > 0:
+                        open_leg["signal_price"] = s_px
+                    open_leg["qty"] = tot_q
+                    open_leg["last_leg_minute"] = s_min
+                elif ":v9-exit:" in skey or ":t0-guard-stop:" in skey:
+                    open_leg = None
+                elif ":v9-close:" in skey or ":t0-flatten:" in skey:
+                    open_leg = None
+                    close_done = True
+
+            if open_leg is not None and open_leg["side"] == "buy":
+                expected_sh = self._expected_symbol_ledger_shares(symbol, config, trade_date)
+                ext_delta = net_sh - int(expected_sh)
+                if net_sh <= max(99, min_hold):
+                    open_leg = None
+                elif ext_delta < 0:
+                    rem_qty = (max(0, int(open_leg["qty"]) + ext_delta) // 100) * 100
+                    if rem_qty < 100:
+                        open_leg = None
+                    else:
+                        open_leg["qty"] = rem_qty
+
+            if open_leg is None or open_leg["side"] != "buy" or int(open_leg["qty"]) < 100:
+                return None
+            sell_qty = min((int(open_leg["qty"]) // 100) * 100, sellable_above_floor)
+            if sell_qty < 100:
+                return None
+            return {
+                "qty": sell_qty,
+                "entry_px": float(open_leg["signal_price"] or 0.0),
+                "last_buy_minute": str(open_leg["last_leg_minute"]),
+                "mode": str(open_leg["mode"]),
+                "close_done": close_done,
+                "min_hold": min_hold,
+                "sellable_above_floor": sellable_above_floor,
+                "is_v9": True,
+            }
+
+        open_qty = 0
+        open_cost = 0.0
+        last_buy_min = ""
+        close_done = False
+        for sig in today_sigs:
+            skey = str(sig.get("signal_key") or "")
+            s_side = str(sig.get("side") or "")
+            s_qty = int(sig.get("quantity") or 0)
+            s_min = str(sig.get("minute") or "")
+            if s_qty <= 0:
+                continue
+            if s_side == "buy" and ":t0-flatten:" not in skey and ":v9-close:" not in skey:
+                px = float(sig.get("limit_price") or sig.get("signal_price") or 0.0)
+                if px > 0:
+                    open_cost += s_qty * px
+                open_qty += s_qty
+                last_buy_min = s_min
+            elif s_side == "sell":
+                if ":t0-flatten:" in skey or ":v9-close:" in skey:
+                    close_done = True
+                if open_qty > 0:
+                    rem_after = max(0, open_qty - s_qty)
+                    open_cost = open_cost * (rem_after / open_qty) if open_qty > 0 else 0.0
+                    open_qty = rem_after
+
+        if open_qty < 100:
+            return None
+        sell_qty = min((open_qty // 100) * 100, sellable_above_floor)
+        if sell_qty < 100:
+            return None
+        return {
+            "qty": sell_qty,
+            "entry_px": (open_cost / open_qty) if open_cost > 0 else 0.0,
+            "last_buy_minute": last_buy_min,
+            "mode": "standard",
+            "close_done": close_done,
+            "min_hold": min_hold,
+            "sellable_above_floor": sellable_above_floor,
+            "is_v9": False,
+        }
+
+    def _evaluate_protective_t0_exit_candidates(
+        self,
+        *,
+        symbol: str,
+        selected_rule: Mapping[str, Any],
+        pos_sizing: Mapping[str, Any],
+        guard: Mapping[str, Any],
+        trade_date: str,
+        points: Sequence[Mapping[str, Any]],
+        name: str,
+        market: str,
+        config: Mapping[str, Any],
+    ) -> list[dict[str, Any]]:
+        """Evaluate intraday T+0 hard stop-loss sells using only verified A-share 1m bars."""
+        if not guard.get("blocked") or not guard.get("allow_protective_exit") or len(points) < 2:
+            return []
+        open_info = self._reconstruct_open_intraday_t0_buy(
+            symbol=symbol,
+            trade_date=trade_date,
+            config=config,
+            pos_sizing=pos_sizing,
+        )
+        if open_info is None or open_info["close_done"]:
+            return []
+
+        b_last = points[-1]
+        t_mm = str(b_last.get("time") or "")
+        try:
+            cur_px = float(b_last.get("price") or 0.0)
+        except (TypeError, ValueError):
+            cur_px = 0.0
+        entry_px = float(open_info["entry_px"] or 0.0)
+        last_buy_min = str(open_info["last_buy_minute"] or "")
+        if entry_px <= 0.0 and last_buy_min:
+            for pt in reversed(points):
+                if str(pt.get("time") or "") <= last_buy_min:
+                    try:
+                        px_cand = float(pt.get("price") or 0.0)
+                    except (TypeError, ValueError):
+                        px_cand = 0.0
+                    if px_cand > 0.0:
+                        entry_px = px_cand
+                        break
+
+        close_hhmm = str(pos_sizing.get("close_flatten_time") or "14:53")
+        if cur_px <= 0.0 or entry_px <= 0.0 or not ("09:32" <= t_mm < close_hhmm):
+            return []
+        if last_buy_min and t_mm <= last_buy_min:
+            return []
+
+        rule_macd = selected_rule.get("macd_settings") or {}
+        prices = [float(p.get("price") or 0.0) for p in points]
+        macd_rows = calculate_macd(prices, rule_macd)
+        dmc10 = (
+            float(macd_rows[-1].get("macd") or 0.0) - float(macd_rows[-2].get("macd") or 0.0)
+            if len(macd_rows) >= 2
+            else 0.0
+        )
+        gain_pct = (cur_px - entry_px) / entry_px * 100.0
+        if not ((gain_pct <= -0.65 and dmc10 < 0.0) or gain_pct <= -0.90):
+            return []
+
+        qty_out = int(open_info["qty"])
+        if str(config.get("sizing_mode") or "fixed_qty") != "model_auto":
+            qty_out = (min(int(config["order_quantity"]), int(open_info["sellable_above_floor"])) // 100) * 100
+            if qty_out < 100:
+                return []
+
+        sig_tag = "v9-exit" if open_info["is_v9"] else "t0-guard-stop"
+        block_src_txt = ", ".join(guard.get("blocking_sources") or []) or "辅助数据源"
+        return [
+            {
+                "rule_id": str(selected_rule["id"]),
+                "rule_title": f"[缺数保护·日内T+0硬止损] {selected_rule['name']}",
+                "rule_summary": (
+                    f"{block_src_txt} 异常期间已禁新开仓；现价 {cur_px:.3f} 较日内买价 {entry_px:.3f} 回撤 {gain_pct:+.2f}%"
+                    f"（MACD柱变 {dmc10:+.5f}），触发日内 T+0 保护止损卖出 {qty_out} 股"
+                ),
+                "side": "sell",
+                "minute": t_mm,
+                "price": f"{cur_px:.3f}",
+                "name": name,
+                "market": market,
+                "trade_date": trade_date,
+                "position_sizing": pos_sizing,
+                "qty_override": qty_out,
+                "weight_pct": 100.0,
+                "sizing_tier": "缺数保护硬止损",
+                "signal_tag": sig_tag,
+                "protective_exit": True,
+                "t0_net_cap_mode": True,
+            }
+        ]
+
+    def _build_protective_close_flatten_item(
+        self,
+        *,
+        symbol: str,
+        selected_rule: Mapping[str, Any],
+        pos_sizing: Mapping[str, Any],
+        guard: Mapping[str, Any],
+        trade_date: str,
+        now_hhmm: str,
+        config: Mapping[str, Any],
+        points: Sequence[Mapping[str, Any]] | None = None,
+    ) -> dict[str, Any] | None:
+        """Build 14:53 protective close-flatten sell for an open intraday T+0 buy leg."""
+        close_hhmm = str(pos_sizing.get("close_flatten_time") or "14:53")
+        if not guard.get("blocked") or not guard.get("allow_protective_exit") or not (close_hhmm <= now_hhmm <= "14:55"):
+            return None
+        open_info = self._reconstruct_open_intraday_t0_buy(
+            symbol=symbol,
+            trade_date=trade_date,
+            config=config,
+            pos_sizing=pos_sizing,
+        )
+        if open_info is None or open_info["close_done"]:
+            return None
+
+        pts = list(points) if points else []
+        if not pts:
+            read_series = getattr(self.research_store, "read_series", None)
+            if callable(read_series):
+                try:
+                    sr = read_series(symbol, trade_date)
+                    if isinstance(sr, Mapping) and str(sr.get("trade_date") or trade_date) == trade_date:
+                        pts = list(sr.get("points") or [])
+                except Exception:
+                    pts = []
+
+        cur_px = 0.0
+        if pts:
+            try:
+                cur_px = float(pts[-1].get("price") or 0.0)
+            except (TypeError, ValueError):
+                cur_px = 0.0
+        sym_name, sym_mkt = self._resolve_symbol_meta(symbol)
+        if cur_px <= 0.0:
+            book = self.get_order_book(symbol, sym_mkt)
+            try:
+                cur_px = float((book or {}).get("last_price") or 0.0)
+            except (TypeError, ValueError):
+                cur_px = 0.0
+        if cur_px <= 0.0:
+            return None
+
+        qty_out = int(open_info["qty"])
+        block_src_txt = ", ".join(guard.get("blocking_sources") or []) or "辅助数据源"
+        sig_tag = "v9-close" if open_info["is_v9"] else "t0-flatten"
+        return {
+            "rule_id": str(selected_rule["id"]),
+            "rule_title": f"[缺数保护·尾盘平T避险] {selected_rule['name']}",
+            "rule_summary": (
+                f"辅助源缺失（{block_src_txt}）严禁留隔夜盲仓，"
+                f"于 {close_hhmm} 将今日日内 T+0 买入仓位 {qty_out} 股平仓避险"
+            ),
+            "side": "sell",
+            "minute": now_hhmm,
+            "price": f"{cur_px:.3f}",
+            "name": sym_name,
+            "market": sym_mkt,
+            "trade_date": trade_date,
+            "position_sizing": pos_sizing,
+            "qty_override": qty_out,
+            "weight_pct": 100.0,
+            "sizing_tier": "缺数保护尾盘平T",
+            "signal_tag": sig_tag,
+            "protective_exit": True,
+            "t0_net_cap_mode": True,
+        }
 
     def _evaluate_single_rule_candidates(
         self,
@@ -4029,15 +5130,49 @@ class AutoTradeEngine:
         signal_source = config["signal_source"]
         if signal_source == "quant_rule":
             selected_rule = self._get_active_quant_rule(config)
-            if selected_rule is None or not points or len(points) < 2:
+            if selected_rule is None:
                 return []
             rule_symbols = [str(s).strip() for s in (selected_rule.get("symbols") or []) if str(s).strip()]
             if rule_symbols and symbol not in rule_symbols:
                 return []
+            actual_td = str(series.get("trade_date") or trade_date) if isinstance(series, Mapping) else trade_date
+            local_now_dt = self._local_now()
+            is_tday = self.is_trading_day(local_now_dt.date()) if self.is_trading_day is not None else (local_now_dt.weekday() < 5)
+            guard = check_rule_live_data_guard(
+                self.research_store,
+                selected_rule,
+                symbol=symbol,
+                trade_date=trade_date,
+                actual_trade_date=actual_td,
+                points=points,
+                now_dt=local_now_dt,
+                is_trading_day=is_tday,
+            )
+            self._last_data_guard_by_symbol[symbol] = guard
             q_pos_sizing = normalize_position_sizing(selected_rule.get("position_sizing"))
+            if guard.get("blocked"):
+                logger.warning(
+                    "quant_rule live guard blocked signal evaluation for %s (%s): %s",
+                    symbol,
+                    selected_rule.get("id"),
+                    guard.get("reason"),
+                )
+                if guard.get("allow_protective_exit") and points and len(points) >= 2:
+                    return self._evaluate_protective_t0_exit_candidates(
+                        symbol=symbol,
+                        selected_rule=selected_rule,
+                        pos_sizing=q_pos_sizing,
+                        guard=guard,
+                        trade_date=actual_td,
+                        points=points,
+                        name=name,
+                        market=market,
+                        config=config,
+                    )
+                return []
+            if not points or len(points) < 2:
+                return []
             if q_pos_sizing.get("engine_profile") in {"v9_plus_aggressive", "v9_plus_balanced"}:
-                actual_td = str(series.get("trade_date") or trade_date) if isinstance(series, Mapping) else trade_date
-                local_now_dt = self._local_now()
                 local_hhmm = local_now_dt.strftime("%H:%M")
                 today_sigs = self.auto_store.list_today_symbol_signals(actual_td, symbol)
                 net_sh, eff_cash, expected_sh = self._v9_live_context_args(symbol, config, actual_td)
@@ -4080,6 +5215,16 @@ class AutoTradeEngine:
                 q_rules.append({**dict(selected_rule["sell_rule"]), "enabled": True})
             if not q_rules:
                 return []
+            actual_td = str(series.get("trade_date") or trade_date) if isinstance(series, Mapping) else trade_date
+            req_packs = detect_rule_required_packs(q_rules, q_pos_sizing)
+            if req_packs:
+                recalc_points = enrich_live_points_with_quant_packs(
+                    self.research_store,
+                    symbol,
+                    actual_td,
+                    recalc_points,
+                    packs=req_packs,
+                )
             threshold = float(rule_macd.get("marker_threshold", 0.00001))
             q_markers = build_replay_markers(symbol, recalc_points, q_rules, marker_threshold=threshold)
             candidate_times = {str(p.get("time") or "") for p in recalc_points[-2:] if p.get("time")}
@@ -4303,6 +5448,7 @@ class AutoTradeEngine:
         if self.trade_executor is None:
             raise TradeExecutionError("TRADE_UNCONFIGURED", "交易执行器未配置", 503)
 
+        root_config = dict(config)
         config = self._effective_symbol_config(config, str(signal_row.get("symbol") or ""))
 
         precision = int(signal_row["precision"])
@@ -4441,7 +5587,20 @@ class AutoTradeEngine:
             # Atomic lock-inside reservation and risk gate (eliminates TOCTOU overbuy/oversell)
             if not dry_run and signal_row["side"] == "buy" and not signal_row["is_simulation"]:
                 planned = round(float(dec_price) * eff_qty, 2)
-                eff_broker_cash = self._effective_broker_available_cash(exclude_signal_id=signal_row["id"])
+                is_route_d_plus = self._is_shared_pool_mode(root_config)
+                if is_route_d_plus:
+                    sig_key_exec = str(signal_row.get("signal_key") or "")
+                    cap_limit_val, eff_broker_cash, _ = self._resolve_route_d_execution_budget(
+                        symbol=signal_row["symbol"],
+                        root_config=root_config,
+                        trade_date=trade_date,
+                        exclude_signal_id=signal_row["id"],
+                        is_short_cover=":v9-exit:" in sig_key_exec,
+                        is_close_rebalance=":v9-close:" in sig_key_exec,
+                    )
+                else:
+                    cap_limit_val = float(config["daily_max_buy_amount"])
+                    eff_broker_cash = self._effective_broker_available_cash(exclude_signal_id=signal_row["id"])
                 if self._is_t0_net_cap_rule(signal_row["symbol"], config):
                     pos = self._effective_symbol_position(
                         signal_row["symbol"],
@@ -4450,7 +5609,7 @@ class AutoTradeEngine:
                         exclude_signal_id=signal_row["id"],
                     )
                     held_val = round(int(pos["net_shares"]) * float(dec_price), 2)
-                    rem_cap = max(0.0, float(config["daily_max_buy_amount"]) - held_val)
+                    rem_cap = max(0.0, cap_limit_val - held_val)
                     if eff_broker_cash is not None:
                         rem_cap = min(rem_cap, max(0.0, eff_broker_cash * 0.9995))
                     if (
@@ -4463,8 +5622,8 @@ class AutoTradeEngine:
                         if 100 <= clamped_qty < eff_qty:
                             eff_qty = clamped_qty
                             planned = round(float(dec_price) * eff_qty, 2)
-                    if held_val + planned > float(config["daily_max_buy_amount"]) + 1e-6:
-                        msg = f"触发T+0净持仓上限保护：当前已持 {held_val:.2f} + 本笔 {planned:.2f} > 上限 {config['daily_max_buy_amount']:.2f}"
+                    if held_val + planned > cap_limit_val + 1e-6:
+                        msg = f"触发T+0净持仓上限保护：当前已持 {held_val:.2f} + 本笔 {planned:.2f} > 上限 {cap_limit_val:.2f}"
                         self.auto_store.update_signal_execution(
                             signal_row["id"],
                             status="RISK_BLOCKED",
@@ -4478,7 +5637,7 @@ class AutoTradeEngine:
                         self._set_symbol_cooldown(signal_row["symbol"], "buy", error_code="TRADE_DAILY_LIMIT_EXCEEDED", reason=msg)
                         raise TradeExecutionError(
                             "TRADE_DAILY_LIMIT_EXCEEDED",
-                            f"超出策略净持仓金额上限（¥{config['daily_max_buy_amount']:.2f}），已风控拦截",
+                            f"超出策略净持仓金额上限（¥{cap_limit_val:.2f}），已风控拦截",
                             409,
                         )
                 else:
@@ -4495,15 +5654,15 @@ class AutoTradeEngine:
                         and planned > max(0.0, eff_broker_cash * 0.9995) + 1e-6
                     ):
                         rem_cash = min(
-                            max(0.0, float(config["daily_max_buy_amount"]) - usage["buy_amount"]),
+                            max(0.0, cap_limit_val - usage["buy_amount"]),
                             max(0.0, eff_broker_cash * 0.9995),
                         )
                         clamped_qty = compute_lot_shares_from_budget(rem_cash, float(dec_price), 100)
                         if 100 <= clamped_qty < eff_qty:
                             eff_qty = clamped_qty
                             planned = round(float(dec_price) * eff_qty, 2)
-                    if usage["buy_amount"] + planned > float(config["daily_max_buy_amount"]) + 1e-6:
-                        msg = f"触发 {signal_row['symbol']} 单日买入限额保护：已用 {usage['buy_amount']:.2f} + 本笔 {planned:.2f} > 上限 {config['daily_max_buy_amount']:.2f}"
+                    if usage["buy_amount"] + planned > cap_limit_val + 1e-6:
+                        msg = f"触发 {signal_row['symbol']} 单日买入限额保护：已用 {usage['buy_amount']:.2f} + 本笔 {planned:.2f} > 上限 {cap_limit_val:.2f}"
                         self.auto_store.update_signal_execution(
                             signal_row["id"],
                             status="RISK_BLOCKED",
@@ -4517,7 +5676,7 @@ class AutoTradeEngine:
                         self._set_symbol_cooldown(signal_row["symbol"], "buy", error_code="TRADE_DAILY_LIMIT_EXCEEDED", reason=msg)
                         raise TradeExecutionError(
                             "TRADE_DAILY_LIMIT_EXCEEDED",
-                            f"超出 {signal_row['symbol']} 最大买入金额上限（¥{config['daily_max_buy_amount']:.2f}），已风控拦截",
+                            f"超出 {signal_row['symbol']} 最大买入金额上限（¥{cap_limit_val:.2f}），已风控拦截",
                             409,
                         )
                 if eff_broker_cash is not None and planned > max(0.0, eff_broker_cash * 0.9995) + 1e-6:
@@ -4708,11 +5867,15 @@ class AutoTradeEngine:
         skip_cap_check: bool = False,
         deferred_execs: list[Callable[[], Awaitable[None]]] | None = None,
     ) -> int:
+        root_config = dict(config)
+        is_route_d_plus = self._is_shared_pool_mode(root_config)
         config = self._effective_symbol_config(config, symbol)
         is_closing_flatten = (
-            item.get("signal_tag") in {"t0-flatten", "v9-close"}
+            bool(item.get("protective_exit"))
+            or item.get("signal_tag") in {"t0-flatten", "v9-close", "t0-guard-stop"}
             or ":t0-flatten:" in sig_key
             or ":v9-close:" in sig_key
+            or ":t0-guard-stop:" in sig_key
         )
         if not is_closing_flatten and self._active_symbol_cooldown(symbol, str(item["side"]), config=config) is not None:
             return 0
@@ -4736,6 +5899,21 @@ class AutoTradeEngine:
         except ValueError:
             return 0
 
+        is_short_cover = (item.get("signal_tag") == "v9-exit") or (":v9-exit:" in sig_key)
+        is_close_rebal = (item.get("signal_tag") == "v9-close") or (":v9-close:" in sig_key)
+        rd_cap_limit: float | None = None
+        rd_cash_limit: float | None = None
+        if is_route_d_plus and item["side"] == "buy" and not skip_cap_check:
+            dyn_hint = item.get("dynamic_cap_limit")
+            rd_cap_limit, rd_cash_limit, _ = self._resolve_route_d_execution_budget(
+                symbol=symbol,
+                root_config=root_config,
+                trade_date=trade_date,
+                is_short_cover=is_short_cover,
+                is_close_rebalance=is_close_rebal,
+                dynamic_cap_hint=float(dyn_hint) if dyn_hint is not None else None,
+            )
+
         price_basis = str(price_meta.get("price_basis") or "")
         base_summary = str(item.get("rule_summary") or "")
         if qty_override is not None:
@@ -4743,11 +5921,16 @@ class AutoTradeEngine:
             sizing_note = None
             skip_reason = None
         else:
+            qty_cfg = (
+                {**config, "daily_max_buy_amount": rd_cap_limit, "_route_d_avail_cash": rd_cash_limit}
+                if (is_route_d_plus and item["side"] == "buy" and rd_cap_limit is not None)
+                else config
+            )
             qty, sizing_note, skip_reason = self._resolve_signal_quantity(
                 symbol=symbol,
                 side="sell" if item["side"] == "sell" else "buy",
                 limit_price=limit_price,
-                config=config,
+                config=qty_cfg,
                 candidate=item,
                 trade_date=trade_date,
                 is_simulation=False,
@@ -4796,7 +5979,8 @@ class AutoTradeEngine:
         over_cap = False
         cap_block_msg = ""
         if not skip_cap_check and item["side"] == "buy":
-            eff_broker_cash = self._effective_broker_available_cash()
+            cap_limit_val = rd_cap_limit if (is_route_d_plus and rd_cap_limit is not None) else float(config["daily_max_buy_amount"])
+            eff_broker_cash = rd_cash_limit if is_route_d_plus else self._effective_broker_available_cash()
             fee_safe_cash = max(0.0, eff_broker_cash * 0.9995) if eff_broker_cash is not None else None
             use_net_cap = bool(item.get("t0_net_cap_mode")) or self._is_t0_net_cap_rule(symbol, config)
             if use_net_cap:
@@ -4806,7 +5990,7 @@ class AutoTradeEngine:
                     same_day_turnaround=True,
                 )
                 held_amt = round(int(pos["net_shares"]) * float(limit_price), 2)
-                rem_cap = max(0.0, float(config["daily_max_buy_amount"]) - held_amt)
+                rem_cap = max(0.0, cap_limit_val - held_amt)
                 if fee_safe_cash is not None:
                     rem_cap = min(rem_cap, fee_safe_cash)
                 if str(config.get("sizing_mode") or "fixed_qty") == "model_auto":
@@ -4823,7 +6007,7 @@ class AutoTradeEngine:
                             )
                         elif int(pos["net_shares"]) >= 100 and (fee_safe_cash is None or fee_safe_cash >= float(limit_price) * 100):
                             return 0
-                        elif fee_safe_cash is not None and fee_safe_cash < max(0.0, float(config["daily_max_buy_amount"]) - held_amt):
+                        elif fee_safe_cash is not None and fee_safe_cash < max(0.0, cap_limit_val - held_amt):
                             over_cap = True
                             cap_block_msg = (
                                 f"柜台实时可用资金不足：可用 ¥{eff_broker_cash:.2f} "
@@ -4832,19 +6016,19 @@ class AutoTradeEngine:
                         else:
                             over_cap = True
                             cap_block_msg = (
-                                f"T+0净仓位金额上限拦截：上限 {config['daily_max_buy_amount']:.2f} "
+                                f"T+0净仓位金额上限拦截：上限 {cap_limit_val:.2f} "
                                 f"不足按限价 {limit_price} 买 100 股"
                             )
-                if not over_cap and held_amt + planned_amount > float(config["daily_max_buy_amount"]) + 1e-6:
+                if not over_cap and held_amt + planned_amount > cap_limit_val + 1e-6:
                     over_cap = True
                     cap_block_msg = (
-                        f"T+0净仓位金额上限拦截：已持 {held_amt:.2f} + 本笔 {planned_amount:.2f} > {config['daily_max_buy_amount']:.2f}"
+                        f"T+0净仓位金额上限拦截：已持 {held_amt:.2f} + 本笔 {planned_amount:.2f} > {cap_limit_val:.2f}"
                     )
             else:
                 usage = self.auto_store.today_symbol_buy_usage(trade_date, symbol)
                 if fee_safe_cash is not None and str(config.get("sizing_mode") or "fixed_qty") == "model_auto":
                     rem_cap = min(
-                        max(0.0, float(config["daily_max_buy_amount"]) - usage["buy_amount"]),
+                        max(0.0, cap_limit_val - usage["buy_amount"]),
                         fee_safe_cash,
                     )
                     max_afford_qty = compute_lot_shares_from_budget(rem_cap, float(limit_price), 100)
@@ -4864,10 +6048,10 @@ class AutoTradeEngine:
                                 f"柜台实时可用资金不足：可用 ¥{eff_broker_cash:.2f} "
                                 f"不足按限价 {limit_price} 买 100 股"
                             )
-                if not over_cap and usage["buy_amount"] + planned_amount > float(config["daily_max_buy_amount"]) + 1e-6:
+                if not over_cap and usage["buy_amount"] + planned_amount > cap_limit_val + 1e-6:
                     over_cap = True
                     cap_block_msg = (
-                        f"{symbol} 单日累计买入上限拦截：已用 {usage['buy_amount']:.2f} + 本笔 {planned_amount:.2f} > {config['daily_max_buy_amount']:.2f}"
+                        f"{symbol} 单日累计买入上限拦截：已用 {usage['buy_amount']:.2f} + 本笔 {planned_amount:.2f} > {cap_limit_val:.2f}"
                     )
             if not over_cap and fee_safe_cash is not None and planned_amount > fee_safe_cash + 1e-6:
                 over_cap = True
@@ -4977,7 +6161,7 @@ class AutoTradeEngine:
         else:
             exec_prio = PriorityTradeScheduler.P0_CRITICAL if is_closing_flatten else PriorityTradeScheduler.P1_ORDER
             enqueued_mono = time.monotonic()
-            cfg_copy = dict(config)
+            cfg_copy = dict(root_config if is_route_d_plus else config)
             item_copy = dict(item)
             is_dry = cfg_copy["execution_mode"] == "dry_run"
 
@@ -5114,6 +6298,473 @@ class AutoTradeEngine:
             )
             return
 
+    def _build_base_t0_flatten_item(
+        self,
+        *,
+        symbol: str,
+        sym_q_rule: Mapping[str, Any],
+        sym_ps: Mapping[str, Any],
+        trade_date: str,
+        now_hhmm: str,
+    ) -> tuple[dict[str, Any], int, str] | None:
+        last_sym_guard = self._last_data_guard_by_symbol.get(symbol)
+        act = self.auto_store.today_symbol_activity(trade_date, symbol)
+        net_sh = int(act["net_shares"])
+        if abs(net_sh) < 100:
+            return None
+        flatten_side: Literal["buy", "sell"] = "sell" if net_sh > 0 else "buy"
+        if isinstance(last_sym_guard, Mapping) and last_sym_guard.get("blocked") and flatten_side == "buy":
+            return None
+        flatten_qty = (abs(net_sh) // 100) * 100
+        if flatten_side == "sell":
+            net_total, max_sell, pos_src = self._max_sellable_above_floor(symbol, trade_date)
+            if pos_src != "none" or net_total > 0:
+                flatten_qty = min(flatten_qty, max_sell)
+        if flatten_qty < 100:
+            return None
+        sym_name, sym_mkt = self._resolve_symbol_meta(symbol)
+        fl_book = self.get_order_book(symbol, sym_mkt)
+        ref_px = (
+            str((fl_book or {}).get("last_price") or "").strip()
+            or ("2.100" if symbol.startswith(_FUND_PREFIXES) else "10.00")
+        )
+        if not fl_book:
+            read_series = getattr(self.research_store, "read_series", None)
+            if callable(read_series):
+                try:
+                    sr = read_series(symbol, trade_date)
+                    if isinstance(sr, Mapping) and sr.get("points"):
+                        ref_px = str(sr["points"][-1].get("price") or ref_px)
+                except Exception:
+                    pass
+        fl_hhmm = str(sym_ps["close_flatten_time"])
+        prot_flag = bool(isinstance(last_sym_guard, Mapping) and last_sym_guard.get("blocked"))
+        fl_item = {
+            "rule_id": str(sym_q_rule["id"]),
+            "rule_title": (
+                f"[缺数保护·尾盘平T恢复底仓] {sym_q_rule['name']}"
+                if prot_flag
+                else f"[尾盘平T恢复底仓] {sym_q_rule['name']}"
+            ),
+            "rule_summary": f"早盘/日内净敞口 {net_sh:+d} 股，按 {fl_hhmm} 闭环规则自动反向平仓 {flatten_qty} 股恢复底仓",
+            "side": flatten_side,
+            "minute": now_hhmm,
+            "price": ref_px,
+            "name": sym_name,
+            "market": sym_mkt,
+            "trade_date": trade_date,
+            "signal_tag": "t0-flatten",
+            "protective_exit": prot_flag,
+            "t0_net_cap_mode": True,
+        }
+        sig_key = f"{symbol}:{trade_date}:{fl_hhmm}:t0-flatten:{flatten_side}"
+        return fl_item, flatten_qty, sig_key
+
+    async def _execute_route_d_poll_plans(
+        self,
+        *,
+        symbol_plans: Sequence[Mapping[str, Any]],
+        root_config: Mapping[str, Any],
+        trade_date: str,
+        now_hhmm: str,
+        now_epoch: float,
+        local_iso: str,
+    ) -> int:
+        """Coordinate intraday shared-pool sizing and two-wave (sell-first) close rebalance."""
+        if not symbol_plans:
+            return 0
+        triggered = 0
+        mid_state = await asyncio.to_thread(self._gather_pool_state, root_config, trade_date, include_causal=True)
+        causal_ctx = mid_state.get("causal_ctx") or {}
+        pp = mid_state["policy"]
+        engine_type = str(mid_state.get("engine_type") or "route_d_plus")
+        active_cap_name = str((mid_state.get("active_capital_policy") or {}).get("name") or "共享资金池")
+        cap_tag = "RouteD+" if engine_type == "route_d_plus" else active_cap_name.split("（", 1)[0][:16]
+        single_fee = float(pp["single_fee_rate"])
+
+        # 1. Coordinate intraday model_auto long entries (v9-entry / v9-scalp buys) across the pool
+        buy_reqs: list[dict[str, Any]] = []
+        for plan in symbol_plans:
+            sym = str(plan["symbol"])
+            if str(plan["sym_cfg"].get("sizing_mode") or "fixed_qty") != "model_auto":
+                continue
+            for cand in plan["candidates"]:
+                if str(cand.get("side")) == "buy" and str(cand.get("signal_tag") or "") in {"v9-entry", "v9-scalp"}:
+                    buy_reqs.append(
+                        {
+                            "symbol": sym,
+                            "price": float(cand["price"]),
+                            "signal_frac": max(0.05, float(cand.get("weight_pct") or 100.0) / 100.0),
+                            "signal_tag": str(cand["signal_tag"]),
+                        }
+                    )
+                    break
+
+        coord_buys: dict[str, dict[str, Any]] = {}
+        if buy_reqs:
+            coord_buys = self._pool_allocator.coordinate_intraday_buys(
+                buy_requests=buy_reqs,
+                symbols=mid_state["symbols"],
+                held_mvs=mid_state["held_mvs"],
+                pool_equity=float(mid_state["pool_equity"]),
+                free_pool_cash=float(mid_state["free_pool_cash"]),
+                anchors=mid_state["anchors"],
+                causal_ctx=causal_ctx,
+                policy=pp,
+                engine_type=engine_type,
+            )
+
+        wave1_sell_cands: list[tuple[str, dict[str, Any], str]] = []
+        wave2_buy_cands: list[tuple[str, dict[str, Any], str]] = []
+        wave1_prot_closes: list[tuple[str, dict[str, Any], str, int]] = []
+        wave1_fixed_rebal: list[tuple[str, dict[str, Any], str, int]] = []
+        wave2_fixed_rebal: list[tuple[str, dict[str, Any], str, int]] = []
+
+        close_plans: dict[str, Mapping[str, Any]] = {}
+        already_rebal_syms: set[str] = set()
+        raw_wts: dict[str, float] = {}
+        min_ret_map: dict[str, int] = {}
+        wt_reasons: dict[str, str] = {}
+        locked_outside_mv = 0.0
+
+        for plan in symbol_plans:
+            sym = str(plan["symbol"])
+            is_model_auto = str(plan["sym_cfg"].get("sizing_mode") or "fixed_qty") == "model_auto"
+            for item in plan["candidates"]:
+                sig_tag = str(item.get("signal_tag") or item["rule_id"])
+                sig_key = f"{sym}:{trade_date}:{item['minute']}:{sig_tag}:{item['side']}"
+                if item["side"] == "sell":
+                    wave1_sell_cands.append((sym, dict(item), sig_key))
+                    continue
+                if is_model_auto and sig_tag in {"v9-entry", "v9-scalp"}:
+                    coord = coord_buys.get(sym)
+                    if not coord or not coord.get("approved") or int(coord.get("qty") or 0) < 100:
+                        continue
+                    q_alloc = int(coord["qty"])
+                    upd = {
+                        **dict(item),
+                        "qty_override": q_alloc,
+                        "dynamic_cap_limit": float(coord["dynamic_cap_limit"]),
+                        "rule_summary": f"{item.get('rule_summary') or ''}；{cap_tag}共享池分配{q_alloc}股".strip("；"),
+                    }
+                    wave2_buy_cands.append((sym, upd, sig_key))
+                else:
+                    wave2_buy_cands.append((sym, dict(item), sig_key))
+
+            v9_dec = plan.get("v9_dec")
+            sym_ps = plan.get("sym_ps")
+            if plan.get("v9_close_window_active") and isinstance(sym_ps, Mapping):
+                if is_model_auto:
+                    if isinstance(v9_dec, Mapping):
+                        rebal = v9_dec.get("close_rebalance")
+                        if isinstance(rebal, Mapping) and rebal.get("protective_exit"):
+                            sym_name, sym_mkt = self._resolve_symbol_meta(sym)
+                            fl_hhmm = str(sym_ps["close_flatten_time"])
+                            prot_item = {**dict(rebal), "name": sym_name, "market": sym_mkt, "trade_date": trade_date}
+                            prot_q = int(rebal["qty_override"])
+                            wave1_prot_closes.append((sym, prot_item, f"{sym}:{trade_date}:{fl_hhmm}:v9-close:{rebal['side']}", prot_q))
+                            rem_sh = max(0, int(mid_state["held_shares"].get(sym) or 0) - prot_q)
+                            locked_outside_mv += rem_sh * float(mid_state["prices"].get(sym) or 0.0)
+                        elif isinstance(v9_dec.get("diagnostics"), Mapping):
+                            diag = v9_dec["diagnostics"]
+                            today_sigs = self.auto_store.list_today_symbol_signals(trade_date, sym)
+                            if any(":v9-close:" in str(s.get("signal_key") or "") for s in today_sigs):
+                                already_rebal_syms.add(sym)
+                            raw_wts[sym] = max(0.0, float(diag.get("close_target_weight_pct") or 0.0) / 100.0)
+                            min_ret_map[sym] = max(0, int(diag.get("min_retained_shares") or MIN_RETAINED_SHARES))
+                            wt_reasons[sym] = str(diag.get("close_target_reason") or "尾盘三态动态调仓")
+                            close_plans[sym] = plan
+                        else:
+                            locked_outside_mv += float(mid_state["held_mvs"].get(sym) or 0.0)
+                    else:
+                        locked_outside_mv += float(mid_state["held_mvs"].get(sym) or 0.0)
+                elif isinstance(v9_dec, Mapping) and isinstance(v9_dec.get("close_rebalance"), Mapping):
+                    rebal = v9_dec["close_rebalance"]
+                    sym_name, sym_mkt = self._resolve_symbol_meta(sym)
+                    fl_hhmm = str(sym_ps["close_flatten_time"])
+                    rebal_item = {**dict(rebal), "name": sym_name, "market": sym_mkt, "trade_date": trade_date}
+                    s_key = f"{sym}:{trade_date}:{fl_hhmm}:v9-close:{rebal['side']}"
+                    q_fixed = int(rebal["qty_override"])
+                    if rebal["side"] == "sell":
+                        wave1_fixed_rebal.append((sym, rebal_item, s_key, q_fixed))
+                    else:
+                        wave2_fixed_rebal.append((sym, rebal_item, s_key, q_fixed))
+                    locked_outside_mv += float(mid_state["held_mvs"].get(sym) or 0.0)
+            else:
+                locked_outside_mv += float(mid_state["held_mvs"].get(sym) or 0.0)
+
+        rebal_plan: dict[str, Any] | None = None
+        if close_plans:
+            close_syms = list(close_plans)
+            rebal_plan = self._pool_allocator.plan_overnight_rebalance(
+                symbols=close_syms,
+                raw_weights=raw_wts,
+                current_shares={s: int(mid_state["held_shares"].get(s) or 0) for s in close_syms},
+                prices={s: float(mid_state["prices"].get(s) or 0.0) for s in close_syms},
+                min_retained_by_symbol=min_ret_map,
+                pool_equity=max(0.0, float(mid_state["pool_equity"]) - locked_outside_mv),
+                available_pool_cash=float(mid_state["available_pool_cash"]),
+                anchors={s: mid_state["anchors"][s] for s in close_syms},
+                causal_ctx=causal_ctx,
+                policy=pp,
+                skip_order_symbols=sorted(already_rebal_syms),
+                engine_type=engine_type,
+            )
+
+        # 2. Wave 1: Execute ALL sells (intraday sells + protective flattens + close rebalance sells) FIRST
+        wave1_execs: list[Callable[[], Awaitable[None]]] = []
+        wave1_close_sell_records: list[tuple[str, str, float]] = []
+
+        for sym, item, sig_key in wave1_sell_cands:
+            triggered += await self._emit_trade_signal(
+                symbol=sym,
+                item=item,
+                config=root_config,
+                trade_date=trade_date,
+                now_epoch=now_epoch,
+                local_iso=local_iso,
+                sig_key=sig_key,
+                qty_override=item.get("qty_override"),
+                deferred_execs=wave1_execs,
+            )
+
+        for sym, item, sig_key, qty in wave1_prot_closes:
+            triggered += await self._emit_trade_signal(
+                symbol=sym,
+                item=item,
+                config=root_config,
+                trade_date=trade_date,
+                now_epoch=now_epoch,
+                local_iso=local_iso,
+                sig_key=sig_key,
+                qty_override=qty,
+                deferred_execs=wave1_execs,
+            )
+
+        for sym, item, sig_key, qty in wave1_fixed_rebal:
+            triggered += await self._emit_trade_signal(
+                symbol=sym,
+                item=item,
+                config=root_config,
+                trade_date=trade_date,
+                now_epoch=now_epoch,
+                local_iso=local_iso,
+                sig_key=sig_key,
+                qty_override=qty,
+                deferred_execs=wave1_execs,
+            )
+
+        if rebal_plan is not None:
+            p_sigma = float(rebal_plan["portfolio_sigma_pct"])
+            for sym, sell_q in (rebal_plan.get("sell_orders") or {}).items():
+                plan = close_plans[sym]
+                sym_q_rule = plan["sym_q_rule"]
+                sym_ps = plan["sym_ps"]
+                px = float(mid_state["prices"].get(sym) or 0.0)
+                cur_sh = int(mid_state["held_shares"].get(sym) or 0)
+                tgt_sh = int(rebal_plan["target_shares"].get(sym) or cur_sh)
+                alloc_wt = float(rebal_plan["alloc_weights"].get(sym) or 0.0)
+                min_hold = min_ret_map.get(sym, MIN_RETAINED_SHARES)
+                fl_hhmm = str(sym_ps["close_flatten_time"])
+                sym_name, sym_mkt = self._resolve_symbol_meta(sym)
+                rule_name = str((sym_q_rule or {}).get("name") or sym)
+                retain_note = f"(保留{min_hold}股底仓)" if min_hold > 0 and tgt_sh == min_hold else ""
+                sig_key = f"{sym}:{trade_date}:{fl_hhmm}:v9-close:sell"
+                sell_item = {
+                    "rule_id": str((sym_q_rule or {}).get("id") or "route-d-close"),
+                    "rule_title": f"[{cap_tag}尾盘调仓·减仓] {rule_name}",
+                    "rule_summary": f"{wt_reasons.get(sym, '')}{retain_note}；组合目标{alloc_wt * 100:.1f}%(σ={p_sigma:.2f}%)，{cur_sh}股→{tgt_sh}股，卖出{sell_q}股",
+                    "side": "sell",
+                    "minute": now_hhmm,
+                    "price": f"{px:.3f}",
+                    "name": sym_name,
+                    "market": sym_mkt,
+                    "trade_date": trade_date,
+                    "signal_tag": "v9-close",
+                    "t0_net_cap_mode": True,
+                }
+                added = await self._emit_trade_signal(
+                    symbol=sym,
+                    item=sell_item,
+                    config=root_config,
+                    trade_date=trade_date,
+                    now_epoch=now_epoch,
+                    local_iso=local_iso,
+                    sig_key=sig_key,
+                    qty_override=int(sell_q),
+                    deferred_execs=wave1_execs,
+                )
+                if added > 0:
+                    triggered += added
+                    wave1_close_sell_records.append((sym, sig_key, round(int(sell_q) * px * (1.0 - single_fee), 2)))
+
+        wave1_t0_buys: list[tuple[str, dict[str, Any], str, int]] = []
+        for plan in symbol_plans:
+            sym = str(plan["symbol"])
+            sym_ps = plan.get("sym_ps")
+            std_prot_close = plan.get("std_prot_close")
+            if isinstance(std_prot_close, Mapping) and isinstance(sym_ps, Mapping):
+                fl_hhmm = str(sym_ps["close_flatten_time"])
+                s_key = f"{sym}:{trade_date}:{fl_hhmm}:t0-flatten:{std_prot_close['side']}"
+                q_std = int(std_prot_close["qty_override"])
+                triggered += await self._emit_trade_signal(
+                    symbol=sym,
+                    item=std_prot_close,
+                    config=root_config,
+                    trade_date=trade_date,
+                    now_epoch=now_epoch,
+                    local_iso=local_iso,
+                    sig_key=s_key,
+                    qty_override=q_std,
+                    deferred_execs=wave1_execs,
+                )
+            if plan.get("flatten_window_active") and plan.get("sym_q_rule") is not None and isinstance(sym_ps, Mapping):
+                built = self._build_base_t0_flatten_item(
+                    symbol=sym,
+                    sym_q_rule=plan["sym_q_rule"],
+                    sym_ps=sym_ps,
+                    trade_date=trade_date,
+                    now_hhmm=now_hhmm,
+                )
+                if built is not None:
+                    fl_item, fl_qty, fl_key = built
+                    if fl_item["side"] == "sell":
+                        triggered += await self._emit_trade_signal(
+                            symbol=sym,
+                            item=fl_item,
+                            config=root_config,
+                            trade_date=trade_date,
+                            now_epoch=now_epoch,
+                            local_iso=local_iso,
+                            sig_key=fl_key,
+                            qty_override=fl_qty,
+                            deferred_execs=wave1_execs,
+                        )
+                    else:
+                        wave1_t0_buys.append((sym, fl_item, fl_key, fl_qty))
+
+        if wave1_execs:
+            await asyncio.gather(*(fn() for fn in wave1_execs))
+
+        # 3. Wave 2: Re-verify post-Wave-1 pool cash and execute buys second
+        wave2_execs: list[Callable[[], Awaitable[None]]] = []
+
+        if rebal_plan is not None and (rebal_plan.get("buy_diffs") or {}):
+            post_state = await asyncio.to_thread(self._gather_pool_state, root_config, trade_date, include_causal=False)
+            non_close_reserves = sum(
+                float(post_state["reserves"].get(s) or 0.0)
+                for s in post_state["symbols"]
+                if s not in close_plans
+            )
+            cash_for_close_buys = max(0.0, float(post_state["available_pool_cash"]) - non_close_reserves)
+            if str(root_config.get("execution_mode") or "") == "full_auto" and wave1_close_sell_records:
+                for sell_sym, sell_key, est_proc in wave1_close_sell_records:
+                    sym_sigs = self.auto_store.list_today_symbol_signals(trade_date, sell_sym)
+                    matched = next((s for s in sym_sigs if s.get("signal_key") == sell_key), None)
+                    if matched is not None and matched.get("status") == "PENDING_CONFIRM":
+                        cash_for_close_buys = max(0.0, cash_for_close_buys - est_proc)
+
+            final_buys = scale_buy_orders_to_cash(
+                rebal_plan["buy_diffs"],
+                post_state["prices"],
+                cash_for_close_buys,
+                single_fee,
+            )
+            p_sigma = float(rebal_plan["portfolio_sigma_pct"])
+            for sym, buy_q in sorted(
+                final_buys.items(),
+                key=lambda kv: kv[1] * float(post_state["prices"].get(kv[0]) or 0.0),
+                reverse=True,
+            ):
+                plan = close_plans[sym]
+                sym_q_rule = plan["sym_q_rule"]
+                sym_ps = plan["sym_ps"]
+                px = float(post_state["prices"].get(sym) or 0.0)
+                if px <= 0.0 or buy_q < 100:
+                    continue
+                cur_sh = int(post_state["held_shares"].get(sym) or 0)
+                cur_mv = float(post_state["held_mvs"].get(sym) or 0.0)
+                tgt_sh = int(rebal_plan["target_shares"].get(sym) or (cur_sh + buy_q))
+                alloc_wt = float(rebal_plan["alloc_weights"].get(sym) or 0.0)
+                min_hold = min_ret_map.get(sym, MIN_RETAINED_SHARES)
+                fl_hhmm = str(sym_ps["close_flatten_time"])
+                sym_name, sym_mkt = self._resolve_symbol_meta(sym)
+                rule_name = str((sym_q_rule or {}).get("name") or sym)
+                if raw_wts.get(sym, 0.0) <= 0.0 and min_hold > 0 and tgt_sh == min_hold:
+                    title = f"[{cap_tag}尾盘调仓·保底留仓{min_hold}股] {rule_name}"
+                else:
+                    title = f"[{cap_tag}尾盘调仓·补仓] {rule_name}"
+                buy_item = {
+                    "rule_id": str((sym_q_rule or {}).get("id") or "route-d-close"),
+                    "rule_title": title,
+                    "rule_summary": f"{wt_reasons.get(sym, '')}；组合目标{alloc_wt * 100:.1f}%(σ={p_sigma:.2f}%)，{cur_sh}股→{tgt_sh}股，买入{buy_q}股",
+                    "side": "buy",
+                    "minute": now_hhmm,
+                    "price": f"{px:.3f}",
+                    "name": sym_name,
+                    "market": sym_mkt,
+                    "trade_date": trade_date,
+                    "signal_tag": "v9-close",
+                    "t0_net_cap_mode": True,
+                    "dynamic_cap_limit": round(cur_mv + buy_q * px * 1.03, 2),
+                }
+                triggered += await self._emit_trade_signal(
+                    symbol=sym,
+                    item=buy_item,
+                    config=root_config,
+                    trade_date=trade_date,
+                    now_epoch=now_epoch,
+                    local_iso=local_iso,
+                    sig_key=f"{sym}:{trade_date}:{fl_hhmm}:v9-close:buy",
+                    qty_override=int(buy_q),
+                    deferred_execs=wave2_execs,
+                )
+
+        for sym, item, sig_key, qty in wave2_fixed_rebal:
+            triggered += await self._emit_trade_signal(
+                symbol=sym,
+                item=item,
+                config=root_config,
+                trade_date=trade_date,
+                now_epoch=now_epoch,
+                local_iso=local_iso,
+                sig_key=sig_key,
+                qty_override=qty,
+                deferred_execs=wave2_execs,
+            )
+
+        for sym, item, sig_key in wave2_buy_cands:
+            triggered += await self._emit_trade_signal(
+                symbol=sym,
+                item=item,
+                config=root_config,
+                trade_date=trade_date,
+                now_epoch=now_epoch,
+                local_iso=local_iso,
+                sig_key=sig_key,
+                qty_override=item.get("qty_override"),
+                deferred_execs=wave2_execs,
+            )
+
+        for sym, fl_item, fl_key, fl_qty in wave1_t0_buys:
+            triggered += await self._emit_trade_signal(
+                symbol=sym,
+                item=fl_item,
+                config=root_config,
+                trade_date=trade_date,
+                now_epoch=now_epoch,
+                local_iso=local_iso,
+                sig_key=fl_key,
+                qty_override=fl_qty,
+                skip_cap_check=True,
+                deferred_execs=wave2_execs,
+            )
+
+        if wave2_execs:
+            await asyncio.gather(*(fn() for fn in wave2_execs))
+
+        return triggered
+
     async def poll_once(self, *, force_session: bool = False) -> dict[str, Any]:
         local_now = self._local_now()
         now_epoch = self._epoch()
@@ -5165,6 +6816,12 @@ class AutoTradeEngine:
                 pass
 
         poll_sem = asyncio.Semaphore(6)
+        is_route_d_plus = self._is_shared_pool_mode(config)
+        pre_pool_state = (
+            await asyncio.to_thread(self._gather_pool_state, config, trade_date)
+            if is_route_d_plus
+            else None
+        )
 
         async def _prepare_symbol_plan(symbol: str, sym_cfg: dict[str, Any]) -> dict[str, Any]:
             async with poll_sem:
@@ -5208,40 +6865,95 @@ class AutoTradeEngine:
                             except Exception:
                                 pass
 
+                eval_cfg = sym_cfg
+                if is_route_d_plus and pre_pool_state is not None:
+                    is_short_open = bool((pre_pool_state.get("reserves") or {}).get(symbol, 0.0) > 0.0)
+                    dyn_cap, dyn_cash, _ = self._resolve_route_d_execution_budget(
+                        symbol=symbol,
+                        root_config=config,
+                        trade_date=trade_date,
+                        is_short_cover=is_short_open,
+                        is_close_rebalance=v9_close_window_active,
+                        pool_state=pre_pool_state,
+                    )
+                    eval_cap = max(dyn_cap, float(pre_pool_state["pool_cap"])) if v9_close_window_active else dyn_cap
+                    eval_cfg = {**sym_cfg, "daily_max_buy_amount": eval_cap, "_route_d_avail_cash": dyn_cash}
+
                 candidates = await asyncio.to_thread(
                     self._evaluate_symbol_candidates,
                     symbol=symbol,
-                    config=sym_cfg,
+                    config=eval_cfg,
                     trade_date=trade_date,
                 )
                 v9_dec = None
+                std_prot_close = None
+                last_sym_guard = self._last_data_guard_by_symbol.get(symbol)
                 if v9_close_window_active and sym_q_rule is not None:
-                    rule_syms = [str(s).strip() for s in (sym_q_rule.get("symbols") or []) if str(s).strip()]
-                    if not rule_syms or symbol in rule_syms:
-                        today_sigs = self.auto_store.list_today_symbol_signals(trade_date, symbol)
-                        net_sh, eff_cash, expected_sh = self._v9_live_context_args(symbol, sym_cfg, trade_date)
-                        v9_dec = await asyncio.to_thread(
-                            evaluate_v9_plus_live_decision,
-                            self.research_store,
-                            symbol=symbol,
-                            trade_date=trade_date,
-                            now_hhmm=now_hhmm,
-                            now_dt=local_now,
-                            cap_limit=float(sym_cfg.get("daily_max_buy_amount") or 50000.0),
-                            rule_spec=sym_q_rule,
-                            pos_sizing=sym_ps,
-                            today_signals=today_sigs,
-                            rolling_shares=net_sh,
-                            broker_available_cash=eff_cash,
-                            expected_ledger_shares=expected_sh,
-                        )
+                    if isinstance(last_sym_guard, Mapping) and last_sym_guard.get("blocked"):
+                        if last_sym_guard.get("allow_protective_exit"):
+                            prot_rebal = await asyncio.to_thread(
+                                self._build_protective_close_flatten_item,
+                                symbol=symbol,
+                                selected_rule=sym_q_rule,
+                                pos_sizing=sym_ps,
+                                guard=last_sym_guard,
+                                trade_date=trade_date,
+                                now_hhmm=now_hhmm,
+                                config=sym_cfg,
+                            )
+                            if prot_rebal is not None:
+                                v9_dec = {"intraday": [], "close_rebalance": prot_rebal}
+                    else:
+                        rule_syms = [str(s).strip() for s in (sym_q_rule.get("symbols") or []) if str(s).strip()]
+                        if not rule_syms or symbol in rule_syms:
+                            today_sigs = self.auto_store.list_today_symbol_signals(trade_date, symbol)
+                            net_sh, eff_cash, expected_sh = self._v9_live_context_args(symbol, eval_cfg, trade_date)
+                            v9_dec = await asyncio.to_thread(
+                                evaluate_v9_plus_live_decision,
+                                self.research_store,
+                                symbol=symbol,
+                                trade_date=trade_date,
+                                now_hhmm=now_hhmm,
+                                now_dt=local_now,
+                                cap_limit=float(eval_cfg.get("daily_max_buy_amount") or 50000.0),
+                                rule_spec=sym_q_rule,
+                                pos_sizing=sym_ps,
+                                today_signals=today_sigs,
+                                rolling_shares=net_sh,
+                                broker_available_cash=eff_cash,
+                                expected_ledger_shares=expected_sh,
+                            )
+                elif (
+                    sym_cfg.get("sizing_mode") == "model_auto"
+                    and sym_q_rule is not None
+                    and sym_profile == "standard"
+                    and sym_ps["mode"] == "cash_pool_rolling"
+                    and in_session
+                    and str(sym_ps["close_flatten_time"]) <= now_hhmm <= "14:55"
+                    and isinstance(last_sym_guard, Mapping)
+                    and last_sym_guard.get("blocked")
+                    and last_sym_guard.get("allow_protective_exit")
+                ):
+                    std_prot_close = await asyncio.to_thread(
+                        self._build_protective_close_flatten_item,
+                        symbol=symbol,
+                        selected_rule=sym_q_rule,
+                        pos_sizing=sym_ps,
+                        guard=last_sym_guard,
+                        trade_date=trade_date,
+                        now_hhmm=now_hhmm,
+                        config=sym_cfg,
+                    )
                 return {
                     "symbol": symbol,
                     "sym_cfg": sym_cfg,
                     "sym_q_rule": sym_q_rule,
                     "sym_ps": sym_ps,
                     "flatten_window_active": flatten_window_active,
+                    "v9_close_window_active": v9_close_window_active,
+                    "last_sym_guard": last_sym_guard,
                     "v9_dec": v9_dec,
+                    "std_prot_close": std_prot_close,
                     "candidates": candidates,
                 }
 
@@ -5251,106 +6963,142 @@ class AutoTradeEngine:
             else ([await _prepare_symbol_plan(active_configs[0][0], active_configs[0][1])] if active_configs else [])
         )
 
-        for plan in symbol_plans:
-            symbol = plan["symbol"]
-            sym_cfg = plan["sym_cfg"]
-            sym_q_rule = plan["sym_q_rule"]
-            sym_ps = plan["sym_ps"]
-            flatten_window_active = plan["flatten_window_active"]
-            v9_dec = plan["v9_dec"]
-            for item in plan["candidates"]:
-                sig_tag = str(item.get("signal_tag") or item["rule_id"])
-                sig_key = f"{symbol}:{trade_date}:{item['minute']}:{sig_tag}:{item['side']}"
-                triggered += await self._emit_trade_signal(
-                    symbol=symbol,
-                    item=item,
-                    config=sym_cfg,
-                    trade_date=trade_date,
-                    now_epoch=now_epoch,
-                    local_iso=local_iso,
-                    sig_key=sig_key,
-                    qty_override=item.get("qty_override"),
-                    deferred_execs=deferred_execs,
-                )
-
-            if isinstance(v9_dec, Mapping):
-                rebal = v9_dec.get("close_rebalance")
-                if isinstance(rebal, Mapping) and sym_ps is not None:
-                    sym_name, sym_mkt = self._resolve_symbol_meta(symbol)
-                    fl_hhmm = str(sym_ps["close_flatten_time"])
-                    rebal_item = {
-                        **dict(rebal),
-                        "name": sym_name,
-                        "market": sym_mkt,
-                        "trade_date": trade_date,
-                    }
+        if is_route_d_plus:
+            triggered += await self._execute_route_d_poll_plans(
+                symbol_plans=symbol_plans,
+                root_config=config,
+                trade_date=trade_date,
+                now_hhmm=now_hhmm,
+                now_epoch=now_epoch,
+                local_iso=local_iso,
+            )
+        else:
+            for plan in symbol_plans:
+                symbol = plan["symbol"]
+                sym_cfg = plan["sym_cfg"]
+                sym_q_rule = plan["sym_q_rule"]
+                sym_ps = plan["sym_ps"]
+                flatten_window_active = plan["flatten_window_active"]
+                v9_dec = plan["v9_dec"]
+                for item in plan["candidates"]:
+                    sig_tag = str(item.get("signal_tag") or item["rule_id"])
+                    sig_key = f"{symbol}:{trade_date}:{item['minute']}:{sig_tag}:{item['side']}"
                     triggered += await self._emit_trade_signal(
                         symbol=symbol,
-                        item=rebal_item,
+                        item=item,
                         config=sym_cfg,
                         trade_date=trade_date,
                         now_epoch=now_epoch,
                         local_iso=local_iso,
-                        sig_key=f"{symbol}:{trade_date}:{fl_hhmm}:v9-close:{rebal['side']}",
-                        qty_override=int(rebal["qty_override"]),
+                        sig_key=sig_key,
+                        qty_override=item.get("qty_override"),
                         deferred_execs=deferred_execs,
                     )
 
-            # Automatic tail close-flatten to restore base position when model_auto + base_t0_close
-            if flatten_window_active and sym_q_rule is not None:
-                act = self.auto_store.today_symbol_activity(trade_date, symbol)
-                net_sh = int(act["net_shares"])
-                if abs(net_sh) >= 100:
-                    flatten_side: Literal["buy", "sell"] = "sell" if net_sh > 0 else "buy"
-                    flatten_qty = (abs(net_sh) // 100) * 100
-                    if flatten_side == "sell":
-                        net_total, max_sell, pos_src = self._max_sellable_above_floor(symbol, trade_date)
-                        if pos_src != "none" or net_total > 0:
-                            flatten_qty = min(flatten_qty, max_sell)
-                    if flatten_qty < 100:
-                        continue
-                    sym_name, sym_mkt = self._resolve_symbol_meta(symbol)
-                    fl_book = self.get_order_book(symbol, sym_mkt)
-                    ref_px = (
-                        str((fl_book or {}).get("last_price") or "").strip()
-                        or ("2.100" if symbol.startswith(_FUND_PREFIXES) else "10.00")
-                    )
-                    if not fl_book:
-                        read_series = getattr(self.research_store, "read_series", None)
-                        if callable(read_series):
-                            try:
-                                sr = read_series(symbol, trade_date)
-                                if isinstance(sr, Mapping) and sr.get("points"):
-                                    ref_px = str(sr["points"][-1].get("price") or ref_px)
-                            except Exception:
-                                pass
+                if isinstance(v9_dec, Mapping):
+                    rebal = v9_dec.get("close_rebalance")
+                    if isinstance(rebal, Mapping) and sym_ps is not None:
+                        sym_name, sym_mkt = self._resolve_symbol_meta(symbol)
+                        fl_hhmm = str(sym_ps["close_flatten_time"])
+                        rebal_item = {
+                            **dict(rebal),
+                            "name": sym_name,
+                            "market": sym_mkt,
+                            "trade_date": trade_date,
+                        }
+                        triggered += await self._emit_trade_signal(
+                            symbol=symbol,
+                            item=rebal_item,
+                            config=sym_cfg,
+                            trade_date=trade_date,
+                            now_epoch=now_epoch,
+                            local_iso=local_iso,
+                            sig_key=f"{symbol}:{trade_date}:{fl_hhmm}:v9-close:{rebal['side']}",
+                            qty_override=int(rebal["qty_override"]),
+                            deferred_execs=deferred_execs,
+                        )
+
+                std_prot_close = plan.get("std_prot_close")
+                if isinstance(std_prot_close, Mapping) and sym_ps is not None:
                     fl_hhmm = str(sym_ps["close_flatten_time"])
-                    fl_item = {
-                        "rule_id": str(sym_q_rule["id"]),
-                        "rule_title": f"[尾盘平T恢复底仓] {sym_q_rule['name']}",
-                        "rule_summary": f"早盘/日内净敞口 {net_sh:+d} 股，按 {fl_hhmm} 闭环规则自动反向平仓 {flatten_qty} 股恢复底仓",
-                        "side": flatten_side,
-                        "minute": now_hhmm,
-                        "price": ref_px,
-                        "name": sym_name,
-                        "market": sym_mkt,
-                        "trade_date": trade_date,
-                    }
                     triggered += await self._emit_trade_signal(
                         symbol=symbol,
-                        item=fl_item,
+                        item=std_prot_close,
                         config=sym_cfg,
                         trade_date=trade_date,
                         now_epoch=now_epoch,
                         local_iso=local_iso,
-                        sig_key=f"{symbol}:{trade_date}:{fl_hhmm}:t0-flatten:{flatten_side}",
-                        qty_override=flatten_qty,
-                        skip_cap_check=(flatten_side == "buy"),
+                        sig_key=f"{symbol}:{trade_date}:{fl_hhmm}:t0-flatten:{std_prot_close['side']}",
+                        qty_override=int(std_prot_close["qty_override"]),
                         deferred_execs=deferred_execs,
                     )
 
-        if deferred_execs:
-            await asyncio.gather(*(fn() for fn in deferred_execs))
+                # Automatic tail close-flatten to restore base position when model_auto + base_t0_close
+                if flatten_window_active and sym_q_rule is not None:
+                    last_sym_guard = self._last_data_guard_by_symbol.get(symbol)
+                    act = self.auto_store.today_symbol_activity(trade_date, symbol)
+                    net_sh = int(act["net_shares"])
+                    if abs(net_sh) >= 100:
+                        flatten_side: Literal["buy", "sell"] = "sell" if net_sh > 0 else "buy"
+                        if isinstance(last_sym_guard, Mapping) and last_sym_guard.get("blocked") and flatten_side == "buy":
+                            continue
+                        flatten_qty = (abs(net_sh) // 100) * 100
+                        if flatten_side == "sell":
+                            net_total, max_sell, pos_src = self._max_sellable_above_floor(symbol, trade_date)
+                            if pos_src != "none" or net_total > 0:
+                                flatten_qty = min(flatten_qty, max_sell)
+                        if flatten_qty < 100:
+                            continue
+                        sym_name, sym_mkt = self._resolve_symbol_meta(symbol)
+                        fl_book = self.get_order_book(symbol, sym_mkt)
+                        ref_px = (
+                            str((fl_book or {}).get("last_price") or "").strip()
+                            or ("2.100" if symbol.startswith(_FUND_PREFIXES) else "10.00")
+                        )
+                        if not fl_book:
+                            read_series = getattr(self.research_store, "read_series", None)
+                            if callable(read_series):
+                                try:
+                                    sr = read_series(symbol, trade_date)
+                                    if isinstance(sr, Mapping) and sr.get("points"):
+                                        ref_px = str(sr["points"][-1].get("price") or ref_px)
+                                except Exception:
+                                    pass
+                        fl_hhmm = str(sym_ps["close_flatten_time"])
+                        prot_flag = bool(isinstance(last_sym_guard, Mapping) and last_sym_guard.get("blocked"))
+                        fl_item = {
+                            "rule_id": str(sym_q_rule["id"]),
+                            "rule_title": (
+                                f"[缺数保护·尾盘平T恢复底仓] {sym_q_rule['name']}"
+                                if prot_flag
+                                else f"[尾盘平T恢复底仓] {sym_q_rule['name']}"
+                            ),
+                            "rule_summary": f"早盘/日内净敞口 {net_sh:+d} 股，按 {fl_hhmm} 闭环规则自动反向平仓 {flatten_qty} 股恢复底仓",
+                            "side": flatten_side,
+                            "minute": now_hhmm,
+                            "price": ref_px,
+                            "name": sym_name,
+                            "market": sym_mkt,
+                            "trade_date": trade_date,
+                            "signal_tag": "t0-flatten",
+                            "protective_exit": prot_flag,
+                            "t0_net_cap_mode": True,
+                        }
+                        triggered += await self._emit_trade_signal(
+                            symbol=symbol,
+                            item=fl_item,
+                            config=sym_cfg,
+                            trade_date=trade_date,
+                            now_epoch=now_epoch,
+                            local_iso=local_iso,
+                            sig_key=f"{symbol}:{trade_date}:{fl_hhmm}:t0-flatten:{flatten_side}",
+                            qty_override=flatten_qty,
+                            skip_cap_check=(flatten_side == "buy"),
+                            deferred_execs=deferred_execs,
+                        )
+
+            if deferred_execs:
+                await asyncio.gather(*(fn() for fn in deferred_execs))
 
         if in_session and not force_session and triggered == 0:
             self._maybe_schedule_preapproach_prestage(

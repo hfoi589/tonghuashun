@@ -625,7 +625,9 @@ def test_brent_schedule_dst_alignment_and_base_position_t0(tmp_path) -> None:
     saved = qstore.upsert_rule(rule_spec, research_store=rstore)
     assert "BRN0Y" in saved["symbols"]
     schema = get_quant_rule_schema()
-    assert schema["version"] == 3
+    assert schema["version"] == 4
+    assert len(schema["data_packs"]) == 5
+    assert len(schema["condition_types"]) == 22
     assert "position_sizing_contract" in schema
     assert schema["default_start_date"] == "20260701"
     assert schema["cross_market_brent"]["symbol"] == "BRN0Y"
@@ -2691,4 +2693,1529 @@ def test_v9_plus_501018_tuning_and_tolerant_backfill(tmp_path: Path, monkeypatch
 
     qstore.close()
     rstore.close()
+
+
+def test_v9_plus_xop_v2_multifactor_crack_iwm_and_crash_contrarian(tmp_path: Path, monkeypatch) -> None:
+    import json as _json
+    import time as _time
+    from datetime import timedelta as _timedelta
+    from level2_service.v9_plus_engine import (
+        V9MacroDataStore,
+        _check_xop_bear_quick_tp,
+        apply_xop_overnight_intraday_overlays,
+        evaluate_v9_plus_live_indicators,
+        should_exit_scalp_long,
+        v9_xop_close_weight,
+    )
+
+    # 1. Contrarian stabilization rebound, MA5 reclaim continuation, exhaustion TP, & E&P high-Brent breakout
+    w_rebound, lbl_rebound = v9_xop_close_weight(
+        {
+            "ma5": 0.900,
+            "ma15": 0.950,
+            "max_bpos_20d": 0.65,
+            "max_xpos_20d": 0.70,
+            "xop_bull": False,
+            "xop_above_ma5": True,
+            "xop_5d": -7.5,
+            "xop_ov": 0.50,
+            "iwm_ov": 0.80,
+            "crack_3d": 0.20,
+        },
+        {"brn_pos": 0.48, "xop_pos": 0.52, "prem": -0.50, "price": 0.890, "daytime_lead_pct": 0.15},
+        0,
+    )
+    assert w_rebound == 0.90 and "逆势反弹" in lbl_rebound
+
+    w_cont, _ = v9_xop_close_weight(
+        {
+            "ma5": 0.880,
+            "ma15": 0.950,
+            "max_bpos_20d": 0.85,
+            "max_xpos_20d": 0.85,
+            "xop_bull": False,
+            "xop_above_ma5": True,
+            "xop_5d": 1.5,
+            "xop_ov": 1.50,
+            "iwm_ov": 0.20,
+            "crack_3d": 0.0,
+        },
+        {"brn_pos": 0.50, "xop_pos": 0.55, "prem": -0.05, "price": 0.902, "daytime_lead_pct": 0.10},
+        0,
+    )
+    assert w_cont == 0.85
+
+    w_exhaust, _ = v9_xop_close_weight(
+        {
+            "ma5": 0.920,
+            "ma15": 0.960,
+            "max_bpos_20d": 0.90,
+            "max_xpos_20d": 0.90,
+            "xop_bull": False,
+            "xop_above_ma5": True,
+            "xop_5d": 5.5,
+            "xop_ov": 0.80,
+            "iwm_ov": 0.10,
+            "crack_3d": 0.0,
+        },
+        {"brn_pos": 0.65, "xop_pos": 0.70, "prem": 0.05, "price": 0.931, "daytime_lead_pct": 0.10},
+        0,
+    )
+    assert w_exhaust == 0.0
+
+    day_ep_breakout = {
+        "ma5": 0.990,
+        "ma15": 0.960,
+        "max_bpos_20d": 0.85,
+        "max_xpos_20d": 0.85,
+        "xop_bull": True,
+        "xop_above_ma5": True,
+        "crack_3d": 1.0,
+    }
+    w_breakout, _ = v9_xop_close_weight(
+        day_ep_breakout,
+        {"brn_pos": 0.85, "xop_pos": 0.80, "prem": -0.20, "price": 1.000, "daytime_lead_pct": 0.15},
+        0,
+    )
+    assert w_breakout == 0.90
+    w_break_cut, _ = v9_xop_close_weight(
+        day_ep_breakout,
+        {"brn_pos": 0.85, "xop_pos": 0.80, "prem": -0.20, "price": 0.985, "daytime_lead_pct": 0.15},
+        0,
+    )
+    assert w_break_cut == 0.0
+
+    # 2. Panic capitulation bounce scalp, late bear entry block, and XOP-isolated quick TP
+    bear_day = {
+        "ma5": 0.900,
+        "ma15": 0.950,
+        "xop_ov": -0.30,
+        "spy_ov": 0.10,
+        "ng_ov": 0.0,
+        "iwm_ov": 0.10,
+        "crack_3d": 0.20,
+        "xop_5d": -6.0,
+        "xop_vs_oil_alpha": 0.0,
+        "cross_market_anchor": "xop_us_ep",
+    }
+    _, _, sc_panic, m_panic = apply_xop_overnight_intraday_overlays(
+        bear_day,
+        {
+            "time": "11:15",
+            "prem": -0.60,
+            "sp_fx": -0.35,
+            "dmc10": 0.00025,
+            "m1": 0.05,
+            "dc10": False,
+            "gc10": False,
+            "price": 0.885,
+            "vdev": -0.50,
+            "px_dd_hi": 0.60,
+            "vol_ratio": 1.40,
+            "bounce_from_lo_pct": 0.22,
+            "daytime_lead_pct": 0.0,
+        },
+        s_sig=False,
+        b_sig=False,
+        scalp_ok=False,
+        close_wt=0.0,
+        sc=1.0,
+    )
+    assert sc_panic is True
+    assert m_panic["panic_scalp_xop"] is True
+    assert m_panic["scalp_frac_override"] == 0.85
+
+    _, b_late, sc_late, m_late = apply_xop_overnight_intraday_overlays(
+        bear_day,
+        {
+            "time": "13:35",
+            "prem": -0.35,
+            "sp_fx": -0.30,
+            "dmc10": 0.00010,
+            "m1": 0.01,
+            "dc10": False,
+            "gc10": False,
+            "price": 0.889,
+            "vdev": -0.30,
+            "px_dd_hi": 0.35,
+            "vol_ratio": 0.90,
+            "bounce_from_lo_pct": 0.05,
+            "daytime_lead_pct": 0.0,
+        },
+        s_sig=False,
+        b_sig=True,
+        scalp_ok=True,
+        close_wt=0.0,
+        sc=1.0,
+    )
+    assert b_late is False and sc_late is False and m_late["bear_late_or_weak_blocked"] is True
+
+    # Quick TP fires on xop_us_ep bear-zero (+0.36% stall even when sp_gain=0.20 < 0.30), never mutates brent rules
+    qtp_xop, lbl_xop_tp = should_exit_scalp_long(
+        {"price": 1.0036, "sp_fx": -0.10, "dmc10": 0.0, "time": "11:30"},
+        entry_px=1.000,
+        entry_sp=-0.30,
+        s_sig=False,
+        day=bear_day,
+        close_wt=0.0,
+    )
+    assert qtp_xop is True and "暴跌反抽快进止盈" in lbl_xop_tp
+    assert _check_xop_bear_quick_tp({**bear_day, "cross_market_anchor": "brent"}, {"dmc10": 0.0, "time": "11:30"}, 0.36, 0.0)[0] is False
+    qtp_brent, _ = should_exit_scalp_long(
+        {"price": 1.0036, "sp_fx": -0.10, "dmc10": 0.0, "time": "11:30"},
+        entry_px=1.000,
+        entry_sp=-0.30,
+        s_sig=False,
+        day={**bear_day, "cross_market_anchor": "brent"},
+        close_wt=0.0,
+    )
+    assert qtp_brent is False
+
+    # 3. Offline SQLite store: iwm_daily_2y, xle_daily_2y, cl_daily_2y, ho_daily_2y surface in live indicators
+    monkeypatch.setenv("THS_QUANT_OFFLINE", "1")
+    rstore = SQLiteResearchStore(tmp_path / "v9p_xop_v2.db")
+    V9MacroDataStore(rstore, allow_network=False)
+    now_ts = _time.time()
+
+    def _day_mins(val: float) -> list[tuple[str, float]]:
+        return [
+            (f"{((570 + i + 1) if i < 120 else (780 + (i - 120) + 1)) // 60:02d}:{((570 + i + 1) if i < 120 else (780 + (i - 120) + 1)) % 60:02d}", val)
+            for i in range(240)
+        ]
+
+    oil_rows = [
+        ["20251101", int(datetime(2025, 11, 2, 6, 0, tzinfo=SHANGHAI_TZ).timestamp()), 60.0],
+        ["20261101", int(datetime(2026, 11, 2, 6, 0, tzinfo=SHANGHAI_TZ).timestamp()), 100.0],
+    ]
+    xop_rows = [["20251101", int(datetime(2025, 11, 2, 6, 0, tzinfo=SHANGHAI_TZ).timestamp()), 120.0]]
+    spy_rows = [["20251101", int(datetime(2025, 11, 2, 6, 0, tzinfo=SHANGHAI_TZ).timestamp()), 600.0]]
+    ng_rows = [["20251101", int(datetime(2025, 11, 2, 6, 0, tzinfo=SHANGHAI_TZ).timestamp()), 3.00]]
+    iwm_rows = [["20251101", int(datetime(2025, 11, 2, 6, 0, tzinfo=SHANGHAI_TZ).timestamp()), 200.0]]
+    xle_rows = [["20251101", int(datetime(2025, 11, 2, 6, 0, tzinfo=SHANGHAI_TZ).timestamp()), 50.0]]
+    cl_rows = [["20251101", int(datetime(2025, 11, 2, 6, 0, tzinfo=SHANGHAI_TZ).timestamp()), 70.0]]
+    ho_rows = [["20251101", int(datetime(2025, 11, 2, 6, 0, tzinfo=SHANGHAI_TZ).timestamp()), 3.00]]
+    nav_payload = {}
+
+    for idx in range(7):
+        us_d = (datetime(2026, 11, 10, tzinfo=SHANGHAI_TZ) + _timedelta(days=idx)).strftime("%Y%m%d")
+        a_d = (datetime(2026, 11, 11, tzinfo=SHANGHAI_TZ) + _timedelta(days=idx)).strftime("%Y%m%d")
+        cts = int((datetime.strptime(us_d, "%Y%m%d").replace(tzinfo=SHANGHAI_TZ) + _timedelta(days=1, hours=6)).timestamp())
+        xop_rows.append([us_d, cts, 160.0 - idx * 2.0])
+        spy_rows.append([us_d, cts, 700.0])
+        ng_rows.append([us_d, cts, 3.50])
+        iwm_rows.append([us_d, cts, 260.0 + (4.0 if idx == 6 else 0.0)])
+        xle_rows.append([us_d, cts, 60.0])
+        cl_rows.append([us_d, cts, 80.0])
+        ho_rows.append([us_d, cts, 3.40 + (0.17 if idx == 6 else 0.0)])  # HO surges +5.0% in 3d -> crack_3d = +5.0%
+        nav_payload[us_d] = 0.880
+        _seed_symbol_bars(rstore, "BRN0Y", a_d, 80.0, [("09:30", 80.0), ("14:53", 80.0), ("15:00", 80.0)], name="布伦特", market="ICE")
+        _seed_symbol_bars(rstore, "162411", a_d, 0.880, _day_mins(0.880), name="华宝油气")
+
+    td_check = "20261117"
+    with rstore._lock, rstore._connection:
+        for k_name, payload in (
+            ("nav_162411", nav_payload),
+            ("oil_daily_2y", oil_rows),
+            ("xop_daily_2y", xop_rows),
+            ("spy_daily_2y", spy_rows),
+            ("ng_daily_2y", ng_rows),
+            ("iwm_daily_2y", iwm_rows),
+            ("xle_daily_2y", xle_rows),
+            ("cl_daily_2y", cl_rows),
+            ("ho_daily_2y", ho_rows),
+            ("fx_usdcny_series", {"ts": [int(datetime(2026, 10, 1, 9, 0, tzinfo=SHANGHAI_TZ).timestamp())], "px": [6.70]}),
+        ):
+            rstore._connection.execute(
+                "INSERT OR REPLACE INTO quant_macro_cache VALUES (?, ?, ?)",
+                (k_name, _json.dumps(payload), now_ts),
+            )
+
+    ind_v2 = evaluate_v9_plus_live_indicators(
+        rstore,
+        symbol="162411",
+        trade_date=td_check,
+        now_hhmm="14:53",
+        cap_limit=50000.0,
+        rule_spec={"id": "ai-162411-v9-xop-aggressive", "name": "162411 XOP v2", "macd_settings": {"short": 10, "long": 20, "signal": 5}},
+        pos_sizing={"mode": "cash_pool_rolling", "engine_profile": "v9_plus_aggressive", "cross_market_anchor": "xop_us_ep", "min_retained_shares": 100},
+        today_signals=[],
+        rolling_shares=0,
+        allow_network=False,
+    )
+    assert ind_v2 is not None
+    diag_v2 = ind_v2["diagnostics"]
+    assert diag_v2["crack_3d_pct"] == 5.0
+    assert round(diag_v2["iwm_overnight_pct"], 2) == round((264.0 / 260.0 - 1.0) * 100.0, 2)
+    assert diag_v2["xop_5d_pct"] < -5.0
+    assert diag_v2["xle_overnight_pct"] == 0.0
+    assert diag_v2["vol_ratio"] > 0.0
+
+    rstore.close()
+
+
+def test_v9_plus_501018_multi_oil_and_plunge_contrarian(tmp_path: Path, monkeypatch) -> None:
+    import json as _json
+    import time as _time
+    from datetime import timedelta as _timedelta
+    from level2_service.quant_rules import _normalize_v9_tuning
+    from level2_service.v9_plus_engine import (
+        V9MacroDataStore,
+        apply_v9_close_weight_tuning,
+        apply_v9_sell_tier_tuning,
+        clean_sell_tier,
+        evaluate_v9_plus_live_decision,
+        evaluate_v9_plus_live_indicators,
+        filter_bear_regime_buy,
+        signals_v8_with_tuning,
+        v9_pro_close_weight,
+    )
+
+    # 1. Tuning normalization & bounds check
+    norm = _normalize_v9_tuning(
+        {
+            "macd_price_anchor": 2.2,
+            "buy_prem_offset_pct": 0.6,
+            "bubble_prem_cap_pct": 16.5,
+            "bubble_overnight_weight_pct": 45.0,
+            "bull_pullback_weight_pct": 65.0,
+            "strict_dip_scalp": True,
+            "multi_oil_plunge_mode": True,
+            "plunge_dd15_pct": -11.0,
+            "high_oil_bull_cap_pct": 87.0,
+            "peer_symbol": "160723",
+        }
+    )
+    assert norm["multi_oil_plunge_mode"] is True
+    assert norm["plunge_dd15_pct"] == -11.0
+    assert norm["high_oil_bull_cap_pct"] == 87.0
+    assert norm["peer_symbol"] == "160723"
+
+    clamped = _normalize_v9_tuning({"plunge_dd15_pct": -60.0, "high_oil_bull_cap_pct": 99.0, "peer_symbol": "../bad"})
+    assert clamped["plunge_dd15_pct"] == -35.0
+    assert clamped["high_oil_bull_cap_pct"] == 95.0
+    assert "peer_symbol" not in clamped
+
+    # 2. Contrarian plunge overnight & dual-anchor bubble guard
+    close_fn = apply_v9_close_weight_tuning(v9_pro_close_weight, norm)
+    day_plunge = {"ma5": 1.85, "ma15": 2.00, "max_bpos_20d": 0.90, "macro_oil_ov": 1.25, "xop_ov": 0.50}
+    b_debubbled = {
+        "brn_pos": 0.55,
+        "prem": -1.40,
+        "prem_etf": -1.30,
+        "price": 1.82,
+        "sp_fx": -0.20,
+        "dd15_pct": -13.0,
+        "lof_chg": -0.80,
+        "brn_chg": 0.50,
+        "vwap_intra": 1.81,
+    }
+    w_cap, lbl_cap = close_fn(day_plunge, b_debubbled, 0)
+    assert w_cap == 0.85 and "逆势" in lbl_cap
+
+    # Bubble in USO/BNO ETF anchor blocks contrarian overnight even when Brent-only IOPV looks discounted
+    w_bub, _ = close_fn(day_plunge, {**b_debubbled, "prem_etf": 5.50}, 0)
+    assert w_bub == 0.0
+
+    w_turn, lbl_turn = close_fn(
+        day_plunge,
+        {**b_debubbled, "prem": 0.20, "prem_etf": 0.30, "lof_chg": 0.60, "price": 1.82, "vwap_intra": 1.81},
+        0,
+    )
+    assert w_turn == 0.90 and "逆势" in lbl_turn
+
+    # 3. Late bear knife block (>=13:20 when close_wt==0) & morning bear profit lock (>=+2% gap-up)
+    b_late_bear = {
+        "time": "13:45",
+        "price": 1.82,
+        "vdev": -0.25,
+        "lof_chg": -0.50,
+        "gc10": True,
+        "dc10": False,
+        "dmc10": 0.0002,
+        "m1": 0.02,
+        "sp_fx": -0.50,
+        "coint10": -0.30,
+        "prem": -0.80,
+        "m3": -0.15,
+        "m5": -0.10,
+        "macd10": -0.001,
+        "diff10": -0.002,
+        "dea10": -0.001,
+        "max_red12": 0.0005,
+        "min_grn12": -0.0015,
+        "brn_chg": -0.50,
+        "sp_intra": -0.20,
+    }
+    assert filter_bear_regime_buy(day_plunge, b_late_bear, True, 0.0, 0.95, v9_tuning=norm) is False
+    assert filter_bear_regime_buy(day_plunge, b_late_bear, True, 0.0, 0.95, v9_tuning=None) is True
+
+    b_morning_gap = {
+        **b_late_bear,
+        "time": "09:45",
+        "price": 1.89,
+        "lof_chg": 2.35,
+        "sp_fx": 0.25,
+        "coint10": 0.10,
+        "prem": -0.40,
+        "dmc10": -0.00005,
+    }
+    s_carry, _ = signals_v8_with_tuning(day_plunge, b_morning_gap, 0.95, norm, bear_carry_active=True)
+    assert s_carry is True
+    lbl_lock, frac_lock = apply_v9_sell_tier_tuning(
+        day_plunge, b_morning_gap, *clean_sell_tier(day_plunge, b_morning_gap), norm, bear_carry_active=True
+    )
+    assert frac_lock == 1.0 and "锁利" in lbl_lock
+
+    # 4. Offline end-to-end store integration with USO+BNO+WTI+XOP+160723 peer LOF
+    monkeypatch.setenv("THS_QUANT_OFFLINE", "1")
+    rstore = SQLiteResearchStore(tmp_path / "v9p_501018_multi.db")
+    V9MacroDataStore(rstore, allow_network=False)
+    now_ts = _time.time()
+
+    def _day_mins_ramp(p0: float, p_end: float) -> list[tuple[str, float]]:
+        out: list[tuple[str, float]] = []
+        for i in range(240):
+            hh = ((570 + i + 1) if i < 120 else (780 + (i - 120) + 1)) // 60
+            mm = ((570 + i + 1) if i < 120 else (780 + (i - 120) + 1)) % 60
+            px = p0 + (p_end - p0) * (i / 239.0)
+            out.append((f"{hh:02d}:{mm:02d}", round(px, 4)))
+        return out
+
+    oil_rows = [
+        ["20251101", int(datetime(2025, 11, 2, 6, 0, tzinfo=SHANGHAI_TZ).timestamp()), 60.0],
+        ["20261025", int(datetime(2026, 10, 26, 6, 0, tzinfo=SHANGHAI_TZ).timestamp()), 100.0],
+    ]
+    uso_rows = [["20251101", int(datetime(2025, 11, 2, 6, 0, tzinfo=SHANGHAI_TZ).timestamp()), 70.0]]
+    bno_rows = [["20251101", int(datetime(2025, 11, 2, 6, 0, tzinfo=SHANGHAI_TZ).timestamp()), 30.0]]
+    cl_rows = [["20251101", int(datetime(2025, 11, 2, 6, 0, tzinfo=SHANGHAI_TZ).timestamp()), 65.0]]
+    xop_rows = [["20251101", int(datetime(2025, 11, 2, 6, 0, tzinfo=SHANGHAI_TZ).timestamp()), 140.0]]
+    nav_payload = {}
+
+    closes_501 = [2.20 - i * 0.02 for i in range(18)]
+    last_td = ""
+    for idx, c_val in enumerate(closes_501):
+        us_d = (datetime(2026, 11, 1, tzinfo=SHANGHAI_TZ) + _timedelta(days=idx)).strftime("%Y%m%d")
+        a_d = (datetime(2026, 11, 2, tzinfo=SHANGHAI_TZ) + _timedelta(days=idx)).strftime("%Y%m%d")
+        last_td = a_d
+        cts = int((datetime.strptime(us_d, "%Y%m%d").replace(tzinfo=SHANGHAI_TZ) + _timedelta(days=1, hours=6)).timestamp())
+        uso_px = 92.0 - idx * 1.1 + (2.0 if idx == len(closes_501) - 1 else 0.0)
+        bno_px = 40.0 - idx * 0.5 + (0.9 if idx == len(closes_501) - 1 else 0.0)
+        cl_px = 88.0 - idx * 1.0 + (1.5 if idx == len(closes_501) - 1 else 0.0)
+        uso_rows.append([us_d, cts, round(uso_px, 3)])
+        bno_rows.append([us_d, cts, round(bno_px, 3)])
+        cl_rows.append([us_d, cts, round(cl_px, 3)])
+        xop_rows.append([us_d, cts, round(155.0 - idx * 1.0, 3)])
+        oil_rows.append([us_d, cts, 90.0 - idx * 0.8])
+        nav_payload[us_d] = round(c_val + 0.03, 4)
+
+        pre_501 = closes_501[idx - 1] if idx > 0 else 2.22
+        is_last = idx == len(closes_501) - 1
+        end_501 = pre_501 * (0.985 if is_last else c_val / pre_501)
+        end_160 = 2.00 * (0.998 if is_last else 0.995)
+        _seed_symbol_bars(rstore, "BRN0Y", a_d, 78.0, [("09:30", 78.0), ("14:53", 78.0), ("15:00", 78.0)], name="布伦特", market="ICE")
+        _seed_symbol_bars(rstore, "501018", a_d, pre_501, _day_mins_ramp(pre_501, end_501), name="南方原油")
+        _seed_symbol_bars(rstore, "160723", a_d, 2.00, _day_mins_ramp(2.00, end_160), name="嘉实原油")
+
+    with rstore._lock, rstore._connection:
+        for k_name, payload in (
+            ("nav_501018", nav_payload),
+            ("nav_160723", nav_payload),
+            ("oil_daily_2y", oil_rows),
+            ("uso_daily_2y", uso_rows),
+            ("bno_daily_2y", bno_rows),
+            ("cl_daily_2y", cl_rows),
+            ("xop_daily_2y", xop_rows),
+            ("fx_usdcny_series", {"ts": [int(datetime(2026, 10, 1, 9, 0, tzinfo=SHANGHAI_TZ).timestamp())], "px": [7.10]}),
+        ):
+            rstore._connection.execute(
+                "INSERT OR REPLACE INTO quant_macro_cache VALUES (?, ?, ?)",
+                (k_name, _json.dumps(payload), now_ts),
+            )
+
+    pos_501 = {
+        "mode": "cash_pool_rolling",
+        "engine_profile": "v9_plus_aggressive",
+        "capital_cap": 20000.0,
+        "scale_factor": 0.95,
+        "min_retained_shares": 100,
+        "v9_tuning": norm,
+    }
+    rule_501 = {"id": "ai-501018-v9-plus-aggressive", "name": "501018 Multi-Oil", "macd_settings": {"short": 10, "long": 20, "signal": 5}}
+
+    dec = evaluate_v9_plus_live_decision(
+        rstore,
+        symbol="501018",
+        trade_date=last_td,
+        now_hhmm="14:53",
+        cap_limit=20000.0,
+        rule_spec=rule_501,
+        pos_sizing=pos_501,
+        today_signals=[],
+        rolling_shares=100,
+        allow_network=False,
+    )
+    ind = evaluate_v9_plus_live_indicators(
+        rstore,
+        symbol="501018",
+        trade_date=last_td,
+        now_hhmm="14:53",
+        cap_limit=20000.0,
+        rule_spec=rule_501,
+        pos_sizing=pos_501,
+        today_signals=[],
+        rolling_shares=100,
+        allow_network=False,
+    )
+    assert dec is not None and ind is not None
+    diag = ind["diagnostics"]
+    assert diag["etf_ov_pct"] > 0.0
+    assert diag["wti_ov_pct"] > 0.0
+    assert diag["dd15_pct"] <= -11.0
+    assert diag["peer_gap_pct"] <= -1.0
+    assert dec["diagnostics"]["peer_gap_pct"] == diag["peer_gap_pct"]
+    assert any(c["id"] == "v9-macro-plunge" for c in ind["buy"]["conditions"])
+
+    # Isolation check: standard 160723 must never receive v9-macro-plunge or multi-oil fields
+    ind_160 = evaluate_v9_plus_live_indicators(
+        rstore,
+        symbol="160723",
+        trade_date=last_td,
+        now_hhmm="14:53",
+        cap_limit=50000.0,
+        rule_spec={"id": "ai-160723-v9-plus-aggressive", "name": "160723", "macd_settings": {"short": 10, "long": 20, "signal": 5}},
+        pos_sizing={"mode": "cash_pool_rolling", "engine_profile": "v9_plus_aggressive", "min_retained_shares": 100},
+        today_signals=[],
+        rolling_shares=100,
+        allow_network=False,
+    )
+    assert ind_160 is not None
+    assert not any(c["id"] == "v9-macro-plunge" for c in ind_160["buy"]["conditions"])
+    assert "peer_gap_pct" not in ind_160["diagnostics"]
+
+    rstore.close()
+
+
+def test_v9_plus_uso_bno_sc_peer_161129_engine(tmp_path: Path, monkeypatch) -> None:
+    import json as _json
+    import time as _time
+    from datetime import timedelta as _timedelta
+    from level2_service.quant_rules import normalize_position_sizing
+    from level2_service.v9_plus_engine import (
+        V9MacroDataStore,
+        _parse_sc_daily_payload,
+        apply_dual_oil_peer_intraday_overlays,
+        clean_buy_tier,
+        evaluate_v9_plus_backtest,
+        evaluate_v9_plus_live_decision,
+        evaluate_v9_plus_live_indicators,
+        should_exit_long_v9,
+        should_exit_scalp_long,
+        should_hold_dual_oil_rebound,
+        v9_dual_oil_peer_close_weight,
+    )
+
+    # 1. Anchor normalization & SC0 / A-share parser verification
+    assert "cross_market_anchor" not in normalize_position_sizing({})
+    ps_dual = normalize_position_sizing(
+        {
+            "mode": "cash_pool_rolling",
+            "engine_profile": "v9_plus_aggressive",
+            "cross_market_anchor": "uso_bno_sc_peer",
+            "min_retained_shares": 100,
+        }
+    )
+    assert ps_dual["cross_market_anchor"] == "uso_bno_sc_peer"
+
+    sc_rows = _parse_sc_daily_payload(
+        'var x=([{"d":"2026-11-24","o":"580.0","c":"571.1"},{"d":"2026-11-25","o":"572.9","c":"573.8"}]);'
+    )
+    assert len(sc_rows) == 2 and sc_rows[1][0] == "20261125" and sc_rows[1][2] == 573.8 and sc_rows[1][3] == 572.9
+    q_peer = V9MacroDataStore._extract_sina_a_quote(
+        (["x"] * 2) + ["2.109", "2.174"] + (["0"] * 26) + ["2026-11-26", "14:53:00", "00"]
+    )
+    assert q_peer["pre_close"] == 2.109 and q_peer["price"] == 2.174 and q_peer["date"] == "20261126" and q_peer["time"] == "14:53"
+
+    # 2. Close weight: high-oil dual-bull retention, bubble exit, early reversal, quiet accumulation overnight
+    day_bull = {"ma5": 2.10, "ma15": 2.02, "max_bpos_20d": 0.80, "dual_ov": 1.2}
+    w_high, _ = v9_dual_oil_peer_close_weight(
+        day_bull,
+        {
+            "brn_pos": 0.78,
+            "prem": 0.30,
+            "dual_prem": 0.10,
+            "rel_prem": 0.0,
+            "price": 2.15,
+            "uso_bull": True,
+            "bno_bull": True,
+            "dual_bull": True,
+            "sc_bull": True,
+            "sc_intra": 0.40,
+            "sc_vs_prev": 0.90,
+            "lof_chg": 0.60,
+            "peer_chg": 0.70,
+        },
+    )
+    assert w_high == 0.95
+
+    w_bub, _ = v9_dual_oil_peer_close_weight(
+        day_bull,
+        {"brn_pos": 0.65, "prem": 6.50, "dual_prem": 1.50, "rel_prem": 2.0, "price": 2.05},
+    )
+    assert w_bub == 0.0
+
+    w_rev, _ = v9_dual_oil_peer_close_weight(
+        {"ma5": 2.08, "ma15": 2.15, "max_bpos_20d": 0.78, "dual_ov": 1.90},
+        {
+            "brn_pos": 0.58,
+            "prem": 1.10,
+            "dual_prem": 0.40,
+            "rel_prem": -0.20,
+            "price": 2.11,
+            "uso_bull": True,
+            "dual_bull": True,
+            "sc_bull": True,
+            "sc_intra": 0.60,
+            "sc_vs_prev": 2.10,
+            "lof_chg": 1.90,
+            "peer_chg": 1.50,
+        },
+    )
+    assert w_rev == 0.95
+
+    w_quiet, lbl_quiet = v9_dual_oil_peer_close_weight(
+        {"ma5": 2.18, "ma15": 2.25, "max_bpos_20d": 0.65, "dual_ov": 0.50},
+        {
+            "brn_pos": 0.52,
+            "prem": 1.25,
+            "dual_prem": 0.35,
+            "rel_prem": -0.10,
+            "price": 2.12,
+            "lof_chg": 0.60,
+            "peer_chg": 0.85,
+            "sc_intra": 0.12,
+            "sc_vs_prev": 0.20,
+        },
+    )
+    assert w_quiet == 0.90 and "逆势" in lbl_quiet
+
+    # 3. Bear knife-filter + post-10:08 3-channel contrarian + crash 100% tier + trailing hold
+    bear_day = {"ma5": 2.18, "ma15": 2.26, "open_gap_pct": 0.10, "eq_prem_5d": 0.80, "cross_market_anchor": "uso_bno_sc_peer"}
+    base_bar = {
+        "time": "10:02",
+        "price": 2.13,
+        "prem": -0.50,
+        "dual_prem": -0.95,
+        "rel_prem": -0.75,
+        "sp_fx": -0.65,
+        "coint10": -0.35,
+        "lof_chg": -0.40,
+        "vdev": -0.30,
+        "px_dd_hi": 0.55,
+        "bounce_from_lo_pct": 0.18,
+        "dmc10": 0.00025,
+        "m1": 0.05,
+        "m3": 0.10,
+        "gc10": True,
+        "dc10": False,
+        "iopv_intra": 0.05,
+        "brn_m5": 0.02,
+        "sc_intra": 0.15,
+        "peer_chg": 0.25,
+        "peer_m3": 0.15,
+        "peer_sp": -0.65,
+        "peer_sp_intra": -0.35,
+    }
+    _, b_early, sc_early, meta_early = apply_dual_oil_peer_intraday_overlays(
+        bear_day, base_bar, s_sig=False, b_sig=True, scalp_ok=True, close_wt=0.0, sc=1.0
+    )
+    assert b_early is False and sc_early is False and meta_early["knife_blocked"] is True
+
+    _, b_late, sc_late, _ = apply_dual_oil_peer_intraday_overlays(
+        bear_day, {**base_bar, "time": "13:40"}, s_sig=False, b_sig=True, scalp_ok=True, close_wt=0.0, sc=1.0
+    )
+    assert b_late is False and sc_late is False
+
+    _, _, sc_ctr, meta_ctr = apply_dual_oil_peer_intraday_overlays(
+        bear_day, {**base_bar, "time": "10:25"}, s_sig=False, b_sig=False, scalp_ok=False, close_wt=0.0, sc=1.0
+    )
+    assert sc_ctr is True and meta_ctr["contrarian_triggered"] is True
+    assert set(meta_ctr["contrarian_channels"]) >= {"c_disc", "c_peer"}
+    assert meta_ctr["scalp_frac_override"] == 1.00
+
+    _, _, sc_aug, meta_aug = apply_dual_oil_peer_intraday_overlays(
+        bear_day,
+        {**base_bar, "time": "11:10", "prem": 1.80, "dual_prem": 0.70, "rel_prem": -0.70, "vdev": -0.65, "px_dd_hi": 0.85, "peer_m3": 0.05, "peer_sp_intra": -0.10},
+        s_sig=False,
+        b_sig=False,
+        scalp_ok=False,
+        close_wt=0.0,
+        sc=1.0,
+    )
+    assert sc_aug is True and "c_aug" in meta_aug["contrarian_channels"]
+
+    # Trailing rebound hold overrides mild positive TP while respecting stop-loss and anchor isolation
+    hold_bar = {**base_bar, "price": 2.142, "px_dd_hi": 0.10, "sp_fx": 0.35, "sc_intra": 0.25, "peer_m3": 0.04, "dmc10": 0.00015}
+    assert should_hold_dual_oil_rebound(bear_day, hold_bar, gain_pct=0.56, s_sig=False, is_scalp=True) is True
+    assert should_exit_scalp_long(hold_bar, entry_px=2.13, entry_sp=-0.45, s_sig=False, day=bear_day, close_wt=0.0)[0] is False
+    assert should_exit_long_v9(
+        bear_day,
+        {**hold_bar, "price": 2.10, "dmc10": -0.0002},
+        entry_px=2.13,
+        entry_sp=-0.45,
+        s_sig=False,
+        close_wt=0.0,
+    )[0] is True
+    assert should_hold_dual_oil_rebound({**bear_day, "cross_market_anchor": "brent"}, hold_bar, gain_pct=0.56) is False
+    assert clean_buy_tier(bear_day, {**base_bar, "price": 2.13, "sc_intra": 0.10})[1] == 1.00
+
+    # 4. Offline end-to-end store test + brent isolation check
+    monkeypatch.setenv("THS_QUANT_OFFLINE", "1")
+    rstore = SQLiteResearchStore(tmp_path / "v9p_161129_dual.db")
+    V9MacroDataStore(rstore, allow_network=False)
+    now_ts = _time.time()
+
+    def _day_mins_ramp(p0: float, p_end: float) -> list[tuple[str, float]]:
+        out: list[tuple[str, float]] = []
+        for i in range(240):
+            hh = ((570 + i + 1) if i < 120 else (780 + (i - 120) + 1)) // 60
+            mm = ((570 + i + 1) if i < 120 else (780 + (i - 120) + 1)) % 60
+            px = p0 + (p_end - p0) * (i / 239.0)
+            out.append((f"{hh:02d}:{mm:02d}", round(px, 4)))
+        return out
+
+    oil_rows = [["20251101", int(datetime(2025, 11, 2, 6, 0, tzinfo=SHANGHAI_TZ).timestamp()), 60.0]]
+    uso_rows = [["20251101", int(datetime(2025, 11, 2, 6, 0, tzinfo=SHANGHAI_TZ).timestamp()), 70.0]]
+    bno_rows = [["20251101", int(datetime(2025, 11, 2, 6, 0, tzinfo=SHANGHAI_TZ).timestamp()), 30.0]]
+    sc_daily_rows = [["20251101", int(datetime(2025, 11, 2, 15, 5, tzinfo=SHANGHAI_TZ).timestamp()), 520.0, 518.0]]
+    sc_min_events: dict[int, float] = {}
+    nav_161 = {}
+
+    closes_161 = [2.25 - i * 0.015 for i in range(18)]
+    first_td = ""
+    last_td = ""
+    for idx, c_val in enumerate(closes_161):
+        us_d = (datetime(2026, 11, 1, tzinfo=SHANGHAI_TZ) + _timedelta(days=idx)).strftime("%Y%m%d")
+        a_d = (datetime(2026, 11, 2, tzinfo=SHANGHAI_TZ) + _timedelta(days=idx)).strftime("%Y%m%d")
+        if not first_td:
+            first_td = a_d
+        last_td = a_d
+        cts = int((datetime.strptime(us_d, "%Y%m%d").replace(tzinfo=SHANGHAI_TZ) + _timedelta(days=1, hours=6)).timestamp())
+        uso_rows.append([us_d, cts, round(92.0 - idx * 0.8 + (1.5 if idx == len(closes_161) - 1 else 0.0), 3)])
+        bno_rows.append([us_d, cts, round(40.0 - idx * 0.35 + (0.6 if idx == len(closes_161) - 1 else 0.0), 3)])
+        oil_rows.append([us_d, cts, round(86.0 - idx * 0.7, 3)])
+        sc_ts = int(datetime.strptime(a_d, "%Y%m%d").replace(hour=15, minute=5, tzinfo=SHANGHAI_TZ).timestamp())
+        sc_c = round(600.0 - idx * 2.5 + (6.0 if idx == len(closes_161) - 1 else 0.0), 2)
+        sc_daily_rows.append([a_d, sc_ts, sc_c, round(sc_c - 2.0, 2)])
+        sc_min_events[int(datetime.strptime(a_d, "%Y%m%d").replace(hour=9, minute=30, tzinfo=SHANGHAI_TZ).timestamp())] = round(sc_c - 2.0, 2)
+        sc_min_events[int(datetime.strptime(a_d, "%Y%m%d").replace(hour=14, minute=50, tzinfo=SHANGHAI_TZ).timestamp())] = sc_c
+        nav_161[us_d] = round(c_val - 0.01, 4)
+
+        pre_161 = closes_161[idx - 1] if idx > 0 else 2.26
+        _seed_symbol_bars(rstore, "BRN0Y", a_d, 80.0, [("09:30", 80.0), ("14:53", 80.0), ("15:00", 80.0)], name="布伦特", market="ICE")
+        _seed_symbol_bars(rstore, "161129", a_d, pre_161, _day_mins_ramp(pre_161, c_val), name="易方达原油")
+        _seed_symbol_bars(rstore, "160723", a_d, 2.00, _day_mins_ramp(2.00, 2.00 * (1.008 if idx == len(closes_161) - 1 else 0.996)), name="嘉实原油")
+        _seed_symbol_bars(rstore, "501018", a_d, 1.90, _day_mins_ramp(1.90, 1.90 * (1.007 if idx == len(closes_161) - 1 else 0.996)), name="南方原油")
+
+    sc_ts_sorted = sorted(sc_min_events)
+    with rstore._lock, rstore._connection:
+        for k_name, payload in (
+            ("nav_161129", nav_161),
+            ("nav_160723", nav_161),
+            ("oil_daily_2y", oil_rows),
+            ("uso_daily_2y", uso_rows),
+            ("bno_daily_2y", bno_rows),
+            ("sc0_daily_all", sc_daily_rows),
+            ("sc0_min_series", {"ts": sc_ts_sorted, "px": [sc_min_events[t] for t in sc_ts_sorted]}),
+            ("fx_usdcny_series", {"ts": [int(datetime(2026, 10, 1, 9, 0, tzinfo=SHANGHAI_TZ).timestamp())], "px": [6.70]}),
+        ):
+            rstore._connection.execute(
+                "INSERT OR REPLACE INTO quant_macro_cache VALUES (?, ?, ?)",
+                (k_name, _json.dumps(payload), now_ts),
+            )
+
+    pos_161 = {
+        "mode": "cash_pool_rolling",
+        "engine_profile": "v9_plus_aggressive",
+        "cross_market_anchor": "uso_bno_sc_peer",
+        "min_retained_shares": 100,
+        "v9_tuning": {
+            "bear_high_prem_flat_pct": 2.5,
+            "bull_oil_surge_guard": True,
+            "bull_oil_surge_tier_cap_pct": 50.0,
+            "scalp_strict_mode": True,
+            "macd_price_anchor": 2.0,
+        },
+    }
+    rule_161 = {"id": "ai-161129-v9-plus-aggressive", "name": "161129 双油沪SC同类", "macd_settings": {"short": 10, "long": 20, "signal": 5}}
+    bt = evaluate_v9_plus_backtest(
+        rstore,
+        rule_161,
+        {"start_date": first_td, "end_date": last_td, "capital_cap": 50000.0, "round_trip_fee_pct": 0.01},
+        pos_161,
+        symbol="161129",
+        cleaned_end=last_td,
+        allow_network=False,
+    )
+    assert bt["capital_sim"]["evaluated_days"] == len(closes_161)
+
+    dec = evaluate_v9_plus_live_decision(
+        rstore,
+        symbol="161129",
+        trade_date=last_td,
+        now_hhmm="14:53",
+        cap_limit=50000.0,
+        rule_spec=rule_161,
+        pos_sizing=pos_161,
+        today_signals=[],
+        rolling_shares=100,
+        allow_network=False,
+    )
+    ind = evaluate_v9_plus_live_indicators(
+        rstore,
+        symbol="161129",
+        trade_date=last_td,
+        now_hhmm="14:53",
+        cap_limit=50000.0,
+        rule_spec=rule_161,
+        pos_sizing=pos_161,
+        today_signals=[],
+        rolling_shares=100,
+        allow_network=False,
+    )
+    assert dec is not None and ind is not None
+    assert dec["diagnostics"]["cross_market_anchor"] == "uso_bno_sc_peer"
+    assert ind["diagnostics"]["cross_market_anchor"] == "uso_bno_sc_peer"
+    for dk in ("dual_prem_pct", "eq_prem_5d_pct", "rel_prem_pct", "sc_intra_pct", "peer_chg_pct"):
+        assert dk in ind["diagnostics"]
+    card_keys = {c["key"] for c in ind["market_indicators"]}
+    assert {"dual_prem", "sc_peer"} <= card_keys
+    assert any(c["id"] == "v9-buy-contrarian" for c in ind["buy"]["conditions"])
+
+    # Isolation: standard 160723 must never emit dual_prem / v9-buy-contrarian
+    ind_160 = evaluate_v9_plus_live_indicators(
+        rstore,
+        symbol="160723",
+        trade_date=last_td,
+        now_hhmm="14:53",
+        cap_limit=50000.0,
+        rule_spec={"id": "ai-160723-v9-plus-aggressive", "name": "160723", "macd_settings": {"short": 10, "long": 20, "signal": 5}},
+        pos_sizing={"mode": "cash_pool_rolling", "engine_profile": "v9_plus_aggressive", "min_retained_shares": 100},
+        today_signals=[],
+        rolling_shares=100,
+        allow_network=False,
+    )
+    assert ind_160 is not None
+    assert not any(c["id"] == "v9-buy-contrarian" for c in ind_160["buy"]["conditions"])
+    assert "dual_prem_pct" not in ind_160["diagnostics"]
+    rstore.close()
+
+
+def _seed_extended_pack_environment(rstore: SQLiteResearchStore, etf_db_path: Path) -> None:
+    """Seed deterministic offline macro, L2 multi-period, peer LOF, and ETF cache data for 20260701-20260702."""
+    from level2_service.etf_fund_flow import SQLiteEtfFundFlowCache
+    from level2_service.quant_rules import V9MacroDataStore
+
+    # Day 0: 20260701
+    _seed_symbol_bars(
+        rstore,
+        "BRN0Y",
+        "20260701",
+        80.0,
+        [("09:30", 80.0), ("10:00", 80.0), ("15:00", 80.0)],
+        name="ICE布伦特",
+        market="ICE",
+    )
+    _seed_symbol_bars(
+        rstore,
+        "160723",
+        "20260701",
+        1.000,
+        [("09:30", 1.000), ("09:45", 1.000), ("10:00", 1.000), ("15:00", 1.000)],
+        name="嘉实原油",
+    )
+    _seed_symbol_bars(
+        rstore,
+        "501018",
+        "20260701",
+        1.000,
+        [("09:30", 1.000), ("09:45", 1.000), ("10:00", 1.000), ("15:00", 1.000)],
+        name="南方原油",
+    )
+
+    # Day 1: 20260702 — BRN0Y rallies to 82.0 (+2.5%), SC0 drops -1.0%, 501018 rallies +2.0% while 160723 lags at 0.990 (-1.0% => discount + peer spread -3.0%)
+    _seed_symbol_bars(
+        rstore,
+        "BRN0Y",
+        "20260702",
+        80.0,
+        [("09:30", 81.6), ("10:00", 82.0), ("10:05", 82.1), ("15:00", 82.0)],
+        name="ICE布伦特",
+        market="ICE",
+    )
+    _seed_symbol_bars(
+        rstore,
+        "160723",
+        "20260702",
+        1.000,
+        [
+            ("09:30", 0.995),
+            ("09:35", 0.994),
+            ("09:40", 0.993),
+            ("09:45", 0.992),
+            ("09:50", 0.991),
+            ("09:55", 0.990),
+            ("10:00", 0.990),
+            ("10:05", 1.002),
+            ("10:10", 1.008),
+            ("15:00", 1.020),
+        ],
+        name="嘉实原油",
+    )
+    _seed_symbol_bars(
+        rstore,
+        "501018",
+        "20260702",
+        1.000,
+        [("09:30", 1.010), ("10:00", 1.020), ("10:10", 1.020), ("15:00", 1.020)],
+        name="南方原油",
+    )
+
+    # Seed L2 today / 3d / 5d flow points (today uses 亿元 -> converts *10000 to 万元)
+    with rstore._lock, rstore._connection:
+        for period, unit, mn, vis, hid, ret in (
+            ("today", "亿元", "0.025", "0.010", "0.015", "-0.025"),
+            ("three_day", "万元", "420.0", "180.0", "240.0", "-420.0"),
+            ("five_day", "万元", "880.0", "350.0", "530.0", "-880.0"),
+        ):
+            rstore._connection.execute(
+                """INSERT INTO fund_flow_history_points(
+                       symbol, trade_date, minute, period, unit,
+                       main_net_inflow, main_visible_inflow, main_hidden_inflow,
+                       retail_inflow, captured_at
+                   ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                ("160723", "20260702", "10:00", period, unit, mn, vis, hid, ret, "2026-07-02T10:00:00+08:00"),
+            )
+        rstore._connection.execute(
+            """INSERT INTO fund_flow_history_status(
+                   symbol, latest_trade_date, latest_time, last_sync_at, last_error
+               ) VALUES(?, ?, ?, ?, NULL)
+               ON CONFLICT(symbol) DO UPDATE SET latest_trade_date=excluded.latest_trade_date""",
+            ("160723", "20260702", "10:00", "2026-07-02T10:00:00+08:00"),
+        )
+
+    macro = V9MacroDataStore(rstore, allow_network=False)
+    ts_0630 = int(datetime(2026, 6, 30, 15, 0, tzinfo=SHANGHAI_TZ).timestamp())
+    ts_0701_us = int(datetime(2026, 7, 1, 4, 0, tzinfo=SHANGHAI_TZ).timestamp())
+    ts_0701_15 = int(datetime(2026, 7, 1, 15, 0, tzinfo=SHANGHAI_TZ).timestamp())
+    ts_0702_us = int(datetime(2026, 7, 2, 4, 0, tzinfo=SHANGHAI_TZ).timestamp())
+    ts_0702_10 = int(datetime(2026, 7, 2, 10, 0, tzinfo=SHANGHAI_TZ).timestamp())
+    ts_0702_15 = int(datetime(2026, 7, 2, 15, 0, tzinfo=SHANGHAI_TZ).timestamp())
+
+    macro._write_db_cache("nav_160723", {"20260630": 1.000, "20260701": 1.000}, 9999999999.0)
+    ts_0630_oil = int(datetime(2026, 7, 1, 6, 0, tzinfo=SHANGHAI_TZ).timestamp())
+    ts_0701_oil = int(datetime(2026, 7, 2, 6, 0, tzinfo=SHANGHAI_TZ).timestamp())
+    ts_0702_oil = int(datetime(2026, 7, 3, 6, 0, tzinfo=SHANGHAI_TZ).timestamp())
+    ts_0701_1505 = int(datetime(2026, 7, 1, 15, 5, tzinfo=SHANGHAI_TZ).timestamp())
+    ts_0702_1505 = int(datetime(2026, 7, 2, 15, 5, tzinfo=SHANGHAI_TZ).timestamp())
+    macro._write_db_cache(
+        "oil_daily_2y",
+        [["20260630", ts_0630_oil, 78.0], ["20260701", ts_0701_oil, 80.0], ["20260702", ts_0702_oil, 82.0]],
+        9999999999.0,
+    )
+    macro._write_db_cache(
+        "fx_usdcny_series",
+        {"ts": [ts_0630, ts_0701_15, ts_0702_10, ts_0702_15], "px": [7.20, 7.20, 7.21, 7.21]},
+        9999999999.0,
+    )
+    macro._write_db_cache("xop_daily_2y", [["20260630", ts_0701_us, 130.0], ["20260701", ts_0702_us, 135.2]], 9999999999.0)
+    macro._write_db_cache("xle_daily_2y", [["20260630", ts_0701_us, 90.0], ["20260701", ts_0702_us, 91.8]], 9999999999.0)
+    macro._write_db_cache("spy_daily_2y", [["20260630", ts_0701_us, 550.0], ["20260701", ts_0702_us, 555.5]], 9999999999.0)
+    macro._write_db_cache("iwm_daily_2y", [["20260630", ts_0701_us, 210.0], ["20260701", ts_0702_us, 212.1]], 9999999999.0)
+    macro._write_db_cache("cl_daily_2y", [["20260630", ts_0701_us, 76.0], ["20260701", ts_0702_us, 77.52]], 9999999999.0)
+    macro._write_db_cache("ho_daily_2y", [["20260630", ts_0701_us, 2.40], ["20260701", ts_0702_us, 2.496]], 9999999999.0)
+    macro._write_db_cache("ng_daily_2y", [["20260630", ts_0701_us, 2.50], ["20260701", ts_0702_us, 2.55]], 9999999999.0)
+    macro._write_db_cache("uso_daily_2y", [["20260630", ts_0701_us, 74.0], ["20260701", ts_0702_us, 75.48]], 9999999999.0)
+    macro._write_db_cache("bno_daily_2y", [["20260630", ts_0701_us, 30.0], ["20260701", ts_0702_us, 30.60]], 9999999999.0)
+    macro._write_db_cache(
+        "sc0_daily_all",
+        [["20260701", ts_0701_1505, 600.0, 600.0], ["20260702", ts_0702_1505, 594.0, 596.0]],
+        9999999999.0,
+    )
+    macro._write_db_cache(
+        "sc0_min_series",
+        {"ts": [ts_0701_15, ts_0702_10], "px": [600.0, 594.0]},
+        9999999999.0,
+    )
+
+    etf_cache = SQLiteEtfFundFlowCache(etf_db_path)
+    etf_cache.put(
+        "line:160723:60d",
+        symbol="160723",
+        kind="line",
+        data_date="2026-07-03",
+        updated_at=9999999999.0,
+        value=[
+            ["2026-06-29", "06-29", 1000000.0],
+            ["2026-06-30", "06-30", 2000000.0],
+            ["2026-07-01", "07-01", 5000000.0],
+            ["2026-07-02", "07-02", -99000000.0],  # Must NOT leak into trade_date=20260702
+            ["2026-07-03", "07-03", -88000000.0],
+        ],
+    )
+    etf_cache.put(
+        "summary:160723",
+        symbol="160723",
+        kind="summary",
+        data_date="2026-07-01",
+        updated_at=9999999999.0,
+        value={
+            "stockEtfNetBuyFlowDate": "2026-07-01",
+            "stockEtfNetBuyFlow": 5000000.0,
+            "stockEtfNetBuyFlow3d": 8000000.0,
+            "stockEtfFundScale": 1000000000.0,
+        },
+    )
+    etf_cache.put(
+        "holdings:160723",
+        symbol="160723",
+        kind="holdings",
+        data_date="2026-07-01",
+        updated_at=9999999999.0,
+        value=[{"etf_code": "160723", "name": "嘉实原油LOF", "net_inflow_raw": 5000000.0, "streak_days": 3, "hold_rate": 12.5}],
+    )
+    etf_cache.close()
+
+
+def test_v4_dataset_export_five_data_packs_and_causal_t1_cutoff(tmp_path: Path) -> None:
+    db_path = tmp_path / "research.db"
+    etf_db_path = tmp_path / "etf-fund-flow.db"
+    rstore = SQLiteResearchStore(db_path)
+    _seed_extended_pack_environment(rstore, etf_db_path)
+
+    summary = export_quant_dataset(
+        rstore,
+        "160723",
+        start_date="20260701",
+        mode="summary",
+        etf_flow_db_path=etf_db_path,
+    )
+    assert summary["schema"]["version"] == 4
+    avail = summary["available_data_packs"]
+    assert avail["l2_darkpool_flow"]["available"] is True
+    assert avail["etf_redemption_flow"]["available"] is True
+    assert avail["iopv_fx"]["available"] is True
+    assert avail["xop_us_ep"]["available"] is True
+    assert avail["uso_bno_sc_peer"]["available"] is True
+
+    # Daily pack whitelist isolation + strict T-1 ETF cutoff (20260702 sees 20260701=500万, never 20260702=-9900万)
+    daily_res = export_quant_dataset(
+        rstore,
+        "160723",
+        start_date="20260701",
+        mode="daily",
+        packs="iopv_fx,etf_redemption_flow",
+        allow_network=False,
+        etf_flow_db_path=etf_db_path,
+    )
+    assert daily_res["data_packs_included"] == ["iopv_fx", "etf_redemption_flow"]
+    day_0702 = next(d for d in daily_res["days"] if d["trade_date"] == "20260702")
+    assert day_0702["etf_flow_ref_date"] == "20260701"
+    assert day_0702["etf_net_buy_1d_wan"] == 500.0
+    assert day_0702["etf_net_buy_3d_wan"] == 800.0
+    assert day_0702["etf_share_scale_yi"] == 10.0
+    assert day_0702["iopv_fx_close"] is not None
+    assert "xop_ov_pct" not in day_0702
+
+    # Minutes export with remaining 3 packs
+    min_res = export_quant_dataset(
+        rstore,
+        "160723",
+        start_date="20260702",
+        mode="minutes",
+        packs=["l2_darkpool_flow", "uso_bno_sc_peer", "xop_us_ep"],
+        allow_network=False,
+        etf_flow_db_path=etf_db_path,
+    )
+    assert min_res["data_packs_included"] == ["l2_darkpool_flow", "uso_bno_sc_peer", "xop_us_ep"]
+    pt_1000 = next(p for p in min_res["days"][0]["points"] if p["time"] == "10:00")
+    assert abs(pt_1000["l2_today_main_net_wan"] - 250.0) < 0.01  # 0.025亿元 => 250万元
+    assert abs(pt_1000["l2_today_hidden_wan"] - 150.0) < 0.01
+    assert abs(pt_1000["l2_3d_hidden_wan"] - 240.0) < 0.01
+    assert abs(pt_1000["l2_5d_hidden_wan"] - 530.0) < 0.01
+    assert abs(pt_1000["xop_change_pct"] - 4.0) < 0.05
+    assert abs(pt_1000["sc0_change_pct"] - (-1.0)) < 0.05
+    assert abs(pt_1000["peer_501018_spread_pct"] - (-3.0)) < 0.05
+    assert "iopv_premium_pct" not in pt_1000
+    rstore.close()
+
+
+def test_extended_dsl_operators_backtest_and_live_autopilot_symmetry(tmp_path: Path) -> None:
+    db_path = tmp_path / "research.db"
+    etf_db_path = tmp_path / "etf-fund-flow.db"
+    rstore = SQLiteResearchStore(db_path)
+    qstore = SQLiteQuantRuleStore(db_path)
+    astore = SQLiteAutoTradeStore(db_path)
+    _seed_extended_pack_environment(rstore, etf_db_path)
+
+    rule_spec = {
+        "id": "ext-7ops-symmetry",
+        "name": "partner01-160723-嘉实原油-全维度7算子共振",
+        "symbols": ["160723"],
+        "macd_settings": {"short": 10, "long": 20, "signal": 5, "marker_threshold": 0.0},
+        "buy_rule": {
+            "id": "b-7ops",
+            "side": "buy",
+            "title": "7算子共振买点",
+            "joiner": "and",
+            "conditions": [
+                {"type": "iopv_premium_pct", "metric": "premium_pct", "direction": "lte", "value": -1.5},
+                {"type": "fx_spread_pct", "metric": "usdcny", "direction": "gte", "value": 7.15},
+                {"type": "xop_macro_pct", "metric": "xop_change_pct", "direction": "gte", "value": 3.0},
+                {"type": "sc_crude_pct", "metric": "sc0_change_pct", "direction": "lte", "value": -0.5},
+                {"type": "peer_spread_pct", "peer": "501018", "metric": "spread_pct", "direction": "lte", "value": -2.0},
+                {"type": "l2_flow_level", "period": "three_day", "flow": "main_hidden", "direction": "gte", "value": 200.0},
+                {"type": "etf_net_flow", "metric": "net_buy_1d_wan", "direction": "gte", "value": 300.0},
+                {"type": "time_window", "windows": [["09:58", "10:02"]]},
+            ],
+        },
+        "sell_rule": {
+            "id": "s-7ops",
+            "side": "sell",
+            "title": "尾盘涨幅止盈",
+            "joiner": "and",
+            "conditions": [{"type": "change_pct", "direction": "gte", "value": 1.8}],
+        },
+        "eval_criteria": {
+            "start_date": "20260702",
+            "data_scope": "all",
+            "morning_start": "09:30",
+            "morning_end": "11:30",
+            "max_daily_trades": 1,
+            "round_trip_fee_pct": 0.02,
+        },
+    }
+
+    eval_res = evaluate_quant_strategy(rstore, rule_spec, symbol="160723")
+    assert eval_res["base_position_t0"]["buy_t_days"] == 1
+    assert any(sig["time"] == "10:00" and sig["side"] == "buy" for sig in eval_res["signals"])
+
+    saved = qstore.upsert_rule(rule_spec, research_store=rstore)
+    astore.update_config(
+        {
+            "enabled": True,
+            "symbols": ["160723"],
+            "signal_source": "quant_rule",
+            "quant_rule_id": saved["id"],
+        }
+    )
+    # Trim post-10:00 bars so the simulated 10:00 live snapshot evaluates at 10:00 causally
+    with rstore._lock, rstore._connection:
+        rstore._connection.execute(
+            "DELETE FROM research_points WHERE trade_date='20260702' AND REPLACE(minute, ':', '') > '1000'"
+        )
+    engine = AutoTradeEngine(
+        auto_store=astore,
+        research_store=rstore,
+        broker=None,
+        trade_executor=None,
+        symbol_lookup=lambda s: CATALOG.get(s),
+        is_trading_day=lambda _d: True,
+        now_fn=lambda: datetime(2026, 7, 2, 10, 0, tzinfo=SHANGHAI_TZ),
+        epoch_fn=lambda: 1_800_000_000.0,
+        quant_rule_store=qstore,
+    )
+    snap = engine.evaluate_live_snapshot(symbol="160723")
+    assert snap["buy"]["matched"] is True
+    assert len(snap["buy"]["conditions"]) == 8
+    assert all(c["matched"] for c in snap["buy"]["conditions"])
+    rstore.close()
+
+
+def test_bridge_strict_dsl_120_char_name_metadata_and_symbol_filter(tmp_path: Path) -> None:
+    db_path = tmp_path / "research.db"
+    rstore = SQLiteResearchStore(db_path)
+    qstore = SQLiteQuantRuleStore(db_path)
+    astore = SQLiteAutoTradeStore(db_path)
+    _seed_day(rstore, "20260702", [1.0 + i * 0.002 for i in range(15)], pre_close=1.0, flows=[50.0] * 15)
+
+    engine = AutoTradeEngine(
+        auto_store=astore,
+        research_store=rstore,
+        broker=None,
+        trade_executor=None,
+        symbol_lookup=lambda s: CATALOG.get(s),
+        is_trading_day=lambda _d: True,
+        now_fn=lambda: datetime(2026, 7, 2, 10, 5, tzinfo=SHANGHAI_TZ),
+        epoch_fn=lambda: 1_800_000_000.0,
+        quant_rule_store=qstore,
+    )
+    app = create_app(
+        admin_password_hash=PasswordHasher().hash("admin-pass-123"),
+        admin_session_secret="b" * 32,
+        symbol_lookup=lambda sym: CATALOG[sym],
+        market_account_store=SQLiteMarketAccountStore(tmp_path / "market.db"),
+        research_store=rstore,
+        goodluck_internal_token=TOKEN,
+        auto_trade_engine=engine,
+        quant_rule_store=qstore,
+    )
+    client = TestClient(app)
+
+    # Unknown DSL operator must be rejected with 422
+    bad_resp = client.post(
+        "/api/internal/goodluck/quant/rules",
+        headers=_headers(),
+        json={
+            "name": "bad-op-rule",
+            "symbols": ["160723"],
+            "buy_rule": {"conditions": [{"type": "totally_unknown_op", "value": 1}]},
+        },
+    )
+    assert bad_resp.status_code == 422
+
+    # 110-char canonical rule name + provenance metadata
+    long_name = "quant_partner_01-501018-南方原油-" + ("超短跨市场均值回归多因子联动" * 4)[:60]
+    assert 80 < len(long_name) <= 120
+    create_resp = client.post(
+        "/api/internal/goodluck/quant/rules",
+        headers=_headers(),
+        json={
+            "id": "ext-501018-canonical",
+            "name": long_name,
+            "source": "ai",
+            "symbols": ["501018"],
+            "target_symbol": "501018",
+            "stock_name": "南方原油",
+            "raw_strategy_name": "超短跨市场均值回归多因子联动",
+            "submitter_id": "key_partner_01",
+            "submitter_name": "quant_partner_01",
+            "submission_id": "sub_001",
+            "approved_by": "admin",
+            "approved_at": "2026-07-02T12:00:00Z",
+            "buy_rule": {"conditions": [{"type": "iopv_premium_pct", "metric": "premium_pct", "direction": "lte", "value": -1.0}]},
+        },
+    )
+    assert create_resp.status_code == 200
+    saved_rule = create_resp.json()["rule"]
+    assert saved_rule["name"] == long_name
+    assert saved_rule["submitter_name"] == "quant_partner_01"
+    assert saved_rule["target_symbol"] == "501018"
+
+    # Symbol filter strictly separates 501018 vs 160723
+    rules_501 = client.get("/api/internal/goodluck/quant/rules?symbol=501018", headers=_headers()).json()["rules"]
+    rules_160 = client.get("/api/internal/goodluck/quant/rules?symbol=160723", headers=_headers()).json()["rules"]
+    assert any(r["id"] == "ext-501018-canonical" for r in rules_501)
+    assert not any(r["id"] == "ext-501018-canonical" for r in rules_160)
+    rstore.close()
+
+
+def test_v9_plus_three_state_nav_reconciliation_and_compact_strip(tmp_path: Path, monkeypatch) -> None:
+    import json as _json
+    import time as _time
+    from datetime import timedelta as _timedelta
+    from level2_service.quant_rules import compact_quant_rule_record
+    from level2_service.v9_plus_engine import V9MacroDataStore, evaluate_v9_plus_backtest
+
+    monkeypatch.setenv("THS_QUANT_OFFLINE", "1")
+    rstore = SQLiteResearchStore(tmp_path / "v9p_reconcile.db")
+    V9MacroDataStore(rstore, allow_network=False)
+    now_ts = _time.time()
+
+    # Build 21 trading days across 2026-10 and 2026-11 so multi-month NAV compounding & events execute
+    all_tds = [
+        f"202610{d:02d}" for d in range(1, 20)
+    ] + ["20261102", "20261103"]
+    nav_payload = {"20260925": 1.000, **{td: 1.000 for td in all_tds}}
+    oil_rows = [
+        ["20251001", int(datetime(2025, 10, 2, 6, 0, tzinfo=SHANGHAI_TZ).timestamp()), 60.0],
+        ["20260925", int(datetime(2026, 9, 26, 6, 0, tzinfo=SHANGHAI_TZ).timestamp()), 100.0],
+    ]
+    for td in all_tds:
+        y, m, d = int(td[:4]), int(td[4:6]), int(td[6:8])
+        px = 72.0 if td == "20261102" else (96.0 if td == "20261103" else 70.0)
+        ts = int((datetime(y, m, d, 6, 0, tzinfo=SHANGHAI_TZ) + _timedelta(days=1)).timestamp())
+        oil_rows.append([td, ts, px])
+        brn_bars = [("09:30", 70.0 if td != "20261103" else 72.0), ("10:00", px), ("14:53", px), ("15:00", px)]
+        _seed_symbol_bars(rstore, "BRN0Y", td, px, brn_bars, name="布伦特", market="ICE")
+        # Intraday dip then recovery + day-over-day move across 2026-11-02 -> 2026-11-03
+        base_px = 1.050 if td == "20261102" else (1.080 if td == "20261103" else 1.000)
+        bars: list[tuple[str, float]] = []
+        for idx in range(241):
+            hh = 9 + (30 + idx) // 60 if idx < 120 else 13 + (idx - 120) // 60
+            mm = (30 + idx) % 60 if idx < 120 else (idx - 120) % 60
+            tstr = f"{hh:02d}:{mm:02d}"
+            p = base_px
+            if "09:42" <= tstr <= "09:50":
+                p = round(base_px * 0.985, 3)
+            elif "14:15" <= tstr <= "14:52":
+                p = round(base_px * 1.006, 3)
+            elif tstr >= "14:53":
+                p = round(base_px * (1.002 if td == "20261102" else 1.008), 3)
+            bars.append((tstr, p))
+        _seed_symbol_bars(rstore, "160723", td, round(base_px * 0.998, 3), bars, name="嘉实原油")
+
+    with rstore._lock, rstore._connection:
+        rstore._connection.execute(
+            "INSERT OR REPLACE INTO quant_macro_cache VALUES (?, ?, ?)",
+            ("nav_160723", _json.dumps(nav_payload), now_ts),
+        )
+        rstore._connection.execute(
+            "INSERT OR REPLACE INTO quant_macro_cache VALUES (?, ?, ?)",
+            ("oil_daily_2y", _json.dumps(oil_rows), now_ts),
+        )
+        rstore._connection.execute(
+            "INSERT OR REPLACE INTO quant_macro_cache VALUES (?, ?, ?)",
+            ("fx_usdcny_series", _json.dumps({"ts": [int(datetime(2026, 9, 1, 9, 0, tzinfo=SHANGHAI_TZ).timestamp())], "px": [6.80]}), now_ts),
+        )
+
+    res = evaluate_v9_plus_backtest(
+        rstore,
+        {
+            "id": "ai-160723-v9-plus-aggressive",
+            "macd_settings": {"short": 10, "long": 20, "signal": 5, "marker_threshold": 0.0002},
+        },
+        {"start_date": "20261001", "round_trip_fee_pct": 0.01, "capital_cap": 50000.0},
+        {
+            "mode": "cash_pool_rolling",
+            "engine_profile": "v9_plus_aggressive",
+            "close_flatten_time": "14:53",
+            "max_daily_entries": 8,
+            "cooldown_minutes": 4,
+            "scale_factor": 1.0,
+        },
+        symbol="160723",
+        cleaned_end="20261103",
+        signal_limit=200,
+        allow_network=False,
+    )
+    t0 = res["base_position_t0"]
+    assert t0["accounting_mode"] == "three_state_nav"
+    assert t0["account_events_truncated"] is False
+    events = t0["account_events"]
+    assert len(events) > 0
+    assert any(ev["event_kind"] == "overnight_hold" for ev in events)
+    assert any(ev["event_kind"] in {"intraday_t0", "close_rebalance"} for ev in events)
+
+    # Monthly identity: overnight_return_pct + intraday_t0_return_pct == net_return_pct == sum(month_contrib_pct)
+    for m in t0["monthly_returns"]:
+        m_key = m["month"]
+        m_evs = [ev for ev in events if ev["month"] == m_key]
+        sum_month = sum(float(ev["month_contrib_pct"]) for ev in m_evs)
+        sum_ov = sum(float(ev["month_contrib_pct"]) for ev in m_evs if ev["event_kind"] == "overnight_hold")
+        sum_intra = sum(float(ev["month_contrib_pct"]) for ev in m_evs if ev["event_kind"] != "overnight_hold")
+        assert abs((m["overnight_return_pct"] + m["intraday_t0_return_pct"]) - m["net_return_pct"]) < 1e-2
+        assert abs(sum_month - m["net_return_pct"]) < 1e-2
+        assert abs(sum_ov - m["overnight_return_pct"]) < 1e-2
+        assert abs(sum_intra - m["intraday_t0_return_pct"]) < 1e-2
+
+    # Overall evaluation identity: sum(total_contrib_pct) == net_cum_return_pct
+    assert abs((t0["overnight_return_pct"] + t0["intraday_t0_return_pct"]) - t0["net_cum_return_pct"]) < 0.02
+    assert abs(sum(float(ev["total_contrib_pct"]) for ev in events) - t0["net_cum_return_pct"]) < 0.02
+
+    # Position transition continuity in chronological order: every event explains shares & weight change (pure %)
+    chrono_events = list(reversed(events))
+    assert chrono_events
+    for idx_ev, ev in enumerate(chrono_events):
+        assert isinstance(ev.get("before_shares"), int)
+        assert isinstance(ev.get("after_shares"), int)
+        act_lbl = str(ev.get("position_action_label") or "").strip()
+        trans_lbl = str(ev.get("position_transition_label") or "").strip()
+        ev_title = str(ev.get("title") or "").strip()
+        assert act_lbl and "手" not in act_lbl
+        assert trans_lbl and "手" not in trans_lbl
+        assert "手" not in ev_title
+        if idx_ev > 0:
+            assert chrono_events[idx_ev - 1]["after_shares"] == ev["before_shares"], (
+                f"Share discontinuity between {chrono_events[idx_ev - 1]} and {ev}"
+            )
+
+    # Compact rule list strips heavy account_events and sets account_events_truncated=True
+    compacted = compact_quant_rule_record({"id": "ai-160723-v9-plus-aggressive", "latest_eval": res})
+    assert compacted["latest_eval"]["base_position_t0"]["account_events"] == []
+    assert compacted["latest_eval"]["base_position_t0"]["account_events_truncated"] is True
+    assert len(compacted["latest_eval"]["base_position_t0"]["monthly_returns"]) == len(t0["monthly_returns"])
+    rstore.close()
+
+
+def test_export_dataset_supports_all_13_monitor_sources_and_orderbook_qdii_snapshots(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import json as _json
+    import time as _time
+    from level2_service.v9_plus_engine import V9MacroDataStore
+
+    monkeypatch.setenv("THS_QUANT_OFFLINE", "1")
+    rstore = SQLiteResearchStore(tmp_path / "monitor_sources_export.db")
+    qstore = SQLiteQuantRuleStore(tmp_path / "monitor_sources_export.db")
+    V9MacroDataStore(rstore, allow_network=False)
+    now_ts = _time.time()
+
+    with rstore._lock, rstore._connection:
+        rstore._connection.execute(
+            "INSERT OR REPLACE INTO quant_macro_cache VALUES (?, ?, ?)",
+            ("nav_160723", _json.dumps({"20260701": 1.8825, "20260702": 1.9050}), now_ts),
+        )
+        rstore._connection.execute(
+            "INSERT OR REPLACE INTO quant_macro_cache VALUES (?, ?, ?)",
+            (
+                "fx_usdcnh_series",
+                _json.dumps(
+                    {
+                        "ts": [int(datetime(2026, 7, 1, 9, 0, tzinfo=SHANGHAI_TZ).timestamp())],
+                        "px": [7.12345],
+                    }
+                ),
+                now_ts,
+            ),
+        )
+        rstore._connection.execute(
+            "INSERT OR REPLACE INTO quant_macro_cache VALUES (?, ?, ?)",
+            (
+                "uso_daily_2y",
+                _json.dumps([
+                    ["20260701", int(datetime(2026, 7, 2, 6, 0, tzinfo=SHANGHAI_TZ).timestamp()), 80.0],
+                    ["20260702", int(datetime(2026, 7, 3, 6, 0, tzinfo=SHANGHAI_TZ).timestamp()), 81.6],
+                ]),
+                now_ts,
+            ),
+        )
+        rstore._connection.execute(
+            "INSERT OR REPLACE INTO quant_macro_cache VALUES (?, ?, ?)",
+            (
+                "bno_daily_2y",
+                _json.dumps([
+                    ["20260701", int(datetime(2026, 7, 2, 6, 0, tzinfo=SHANGHAI_TZ).timestamp()), 30.0],
+                    ["20260702", int(datetime(2026, 7, 3, 6, 0, tzinfo=SHANGHAI_TZ).timestamp()), 30.9],
+                ]),
+                now_ts,
+            ),
+        )
+        rstore._connection.execute(
+            "INSERT OR REPLACE INTO quant_macro_cache VALUES (?, ?, ?)",
+            (
+                "dbo_daily_2y",
+                _json.dumps([
+                    ["20260701", int(datetime(2026, 7, 2, 6, 0, tzinfo=SHANGHAI_TZ).timestamp()), 50.0],
+                    ["20260702", int(datetime(2026, 7, 3, 6, 0, tzinfo=SHANGHAI_TZ).timestamp()), 50.5],
+                ]),
+                now_ts,
+            ),
+        )
+
+    rstore.save_premium_snapshot(
+        {
+            "as_of": "2026-07-03T10:05:00+08:00",
+            "rows": [
+                {
+                    "code": "160723",
+                    "name": "嘉实原油",
+                    "current_price": 1.912,
+                    "estimated_price": 1.930,
+                    "premium_rate": -0.009326,
+                    "estimate_source": "HaoETF",
+                    "stale": False,
+                }
+            ],
+            "valid_count": 1,
+            "errors": {},
+        }
+    )
+
+    for td, px in (("20260701", 1.880), ("20260702", 1.895), ("20260703", 1.912)):
+        _seed_symbol_bars(
+            rstore,
+            "160723",
+            td,
+            px,
+            [("09:30", px), ("10:00", px), ("15:00", px)],
+            name="嘉实原油",
+        )
+
+    engine = AutoTradeEngine(
+        auto_store=SQLiteAutoTradeStore(tmp_path / "monitor_sources_export.db"),
+        research_store=rstore,
+        broker=None,
+        trade_executor=None,
+        symbol_lookup=lambda s: CATALOG.get(s),
+        is_trading_day=lambda _d: True,
+        now_fn=lambda: datetime(2026, 7, 3, 10, 5, tzinfo=SHANGHAI_TZ),
+        epoch_fn=lambda: 1_800_000_000.0,
+        quant_rule_store=qstore,
+    )
+    import time as _tm
+
+    engine._order_book_cache["160723"] = (
+        _tm.monotonic(),
+        {
+            "symbol": "160723",
+            "name": "嘉实原油",
+            "last_price": 1.912,
+            "previous_close": 1.895,
+            "limit_up": 2.085,
+            "limit_down": 1.706,
+            "bids": [{"level": 1, "price": 1.911, "volume": 1200}],
+            "asks": [{"level": 1, "price": 1.912, "volume": 800}],
+            "source_time": "10:05:00",
+        },
+    )
+
+    # Export with monitor source IDs directly
+    ds_res = export_quant_dataset(
+        rstore,
+        "160723",
+        start_date="20260703",
+        end_date="20260703",
+        mode="minutes",
+        sources=(
+            "ashare_intraday_1m,"
+            "ashare_orderbook_l1,"
+            "fx_usdcny_usdcnh,"
+            "eastmoney_fund_nav,"
+            "qdii_premium_panel_feed,"
+            "us_oil_etf_uso_bno_dbo"
+        ),
+        auto_trade_engine=engine,
+    )
+    assert set(ds_res["data_packs_included"]) == {"iopv_fx", "uso_bno_sc_peer"}
+    assert "ashare_orderbook_l1" in ds_res["requested_sources"]
+    assert len(ds_res["monitored_data_sources"]) == 13
+    assert ds_res["orderbook_l1_snapshot"]["bids"][0]["price"] == 1.911
+    assert ds_res["qdii_panel_snapshot"]["premium_pct"] == -0.933
+
+    day_row = ds_res["days"][0]
+    assert day_row["day_pack_summary"]["official_nav"] == 1.8825
+    assert day_row["day_pack_summary"]["official_nav_date"] == "20260701"
+    assert abs(day_row["day_pack_summary"]["uso_ov_pct"] - 2.0) < 0.01
+    assert abs(day_row["day_pack_summary"]["bno_ov_pct"] - 3.0) < 0.01
+    assert abs(day_row["day_pack_summary"]["dbo_ov_pct"] - 1.0) < 0.01
+    assert abs(day_row["day_pack_summary"]["fof_3oil_ov_pct"] - 2.05) < 0.01
+
+    pt0 = day_row["points"][0]
+    assert pt0["usdcnh"] == 7.12345
+    assert pt0["official_nav"] == 1.8825
+    assert abs(pt0["dbo_change_pct"] - 1.0) < 0.01
+
+    # HTTP bridge /quant/dataset?sources=... passthrough
+    app = create_app(
+        admin_password_hash=PasswordHasher().hash("admin-pass-123"),
+        admin_session_secret="c" * 32,
+        symbol_lookup=lambda sym: CATALOG[sym],
+        market_account_store=SQLiteMarketAccountStore(tmp_path / "market.db"),
+        research_store=rstore,
+        goodluck_internal_token=TOKEN,
+        auto_trade_engine=engine,
+        quant_rule_store=qstore,
+    )
+    client = TestClient(app)
+    http_res = client.get(
+        "/api/internal/goodluck/quant/dataset?symbol=160723&start_date=20260703&mode=summary&sources=ashare_orderbook_l1,fx_usdcny_usdcnh",
+        headers=_headers(),
+    )
+    assert http_res.status_code == 200
+    body = http_res.json()
+    assert body["orderbook_l1_snapshot"]["last_price"] == 1.912
+    assert len(body["monitored_data_sources"]) == 13
+    rstore.close()
+    qstore.close()
+
 

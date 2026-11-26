@@ -1493,7 +1493,7 @@ class SQLiteAutoTradeStore:
             amt = float(row["estimated_amount"] or 0.0)
             sig_k = str(row["signal_key"] or "")
             is_flatten = ":t0-flatten:" in sig_k or ":t0-guard-stop:" in sig_k
-            is_closing = is_flatten or ":v9-close:" in sig_k or ":v9-exit:" in sig_k
+            is_closing = is_flatten or ":v9-close:" in sig_k or ":v9-exit:" in sig_k or ":v9-init-base:" in sig_k
             if not is_flatten:
                 entry_count += 1
             if str(row["side"]) == "buy":
@@ -1878,6 +1878,7 @@ class AutoTradeEngine:
         self._last_data_guard_by_symbol: dict[str, dict[str, Any]] = {}
         self._pool_allocator = RouteDPlusAllocator()
         self._live_weight_cache: dict[str, tuple[float, dict[str, Any]]] = {}
+        self._prev_close_eval_cache: dict[str, dict[str, Any]] = {}
 
     def subscribe(self, *, maxsize: int = 128) -> asyncio.Queue[dict[str, Any]]:
         q: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=max(16, int(maxsize)))
@@ -5596,7 +5597,7 @@ class AutoTradeEngine:
                         trade_date=trade_date,
                         exclude_signal_id=signal_row["id"],
                         is_short_cover=":v9-exit:" in sig_key_exec,
-                        is_close_rebalance=":v9-close:" in sig_key_exec,
+                        is_close_rebalance=(":v9-close:" in sig_key_exec or ":v9-init-base:" in sig_key_exec),
                     )
                 else:
                     cap_limit_val = float(config["daily_max_buy_amount"])
@@ -5900,7 +5901,11 @@ class AutoTradeEngine:
             return 0
 
         is_short_cover = (item.get("signal_tag") == "v9-exit") or (":v9-exit:" in sig_key)
-        is_close_rebal = (item.get("signal_tag") == "v9-close") or (":v9-close:" in sig_key)
+        is_close_rebal = (
+            (item.get("signal_tag") in {"v9-close", "v9-init-base"})
+            or (":v9-close:" in sig_key)
+            or (":v9-init-base:" in sig_key)
+        )
         rd_cap_limit: float | None = None
         rd_cash_limit: float | None = None
         if is_route_d_plus and item["side"] == "buy" and not skip_cap_check:
@@ -6360,6 +6365,258 @@ class AutoTradeEngine:
         sig_key = f"{symbol}:{trade_date}:{fl_hhmm}:t0-flatten:{flatten_side}"
         return fl_item, flatten_qty, sig_key
 
+    def _plan_morning_cold_start_base_buys(
+        self,
+        *,
+        symbol_plans: Sequence[Mapping[str, Any]],
+        mid_state: Mapping[str, Any],
+        trade_date: str,
+        now_hhmm: str,
+    ) -> list[tuple[str, dict[str, Any], str, int]]:
+        """Safely catch up overnight target base positions on a morning cold start."""
+        pp = mid_state.get("policy") or {}
+        if not bool(pp.get("enable_morning_base_catchup", True)):
+            return []
+        end_hhmm = str(pp.get("morning_catchup_end_hhmm") or "09:50")
+        if not ("09:32" <= now_hhmm <= end_hhmm):
+            return []
+        read_series = getattr(self.research_store, "read_series", None)
+        if not callable(read_series):
+            return []
+
+        engine_type = str(mid_state.get("engine_type") or "route_d_plus")
+        pool_cap = float(mid_state.get("pool_cap") or 0.0)
+        pool_equity = float(mid_state.get("pool_equity") or 0.0)
+        free_cash = float(mid_state.get("free_pool_cash") or 0.0)
+        avail_pool_cash = float(mid_state.get("available_pool_cash") or 0.0)
+        single_fee = float(pp.get("single_fee_rate") or 0.00005)
+        held_shares_map = mid_state.get("held_shares") or {}
+        held_mvs_map = mid_state.get("held_mvs") or {}
+        anchors = mid_state.get("anchors") or {}
+        causal_ctx = mid_state.get("causal_ctx") or {}
+        sym_cfgs = mid_state.get("sym_cfgs") or {}
+        all_syms = list(mid_state.get("symbols") or [])
+        static_caps = {
+            sym: float((sym_cfgs.get(sym) or {}).get("daily_max_buy_amount") or 0.0)
+            for sym in all_syms
+        }
+        active_cap_name = str((mid_state.get("active_capital_policy") or {}).get("name") or "共享资金池")
+        cap_tag = "RouteD+" if engine_type == "route_d_plus" else active_cap_name.split("（", 1)[0][:16]
+
+        max_gap_pct = float(pp.get("morning_catchup_max_gap_pct") or 2.50)
+        max_sp_fx_pct = float(
+            pp.get("morning_catchup_max_sp_fx_pct")
+            if pp.get("morning_catchup_max_sp_fx_pct") is not None
+            else 0.38
+        )
+        default_max_prem_pct = float(
+            pp.get("morning_catchup_max_prem_pct")
+            if pp.get("morning_catchup_max_prem_pct") is not None
+            else 2.00
+        )
+
+        qualifying: dict[str, dict[str, Any]] = {}
+        for plan in symbol_plans:
+            sym = str(plan["symbol"])
+            sym_cfg = plan["sym_cfg"]
+            sym_q_rule = plan.get("sym_q_rule")
+            sym_ps = plan.get("sym_ps") or {}
+            last_sym_guard = plan.get("last_sym_guard")
+
+            if str(sym_cfg.get("sizing_mode") or "fixed_qty") != "model_auto":
+                continue
+            if sym_q_rule is None:
+                continue
+            engine_profile = str(sym_ps.get("engine_profile") or "standard")
+            if engine_profile not in {"v9_plus_aggressive", "v9_plus_balanced"}:
+                continue
+            rule_syms = [str(s).strip() for s in (sym_q_rule.get("symbols") or []) if str(s).strip()]
+            if rule_syms and sym not in rule_syms:
+                continue
+            if isinstance(last_sym_guard, Mapping) and last_sym_guard.get("blocked"):
+                continue
+
+            today_sigs = self.auto_store.list_today_symbol_signals(trade_date, sym)
+            if any(
+                (":v9-init-base:" in skey or ":v9-entry:" in skey or ":v9-scalp:" in skey or ":v9-close:" in skey)
+                for skey in (str(sig.get("signal_key") or "") for sig in today_sigs)
+            ):
+                continue
+
+            try:
+                cur_series = read_series(sym, trade_date)
+            except Exception:
+                cur_series = None
+            if not isinstance(cur_series, Mapping):
+                continue
+            avail_dates = [str(d) for d in (cur_series.get("available_dates") or []) if str(d) < trade_date]
+            prev_td = max(avail_dates) if avail_dates else None
+            if not prev_td:
+                continue
+
+            rule_id_str = str(sym_q_rule.get("id") or "")
+            prev_cache_key = f"{sym}|{trade_date}|{prev_td}|{rule_id_str}|{pool_cap:.2f}"
+            cached_prev = self._prev_close_eval_cache.get(prev_cache_key)
+            if cached_prev is None:
+                try:
+                    prev_ind = evaluate_v9_plus_live_indicators(
+                        self.research_store,
+                        symbol=sym,
+                        trade_date=prev_td,
+                        now_hhmm="15:00",
+                        cap_limit=pool_cap,
+                        rule_spec=sym_q_rule,
+                        pos_sizing=sym_ps,
+                        today_signals=[],
+                        rolling_shares=0,
+                        allow_network=False,
+                    )
+                except Exception:
+                    prev_ind = None
+                if isinstance(prev_ind, Mapping) and isinstance(prev_ind.get("diagnostics"), Mapping):
+                    prev_diag = prev_ind["diagnostics"]
+                    cached_prev = {
+                        "prev_td": prev_td,
+                        "prev_raw_wt": max(0.0, float(prev_diag.get("close_target_weight_pct") or 0.0) / 100.0),
+                        "prev_close_px": float(prev_diag.get("price") or 0.0),
+                        "reason": str(prev_diag.get("close_target_reason") or ""),
+                    }
+                else:
+                    cached_prev = {"prev_td": prev_td, "prev_raw_wt": 0.0, "prev_close_px": 0.0, "reason": ""}
+                if len(self._prev_close_eval_cache) > 64:
+                    self._prev_close_eval_cache.clear()
+                self._prev_close_eval_cache[prev_cache_key] = cached_prev
+
+            prev_raw_wt = float(cached_prev.get("prev_raw_wt") or 0.0)
+            if prev_raw_wt <= 0.0:
+                continue
+
+            cur_sh = max(0, int(held_shares_map.get(sym) or 0))
+            try:
+                cur_ind = evaluate_v9_plus_live_indicators(
+                    self.research_store,
+                    symbol=sym,
+                    trade_date=trade_date,
+                    now_hhmm=now_hhmm,
+                    cap_limit=pool_cap,
+                    rule_spec=sym_q_rule,
+                    pos_sizing=sym_ps,
+                    today_signals=today_sigs,
+                    rolling_shares=cur_sh,
+                    broker_available_cash=avail_pool_cash,
+                )
+            except Exception:
+                cur_ind = None
+            if not isinstance(cur_ind, Mapping) or not isinstance(cur_ind.get("diagnostics"), Mapping):
+                continue
+            cur_diag = cur_ind["diagnostics"]
+            cur_px = float(cur_diag.get("price") or 0.0)
+            cur_raw_wt = max(0.0, float(cur_diag.get("close_target_weight_pct") or 0.0) / 100.0)
+            if cur_px <= 0.0 or cur_raw_wt <= 0.0 or bool(cur_diag.get("sell_s_sig")):
+                continue
+
+            prev_close_px = float(cur_series.get("pre_close") or 0.0)
+            if prev_close_px <= 0.0:
+                prev_close_px = float(cached_prev.get("prev_close_px") or 0.0)
+            if prev_close_px <= 0.0:
+                continue
+
+            gap_pct = (cur_px - prev_close_px) / prev_close_px * 100.0
+            sp_fx_pct = float(cur_diag.get("sp_fx_pct") or 0.0)
+            prem_pct = float(cur_diag.get("prem_pct") or 0.0)
+            anchor_sym = str(anchors.get(sym) or cur_diag.get("cross_market_anchor") or "brent")
+            max_prem_pct = 0.55 if anchor_sym == "xop_us_ep" else default_max_prem_pct
+            if gap_pct > max_gap_pct or sp_fx_pct > max_sp_fx_pct or prem_pct > max_prem_pct:
+                continue
+
+            qualifying[sym] = {
+                "sym_q_rule": sym_q_rule,
+                "cur_px": cur_px,
+                "cur_sh": cur_sh,
+                "prev_td": prev_td,
+                "prev_raw_wt": prev_raw_wt,
+                "cur_raw_wt": cur_raw_wt,
+                "gap_pct": gap_pct,
+                "sp_fx_pct": sp_fx_pct,
+                "prem_pct": prem_pct,
+            }
+
+        if not qualifying:
+            return []
+
+        eff_raw_weights: dict[str, float] = {}
+        for s in all_syms:
+            if s in qualifying:
+                q_info = qualifying[s]
+                eff_raw_weights[s] = min(float(q_info["prev_raw_wt"]), float(q_info["cur_raw_wt"]))
+            else:
+                s_sh = max(0, int(held_shares_map.get(s) or 0))
+                s_mv = max(0.0, float(held_mvs_map.get(s) or 0.0))
+                eff_raw_weights[s] = min(1.0, s_mv / max(1.0, pool_equity)) if s_sh >= 200 else 0.0
+
+        ov = self._pool_allocator.compute_overnight_weights(
+            symbols=all_syms,
+            raw_weights=eff_raw_weights,
+            anchors=anchors,
+            causal_ctx=causal_ctx,
+            policy=pp,
+            engine_type=engine_type,
+            static_caps=static_caps,
+            pool_cap=pool_cap,
+        )
+        alloc_wts = ov.get("alloc_weights") or {}
+
+        raw_buy_diffs: dict[str, int] = {}
+        prices_for_cash: dict[str, float] = {}
+        for sym, q_info in qualifying.items():
+            cur_px = float(q_info["cur_px"])
+            cur_sh = int(q_info["cur_sh"])
+            alloc_wt = max(0.0, float(alloc_wts.get(sym) or 0.0))
+            tgt_sh = int((pool_equity * alloc_wt) // (cur_px * 100 * (1.0 + single_fee))) * 100
+            if cur_sh < max(200, int(tgt_sh * 0.5)) and (tgt_sh - cur_sh) >= 100:
+                raw_buy_diffs[sym] = int(tgt_sh - cur_sh)
+                prices_for_cash[sym] = cur_px
+                q_info["tgt_sh"] = tgt_sh
+                q_info["alloc_wt"] = alloc_wt
+
+        if not raw_buy_diffs:
+            return []
+        scaled_buys = scale_buy_orders_to_cash(raw_buy_diffs, prices_for_cash, free_cash, single_fee)
+        if not scaled_buys:
+            return []
+
+        out_buys: list[tuple[str, dict[str, Any], str, int]] = []
+        for sym, buy_q in scaled_buys.items():
+            if int(buy_q) < 100:
+                continue
+            q_info = qualifying[sym]
+            cur_px = float(q_info["cur_px"])
+            cur_mv = max(0.0, float(held_mvs_map.get(sym) or 0.0))
+            sym_q_rule = q_info["sym_q_rule"]
+            sym_name, sym_mkt = self._resolve_symbol_meta(sym)
+            rule_name = str((sym_q_rule or {}).get("name") or sym)
+            sig_key = f"{sym}:{trade_date}:init-base:v9-init-base:buy"
+            buy_item = {
+                "rule_id": str((sym_q_rule or {}).get("id") or "route-d-init-base"),
+                "rule_title": f"[{cap_tag}早盘补底仓] {rule_name}",
+                "rule_summary": (
+                    f"昨收({q_info['prev_td']})目标仓位 {float(q_info['prev_raw_wt']) * 100.0:.0f}%({float(q_info['alloc_wt']) * 100.0:.1f}%池配比)，"
+                    f"今早高开 {float(q_info['gap_pct']):+.2f}% / 外盘偏差 {float(q_info['sp_fx_pct']):+.2f}% / 溢价 {float(q_info['prem_pct']):+.2f}% 均在安全阈值内，"
+                    f"冷启动补买底仓 {int(buy_q)} 股(目标 {int(q_info['tgt_sh'])} 股)"
+                ),
+                "side": "buy",
+                "minute": now_hhmm,
+                "price": f"{cur_px:.3f}",
+                "name": sym_name,
+                "market": sym_mkt,
+                "trade_date": trade_date,
+                "signal_tag": "v9-init-base",
+                "t0_net_cap_mode": True,
+                "dynamic_cap_limit": round(cur_mv + int(buy_q) * cur_px * 1.03, 2),
+            }
+            out_buys.append((sym, buy_item, sig_key, int(buy_q)))
+        return out_buys
+
     async def _execute_route_d_poll_plans(
         self,
         *,
@@ -6382,10 +6639,21 @@ class AutoTradeEngine:
         cap_tag = "RouteD+" if engine_type == "route_d_plus" else active_cap_name.split("（", 1)[0][:16]
         single_fee = float(pp["single_fee_rate"])
 
+        morning_init_buys = await asyncio.to_thread(
+            self._plan_morning_cold_start_base_buys,
+            symbol_plans=symbol_plans,
+            mid_state=mid_state,
+            trade_date=trade_date,
+            now_hhmm=now_hhmm,
+        )
+        init_buy_syms = {sym for sym, *_ in morning_init_buys}
+
         # 1. Coordinate intraday model_auto long entries (v9-entry / v9-scalp buys) across the pool
         buy_reqs: list[dict[str, Any]] = []
         for plan in symbol_plans:
             sym = str(plan["symbol"])
+            if sym in init_buy_syms:
+                continue
             if str(plan["sym_cfg"].get("sizing_mode") or "fixed_qty") != "model_auto":
                 continue
             for cand in plan["candidates"]:
@@ -6437,6 +6705,8 @@ class AutoTradeEngine:
                     wave1_sell_cands.append((sym, dict(item), sig_key))
                     continue
                 if is_model_auto and sig_tag in {"v9-entry", "v9-scalp"}:
+                    if sym in init_buy_syms:
+                        continue
                     coord = coord_buys.get(sym)
                     if not coord or not coord.get("approved") or int(coord.get("qty") or 0) < 100:
                         continue
@@ -6719,6 +6989,19 @@ class AutoTradeEngine:
                     qty_override=int(buy_q),
                     deferred_execs=wave2_execs,
                 )
+
+        for sym, init_item, init_key, init_qty in morning_init_buys:
+            triggered += await self._emit_trade_signal(
+                symbol=sym,
+                item=init_item,
+                config=root_config,
+                trade_date=trade_date,
+                now_epoch=now_epoch,
+                local_iso=local_iso,
+                sig_key=init_key,
+                qty_override=init_qty,
+                deferred_execs=wave2_execs,
+            )
 
         for sym, item, sig_key, qty in wave2_fixed_rebal:
             triggered += await self._emit_trade_signal(

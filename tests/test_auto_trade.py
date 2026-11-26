@@ -3366,3 +3366,221 @@ def test_evaluate_live_snapshot_offhours_falls_back_to_latest_close_and_computes
     astore.close()
 
 
+
+
+def test_morning_cold_start_base_catchup_respects_gap_gate_and_enables_reverse_t(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("THS_QUANT_OFFLINE", "1")
+    ctx = _setup_v9_plus_fixture(
+        tmp_path / "morning_catchup.db",
+        execution_mode="full_auto",
+        daily_max_buy_amount=140000.0,
+    )
+    rstore, qstore, astore, clock_dt = ctx["rstore"], ctx["qstore"], ctx["astore"], ctx["clock_dt"]
+    _seed_day_pts = ctx["seed_day_pts"]
+
+    # Clear 10:05 bars seeded by _setup_v9_plus_fixture on 20261126 so morning clock (09:33..09:36) sees fresh bars
+    with rstore._lock:
+        rstore._connection.execute("DELETE FROM research_points WHERE trade_date = ?", ("20261126",))
+        rstore._connection.commit()
+
+    # Morning series on 20261126 starting at 09:30; previous close (pre_close) = 2.000
+    morning_lof = [("09:30", 2.000), ("09:31", 2.005), ("09:32", 2.008), ("09:33", 2.010), ("09:34", 2.010), ("09:35", 2.010)]
+    morning_brn = [("09:30", 70.0), ("09:33", 70.3), ("09:35", 70.3)]
+    _seed_day_pts("BRN0Y", "20261126", 70.0, morning_brn, market="ICE")
+    _seed_day_pts("160723", "20261126", 2.000, morning_lof)
+
+    placed_orders: list[dict[str, Any]] = []
+
+    class _CatchupExecutor:
+        adb_serial = "emulator-5556"
+        active_tab = "buy"
+
+        def __init__(self) -> None:
+            self.held_shares = 0
+            self.avail_cash = 140000.0
+
+        def _make_snap(self) -> dict[str, Any]:
+            mv = round(self.held_shares * 2.010, 2)
+            positions = (
+                [
+                    {
+                        "symbol": "160723",
+                        "name": "嘉实原油",
+                        "shares": self.held_shares,
+                        "available_shares": self.held_shares,
+                        "market_value": f"{mv:.2f}",
+                        "current_price": "2.010",
+                    }
+                ]
+                if self.held_shares > 0
+                else []
+            )
+            return {
+                "logged_in": True,
+                "metrics": {
+                    "available_cash": f"{self.avail_cash:.2f}",
+                    "total_assets": f"{self.avail_cash + mv:.2f}",
+                },
+                "positions": positions,
+                "captured_at": clock_dt["dt"].isoformat(timespec="seconds"),
+            }
+
+        def _cached_account_snapshot(self, *_a: Any, **_k: Any) -> dict[str, Any]:
+            return self._make_snap()
+
+        def get_account_summary(self, *_a: Any, **_k: Any) -> dict[str, Any]:
+            return self._make_snap()
+
+        def place_order(self, **kwargs: Any) -> dict[str, Any]:
+            qty = int(kwargs["quantity"])
+            px = float(kwargs["price"])
+            side = str(kwargs["side"])
+            if side == "buy":
+                self.held_shares += qty
+                self.avail_cash = round(self.avail_cash - qty * px, 2)
+            else:
+                self.held_shares = max(0, self.held_shares - qty)
+                self.avail_cash = round(self.avail_cash + qty * px, 2)
+            placed_orders.append({"symbol": kwargs["symbol"], "side": side, "qty": qty, "price": px})
+            return {
+                "accepted": True,
+                "status": "SUBMITTED",
+                "entrust_no": f"MC{len(placed_orders):04d}",
+                "dialog_message": "委托已提交",
+            }
+
+    exec_obj = _CatchupExecutor()
+    engine = AutoTradeEngine(
+        auto_store=astore,
+        research_store=rstore,
+        broker=None,
+        trade_executor=exec_obj,
+        symbol_lookup=lambda s: CATALOG.get(s),
+        is_trading_day=lambda _d: True,
+        now_fn=lambda: clock_dt["dt"],
+        epoch_fn=lambda: clock_dt["ep"],
+        quant_rule_store=qstore,
+    )
+    astore.update_config(
+        {
+            "enabled": True,
+            "signal_source": "quant_rule",
+            "quant_rule_id": "ai-160723-v9-plus-aggressive",
+            "execution_mode": "full_auto",
+            "sizing_mode": "model_auto",
+            "capital_policy_mode": "route_d_sharpe_shield",
+            "daily_max_buy_amount": 140000.0,
+            "pool_policy": {"total_pool_cap": 140000.0},
+            "symbols": ["160723"],
+            "symbol_profiles": {
+                "160723": {
+                    "enabled": True,
+                    "signal_source": "quant_rule",
+                    "quant_rule_id": "ai-160723-v9-plus-aggressive",
+                    "sizing_mode": "model_auto",
+                    "capital_cap": 140000.0,
+                }
+            },
+        }
+    )
+
+    from level2_service.v9_plus_engine import evaluate_v9_plus_live_indicators
+
+    real_ind_fn = evaluate_v9_plus_live_indicators
+    probe_state = {"sp_fx": 0.55, "price": 2.010, "prem": 0.20, "wt_pct": 90.0}
+
+    def _stub_indicators(store: Any, **kwargs: Any) -> dict[str, Any] | None:
+        td = str(kwargs.get("trade_date") or "")
+        if td < "20261126":
+            return {
+                "diagnostics": {
+                    "price": 2.000,
+                    "prem_pct": 0.10,
+                    "sp_fx_pct": 0.05,
+                    "close_target_weight_pct": 90.0,
+                    "close_target_reason": "隔夜目标重仓90%",
+                    "sell_s_sig": False,
+                    "cross_market_anchor": "brent",
+                }
+            }
+        return {
+            "diagnostics": {
+                "price": float(probe_state["price"]),
+                "prem_pct": float(probe_state["prem"]),
+                "sp_fx_pct": float(probe_state["sp_fx"]),
+                "close_target_weight_pct": float(probe_state["wt_pct"]),
+                "close_target_reason": "隔夜延续目标仓位",
+                "sell_s_sig": False,
+                "cross_market_anchor": "brent",
+            }
+        }
+
+    with monkeypatch.context() as mp:
+        mp.setattr("level2_service.auto_trade.evaluate_v9_plus_live_indicators", _stub_indicators)
+
+        # 1) 09:33 sp_fx_pct = +0.55% (> +0.38%) -> blocked!
+        clock_dt["dt"] = datetime(2026, 11, 26, 9, 33, tzinfo=SHANGHAI_TZ)
+        clock_dt["ep"] += 60.0
+        res_block_sp = asyncio.run(engine.poll_once())
+        assert res_block_sp["triggered"] == 0
+        assert placed_orders == []
+
+        # 2) 09:34 gap_pct = +3.00% (2.060 vs 2.000 > +2.50%) -> blocked!
+        probe_state.update({"sp_fx": 0.10, "price": 2.060})
+        clock_dt["dt"] = datetime(2026, 11, 26, 9, 34, tzinfo=SHANGHAI_TZ)
+        clock_dt["ep"] += 60.0
+        res_block_gap = asyncio.run(engine.poll_once())
+        assert res_block_gap["triggered"] == 0
+        assert placed_orders == []
+
+        # 3) 09:35 safe fair open (gap +0.50%, sp_fx +0.10%, prem +0.20%) -> emits 1 catch-up buy!
+        probe_state.update({"sp_fx": 0.10, "price": 2.010})
+        clock_dt["dt"] = datetime(2026, 11, 26, 9, 35, tzinfo=SHANGHAI_TZ)
+        clock_dt["ep"] += 60.0
+        res_buy = asyncio.run(engine.poll_once())
+        assert res_buy["triggered"] == 1
+        assert len(placed_orders) == 1
+        assert placed_orders[0]["side"] == "buy"
+        caught_qty = placed_orders[0]["qty"]
+        assert caught_qty >= 100
+        sigs_after_buy = astore.list_today_symbol_signals("20261126", "160723")
+        assert any(":v9-init-base:buy" in str(s.get("signal_key") or "") for s in sigs_after_buy)
+        row_title = astore._connection.execute(
+            "SELECT rule_title FROM auto_trade_signals WHERE trade_date=? AND symbol=? AND signal_key LIKE '%:v9-init-base:%'",
+            ("20261126", "160723"),
+        ).fetchone()
+        assert row_title is not None and "早盘补底仓" in str(row_title["rule_title"])
+        assert astore.today_symbol_activity("20261126", "160723")["buy_entry_count"] == 0
+
+        # 4) 09:36 next poll -> idempotent, zero duplicate buys!
+        clock_dt["dt"] = datetime(2026, 11, 26, 9, 36, tzinfo=SHANGHAI_TZ)
+        clock_dt["ep"] += 60.0
+        res_idem = asyncio.run(engine.poll_once())
+        assert res_idem["triggered"] == 0
+        assert len(placed_orders) == 1
+
+    # 5) 10:15 real V9+ engine runs intraday spike -> reverse-T sell triggers on caught-up base shares while retaining >= 100 floor shares!
+    assert real_ind_fn is not None
+    spike_lof = morning_lof + [(f"09:{m:02d}", 2.005) for m in range(36, 60)] + [(f"10:{m:02d}", 2.008) for m in range(0, 12)] + [
+        ("10:12", 2.030),
+        ("10:13", 2.045),
+        ("10:14", 2.060),
+        ("10:15", 2.055),
+    ]
+    _seed_day_pts("BRN0Y", "20261126", 70.0, morning_brn + [("10:15", 70.0)], market="ICE")
+    _seed_day_pts("160723", "20261126", 2.000, spike_lof)
+    clock_dt["dt"] = datetime(2026, 11, 26, 10, 15, tzinfo=SHANGHAI_TZ)
+    clock_dt["ep"] += 2340.0
+    res_sell = asyncio.run(engine.poll_once())
+    assert res_sell["triggered"] == 1
+    assert len(placed_orders) == 2
+    assert placed_orders[-1]["side"] == "sell"
+    assert placed_orders[-1]["qty"] <= caught_qty - 100
+    assert exec_obj.held_shares >= 100
+
+    rstore.close()
+    qstore.close()
+    astore.close()

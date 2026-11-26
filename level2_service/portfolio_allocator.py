@@ -111,6 +111,11 @@ DEFAULT_POOL_POLICY: dict[str, Any] = {
     "symbol_weight_multipliers": {},
     "symbol_max_caps": {},
     "enforce_min_retained_floor": True,
+    "enable_morning_base_catchup": True,
+    "morning_catchup_end_hhmm": "09:50",
+    "morning_catchup_max_gap_pct": 2.50,
+    "morning_catchup_max_sp_fx_pct": 0.38,
+    "morning_catchup_max_prem_pct": 2.00,
     "single_fee_rate": 0.00005,
 }
 
@@ -165,6 +170,9 @@ def normalize_pool_policy(raw: Mapping[str, Any] | None) -> dict[str, Any]:
         ("multi_cap_max", 0.15, 1.0),
         ("cap_floor", 0.05, 0.80),
         ("max_total_budget_wt", 0.20, 1.0),
+        ("morning_catchup_max_gap_pct", 0.20, 9.50),
+        ("morning_catchup_max_sp_fx_pct", -1.0, 3.0),
+        ("morning_catchup_max_prem_pct", -2.0, 15.0),
         ("single_fee_rate", 0.0, 0.01),
     )
     for key, lo, hi in float_bounds:
@@ -213,6 +221,12 @@ def normalize_pool_policy(raw: Mapping[str, Any] | None) -> dict[str, Any]:
 
     if "enforce_min_retained_floor" in raw:
         out["enforce_min_retained_floor"] = bool(raw.get("enforce_min_retained_floor"))
+    if "enable_morning_base_catchup" in raw:
+        out["enable_morning_base_catchup"] = bool(raw.get("enable_morning_base_catchup"))
+    if "morning_catchup_end_hhmm" in raw:
+        hhmm_val = str(raw.get("morning_catchup_end_hhmm") or "").strip()
+        if re.match(r"^(?:09:[3-5][0-9]|10:[0-2][0-9]|10:30)\Z", hhmm_val):
+            out["morning_catchup_end_hhmm"] = hhmm_val
 
     for map_key, lo_v, hi_v in (("symbol_weight_multipliers", 0.0, 3.0), ("symbol_max_caps", 0.05, 1.0)):
         raw_map = raw.get(map_key)
@@ -1139,11 +1153,12 @@ class RouteDPlusAllocator:
 
         floor_mv_locked = 0.0
         for s in clean_syms:
-            sh = max(0, int(current_shares.get(s) or 0))
             fl = floor_by_sym[s]
             px = float(prices.get(s) or 0.0)
-            if fl > 0 and sh >= fl and float(raw_weights.get(s) or 0.0) <= 0.0 and px > 0.0:
-                floor_mv_locked += min(sh, fl) * px * (1.0 + single_fee)
+            if fl > 0 and px > 0.0 and float(alloc_wts.get(s) or 0.0) <= 0.0:
+                need_mv = fl * px * (1.0 + single_fee)
+                if float(pool_equity) - floor_mv_locked >= need_mv:
+                    floor_mv_locked += need_mv
 
         alloc_eq = max(0.0, float(pool_equity) - floor_mv_locked)
         target_shares: dict[str, int] = {}
@@ -1158,7 +1173,7 @@ class RouteDPlusAllocator:
                 target_shares[s] = sh
                 continue
             raw_tgt = int((alloc_eq * alloc_wts[s]) // (px * lot_size * (1.0 + single_fee))) * lot_size
-            tgt_sh = max(fl, raw_tgt) if (fl > 0 and sh >= fl) else raw_tgt
+            tgt_sh = max(fl, raw_tgt) if (fl > 0 and float(pool_equity) >= fl * px * (1.0 + single_fee)) else raw_tgt
             target_shares[s] = tgt_sh
             if s in skip_set:
                 continue
@@ -1604,6 +1619,12 @@ def get_portfolio_policy_schema() -> dict[str, Any]:
             "equity_solo_anchors": {"type": "array[string]", "default": ["xop_us_ep"], "note": "适用权益独苗上限的跨市场锚"},
             "symbol_weight_multipliers": {"type": "object<symbol,number>", "default": {}, "note": "按6位证券代码微调得分/权重乘子(0~3)"},
             "symbol_max_caps": {"type": "object<symbol,number>", "default": {}, "note": "按6位证券代码限定最高池占比(0.05~1.0)"},
+            "enforce_min_retained_floor": {"type": "boolean", "default": True, "note": "是否强制每只启用标的无条件保留百股底仓"},
+            "enable_morning_base_catchup": {"type": "boolean", "default": True, "note": "隔夜有目标仓位但早盘零持仓时，在未大幅高开前提下补建底仓"},
+            "morning_catchup_end_hhmm": {"type": "string", "default": "09:50", "note": "早盘补底仓截止时间(HH:MM，09:32起生效)"},
+            "morning_catchup_max_gap_pct": {"type": "number", "default": 2.50, "min": 0.20, "max": 9.50, "note": "早盘补底仓允许相对昨收最大涨幅(%)"},
+            "morning_catchup_max_sp_fx_pct": {"type": "number", "default": 0.38, "min": -1.0, "max": 3.0, "note": "早盘补底仓允许相对汇率调整外盘锚最大溢价(%)"},
+            "morning_catchup_max_prem_pct": {"type": "number", "default": 2.00, "min": -2.0, "max": 15.0, "note": "早盘补底仓允许最大LOF实时溢价(%)"},
         },
         "payload_example": {
             "id": "custom-risk-parity-22",

@@ -370,3 +370,68 @@ def test_sqlite_portfolio_policy_store_crud_and_multi_engine_weights(tmp_path: P
     assert store.get_policy("custom-inv-vol-v1") is None
     assert len(BUILTIN_PORTFOLIO_POLICIES) == 5
     store.close()
+
+
+def test_overnight_rebalance_initializes_and_holds_100_share_floor_unconditionally() -> None:
+    from level2_service.portfolio_allocator import (
+        RouteDPlusAllocator,
+        get_portfolio_policy_schema,
+        normalize_pool_policy,
+    )
+
+    alloc = RouteDPlusAllocator()
+    pp = normalize_pool_policy(
+        {
+            "morning_catchup_end_hhmm": "09:45",
+            "morning_catchup_max_gap_pct": 12.0,
+        },
+    )
+    assert pp["enable_morning_base_catchup"] is True
+    assert pp["morning_catchup_end_hhmm"] == "09:45"
+    assert pp["morning_catchup_max_gap_pct"] == pytest.approx(9.50)
+
+    bad_time = normalize_pool_policy({"morning_catchup_end_hhmm": "14:50"})
+    assert bad_time["morning_catchup_end_hhmm"] == "09:50"
+    schema_keys = set((get_portfolio_policy_schema().get("params_schema") or {}).keys())
+    assert {
+        "enforce_min_retained_floor",
+        "enable_morning_base_catchup",
+        "morning_catchup_end_hhmm",
+        "morning_catchup_max_gap_pct",
+        "morning_catchup_max_sp_fx_pct",
+        "morning_catchup_max_prem_pct",
+    } <= schema_keys
+
+    syms = ["160723", "161129", "162411"]
+    causal_ctx = {
+        "vols": {s: 0.02 for s in syms},
+        "corrs": {(a, b): (1.0 if a == b else 0.55) for a in syms for b in syms},
+        "shrink_mults": {s: 1.0 for s in syms},
+    }
+    plan = alloc.plan_overnight_rebalance(
+        symbols=syms,
+        raw_weights={"160723": 0.0, "161129": 0.0, "162411": 1.0},
+        current_shares={"160723": 50000, "161129": 0, "162411": 0},
+        prices={"160723": 2.00, "161129": 1.80, "162411": 1.00},
+        pool_equity=100000.0,
+        available_pool_cash=2000.0,
+        anchors={"160723": "brent", "161129": "brent", "162411": "xop_us_ep"},
+        causal_ctx=causal_ctx,
+        min_retained_by_symbol={"160723": 100, "161129": 100, "162411": 100},
+        policy=pp,
+        engine_type="route_d_sharpe_shield",
+    )
+    assert plan["target_shares"]["160723"] == 100
+    assert plan["sell_orders"]["160723"] == 49900
+    assert plan["target_shares"]["161129"] == 100
+    assert plan["buy_orders"]["161129"] == 100
+    assert plan["target_shares"]["162411"] >= 100
+    assert plan["buy_orders"]["162411"] == plan["target_shares"]["162411"]
+    fee = float(pp["single_fee_rate"])
+    net_cash = (
+        plan["sell_orders"]["160723"] * 2.00 * (1.0 - fee)
+        + 2000.0
+        - plan["buy_orders"]["161129"] * 1.80 * (1.0 + fee)
+        - plan["buy_orders"]["162411"] * 1.00 * (1.0 + fee)
+    )
+    assert net_cash >= -1e-3

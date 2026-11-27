@@ -1739,8 +1739,10 @@ def _apply_v9_macd_anchor(
     days: Sequence[dict[str, Any]],
     v9_tuning: Mapping[str, Any] | None,
 ) -> None:
-    """Rescale absolute MACD-amplitude fields per bar to the calibrated price anchor."""
-    tuning = v9_tuning if isinstance(v9_tuning, Mapping) else {}
+    """Attach `v9_tuning` onto each day and rescale absolute MACD-amplitude fields to the calibrated price anchor."""
+    tuning = dict(v9_tuning) if isinstance(v9_tuning, Mapping) else {}
+    for day in days:
+        day["v9_tuning"] = dict(tuning)
     raw_anchor = tuning.get("macd_price_anchor")
     if raw_anchor is None:
         return
@@ -2003,6 +2005,54 @@ def signals_v8_with_tuning(
     return s_sig, raw_b_sig
 
 
+def _has_morning_init_base_signal(today_signals: Sequence[Mapping[str, Any]] | None) -> bool:
+    """Return True if today's executed/active signal list already contains a morning `:v9-init-base:` fill."""
+    for sig in today_signals or ():
+        if not isinstance(sig, Mapping):
+            continue
+        skey = str(sig.get("signal_key") or "")
+        stag = str(sig.get("signal_tag") or "")
+        if ":v9-init-base:" in skey or stag == "v9-init-base":
+            return True
+    return False
+
+
+def _apply_v9_antislip_intraday_gates(
+    b: Mapping[str, Any],
+    *,
+    b_sig: bool,
+    s_sig_short: bool,
+    scalp_ok: bool,
+    v9_tuning: Mapping[str, Any] | None,
+    bear_carry_active: bool = False,
+) -> tuple[bool, bool, bool]:
+    """Apply optional anti-1-tick-slippage intraday gates (disable_scalp, rev_t_min_sp_fx, sub_1yuan_pure_overnight)."""
+    tuning = v9_tuning if isinstance(v9_tuning, Mapping) else {}
+    if not tuning:
+        return b_sig, s_sig_short, scalp_ok
+    if bool(tuning.get("disable_scalp")):
+        scalp_ok = False
+    raw_rev_min = tuning.get("rev_t_min_sp_fx")
+    if raw_rev_min is not None and s_sig_short and (not bear_carry_active):
+        try:
+            rev_min = float(raw_rev_min)
+        except (TypeError, ValueError):
+            rev_min = None
+        if rev_min is not None and float(b.get("sp_fx") or 0.0) < rev_min:
+            s_sig_short = False
+    if bool(tuning.get("sub_1yuan_pure_overnight")):
+        raw_thresh = tuning.get("sub_1yuan_price_thresh")
+        try:
+            px_thresh = float(raw_thresh) if raw_thresh is not None else 1.20
+        except (TypeError, ValueError):
+            px_thresh = 1.20
+        if float(b.get("price") or 0.0) < px_thresh:
+            b_sig = False
+            s_sig_short = False
+            scalp_ok = False
+    return b_sig, s_sig_short, scalp_ok
+
+
 def should_enter_intraday_dip_scalp(
     b: Mapping[str, Any],
     sc: float = 1.0,
@@ -2013,7 +2063,14 @@ def should_enter_intraday_dip_scalp(
     cur_close_wt: float = 1.0,
 ) -> tuple[bool, str, float]:
     """Unlock causal intraday relative-dip T+0 inventory building even in high-premium or flat regimes."""
-    tuning = v9_tuning if isinstance(v9_tuning, Mapping) else {}
+    if isinstance(v9_tuning, Mapping):
+        tuning = v9_tuning
+    elif isinstance(day, Mapping) and isinstance(day.get("v9_tuning"), Mapping):
+        tuning = day["v9_tuning"]
+    else:
+        tuning = {}
+    if bool(tuning.get("disable_scalp")):
+        return False, "", 0.0
     strict_dip = bool(tuning.get("strict_dip_scalp"))
     t = str(b["time"])
     max_time = "13:45" if strict_mode else "14:15"
@@ -2589,7 +2646,7 @@ def apply_v9_close_weight_tuning(
     overnight_fn: Callable[[Mapping[str, Any], Mapping[str, Any], int], tuple[float, str]],
     v9_tuning: Mapping[str, Any] | None,
 ) -> Callable[[Mapping[str, Any], Mapping[str, Any], int], tuple[float, str]]:
-    """Wrap 14:53 close-weight logic with optional LOF bubble/pullback/offset tuning and high-premium bear guard."""
+    """Wrap 14:53 close-weight logic with optional LOF bubble/pullback/offset tuning, bear guard, and unconfirmed-trend caps."""
     tuning = v9_tuning if isinstance(v9_tuning, Mapping) else {}
     base_fn = overnight_fn
     if base_fn is v9_pro_close_weight and any(
@@ -2605,25 +2662,79 @@ def apply_v9_close_weight_tuning(
 
     raw_cut = tuning.get("bear_high_prem_flat_pct")
     if base_fn is v9_dual_oil_peer_close_weight:
-        if raw_cut is None:
-            return base_fn
-        cut_val = float(raw_cut)
-        return lambda day, b1453, pos=0: v9_dual_oil_peer_close_weight(day, b1453, pos, bear_cut=cut_val)
-    if raw_cut is None:
-        return base_fn
-    cut = float(raw_cut)
+        if raw_cut is not None:
+            cut_val = float(raw_cut)
+            inner_fn: Callable[[Mapping[str, Any], Mapping[str, Any], int], tuple[float, str]] = (
+                lambda day, b1453, pos=0: v9_dual_oil_peer_close_weight(day, b1453, pos, bear_cut=cut_val)
+            )
+        else:
+            inner_fn = base_fn
+    elif raw_cut is not None:
+        cut = float(raw_cut)
 
-    def _wrapped(day: Mapping[str, Any], b1453: Mapping[str, Any], pos: int = 0) -> tuple[float, str]:
-        wt, lbl = base_fn(day, b1453, pos)
-        pm = float(b1453["prem"])
-        pr = float(b1453["price"])
-        above_ma5 = pr >= float(day["ma5"])
-        non_bear_ma15 = float(day["ma5"]) >= float(day["ma15"]) or pr >= float(day["ma15"])
-        if (not non_bear_ma15) and (not above_ma5) and pm >= cut:
-            return 0.0, f"空头破位且高溢价({pm:+.2f}%>={cut:+.1f}%)防杀溢价清仓(0%)"
+        def _bear_cut_wrapped(day: Mapping[str, Any], b1453: Mapping[str, Any], pos: int = 0) -> tuple[float, str]:
+            wt, lbl = base_fn(day, b1453, pos)
+            pm = float(b1453["prem"])
+            pr = float(b1453["price"])
+            above_ma5 = pr >= float(day["ma5"])
+            non_bear_ma15 = float(day["ma5"]) >= float(day["ma15"]) or pr >= float(day["ma15"])
+            if (not non_bear_ma15) and (not above_ma5) and pm >= cut:
+                return 0.0, f"空头破位且高溢价({pm:+.2f}%>={cut:+.1f}%)防杀溢价清仓(0%)"
+            return wt, lbl
+
+        inner_fn = _bear_cut_wrapped
+    else:
+        inner_fn = base_fn
+
+    raw_unconf_cap = tuning.get("unconfirmed_ma15_cap_wt")
+    raw_dual_unconf_cap = tuning.get("dual_prem_unconf_cap_wt")
+    raw_rebound_taper = tuning.get("rebound_taper_wt")
+    if raw_unconf_cap is None and raw_dual_unconf_cap is None and raw_rebound_taper is None:
+        return inner_fn
+
+    unconf_cap = float(raw_unconf_cap) if raw_unconf_cap is not None else None
+    dual_unconf_cap = float(raw_dual_unconf_cap) if raw_dual_unconf_cap is not None else None
+    raw_dual_thresh = tuning.get("dual_prem_unconf_thresh")
+    dual_unconf_thresh = float(raw_dual_thresh) if raw_dual_thresh is not None else 0.45
+    rebound_taper_wt = float(raw_rebound_taper) if raw_rebound_taper is not None else None
+    raw_rebound_pct = tuning.get("rebound_taper_pct")
+    rebound_taper_pct = float(raw_rebound_pct) if raw_rebound_pct is not None else 4.0
+
+    def _antislip_wrapped(day: Mapping[str, Any], b1453: Mapping[str, Any], pos: int = 0) -> tuple[float, str]:
+        wt, lbl = inner_fn(day, b1453, pos)
+        ma5 = float(day.get("ma5") or 0.0)
+        ma15 = float(day.get("ma15") or 0.0)
+        if ma15 > 0.0 and ma5 < ma15:
+            if unconf_cap is not None and wt > unconf_cap:
+                wt = unconf_cap
+                if "未金叉渐进限仓" not in lbl:
+                    lbl = f"{lbl}·未金叉渐进限仓"
+            if dual_unconf_cap is not None and wt > dual_unconf_cap:
+                raw_dpm = b1453.get("dual_prem")
+                if raw_dpm is None:
+                    raw_dpm = b1453.get("prem", 0.0)
+                dpm = float(raw_dpm or 0.0)
+                if dpm >= dual_unconf_thresh:
+                    wt = min(wt, dual_unconf_cap)
+                    if "假折价限仓" not in lbl:
+                        lbl = f"{lbl}·假折价限仓"
+            if rebound_taper_wt is not None and wt > rebound_taper_wt:
+                pr = float(b1453.get("price") or 0.0)
+                lo10_raw = day.get("lo10_prev")
+                if lo10_raw is None:
+                    hist_c = day.get("close_hist_10d") or day.get("prev_closes")
+                    if isinstance(hist_c, Sequence) and not isinstance(hist_c, (str, bytes)):
+                        valid_c = [float(x) for x in hist_c if x is not None and float(x) > 0.0]
+                        lo10_raw = min(valid_c) if valid_c else None
+                lo10 = float(lo10_raw) if (lo10_raw is not None and float(lo10_raw) > 0.0) else 0.0
+                rebound_from_lo = ((pr / lo10 - 1.0) * 100.0) if (lo10 > 0.0 and pr > 0.0) else 0.0
+                if (lo10 > 0.0 and rebound_from_lo >= rebound_taper_pct) or (pr >= ma15 * 0.996):
+                    wt = rebound_taper_wt
+                    if "反弹阶梯退坡" not in lbl:
+                        lbl = f"{lbl}·反弹阶梯退坡"
         return wt, lbl
 
-    return _wrapped
+    return _antislip_wrapped
 
 
 def _load_brn_series_for_window(store: Any, lookback_start: str, cleaned_end: str | None) -> tuple[list[int], list[float]]:
@@ -2889,6 +3000,7 @@ def _build_xop_days_timeline(
             )
             ma5 = statistics.mean(close_hist[-5:]) if close_hist else pre
             ma15 = statistics.mean(close_hist[-15:]) if close_hist else pre
+            lo10_prev = min(close_hist[-10:] + [pre]) if close_hist else pre
 
             def _anchor_fut_us(ts_s: Sequence[int], px_s: Sequence[float]) -> tuple[float | None, int]:
                 pair = _val_at_with_ts(ts_s, px_s, dt_us_close)
@@ -3077,6 +3189,7 @@ def _build_xop_days_timeline(
                         "pre": pre,
                         "ma5": ma5,
                         "ma15": ma15,
+                        "lo10_prev": lo10_prev,
                         "p1500": bars[-1]["price"],
                         "lo_hist": lo_h,
                         "hi_hist": hi_h,
@@ -3349,6 +3462,7 @@ def _build_dual_oil_peer_days_timeline(
             )
             ma5 = statistics.mean(close_hist[-5:]) if close_hist else pre
             ma15 = statistics.mean(close_hist[-15:]) if close_hist else pre
+            lo10_prev = min(close_hist[-10:] + [pre]) if close_hist else pre
             lo_h, hi_h = _day_oil_range(oil_rows, brn_px, td, t0930_ts)
 
             # Causal USO / BNO overnight & trend before today A-share open
@@ -3585,6 +3699,7 @@ def _build_dual_oil_peer_days_timeline(
                         "pre": pre,
                         "ma5": ma5,
                         "ma15": ma15,
+                        "lo10_prev": lo10_prev,
                         "p1500": bars[-1]["price"],
                         "lo_hist": lo_h,
                         "hi_hist": hi_h,
@@ -4070,6 +4185,7 @@ def build_v9_plus_days(
             )
             ma5 = statistics.mean(close_hist[-5:]) if close_hist else pre
             ma15 = statistics.mean(close_hist[-15:]) if close_hist else pre
+            lo10_prev = min(close_hist[-10:] + [pre]) if close_hist else pre
             hi15_pre = max(close_hist[-15:] + [pre]) if close_hist else pre
             lo_h, hi_h = _day_oil_range(oil_rows, brn_px, td, int(_parse_sh(td, "09:30").timestamp()))
 
@@ -4166,6 +4282,7 @@ def build_v9_plus_days(
                         "pre": pre,
                         "ma5": ma5,
                         "ma15": ma15,
+                        "lo10_prev": lo10_prev,
                         "p1500": bars[-1]["price"],
                         "lo_hist": lo_h,
                         "hi_hist": hi_h,
@@ -4742,6 +4859,14 @@ def evaluate_v9_plus_backtest(
             s_sig_short = False if (s_sig and (sp_waterfall if is_sp_etf else _suppress_waterfall_short_entry(b, cur_wt, sc))) else s_sig
             if s_sig_short and is_fof_t0 and should_suppress_fof_t0_short_entry(b):
                 s_sig_short = False
+            b_sig, s_sig_short, scalp_ok = _apply_v9_antislip_intraday_gates(
+                b,
+                b_sig=b_sig,
+                s_sig_short=s_sig_short,
+                scalp_ok=scalp_ok,
+                v9_tuning=v9_tuning,
+                bear_carry_active=bear_carry_morning,
+            )
             if pos == 0 and in_win and (b["i"] - last_exit_idx) >= cooldown and legs_d < max_legs:
                 if s_sig_short and shares >= _LOT_SIZE:
                     if is_sp_etf:
@@ -6072,6 +6197,7 @@ def _prepare_v9_plus_live_state(
     last_exit_minute: str | None = None
     entries_count = 0
     close_rebal_done = False
+    has_morning_init_base = _has_morning_init_base_signal(today_signals)
     for sig in today_signals:
         skey = str(sig.get("signal_key") or "")
         s_side = str(sig.get("side") or "")
@@ -6181,6 +6307,7 @@ def _prepare_v9_plus_live_state(
         "last_exit_idx": last_exit_idx,
         "entries_count": entries_count,
         "close_rebal_done": close_rebal_done,
+        "has_morning_init_base": has_morning_init_base,
         "entry_sp_fx": entry_sp_fx,
         "entry_px": entry_px,
         "entry_prem": entry_prem,
@@ -6496,6 +6623,7 @@ def evaluate_v9_plus_live_decision(
     allow_network: bool | None = None,
     broker_available_cash: float | None = None,
     expected_ledger_shares: int | None = None,
+    has_morning_init_base: bool | None = None,
 ) -> dict[str, Any]:
     """Evaluate live V9+ intraday entry/exit & 14:53 3-state close rebalance."""
     ctx = _prepare_v9_plus_live_state(
@@ -6549,8 +6677,14 @@ def evaluate_v9_plus_live_decision(
     )
     sellable_above_floor = max(0, int(rolling_shares) - min_hold)
     is_multi_oil = bool(v9_tuning.get("multi_oil_plunge_mode"))
+    morning_init_base = bool(
+        ctx.get("has_morning_init_base")
+        or has_morning_init_base
+        or _has_morning_init_base_signal(today_signals)
+    )
     bear_carry_active = bool(
         is_multi_oil
+        and (not morning_init_base)
         and (sellable_above_floor >= _LOT_SIZE)
         and (float(day["ma5"]) < float(day["ma15"]))
         and (entries_count == 0)
@@ -6658,6 +6792,14 @@ def evaluate_v9_plus_live_decision(
             s_sig_short = False if (s_sig and (sp_waterfall if is_sp_oilgas else _suppress_waterfall_short_entry(b, cur_wt, sc))) else s_sig
             if s_sig_short and is_fof_t0 and should_suppress_fof_t0_short_entry(b):
                 s_sig_short = False
+            b_sig, s_sig_short, scalp_ok = _apply_v9_antislip_intraday_gates(
+                b,
+                b_sig=b_sig,
+                s_sig_short=s_sig_short,
+                scalp_ok=scalp_ok,
+                v9_tuning=v9_tuning,
+                bear_carry_active=bear_carry_active,
+            )
             if s_sig_short and sellable_above_floor >= _LOT_SIZE:
                 if is_sp_oilgas:
                     frac, t_lbl = resolve_sp_oilgas_sell_tier(day, b, cur_wt)
@@ -7166,8 +7308,12 @@ def evaluate_v9_plus_live_indicators(
     fx = float(b["fx"])
     below_ma5 = cur_px < ma5
     is_multi_oil = bool(v9_tuning.get("multi_oil_plunge_mode"))
+    morning_init_base = bool(
+        ctx.get("has_morning_init_base") or _has_morning_init_base_signal(today_signals)
+    )
     bear_carry_active = bool(
         is_multi_oil
+        and (not morning_init_base)
         and (max(0, int(rolling_shares) - min_hold) >= _LOT_SIZE)
         and (ma5 < ma15)
         and (entries_count == 0)
@@ -7262,6 +7408,14 @@ def evaluate_v9_plus_live_indicators(
             scalp_frac = float(sp_overlay_meta.get("scalp_frac_override") or scalp_frac)
         if sp_overlay_meta:
             dual_overlay_meta = sp_overlay_meta
+    b_sig, _, scalp_ok = _apply_v9_antislip_intraday_gates(
+        b,
+        b_sig=b_sig,
+        s_sig_short=False,
+        scalp_ok=scalp_ok,
+        v9_tuning=v9_tuning,
+        bear_carry_active=bear_carry_active,
+    )
     pos_mode_lbl = open_leg.get("mode", 0) if open_leg is not None else 0
     wt, wt_reason = resolve_effective_close_weight(overnight_fn, day, b, pos_mode_lbl, entry_prem, v9_tuning=v9_tuning)
 
@@ -7436,6 +7590,14 @@ def evaluate_v9_plus_live_indicators(
     s_sig_short = False if (s_sig and (sp_waterfall_ind if is_sp_oilgas else _suppress_waterfall_short_entry(b, cur_wt_zero, sc))) else s_sig
     if s_sig_short and is_fof_t0 and should_suppress_fof_t0_short_entry(b):
         s_sig_short = False
+    b_sig, s_sig_short, scalp_ok = _apply_v9_antislip_intraday_gates(
+        b,
+        b_sig=b_sig,
+        s_sig_short=s_sig_short,
+        scalp_ok=scalp_ok,
+        v9_tuning=v9_tuning,
+        bear_carry_active=bear_carry_active,
+    )
     short_cover_signal_ok = (
         bool(
             should_exit_sp_oilgas_short(day, b, entry_px=entry_px, entry_sp=entry_sp_fx, close_wt=cur_wt_zero)

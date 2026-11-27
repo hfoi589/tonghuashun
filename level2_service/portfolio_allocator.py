@@ -20,6 +20,7 @@ from threading import RLock
 from typing import Any, Mapping, Sequence
 from zoneinfo import ZoneInfo
 
+from .oil_regime_router import OilRegimeRouter
 from .quant_rules import _normalize_eval_criteria, normalize_position_sizing
 from .v9_plus_engine import (
     _LOT_SIZE,
@@ -73,6 +74,7 @@ SHARED_POOL_EXECUTION_ENGINES = frozenset(
 )
 
 VALID_CAPITAL_POLICY_MODES = (
+    "route_d_oil_regime",
     "route_d_sharpe_shield",
     "route_d_calmar_peak",
     "route_d_plus",
@@ -82,6 +84,7 @@ VALID_CAPITAL_POLICY_MODES = (
 )
 
 CAPITAL_POLICY_MODE_LABELS: dict[str, str] = {
+    "route_d_oil_regime": "Route D++ 五态油价周期自适应护盾版 (自动识别 · 动态封顶)",
     "route_d_sharpe_shield": "Route D++ 高夏普控回撤旗舰版 (σ≤2.4% · Sharpe 5.65 / 回撤 6.71%)",
     "route_d_calmar_peak": "Route D++ 卡玛均衡优选版 (σ≤2.6% · Calmar 44.59 / 回撤 7.03%)",
     "route_d_plus": "Route D++ 进取高收益版 (σ≤4.2% · 动态共享池)",
@@ -119,6 +122,10 @@ DEFAULT_POOL_POLICY: dict[str, Any] = {
     "morning_catchup_max_sp_fx_pct": 0.38,
     "morning_catchup_max_prem_pct": 2.00,
     "single_fee_rate": 0.00005,
+    "regime_router_enabled": False,
+    "regime_router_profile": "oil_v5_dual_key",
+    "crude_cluster_cap": None,
+    "decouple_overnight_mrec": False,
 }
 
 _POLICY_ID_RE = re.compile(r"^[A-Za-z0-9._-]{2,64}\Z")
@@ -230,6 +237,28 @@ def normalize_pool_policy(raw: Mapping[str, Any] | None) -> dict[str, Any]:
         if re.match(r"^(?:09:[3-5][0-9]|10:[0-2][0-9]|10:30)\Z", hhmm_val):
             out["morning_catchup_end_hhmm"] = hhmm_val
 
+    if "regime_router_enabled" in raw:
+        out["regime_router_enabled"] = bool(raw.get("regime_router_enabled"))
+    if "regime_router_profile" in raw:
+        prof = str(raw.get("regime_router_profile") or "").strip()[:64]
+        if prof:
+            out["regime_router_profile"] = prof
+    if "crude_cluster_cap" in raw:
+        raw_cc = raw.get("crude_cluster_cap")
+        if raw_cc is None or raw_cc == "":
+            out["crude_cluster_cap"] = None
+        else:
+            try:
+                cc_val = float(raw_cc)
+                if math.isfinite(cc_val) and cc_val > 0.0:
+                    out["crude_cluster_cap"] = round(_clip(cc_val, 0.20, 1.0), 4)
+                else:
+                    out["crude_cluster_cap"] = None
+            except (TypeError, ValueError):
+                pass
+    if "decouple_overnight_mrec" in raw:
+        out["decouple_overnight_mrec"] = bool(raw.get("decouple_overnight_mrec"))
+
     for map_key, lo_v, hi_v in (("symbol_weight_multipliers", 0.0, 3.0), ("symbol_max_caps", 0.05, 1.0)):
         raw_map = raw.get(map_key)
         if isinstance(raw_map, Mapping):
@@ -253,6 +282,7 @@ class CausalStats:
 
     def __init__(self) -> None:
         self.events: list[dict[str, float]] = []
+        self.overnight_events: list[dict[str, float]] = []
         self.tier_counts: dict[str, list[float]] = {}
         self.intraday_wins = 0
         self.intraday_total = 0
@@ -279,6 +309,7 @@ class CausalStats:
             tc[3] += abs(ret)
 
         if kind == "overnight":
+            self.overnight_events.append({"ret_pct": ret, "won": won})
             self.overnight_total += 1
             self.overnight_wins += int(won)
             if ret > 0.0:
@@ -293,32 +324,45 @@ class CausalStats:
             elif ret < 0.0:
                 self.intraday_sum_loss += abs(ret)
 
-    def snapshot(self) -> dict[str, Any]:
+    def snapshot(self, *, decouple_overnight: bool = False) -> dict[str, Any]:
         """Compute current causal Bayesian edge & recent-momentum snapshot."""
-        rec = self.events[-16:]
-        n = len(rec)
-        if n < 4:
-            m_rec, sentry = 1.0, 0.0
-        else:
+        if decouple_overnight and len(self.overnight_events) >= 4:
+            ov_rec = self.overnight_events[-12:]
             w_s = win_a = ret_a = 0.0
-            for idx, ev in enumerate(reversed(rec)):
+            for idx, ev in enumerate(reversed(ov_rec)):
                 wt = 0.88 ** idx
                 w_s += wt
                 win_a += wt * ev["won"]
                 ret_a += wt * ev["ret_pct"]
             ew_win = win_a / w_s if w_s > 0.0 else 0.58
             ew_ret = ret_a / w_s if w_s > 0.0 else 0.0
-            consec = 0
-            for ev in reversed(rec):
-                if ev["ret_pct"] <= 0.0:
-                    consec += 1
-                else:
-                    break
-            if consec >= 3 or (n >= 5 and ew_win < 0.42 and ew_ret < 0.0):
-                m_rec, sentry = 0.30, 1.0
+            m_rec = _clip(1.0 + 1.60 * (ew_win - 0.55) + 0.25 * math.tanh(ew_ret / 2.5), 0.45, 1.80)
+            sentry = 0.0
+        else:
+            rec = self.events[-16:]
+            n = len(rec)
+            if n < 4:
+                m_rec, sentry = 1.0, 0.0
             else:
-                m_rec = _clip(1.0 + 1.60 * (ew_win - 0.55) + 0.25 * math.tanh(ew_ret / 2.5), 0.45, 1.80)
-                sentry = 0.0
+                w_s = win_a = ret_a = 0.0
+                for idx, ev in enumerate(reversed(rec)):
+                    wt = 0.88 ** idx
+                    w_s += wt
+                    win_a += wt * ev["won"]
+                    ret_a += wt * ev["ret_pct"]
+                ew_win = win_a / w_s if w_s > 0.0 else 0.58
+                ew_ret = ret_a / w_s if w_s > 0.0 else 0.0
+                consec = 0
+                for ev in reversed(rec):
+                    if ev["ret_pct"] <= 0.0:
+                        consec += 1
+                    else:
+                        break
+                if consec >= 3 or (n >= 5 and ew_win < 0.42 and ew_ret < 0.0):
+                    m_rec, sentry = 0.30, 1.0
+                else:
+                    m_rec = _clip(1.0 + 1.60 * (ew_win - 0.55) + 0.25 * math.tanh(ew_ret / 2.5), 0.45, 1.80)
+                    sentry = 0.0
 
         def _edge(kind: str, bucket: str) -> tuple[float, float]:
             if kind == "overnight":
@@ -484,10 +528,12 @@ class RouteDPlusAllocator:
         self._lock = RLock()
         self._max_cache_days = max(2, int(max_cache_days))
         self._day_cache: OrderedDict[tuple[Any, ...], dict[str, Any]] = OrderedDict()
+        self._oil_regime_router = OilRegimeRouter()
 
     def clear_cache(self) -> None:
         with self._lock:
             self._day_cache.clear()
+        self._oil_regime_router.clear_cache()
 
     @staticmethod
     def _prev_date_window(trade_date: str, history_calendar_days: int) -> tuple[str, str] | None:
@@ -549,7 +595,7 @@ class RouteDPlusAllocator:
             days = []
 
         if not days:
-            return {"anchor": anchor, "events_by_day": {}, "p1500_series": [], "days_count": 0}
+            return {"anchor": anchor, "events_by_day": {}, "p1500_series": [], "days_count": 0, "last_ma": None}
 
         fee_pct = float(single_fee) * 200.0
         cash = 100_000.0
@@ -782,11 +828,22 @@ class RouteDPlusAllocator:
                         pos, leg_q, last_ex = 0, 0, bar_i
             events_by_day[td] = evs
 
+        last_ma: tuple[float, float] | None = None
+        if days:
+            try:
+                m5 = float(days[-1].get("ma5") or 0.0)
+                m15 = float(days[-1].get("ma15") or 0.0)
+                if math.isfinite(m5) and math.isfinite(m15) and m5 > 0.0 and m15 > 0.0:
+                    last_ma = (m5, m15)
+            except (TypeError, ValueError):
+                last_ma = None
+
         return {
             "anchor": anchor,
             "events_by_day": events_by_day,
             "p1500_series": p1500_series,
             "days_count": len(days),
+            "last_ma": last_ma,
         }
 
     def get_causal_context(
@@ -797,6 +854,8 @@ class RouteDPlusAllocator:
         policy: Mapping[str, Any] | None = None,
         *,
         override_context: Mapping[str, Any] | None = None,
+        live_brn_price: float | None = None,
+        live_brn_age_sec: float | None = None,
     ) -> dict[str, Any]:
         """Load or return cached strictly-causal (< trade_date) Bayesian stats and covariance."""
         norm_pol = normalize_pool_policy(policy)
@@ -822,6 +881,10 @@ class RouteDPlusAllocator:
                 )
                 for s in symbols
             }
+            ov_regime = override_context.get("oil_regime")
+            out_regime = copy.deepcopy(ov_regime) if isinstance(ov_regime, Mapping) else None
+            if isinstance(out_regime, dict):
+                out_regime["enforced"] = bool(norm_pol.get("regime_router_enabled"))
             return {
                 "trade_date": str(trade_date),
                 "snaps": snaps,
@@ -829,12 +892,25 @@ class RouteDPlusAllocator:
                 "corrs": corrs,
                 "anchors": anchors,
                 "history_days": dict(override_context.get("history_days") or {s: 0 for s in symbols}),
+                "oil_regime": out_regime,
                 "cache_hit": False,
             }
 
         lookback_days = int(norm_pol["lookback_days"])
         cal_days = int(norm_pol["history_calendar_days"])
         single_fee = float(norm_pol["single_fee_rate"])
+        regime_enabled = bool(norm_pol.get("regime_router_enabled"))
+        decouple_ov = bool(norm_pol.get("decouple_overnight_mrec"))
+        regime_profile = str(norm_pol.get("regime_router_profile") or "oil_v5_dual_key")
+
+        oil_ref_date: str | None = None
+        ho_ref_date: str | None = None
+        xop_ref_date: str | None = None
+        if research_store is not None:
+            oil_ref_date, ho_ref_date, xop_ref_date = self._oil_regime_router.peek_reference_dates(
+                research_store, trade_date=trade_date
+            )
+
         rule_sig = tuple(
             (
                 s,
@@ -844,19 +920,45 @@ class RouteDPlusAllocator:
             )
             for s in symbols
         )
-        ck = (str(trade_date), rule_sig, lookback_days, cal_days, round(single_fee, 6))
+        ck = (
+            str(trade_date),
+            rule_sig,
+            lookback_days,
+            cal_days,
+            round(single_fee, 6),
+            regime_enabled,
+            decouple_ov,
+            regime_profile,
+            oil_ref_date,
+            ho_ref_date,
+            xop_ref_date,
+        )
 
         with self._lock:
             hit = self._day_cache.get(ck)
             if hit is not None:
                 self._day_cache.move_to_end(ck)
-                return {**hit, "cache_hit": True}
+                res_hit = {**hit, "cache_hit": True}
+                if research_store is not None and live_brn_price is not None:
+                    res_hit["oil_regime"] = self._oil_regime_router.evaluate_regime(
+                        research_store,
+                        trade_date=trade_date,
+                        profile=regime_profile,
+                        symbol_ma_map=hit.get("symbol_ma_map"),
+                        live_brn_price=live_brn_price,
+                        live_brn_age_sec=live_brn_age_sec,
+                        enforced=regime_enabled,
+                    )
+                elif isinstance(res_hit.get("oil_regime"), Mapping):
+                    res_hit["oil_regime"] = copy.deepcopy(res_hit["oil_regime"])
+                return res_hit
 
         date_win = self._prev_date_window(trade_date, cal_days)
         snaps: dict[str, dict[str, Any]] = {}
         anchors: dict[str, str] = {}
         series_by_symbol: dict[str, list[tuple[str, float]]] = {}
         history_days: dict[str, int] = {}
+        symbol_ma_map: dict[str, tuple[float, float]] = {}
 
         for sym in symbols:
             rule_spec = symbol_rules.get(sym)
@@ -882,11 +984,24 @@ class RouteDPlusAllocator:
             for td in sorted(hist["events_by_day"]):
                 for ev in hist["events_by_day"][td]:
                     tracker.record(ev)
-            snaps[sym] = tracker.snapshot()
+            snaps[sym] = tracker.snapshot(decouple_overnight=decouple_ov)
             series_by_symbol[sym] = list(hist["p1500_series"])
             history_days[sym] = int(hist["days_count"])
+            if hist.get("last_ma") is not None:
+                symbol_ma_map[sym] = hist["last_ma"]
 
         vols, corrs = compute_ewma_vols_and_corrs(symbols, series_by_symbol, lookback_days=lookback_days)
+        base_oil_regime: dict[str, Any] | None = None
+        if research_store is not None:
+            base_oil_regime = self._oil_regime_router.evaluate_regime(
+                research_store,
+                trade_date=trade_date,
+                profile=regime_profile,
+                symbol_ma_map=symbol_ma_map,
+                enforced=regime_enabled,
+            )
+            base_oil_regime["enforced"] = regime_enabled
+
         built = {
             "trade_date": str(trade_date),
             "snaps": snaps,
@@ -894,13 +1009,83 @@ class RouteDPlusAllocator:
             "corrs": corrs,
             "anchors": anchors,
             "history_days": history_days,
+            "symbol_ma_map": symbol_ma_map,
+            "oil_regime": base_oil_regime,
         }
         with self._lock:
             self._day_cache[ck] = built
             self._day_cache.move_to_end(ck)
             while len(self._day_cache) > self._max_cache_days:
                 self._day_cache.popitem(last=False)
-        return {**built, "cache_hit": False}
+
+        out = {**built, "cache_hit": False}
+        if research_store is not None and live_brn_price is not None:
+            out["oil_regime"] = self._oil_regime_router.evaluate_regime(
+                research_store,
+                trade_date=trade_date,
+                profile=regime_profile,
+                symbol_ma_map=symbol_ma_map,
+                live_brn_price=live_brn_price,
+                live_brn_age_sec=live_brn_age_sec,
+                enforced=regime_enabled,
+            )
+        elif isinstance(out.get("oil_regime"), Mapping):
+            out["oil_regime"] = copy.deepcopy(out["oil_regime"])
+        return out
+
+    def resolve_effective_policy(
+        self,
+        policy: Mapping[str, Any] | None,
+        causal_ctx: Mapping[str, Any] | None,
+    ) -> dict[str, Any]:
+        """Resolve effective policy parameters with dynamic OilRegimeRouter overrides when enabled."""
+        norm_pol = normalize_pool_policy(policy)
+        if not bool(norm_pol.get("regime_router_enabled")):
+            return norm_pol
+        oil_regime = causal_ctx.get("oil_regime") if isinstance(causal_ctx, Mapping) else None
+        if not isinstance(oil_regime, Mapping):
+            return norm_pol
+
+        eff = copy.deepcopy(norm_pol)
+        if oil_regime.get("effective_sigma_cap_pct") is not None:
+            try:
+                sv = float(oil_regime["effective_sigma_cap_pct"])
+                if math.isfinite(sv) and sv > 0.0:
+                    eff["sigma_cap_pct"] = round(_clip(sv, 0.50, 25.0), 4)
+            except (TypeError, ValueError):
+                pass
+        if oil_regime.get("solo_crude_coef") is not None:
+            eff["solo_crude_coef"] = round(
+                _parse_float(oil_regime["solo_crude_coef"], float(eff["solo_crude_coef"]), lo=0.10, hi=1.0), 6
+            )
+        if oil_regime.get("solo_crude_cap") is not None:
+            eff["solo_crude_cap"] = round(
+                _parse_float(oil_regime["solo_crude_cap"], float(eff["solo_crude_cap"]), lo=0.15, hi=1.0), 6
+            )
+        if oil_regime.get("effective_cluster_cap_pct") is not None:
+            try:
+                cc_pct = float(oil_regime["effective_cluster_cap_pct"])
+                if math.isfinite(cc_pct) and cc_pct > 0.0:
+                    eff["crude_cluster_cap"] = round(_clip(cc_pct / 100.0, 0.20, 1.0), 6)
+            except (TypeError, ValueError):
+                pass
+
+        reg_mults = oil_regime.get("symbol_multipliers")
+        if isinstance(reg_mults, Mapping):
+            merged_mults = dict(eff.get("symbol_weight_multipliers") or {})
+            for sym_raw, mult_raw in reg_mults.items():
+                clean_sym = str(sym_raw or "").strip().upper()
+                if not re.fullmatch(r"[0-9]{6}", clean_sym):
+                    continue
+                try:
+                    m_val = float(mult_raw)
+                except (TypeError, ValueError):
+                    continue
+                if math.isfinite(m_val) and m_val >= 0.0:
+                    base_m = float(merged_mults.get(clean_sym, 1.0))
+                    merged_mults[clean_sym] = round(_clip(base_m * m_val, 0.0, 3.0), 4)
+            eff["symbol_weight_multipliers"] = merged_mults
+        return eff
 
     def compute_overnight_weights(
         self,
@@ -915,7 +1100,7 @@ class RouteDPlusAllocator:
         pool_cap: float | None = None,
     ) -> dict[str, Any]:
         """Compute portfolio target weights across engine families with optional vol ceiling."""
-        norm_pol = normalize_pool_policy(policy)
+        norm_pol = self.resolve_effective_policy(policy, causal_ctx)
         clean_syms = [str(s).strip() for s in symbols if str(s).strip()]
         raw_w = {s: max(0.0, float(raw_weights.get(s) or 0.0)) for s in clean_syms}
         active_syms = [s for s in clean_syms if raw_w[s] > 0.0]
@@ -931,6 +1116,8 @@ class RouteDPlusAllocator:
                 "portfolio_sigma_pct": 0.0,
                 "pre_cap_sigma_pct": 0.0,
                 "sigma_scaled": False,
+                "crude_cluster_cap": None,
+                "crude_cluster_scaled": False,
                 "is_solo": False,
                 "active_symbols": [],
                 "avg_active_rho": {},
@@ -1078,6 +1265,26 @@ class RouteDPlusAllocator:
                     break
                 rem_syms = next_rem
 
+        crude_cluster_cap = None if clean_engine == "static_cap" else norm_pol.get("crude_cluster_cap")
+        crude_cluster_scaled = False
+        if crude_cluster_cap is not None and float(crude_cluster_cap) > 0.0:
+            eq_anchors = {
+                str(x).strip()
+                for x in (norm_pol.get("equity_solo_anchors") or ())
+                if str(x).strip()
+            }
+            crude_active = [
+                s for s in active_syms if str(anchors.get(s) or "brent").strip() not in eq_anchors
+            ]
+            # Preserve solo crude exemption (`is_solo=True` or single active crude) for 501018 bottom-fishing
+            if len(crude_active) >= 2:
+                crude_sum = sum(alloc[s] for s in crude_active)
+                if crude_sum > float(crude_cluster_cap) + 1e-9:
+                    scale_c = float(crude_cluster_cap) / crude_sum
+                    for s in crude_active:
+                        alloc[s] *= scale_c
+                    crude_cluster_scaled = True
+
         pvar = sum(
             alloc[s1]
             * alloc[s2]
@@ -1105,6 +1312,8 @@ class RouteDPlusAllocator:
             "portfolio_sigma_pct": round(post_sigma, 4),
             "pre_cap_sigma_pct": round(pstd, 4),
             "sigma_scaled": sigma_scaled,
+            "crude_cluster_cap": round(float(crude_cluster_cap), 6) if crude_cluster_cap is not None else None,
+            "crude_cluster_scaled": crude_cluster_scaled,
             "is_solo": is_solo,
             "active_symbols": active_syms,
             "avg_active_rho": avg_active_rho,
@@ -1231,7 +1440,7 @@ class RouteDPlusAllocator:
         static_caps: Mapping[str, float] | None = None,
     ) -> dict[str, Any]:
         """Compute dynamic intraday exposure limit and remaining room for one symbol."""
-        norm_pol = normalize_pool_policy(policy)
+        norm_pol = self.resolve_effective_policy(policy, causal_ctx)
         clean_syms = [str(s).strip() for s in symbols if str(s).strip()]
         snaps = causal_ctx.get("snaps") or {}
         corrs = causal_ctx.get("corrs") or {}
@@ -1321,7 +1530,7 @@ class RouteDPlusAllocator:
         engine_type: str = "route_d_plus",
     ) -> dict[str, dict[str, Any]]:
         """Size and coordinate simultaneous intraday long entries across the shared cash pool."""
-        norm_pol = normalize_pool_policy(policy)
+        norm_pol = self.resolve_effective_policy(policy, causal_ctx)
         single_fee = float(norm_pol["single_fee_rate"])
         snaps = causal_ctx.get("snaps") or {}
         eq_base = max(0.0, float(pool_equity))
@@ -1360,7 +1569,7 @@ class RouteDPlusAllocator:
                 pool_equity=eq_base,
                 anchors=anchors,
                 causal_ctx=causal_ctx,
-                policy=norm_pol,
+                policy=policy,
                 engine_type=clean_engine,
             )
             cap_info_map[sym] = cap_info
@@ -1422,6 +1631,52 @@ class RouteDPlusAllocator:
             req_map[sym] = req
 
         if planned:
+            eq_anchors = {
+                str(x).strip()
+                for x in (norm_pol.get("equity_solo_anchors") or ())
+                if str(x).strip()
+            }
+            clean_all_syms = [str(s).strip() for s in symbols if str(s).strip()]
+            crude_syms_set = {
+                s for s in clean_all_syms if str(anchors.get(s) or "brent").strip() not in eq_anchors
+            }
+            for sym in planned:
+                if str(anchors.get(sym) or "brent").strip() not in eq_anchors:
+                    crude_syms_set.add(sym)
+
+            crude_cluster_cap = None if clean_engine == "static_cap" else norm_pol.get("crude_cluster_cap")
+            involved_crude = {
+                s for s in crude_syms_set if float(held_mvs.get(s) or 0.0) > 1e-6 or s in planned
+            }
+            planned_crude = [s for s in list(planned) if s in crude_syms_set]
+            rem_crude_room: float | None = None
+            if (
+                crude_cluster_cap is not None
+                and float(crude_cluster_cap) > 0.0
+                and len(involved_crude) >= 2
+                and planned_crude
+            ):
+                eff_crude_cap_wt = max(float(crude_cluster_cap), float(norm_pol["solo_crude_cap"]))
+                crude_held_mv = sum(max(0.0, float(held_mvs.get(s) or 0.0)) for s in crude_syms_set)
+                crude_buy_room = max(0.0, eff_crude_cap_wt * eq_base - crude_held_mv)
+                rem_crude_room = crude_buy_room
+                tot_planned_crude = sum(planned[s] for s in planned_crude)
+                if crude_buy_room <= 1e-6:
+                    for sym in planned_crude:
+                        planned.pop(sym, None)
+                        results[sym] = {
+                            "approved": False,
+                            "qty": 0,
+                            "reason": "crude_cluster_cap_reached",
+                            "cap_info": cap_info_map[sym],
+                        }
+                elif tot_planned_crude > crude_buy_room:
+                    tot_sc_c = sum(sc_b[s] for s in planned_crude)
+                    if tot_sc_c > 0.0:
+                        for sym in planned_crude:
+                            planned[sym] = min(planned[sym], crude_buy_room * (sc_b[sym] / tot_sc_c))
+
+        if planned:
             if sum(planned.values()) > free_cash:
                 tot_sb = sum(sc_b.values())
                 if tot_sb > 0.0:
@@ -1432,10 +1687,18 @@ class RouteDPlusAllocator:
                 req = req_map[sym]
                 pr = float(req["price"])
                 unit_cost = pr * lot_size * (1.0 + single_fee)
-                q = int(min(planned[sym], rem_c) // unit_cost) * lot_size if unit_cost > 0 else 0
+                sym_budget = min(planned[sym], rem_c)
+                is_crude_sym = sym in crude_syms_set
+                if is_crude_sym and rem_crude_room is not None:
+                    sym_budget = min(sym_budget, rem_crude_room)
+                q = int(sym_budget // unit_cost) * lot_size if unit_cost > 0 else 0
                 cost = q * pr * (1.0 + single_fee)
-                if q >= lot_size and rem_c >= cost - 1e-6:
+                if q >= lot_size and rem_c >= cost - 1e-6 and (
+                    not is_crude_sym or rem_crude_room is None or rem_crude_room >= cost - 1e-6
+                ):
                     rem_c -= cost
+                    if is_crude_sym and rem_crude_room is not None:
+                        rem_crude_room = max(0.0, rem_crude_room - cost)
                     held_mv = max(0.0, float(held_mvs.get(sym) or 0.0))
                     dyn_cap = round(min(float(cap_info_map[sym]["cap_amount"]) * 1.02, held_mv + max(planned[sym], q * pr) * 1.03), 2)
                     results[sym] = {
@@ -1447,10 +1710,15 @@ class RouteDPlusAllocator:
                         "cap_info": cap_info_map[sym],
                     }
                 else:
+                    fail_reason = (
+                        "crude_cluster_cap_reached"
+                        if (is_crude_sym and rem_crude_room is not None and rem_crude_room < unit_cost)
+                        else "pool_cash_exhausted_by_higher_score"
+                    )
                     results[sym] = {
                         "approved": False,
                         "qty": 0,
-                        "reason": "pool_cash_exhausted_by_higher_score",
+                        "reason": fail_reason,
                         "cap_info": cap_info_map[sym],
                     }
         return results
@@ -1478,6 +1746,34 @@ def _normalize_policy_metrics(raw: Mapping[str, Any] | None) -> dict[str, Any] |
 
 
 BUILTIN_PORTFOLIO_POLICIES: tuple[dict[str, Any], ...] = (
+    {
+        "id": "route_d_oil_regime",
+        "name": "Route D++ 五态油价周期自适应护盾版 (自动识别 · 动态封顶)",
+        "description": "零未来函数识别油价五态周期(上升/震荡上行/震荡横盘/中继下跌/下降)，中继下跌自动压仓至48%防同质追高，震荡上行解锁满额弹性，下降期豁免501018独苗抄底。",
+        "source": "builtin",
+        "engine_type": "route_d_plus",
+        "params": {
+            "sigma_cap_pct": 2.40,
+            "solo_equity_coef": 0.64,
+            "solo_equity_cap": 0.85,
+            "solo_crude_coef": 0.33,
+            "solo_crude_cap": 0.45,
+            "rho_thresh": 0.62,
+            "equity_solo_anchors": ["xop_us_ep"],
+            "regime_router_enabled": True,
+            "regime_router_profile": "oil_v5_dual_key",
+            "decouple_overnight_mrec": True,
+        },
+        "metrics_summary": {
+            "sharpe_ratio": 3.29,
+            "max_drawdown_pct": 10.59,
+            "calmar_ratio": 9.93,
+            "net_return_pct": 70.95,
+            "benchmark": "4标的183日1跳实盘摩擦",
+        },
+        "is_builtin": True,
+        "enabled": True,
+    },
     {
         "id": "route_d_sharpe_shield",
         "name": "Route D++ 高夏普控回撤旗舰版 (σ≤2.4%)",
@@ -1638,6 +1934,10 @@ def get_portfolio_policy_schema() -> dict[str, Any]:
             "morning_catchup_max_gap_pct": {"type": "number", "default": 2.50, "min": 0.20, "max": 9.50, "note": "早盘补底仓允许相对昨收最大涨幅(%)"},
             "morning_catchup_max_sp_fx_pct": {"type": "number", "default": 0.38, "min": -1.0, "max": 3.0, "note": "早盘补底仓允许相对汇率调整外盘锚最大溢价(%)"},
             "morning_catchup_max_prem_pct": {"type": "number", "default": 2.00, "min": -2.0, "max": 15.0, "note": "早盘补底仓允许最大LOF实时溢价(%)"},
+            "regime_router_enabled": {"type": "boolean", "default": False, "note": "是否启用五态油价周期路由器动态覆写波动率/原油簇/乘子参数"},
+            "regime_router_profile": {"type": "string", "default": "oil_v5_dual_key", "note": "五态油价周期路由器配置档位"},
+            "crude_cluster_cap": {"type": "number|null", "range": "0.20..1.0 or null", "default": None, "note": "原油簇多标的并存时的合计仓位硬顶（保留单只原油独苗豁免）"},
+            "decouple_overnight_mrec": {"type": "boolean", "default": False, "note": "隔夜m_rec仅基于历史隔夜事件独立计算并解除日内亏损sentry锁死"},
         },
         "payload_example": {
             "id": "custom-risk-parity-22",

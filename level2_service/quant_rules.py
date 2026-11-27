@@ -393,6 +393,14 @@ def _normalize_v9_tuning(raw: object) -> dict[str, Any]:
         ("bull_pullback_weight_pct", 0.0, 100.0, 2, "any"),
         ("plunge_dd15_pct", -35.0, -4.0, 2, "any"),
         ("high_oil_bull_cap_pct", 72.0, 95.0, 1, "any"),
+        ("fof_t0_min_tp_pct", 0.01, 5.0, 3, "positive"),
+        ("unconfirmed_ma15_cap_wt", 0.0, 1.0, 3, "any"),
+        ("dual_prem_unconf_cap_wt", 0.0, 1.0, 3, "any"),
+        ("dual_prem_unconf_thresh", -5.0, 30.0, 3, "any"),
+        ("rebound_taper_wt", 0.0, 1.0, 3, "any"),
+        ("rebound_taper_pct", 0.1, 50.0, 2, "positive"),
+        ("rev_t_min_sp_fx", 0.0, 30.0, 3, "any"),
+        ("sub_1yuan_price_thresh", 0.1, 5.0, 3, "positive"),
     )
     for key, lo, hi, digits, mode in float_specs:
         raw_val = raw.get(key)
@@ -409,7 +417,14 @@ def _normalize_v9_tuning(raw: object) -> dict[str, Any]:
         if mode == "nonzero" and abs(fval) <= 1e-9:
             continue
         out[key] = round(max(lo, min(hi, fval)), digits)
-    for bool_key in ("bull_oil_surge_guard", "scalp_strict_mode", "strict_dip_scalp", "multi_oil_plunge_mode"):
+    for bool_key in (
+        "bull_oil_surge_guard",
+        "scalp_strict_mode",
+        "strict_dip_scalp",
+        "multi_oil_plunge_mode",
+        "disable_scalp",
+        "sub_1yuan_pure_overnight",
+    ):
         if _as_bool_flag(raw.get(bool_key)):
             out[bool_key] = True
     raw_peer = str(raw.get("peer_symbol") or "").strip()

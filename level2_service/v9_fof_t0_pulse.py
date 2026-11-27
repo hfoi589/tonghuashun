@@ -548,9 +548,11 @@ def apply_fof_t0_pulse_intraday_overlays(
         meta["rev_t_channel"] = rev_t_channel
 
     # 4. Multi-source T+0 positive-T channels (quota-premium intraday dip & tri-peer/SC0 catch-up)
+    day_tuning = day.get("v9_tuning") if isinstance(day.get("v9_tuning"), Mapping) else {}
+    disable_scalp = bool(day_tuning.get("disable_scalp"))
     knife_blk = bool(meta.get("knife_blocked"))
     t0_channels = list(meta.get("contrarian_channels") or [])
-    if in_long_win and (not knife_blk) and (not b_sig) and (not scalp_ok):
+    if in_long_win and (not disable_scalp) and (not knife_blk) and (not b_sig) and (not scalp_ok):
         macd_up = gc10 or (mc < 0.0 and dmc >= 0.00020 * sc) or (dmc >= 0.00030 * sc and m1 >= 0.0)
         if (
             pm > 2.20
@@ -585,6 +587,8 @@ def apply_fof_t0_pulse_intraday_overlays(
             meta["scalp_lbl_override"] = "三同业+沪油共振补涨T+0档(95%)"
             meta["scalp_frac_override"] = 0.95
 
+    if disable_scalp:
+        scalp_ok = False
     return s_sig, b_sig, scalp_ok, meta
 
 
@@ -638,6 +642,12 @@ def should_exit_fof_t0_long(
     m1 = float(b.get("m1") or 0.0)
     dc10 = bool(b.get("dc10"))
     gain_p = ((pr - entry_px) / entry_px * 100.0) if entry_px > 0 else 0.0
+    day_tuning = day.get("v9_tuning") if isinstance(day.get("v9_tuning"), Mapping) else {}
+    raw_min_tp = day_tuning.get("fof_t0_min_tp_pct")
+    try:
+        min_tp_pct = float(raw_min_tp) if raw_min_tp is not None else 0.06
+    except (TypeError, ValueError):
+        min_tp_pct = 0.06
 
     if not is_scalp:
         ex_1, ex_lbl = v9.should_exit_long_v9(
@@ -649,7 +659,7 @@ def should_exit_fof_t0_long(
             close_wt=close_wt,
             adaptive_exits=True,
         )
-        if ex_1 and ("止损" not in ex_lbl) and gain_p <= 0.06:
+        if ex_1 and ("止损" not in ex_lbl) and gain_p <= min_tp_pct:
             return False, ""
         return ex_1, ex_lbl
 
@@ -666,7 +676,7 @@ def should_exit_fof_t0_long(
     )
     if float(entry_prem) > 2.20 and ex_2 and gain_p > 0.0 and dmc > 0.0 and m1 > 0.0:
         return False, ""
-    if ex_2 and gain_p <= 0.06 and gain_p > -0.45 and t < "14:40":
+    if ex_2 and gain_p <= min_tp_pct and gain_p > -0.45 and t < "14:40":
         return False, ""
     return ex_2, ex_2_lbl
 

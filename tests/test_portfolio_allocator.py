@@ -302,6 +302,7 @@ def test_sqlite_portfolio_policy_store_crud_and_multi_engine_weights(tmp_path: P
     policies = store.list_policies()
     ids = {p["id"] for p in policies}
     assert {
+        "route_d_oil_regime",
         "route_d_sharpe_shield",
         "route_d_calmar_peak",
         "route_d_plus",
@@ -309,6 +310,13 @@ def test_sqlite_portfolio_policy_store_crud_and_multi_engine_weights(tmp_path: P
         "static_cap",
         "route_d_shadow",
     } <= ids
+    oil_reg_pol = store.get_policy("route_d_oil_regime")
+    assert oil_reg_pol is not None
+    assert oil_reg_pol["engine_type"] == "route_d_plus"
+    assert oil_reg_pol["params"]["regime_router_enabled"] is True
+    assert oil_reg_pol["params"]["regime_router_profile"] == "oil_v5_dual_key"
+    assert oil_reg_pol["params"]["decouple_overnight_mrec"] is True
+    assert oil_reg_pol["params"]["sigma_cap_pct"] == pytest.approx(2.40)
     shield = store.get_policy("route_d_sharpe_shield")
     assert shield is not None
     assert shield["engine_type"] == "route_d_plus"
@@ -375,7 +383,7 @@ def test_sqlite_portfolio_policy_store_crud_and_multi_engine_weights(tmp_path: P
 
     store.delete_policy("custom-inv-vol-v1")
     assert store.get_policy("custom-inv-vol-v1") is None
-    assert len(BUILTIN_PORTFOLIO_POLICIES) == 6
+    assert len(BUILTIN_PORTFOLIO_POLICIES) == 7
     store.close()
 
 
@@ -442,3 +450,242 @@ def test_overnight_rebalance_initializes_and_holds_100_share_floor_unconditional
         - plan["buy_orders"]["162411"] * 1.00 * (1.0 + fee)
     )
     assert net_cash >= -1e-3
+
+
+def test_causal_stats_decouple_overnight_mrec_prevents_intraday_sentry_lock() -> None:
+    stats = CausalStats()
+    # 5 winning overnight holds, followed by 4 consecutive intraday T losses
+    for _ in range(5):
+        stats.record({"kind": "overnight", "bucket": "overnight_strong", "ret_pct": 1.2})
+    for _ in range(4):
+        stats.record({"kind": "intraday", "bucket": "buy_tier_a", "ret_pct": -0.6})
+
+    coupled = stats.snapshot(decouple_overnight=False)
+    assert coupled["sentry"] == 1.0
+    assert coupled["m_rec"] == pytest.approx(0.30)
+
+    decoupled = stats.snapshot(decouple_overnight=True)
+    assert decoupled["sentry"] == 0.0
+    assert decoupled["m_rec"] > 1.20
+
+
+def test_route_d_oil_regime_relay_downtrend_caps_crude_cluster_and_preserves_solo_501018() -> None:
+    alloc = RouteDPlusAllocator()
+    syms = ["160723", "161129", "501018", "162411"]
+    anchors = {
+        "160723": "fof_t0_multisource",
+        "161129": "uso_bno_sc_peer",
+        "501018": "brent",
+        "162411": "xop_us_ep",
+    }
+    snaps = {s: _make_snap(m_rec=1.35, k_ovs=0.45, p_bkt=0.72, k_bkt=0.42) for s in syms}
+    corrs = {(a, b): (1.0 if a == b else 0.90) for a in syms for b in syms}
+    vols = {s: 2.0 for s in syms}
+
+    relay_regime = {
+        "enforced": True,
+        "profile": "oil_v5_dual_key",
+        "oil_reference_date": "20261126",
+        "oil_close_t1": 91.70,
+        "locked_regime": "中继下跌",
+        "effective_regime": "中继下跌",
+        "probs": {"上升": 0.5, "震荡上行": 1.1, "震荡横盘": 15.9, "中继下跌": 70.3, "下降": 12.2},
+        "ma_confirm_ratio": 0.0,
+        "effective_cluster_cap_pct": 48.0,
+        "effective_sigma_cap_pct": 1.98,
+        "solo_crude_coef": 0.33,
+        "solo_crude_cap": 0.45,
+        "symbol_multipliers": {"160723": 1.08, "161129": 0.64, "501018": 0.94, "162411": 1.08},
+        "symbol_tuning_hints": {"rev_t_501018": 0.46, "unconf_wt": 0.52, "taper_501018": 0.50},
+        "fast_crash_active": False,
+        "degraded_mode": None,
+        "degraded_sources": [],
+    }
+    ctx = {"snaps": snaps, "vols": vols, "corrs": corrs, "oil_regime": relay_regime}
+
+    # Baseline without regime router: 3 crude LOFs firing together surge > 85%
+    pol_no_router = normalize_pool_policy({"sigma_cap_pct": None, "regime_router_enabled": False})
+    res_base = alloc.compute_overnight_weights(
+        symbols=syms,
+        raw_weights={"160723": 1.0, "161129": 1.0, "501018": 1.0, "162411": 0.0},
+        anchors=anchors,
+        causal_ctx=ctx,
+        policy=pol_no_router,
+    )
+    crude_sum_base = sum(res_base["alloc_weights"][s] for s in ("160723", "161129", "501018"))
+    assert crude_sum_base > 0.85
+
+    # With route_d_oil_regime enabled: 3-crude resonance is compressed to ~48%
+    oil_regime_builtin = next(p for p in BUILTIN_PORTFOLIO_POLICIES if p["id"] == "route_d_oil_regime")
+    res_routed = alloc.compute_overnight_weights(
+        symbols=syms,
+        raw_weights={"160723": 1.0, "161129": 1.0, "501018": 1.0, "162411": 0.0},
+        anchors=anchors,
+        causal_ctx=ctx,
+        policy=oil_regime_builtin["params"],
+    )
+    crude_sum_routed = sum(res_routed["alloc_weights"][s] for s in ("160723", "161129", "501018"))
+    assert res_routed["crude_cluster_scaled"] is True
+    assert crude_sum_routed == pytest.approx(0.48, abs=0.01)
+    assert res_routed["portfolio_sigma_pct"] <= 1.98 + 1e-3
+
+    # Downtrend extreme: cluster_cap=42%, solo_crude_cap=48% -> solo 501018 MUST keep 48% exemption!
+    down_regime = {
+        **relay_regime,
+        "locked_regime": "下降",
+        "effective_regime": "下降",
+        "effective_cluster_cap_pct": 42.0,
+        "effective_sigma_cap_pct": 2.40,
+        "solo_crude_coef": 0.36,
+        "solo_crude_cap": 0.48,
+        "symbol_multipliers": {"160723": 0.95, "161129": 0.58, "501018": 1.18, "162411": 0.95},
+    }
+    res_solo_501 = alloc.compute_overnight_weights(
+        symbols=syms,
+        raw_weights={"160723": 0.0, "161129": 0.0, "501018": 1.0, "162411": 0.0},
+        anchors=anchors,
+        causal_ctx={**ctx, "oil_regime": down_regime},
+        policy=oil_regime_builtin["params"],
+    )
+    assert res_solo_501["is_solo"] is True
+    assert res_solo_501["crude_cluster_scaled"] is False
+    assert res_solo_501["alloc_weights"]["501018"] == pytest.approx(0.48, abs=0.01)
+
+    # Intraday coordinate_intraday_buys MUST enforce crude_cluster_cap across multi-crude buys
+    pool_eq = 100_000.0
+    intraday_res = alloc.coordinate_intraday_buys(
+        buy_requests=[
+            {"symbol": "160723", "price": 2.000, "signal_frac": 1.0, "signal_tag": "v9-entry"},
+            {"symbol": "161129", "price": 1.800, "signal_frac": 1.0, "signal_tag": "v9-entry"},
+            {"symbol": "501018", "price": 1.500, "signal_frac": 1.0, "signal_tag": "v9-entry"},
+        ],
+        symbols=syms,
+        held_mvs={"160723": 20_000.0, "161129": 15_000.0, "501018": 5_000.0, "162411": 0.0},
+        pool_equity=pool_eq,
+        free_pool_cash=60_000.0,
+        anchors=anchors,
+        causal_ctx=ctx,
+        policy=oil_regime_builtin["params"],
+    )
+    bought_crude_mv = (
+        intraday_res["160723"]["qty"] * 2.000
+        + intraday_res["161129"]["qty"] * 1.800
+        + intraday_res["501018"]["qty"] * 1.500
+    )
+    # Existing crude held = 40,000; 48% cap = 48,000 -> new crude buys MUST NOT exceed 8,000!
+    assert bought_crude_mv > 0.0
+    assert 40_000.0 + bought_crude_mv <= 48_000.0 + 1e-3
+
+    # When crude cluster is already >= 48% held, further multi-crude buys must be rejected
+    blocked_res = alloc.coordinate_intraday_buys(
+        buy_requests=[
+            {"symbol": "160723", "price": 2.000, "signal_frac": 1.0, "signal_tag": "v9-entry"},
+            {"symbol": "501018", "price": 1.500, "signal_frac": 1.0, "signal_tag": "v9-entry"},
+        ],
+        symbols=syms,
+        held_mvs={"160723": 28_000.0, "161129": 20_000.0, "501018": 0.0, "162411": 0.0},
+        pool_equity=pool_eq,
+        free_pool_cash=52_000.0,
+        anchors=anchors,
+        causal_ctx=ctx,
+        policy=oil_regime_builtin["params"],
+    )
+    assert blocked_res["160723"]["approved"] is False
+    assert blocked_res["160723"]["reason"] == "crude_cluster_cap_reached"
+    assert blocked_res["501018"]["approved"] is False
+    assert blocked_res["501018"]["reason"] == "crude_cluster_cap_reached"
+
+
+def test_normalize_pool_policy_regime_fields_and_schema() -> None:
+    pol = normalize_pool_policy(
+        {
+            "regime_router_enabled": True,
+            "regime_router_profile": "oil_v5_dual_key",
+            "crude_cluster_cap": 0.12,
+            "decouple_overnight_mrec": True,
+        }
+    )
+    assert pol["regime_router_enabled"] is True
+    assert pol["regime_router_profile"] == "oil_v5_dual_key"
+    assert pol["crude_cluster_cap"] == pytest.approx(0.20)
+    assert pol["decouple_overnight_mrec"] is True
+
+    pol_none = normalize_pool_policy({"crude_cluster_cap": ""})
+    assert pol_none["crude_cluster_cap"] is None
+
+    schema_keys = set((get_portfolio_policy_schema().get("params_schema") or {}).keys())
+    assert {
+        "regime_router_enabled",
+        "regime_router_profile",
+        "crude_cluster_cap",
+        "decouple_overnight_mrec",
+    } <= schema_keys
+
+
+def test_get_causal_context_integrates_oil_regime_and_keeps_live_brn_read_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import json
+    from datetime import timedelta
+    from level2_service.v9_plus_engine import V9MacroDataStore
+
+    monkeypatch.setenv("THS_QUANT_OFFLINE", "1")
+    rstore = SQLiteResearchStore(tmp_path / "causal_regime.db")
+    V9MacroDataStore(rstore, allow_network=False)
+
+    # Seed 150 days of oil/ho/xop daily rows strictly before 20261127
+    dt = datetime(2026, 4, 1)
+    oil_rows = []
+    ho_rows = []
+    xop_rows = []
+    closes = [95.0 + 18.0 * (i / 119.0) for i in range(120)] + [
+        113.0 - (113.0 - 86.7) * (i / 25.0) for i in range(1, 26)
+    ] + [88.0, 89.2, 90.7, 91.7]
+    for px in closes:
+        while dt.weekday() >= 5:
+            dt += timedelta(days=1)
+        d_str = dt.strftime("%Y%m%d")
+        ts = int((dt + timedelta(days=1, hours=6)).timestamp())
+        oil_rows.append([d_str, ts, round(px, 4)])
+        ho_rows.append([d_str, ts, round(px * 0.04, 4)])
+        xop_rows.append([d_str, ts, round(px * 1.8, 4)])
+        dt += timedelta(days=1)
+    while dt.weekday() >= 5:
+        dt += timedelta(days=1)
+    trade_date = dt.strftime("%Y%m%d")
+
+    with rstore._lock, rstore._connection:
+        for key, arr in (("oil_daily_2y", oil_rows), ("ho_daily_2y", ho_rows), ("xop_daily_2y", xop_rows)):
+            rstore._connection.execute(
+                "INSERT OR REPLACE INTO quant_macro_cache (cache_key, payload_json, updated_at) VALUES (?, ?, ?)",
+                (key, json.dumps(arr), 1_795_750_000.0),
+            )
+
+    rules = {
+        "160723": {"id": "r1", "updated_at": "2026-11-26T09:00:00+08:00", "position_sizing": {"cross_market_anchor": "brent"}},
+        "501018": {"id": "r2", "updated_at": "2026-11-26T09:00:00+08:00", "position_sizing": {"cross_market_anchor": "brent"}},
+    }
+    alloc = RouteDPlusAllocator()
+    pol_on = {"regime_router_enabled": True, "decouple_overnight_mrec": True}
+    ctx1 = alloc.get_causal_context(rstore, rules, trade_date, policy=pol_on)
+    assert ctx1["cache_hit"] is False
+    assert isinstance(ctx1["oil_regime"], dict)
+    assert ctx1["oil_regime"]["enforced"] is True
+    assert ctx1["oil_regime"]["fast_crash_active"] is False
+
+    # Intraday crash call hits day cache and overlays read-only fast crash
+    ctx_crash = alloc.get_causal_context(
+        rstore, rules, trade_date, policy=pol_on, live_brn_price=85.0, live_brn_age_sec=15.0
+    )
+    assert ctx_crash["cache_hit"] is True
+    assert ctx_crash["oil_regime"]["fast_crash_active"] is True
+    assert ctx_crash["oil_regime"]["effective_regime"] == "下降"
+
+    # Next regular call still reads clean unpolluted base state from cache
+    ctx_clean = alloc.get_causal_context(rstore, rules, trade_date, policy=pol_on)
+    assert ctx_clean["cache_hit"] is True
+    assert ctx_clean["oil_regime"]["fast_crash_active"] is False
+    assert ctx_clean["oil_regime"] == ctx1["oil_regime"]
+    rstore.close()
+
+

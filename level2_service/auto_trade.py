@@ -2484,6 +2484,7 @@ class AutoTradeEngine:
                 "unallocated_reserve_pct": 100.0,
                 "unallocated_reserve_amount": round(pool_cap, 2),
                 "cache_hit": False,
+                "oil_regime": None,
                 "symbols": {},
             }
 
@@ -2570,6 +2571,19 @@ class AutoTradeEngine:
                 "reserve_short_cash": round(state["reserves"].get(sym, 0.0), 2),
                 "history_days": int((causal_ctx.get("history_days") or {}).get(sym, 0)),
             }
+        raw_oil_regime = causal_ctx.get("oil_regime")
+        if not isinstance(raw_oil_regime, Mapping) and isinstance(ov_cur, Mapping):
+            raw_oil_regime = ov_cur.get("oil_regime")
+        oil_regime_out: dict[str, Any] | None = None
+        effective_sigma_cap_pct = pp.get("sigma_cap_pct")
+        if isinstance(raw_oil_regime, Mapping):
+            oil_regime_out = dict(raw_oil_regime)
+            oil_regime_out["enforced"] = bool(pp.get("regime_router_enabled"))
+            if (
+                bool(pp.get("regime_router_enabled"))
+                and oil_regime_out.get("effective_sigma_cap_pct") is not None
+            ):
+                effective_sigma_cap_pct = oil_regime_out["effective_sigma_cap_pct"]
         return {
             "policy_id": active_cap["policy_id"],
             "policy_name": active_cap["name"],
@@ -2582,7 +2596,7 @@ class AutoTradeEngine:
             "available_pool_cash": state["available_pool_cash"],
             "total_short_reserve_cash": state["total_reserve_short"],
             "free_pool_cash": state["free_pool_cash"],
-            "portfolio_sigma_cap_pct": pp.get("sigma_cap_pct"),
+            "portfolio_sigma_cap_pct": effective_sigma_cap_pct,
             "equal_weight_sigma_pct": ov_full["portfolio_sigma_pct"],
             "current_portfolio_sigma_pct": ov_cur["portfolio_sigma_pct"],
             "total_target_position_pct": round(total_target_pct, 2),
@@ -2590,6 +2604,7 @@ class AutoTradeEngine:
             "unallocated_reserve_pct": round(max(0.0, 100.0 - total_target_pct), 2),
             "unallocated_reserve_amount": round(max(0.0, pool_cap - total_target_cap), 2),
             "cache_hit": bool(causal_ctx.get("cache_hit")),
+            "oil_regime": oil_regime_out,
             "symbols": sym_details,
         }
 
@@ -7534,6 +7549,12 @@ class AutoTradeEngine:
                 and active_q_ps.get("engine_profile") in {"v9_plus_aggressive", "v9_plus_balanced"}
             ):
                 sim_td = str((series or {}).get("trade_date") or local_now.strftime("%Y%m%d"))
+                sim_today_sigs = self.auto_store.list_today_symbol_signals(sim_td, target_symbol)
+                sim_has_init_base = any(
+                    (":v9-init-base:" in str(sig.get("signal_key") or ""))
+                    or (str(sig.get("signal_tag") or "") == "v9-init-base")
+                    for sig in sim_today_sigs
+                )
                 sim_net_sh, sim_eff_cash, sim_expected_sh = self._v9_live_context_args(
                     target_symbol, config, sim_td
                 )
@@ -7551,6 +7572,7 @@ class AutoTradeEngine:
                         rolling_shares=sim_net_sh,
                         broker_available_cash=sim_eff_cash,
                         expected_ledger_shares=sim_expected_sh,
+                        has_morning_init_base=sim_has_init_base,
                     )
                     diag = v9_res.get("diagnostics")
                     if isinstance(diag, Mapping):

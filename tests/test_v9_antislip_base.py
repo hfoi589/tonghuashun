@@ -742,3 +742,181 @@ def test_quant_rules_normalize_position_sizing_preserves_antislip_v9_tuning() ->
     assert vt["rev_t_min_sp_fx"] == pytest.approx(0.50)
     assert vt["sub_1yuan_price_thresh"] == pytest.approx(1.20)
 
+
+def test_pool_allocation_summary_oil_regime_dual_track_comparison(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from level2_service.portfolio_allocator import SQLitePortfolioPolicyStore
+
+    auto_store = SQLiteAutoTradeStore(tmp_path / "auto_cmp.db")
+    rstore = SQLiteResearchStore(tmp_path / "res_cmp.db")
+    pstore = SQLitePortfolioPolicyStore(tmp_path / "policies_cmp.db")
+    engine = AutoTradeEngine(
+        auto_store=auto_store,
+        research_store=rstore,
+        broker=None,
+        trade_executor=None,
+    )
+    engine.portfolio_policy_store = pstore
+
+    syms = ["160723", "161129", "501018", "162411"]
+    anchors = {
+        "160723": "fof_t0_multisource",
+        "161129": "uso_bno_sc_peer",
+        "501018": "brent",
+        "162411": "xop_us_ep",
+    }
+    snap = {
+        "m_rec": 1.35,
+        "sentry": 0.0,
+        "k_ov_strong": 0.45,
+        "k_ov_mod": 0.45,
+        "intra": {"buy_tier_a": (0.72, 0.42)},
+        "event_count": 20,
+    }
+    oil_regime = {
+        "enforced": False,
+        "profile": "oil_v5_dual_key",
+        "locked_regime": "中继下跌",
+        "effective_regime": "中继下跌",
+        "probs": {"上升": 0.5, "震荡上行": 1.1, "震荡横盘": 15.9, "中继下跌": 70.3, "下降": 12.2},
+        "ma_confirm_ratio": 0.0,
+        "effective_cluster_cap_pct": 48.0,
+        "effective_sigma_cap_pct": 1.98,
+        "solo_crude_coef": 0.33,
+        "solo_crude_cap": 0.45,
+        "symbol_multipliers": {"160723": 1.08, "161129": 0.64, "501018": 0.94, "162411": 1.08},
+        "fast_crash_active": False,
+        "degraded_mode": None,
+        "degraded_sources": [],
+    }
+    causal_ctx = {
+        "cache_hit": True,
+        "snaps": {s: dict(snap) for s in syms},
+        "vols": {s: 2.0 for s in syms},
+        "corrs": {(a, b): (1.0 if a == b else 0.90) for a in syms for b in syms},
+        "history_days": {s: 20 for s in syms},
+        "oil_regime": oil_regime,
+    }
+    monkeypatch.setattr(
+        engine,
+        "_resolve_live_raw_close_weights",
+        lambda **kw: (
+            {"160723": 1.0, "161129": 1.0, "501018": 1.0, "162411": 0.0},
+            {s: "测试共振信号" for s in syms},
+            {s: "20261127" for s in syms},
+        ),
+    )
+
+    def _build_state(mode: str) -> dict[str, Any]:
+        active_cap = engine._resolve_active_capital_policy(
+            {"capital_policy_mode": mode, "pool_policy": {"total_pool_cap": 100000.0}}
+        )
+        return {
+            "active_capital_policy": active_cap,
+            "engine_type": active_cap["engine_type"],
+            "policy": active_cap["params"],
+            "pool_cap": 100000.0,
+            "pool_equity": 100000.0,
+            "symbols": syms,
+            "sym_cfgs": {s: {"daily_max_buy_amount": 35000.0} for s in syms},
+            "rules_by_sym": {s: {"id": f"r-{s}"} for s in syms},
+            "ps_by_sym": {s: {} for s in syms},
+            "anchors": anchors,
+            "held_shares": {"160723": 10000, "161129": 8000, "501018": 5000, "162411": 0},
+            "prices": {"160723": 2.0, "161129": 1.8, "501018": 1.5, "162411": 1.0},
+            "held_mvs": {"160723": 20000.0, "161129": 14400.0, "501018": 7500.0, "162411": 0.0},
+            "reserves": {s: 0.0 for s in syms},
+            "total_held": 41900.0,
+            "total_reserve_short": 0.0,
+            "available_pool_cash": 58100.0,
+            "free_pool_cash": 58100.0,
+            "causal_ctx": causal_ctx,
+        }
+
+    # Case 1: enforced=False (route_d_sharpe_shield active) -> comparison shows baseline vs routed
+    monkeypatch.setattr(engine, "_gather_pool_state", lambda *a, **kw: _build_state("route_d_sharpe_shield"))
+    sum_off = engine._compute_pool_allocation_summary({}, "20261127")
+    assert sum_off is not None
+    assert sum_off["oil_regime"] is not None
+    assert sum_off["oil_regime"]["enforced"] is False
+    cmp_off = sum_off["oil_regime"]["comparison"]
+    assert cmp_off["baseline_policy_id"] == "route_d_sharpe_shield"
+    assert cmp_off["routed_policy_id"] == "route_d_oil_regime"
+    assert cmp_off["baseline_total_pct"] == pytest.approx(sum_off["total_target_position_pct"])
+    assert cmp_off["baseline_total_amount"] == pytest.approx(sum_off["total_target_capital_amount"])
+    assert cmp_off["routed_total_pct"] < cmp_off["baseline_total_pct"]
+    assert cmp_off["delta_total_pct"] == pytest.approx(
+        round(cmp_off["routed_total_pct"] - cmp_off["baseline_total_pct"], 2)
+    )
+    assert cmp_off["delta_total_amount"] == pytest.approx(
+        round(cmp_off["routed_total_amount"] - cmp_off["baseline_total_amount"], 2)
+    )
+    assert cmp_off["baseline_sigma_cap_pct"] == pytest.approx(2.40)
+    assert cmp_off["routed_sigma_cap_pct"] == pytest.approx(1.98)
+    assert cmp_off["routed_portfolio_sigma_pct"] <= 1.98 + 1e-3
+    for sym in syms:
+        sc = cmp_off["symbols"][sym]
+        assert sc["delta_pct"] == pytest.approx(round(sc["routed_pct"] - sc["baseline_pct"], 2))
+        assert sc["delta_amount"] == pytest.approx(round(sc["routed_amount"] - sc["baseline_amount"], 2))
+        assert sc["delta_intraday_cap"] == pytest.approx(
+            round(sc["routed_intraday_cap"] - sc["baseline_intraday_cap"], 2)
+        )
+        assert sc["baseline_intraday_cap"] == pytest.approx(sum_off["symbols"][sym]["dynamic_intraday_cap"])
+    assert cmp_off["symbols"]["161129"]["routed_intraday_cap"] < cmp_off["symbols"]["161129"]["baseline_intraday_cap"]
+
+    # Case 2: enforced=True (route_d_oil_regime active) -> comparison shows same dual-track symmetry
+    monkeypatch.setattr(engine, "_gather_pool_state", lambda *a, **kw: _build_state("route_d_oil_regime"))
+    sum_on = engine._compute_pool_allocation_summary({}, "20261127")
+    assert sum_on is not None
+    assert sum_on["oil_regime"] is not None
+    assert sum_on["oil_regime"]["enforced"] is True
+    cmp_on = sum_on["oil_regime"]["comparison"]
+    assert cmp_on["baseline_policy_id"] == "route_d_sharpe_shield"
+    assert cmp_on["routed_policy_id"] == "route_d_oil_regime"
+    assert cmp_on["routed_total_pct"] == pytest.approx(sum_on["total_target_position_pct"])
+    assert cmp_on["routed_total_amount"] == pytest.approx(sum_on["total_target_capital_amount"])
+    assert cmp_on["delta_total_pct"] == pytest.approx(
+        round(cmp_on["routed_total_pct"] - cmp_on["baseline_total_pct"], 2)
+    )
+    assert cmp_on["delta_total_amount"] == pytest.approx(
+        round(cmp_on["routed_total_amount"] - cmp_on["baseline_total_amount"], 2)
+    )
+    assert cmp_on["baseline_total_pct"] == pytest.approx(cmp_off["baseline_total_pct"])
+    assert cmp_on["routed_total_pct"] == pytest.approx(cmp_off["routed_total_pct"])
+    assert cmp_on["delta_total_amount"] == pytest.approx(cmp_off["delta_total_amount"])
+    for sym in syms:
+        sc = cmp_on["symbols"][sym]
+        assert sc["routed_intraday_cap"] == pytest.approx(sum_on["symbols"][sym]["dynamic_intraday_cap"])
+        assert sc["delta_amount"] == pytest.approx(round(sc["routed_amount"] - sc["baseline_amount"], 2))
+        assert sc["delta_intraday_cap"] == pytest.approx(
+            round(sc["routed_intraday_cap"] - sc["baseline_intraday_cap"], 2)
+        )
+
+    # Case 3: fallback without portfolio_policy_store still builds valid comparison for both enforced states
+    state_on_cached = _build_state("route_d_oil_regime")
+    state_off_cached = _build_state("route_d_sharpe_shield")
+    engine.portfolio_policy_store = None
+    monkeypatch.setattr(engine, "_gather_pool_state", lambda *a, **kw: state_on_cached)
+    sum_fb_on = engine._compute_pool_allocation_summary({}, "20261127")
+    assert sum_fb_on is not None
+    cmp_fb_on = sum_fb_on["oil_regime"]["comparison"]
+    assert cmp_fb_on["baseline_policy_id"] == "route_d_sharpe_shield"
+    assert cmp_fb_on["routed_policy_id"] == "route_d_oil_regime"
+    assert cmp_fb_on["delta_total_pct"] == pytest.approx(
+        round(cmp_fb_on["routed_total_pct"] - cmp_fb_on["baseline_total_pct"], 2)
+    )
+    monkeypatch.setattr(engine, "_gather_pool_state", lambda *a, **kw: state_off_cached)
+    sum_fb_off = engine._compute_pool_allocation_summary({}, "20261127")
+    assert sum_fb_off is not None
+    cmp_fb_off = sum_fb_off["oil_regime"]["comparison"]
+    assert cmp_fb_off["baseline_policy_id"] == "route_d_sharpe_shield"
+    assert cmp_fb_off["routed_policy_id"] == "route_d_oil_regime"
+    assert cmp_fb_off["delta_total_pct"] == pytest.approx(
+        round(cmp_fb_off["routed_total_pct"] - cmp_fb_off["baseline_total_pct"], 2)
+    )
+    pstore.close()
+    auto_store.close()
+    rstore.close()
+
+

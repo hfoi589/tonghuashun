@@ -689,3 +689,88 @@ def test_get_causal_context_integrates_oil_regime_and_keeps_live_brn_read_only(
     rstore.close()
 
 
+def test_compute_symbol_intraday_cap_aligns_regime_multipliers_and_crude_cluster_cap() -> None:
+    alloc = RouteDPlusAllocator()
+    syms = ["160723", "161129", "501018", "162411"]
+    anchors = {
+        "160723": "fof_t0_multisource",
+        "161129": "uso_bno_sc_peer",
+        "501018": "brent",
+        "162411": "xop_us_ep",
+    }
+    snaps = {
+        "160723": _make_snap(m_rec=1.35),
+        "161129": _make_snap(m_rec=1.00),
+        "501018": _make_snap(m_rec=1.35),
+        "162411": _make_snap(m_rec=1.35),
+    }
+    corrs = {(a, b): (1.0 if a == b else 0.55) for a in syms for b in syms}
+    vols = {s: 2.2 for s in syms}
+    oil_regime = {
+        "enforced": True,
+        "locked_regime": "中继下跌",
+        "effective_regime": "中继下跌",
+        "effective_cluster_cap_pct": 36.0,
+        "effective_sigma_cap_pct": 1.98,
+        "solo_crude_coef": 0.33,
+        "solo_crude_cap": 0.45,
+        "symbol_multipliers": {"160723": 1.08, "161129": 0.64, "501018": 0.94, "162411": 1.08},
+    }
+    ctx = {"snaps": snaps, "vols": vols, "corrs": corrs, "oil_regime": oil_regime}
+    pol_routed = next(p for p in BUILTIN_PORTFOLIO_POLICIES if p["id"] == "route_d_oil_regime")["params"]
+    pol_base = normalize_pool_policy({"regime_router_enabled": False})
+
+    # 1. Solo context (held_mvs empty -> is_multi_context=False):
+    # - 161129 has mult=0.64 < 1.0 -> r_max = 0.33 * 1.00 * 0.64 = 0.2112
+    # - 501018 has mult=0.94 < 1.0 -> 0.33 * 1.35 * 0.94 = 0.41877 (NOT clipped to crude_cluster_cap=0.36 in solo!)
+    # - 160723 has mult=1.08 >= 1.0 -> 0.33 * 1.35 * 1.0 = 0.4455 (no inflation above 1.0, <= solo_crude_cap=0.45)
+    solo_held = {s: 0.0 for s in syms}
+    cap_161_base = alloc.compute_symbol_intraday_cap(
+        symbol="161129", symbols=syms, held_mvs=solo_held, pool_equity=100_000.0, anchors=anchors, causal_ctx=ctx, policy=pol_base
+    )
+    cap_161_solo = alloc.compute_symbol_intraday_cap(
+        symbol="161129", symbols=syms, held_mvs=solo_held, pool_equity=100_000.0, anchors=anchors, causal_ctx=ctx, policy=pol_routed
+    )
+    assert cap_161_solo["is_multi_context"] is False
+    assert cap_161_solo["r_max"] == pytest.approx(0.33 * 1.00 * 0.64, abs=1e-4)
+    assert cap_161_solo["cap_amount"] < cap_161_base["cap_amount"]
+
+    cap_501_solo = alloc.compute_symbol_intraday_cap(
+        symbol="501018", symbols=syms, held_mvs=solo_held, pool_equity=100_000.0, anchors=anchors, causal_ctx=ctx, policy=pol_routed
+    )
+    assert cap_501_solo["is_multi_context"] is False
+    assert cap_501_solo["r_max"] == pytest.approx(0.33 * 1.35 * 0.94, abs=1e-4)
+    assert cap_501_solo["r_max"] > 0.36
+
+    cap_160_solo = alloc.compute_symbol_intraday_cap(
+        symbol="160723", symbols=syms, held_mvs=solo_held, pool_equity=100_000.0, anchors=anchors, causal_ctx=ctx, policy=pol_routed
+    )
+    assert cap_160_solo["r_max"] == pytest.approx(0.33 * 1.35, abs=1e-4)
+
+    # 2. Multi-symbol context (is_multi_context=True):
+    # - Crude anchor 160723 (raw 0.48 * 1.35 = 0.648) is capped by crude_cluster_cap=0.36
+    # - Crude anchor 161129 (0.48 * 1.00 * 0.64 = 0.3072 < 0.36) preserves multiplier reduction
+    # - Equity anchor 162411 (xop_us_ep) is exempt from crude_cluster_cap=0.36
+    multi_held = {"160723": 20_000.0, "161129": 20_000.0, "501018": 15_000.0, "162411": 0.0}
+    cap_160_multi = alloc.compute_symbol_intraday_cap(
+        symbol="160723", symbols=syms, held_mvs=multi_held, pool_equity=100_000.0, anchors=anchors, causal_ctx=ctx, policy=pol_routed
+    )
+    assert cap_160_multi["is_multi_context"] is True
+    assert cap_160_multi["r_max"] == pytest.approx(0.36, abs=1e-6)
+    assert cap_160_multi["cap_amount"] == pytest.approx(36_000.0, abs=1e-2)
+
+    cap_161_multi = alloc.compute_symbol_intraday_cap(
+        symbol="161129", symbols=syms, held_mvs=multi_held, pool_equity=100_000.0, anchors=anchors, causal_ctx=ctx, policy=pol_routed
+    )
+    assert cap_161_multi["is_multi_context"] is True
+    assert cap_161_multi["r_max"] == pytest.approx(0.48 * 1.00 * 0.64, abs=1e-4)
+
+    cap_162_multi = alloc.compute_symbol_intraday_cap(
+        symbol="162411", symbols=syms, held_mvs=multi_held, pool_equity=100_000.0, anchors=anchors, causal_ctx=ctx, policy=pol_routed
+    )
+    assert cap_162_multi["is_multi_context"] is True
+    assert cap_162_multi["r_max"] == pytest.approx(0.48 * 1.35, abs=1e-4)
+    assert cap_162_multi["r_max"] > 0.36
+
+
+

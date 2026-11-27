@@ -2578,12 +2578,247 @@ class AutoTradeEngine:
         effective_sigma_cap_pct = pp.get("sigma_cap_pct")
         if isinstance(raw_oil_regime, Mapping):
             oil_regime_out = dict(raw_oil_regime)
-            oil_regime_out["enforced"] = bool(pp.get("regime_router_enabled"))
+            is_router_enforced = bool(pp.get("regime_router_enabled"))
+            oil_regime_out["enforced"] = is_router_enforced
             if (
-                bool(pp.get("regime_router_enabled"))
+                is_router_enforced
                 and oil_regime_out.get("effective_sigma_cap_pct") is not None
             ):
                 effective_sigma_cap_pct = oil_regime_out["effective_sigma_cap_pct"]
+
+            store = getattr(self, "portfolio_policy_store", None)
+            if not is_router_enforced:
+                base_id = str(active_cap["policy_id"])
+                base_name = str(active_cap["name"])
+                base_sigma_cap = pp.get("sigma_cap_pct")
+                base_ov = ov_cur
+                base_pcts = target_pos_pcts
+                base_amts = target_cap_amts
+                base_total_pct = total_target_pct
+                base_total_amt = total_target_cap
+                base_intra_caps = {
+                    sym: round(float(sym_details[sym]["dynamic_intraday_cap"]), 2)
+                    for sym in symbols
+                }
+
+                routed_row: dict[str, Any] | None = None
+                if store is not None:
+                    try:
+                        routed_row = store.get_policy("route_d_oil_regime")
+                    except Exception:
+                        routed_row = None
+                if isinstance(routed_row, Mapping):
+                    routed_id = str(routed_row.get("id") or "route_d_oil_regime")
+                    routed_name = str(
+                        routed_row.get("name")
+                        or CAPITAL_POLICY_MODE_LABELS.get(
+                            "route_d_oil_regime", "Route D++ 五态油价周期自适应护盾版"
+                        )
+                    )
+                    routed_engine = str(routed_row.get("engine_type") or "route_d_plus").strip() or "route_d_plus"
+                    alt_pp = normalize_pool_policy(
+                        {
+                            **normalize_pool_policy(routed_row.get("params")),
+                            "regime_router_enabled": True,
+                            "total_pool_cap": pp.get("total_pool_cap"),
+                        }
+                    )
+                else:
+                    routed_id = "route_d_oil_regime"
+                    routed_name = CAPITAL_POLICY_MODE_LABELS.get(
+                        "route_d_oil_regime", "Route D++ 五态油价周期自适应护盾版"
+                    )
+                    routed_engine = "route_d_plus"
+                    alt_pp = normalize_pool_policy(
+                        {
+                            **pp,
+                            "regime_router_enabled": True,
+                            "regime_router_profile": "oil_v5_dual_key",
+                            "decouple_overnight_mrec": True,
+                            "crude_cluster_cap": None,
+                            "total_pool_cap": pp.get("total_pool_cap"),
+                        }
+                    )
+                alt_engine = routed_engine
+            else:
+                routed_id = str(active_cap["policy_id"])
+                routed_name = str(active_cap["name"])
+                routed_sigma_cap = effective_sigma_cap_pct
+                routed_ov = ov_cur
+                routed_pcts = target_pos_pcts
+                routed_amts = target_cap_amts
+                routed_total_pct = total_target_pct
+                routed_total_amt = total_target_cap
+                routed_intra_caps = {
+                    sym: round(float(sym_details[sym]["dynamic_intraday_cap"]), 2)
+                    for sym in symbols
+                }
+
+                base_row: dict[str, Any] | None = None
+                if store is not None:
+                    try:
+                        base_row = store.get_policy("route_d_sharpe_shield")
+                    except Exception:
+                        base_row = None
+                if isinstance(base_row, Mapping):
+                    base_id = str(base_row.get("id") or "route_d_sharpe_shield")
+                    base_name = str(
+                        base_row.get("name")
+                        or CAPITAL_POLICY_MODE_LABELS.get(
+                            "route_d_sharpe_shield", "Route D++ 高夏普控回撤旗舰版 (σ≤2.4%)"
+                        )
+                    )
+                    base_engine = str(base_row.get("engine_type") or "route_d_plus").strip() or "route_d_plus"
+                    alt_pp = normalize_pool_policy(
+                        {
+                            **normalize_pool_policy(base_row.get("params")),
+                            "regime_router_enabled": False,
+                            "total_pool_cap": pp.get("total_pool_cap"),
+                        }
+                    )
+                else:
+                    base_id = "route_d_sharpe_shield"
+                    base_name = CAPITAL_POLICY_MODE_LABELS.get(
+                        "route_d_sharpe_shield", "Route D++ 高夏普控回撤旗舰版 (σ≤2.4%)"
+                    )
+                    base_engine = "route_d_plus"
+                    alt_pp = normalize_pool_policy(
+                        {
+                            **pp,
+                            "regime_router_enabled": False,
+                            "decouple_overnight_mrec": False,
+                            "crude_cluster_cap": None,
+                            "sigma_cap_pct": 2.40,
+                            "total_pool_cap": pp.get("total_pool_cap"),
+                        }
+                    )
+                alt_engine = base_engine
+
+            alt_causal_ctx: Mapping[str, Any] = causal_ctx
+            rules_by_sym = state.get("rules_by_sym")
+            has_nonempty_rules = isinstance(rules_by_sym, Mapping) and any(
+                isinstance(rule_val, Mapping) and bool(rule_val)
+                for rule_val in rules_by_sym.values()
+            )
+            if has_nonempty_rules and getattr(self, "research_store", None) is not None:
+                try:
+                    cand_ctx = self._pool_allocator.get_causal_context(
+                        self.research_store,
+                        rules_by_sym,
+                        trade_date,
+                        alt_pp,
+                    )
+                    if isinstance(cand_ctx, Mapping):
+                        orig_hist = (
+                            causal_ctx.get("history_days")
+                            if isinstance(causal_ctx.get("history_days"), Mapping)
+                            else {}
+                        )
+                        alt_hist = (
+                            cand_ctx.get("history_days")
+                            if isinstance(cand_ctx.get("history_days"), Mapping)
+                            else {}
+                        )
+                        orig_has_hist = any(int(v or 0) > 0 for v in orig_hist.values())
+                        alt_has_hist = any(int(v or 0) > 0 for v in alt_hist.values())
+                        if alt_has_hist or not orig_has_hist:
+                            cand_reg = cand_ctx.get("oil_regime")
+                            if not alt_has_hist and (
+                                not isinstance(cand_reg, Mapping)
+                                or (
+                                    bool(cand_reg.get("degraded_mode"))
+                                    and not bool(raw_oil_regime.get("degraded_mode"))
+                                )
+                            ):
+                                alt_causal_ctx = causal_ctx
+                            else:
+                                alt_causal_ctx = cand_ctx
+                except Exception:
+                    alt_causal_ctx = causal_ctx
+
+            alt_ov = self._pool_allocator.compute_overnight_weights(
+                symbols=symbols,
+                raw_weights=raw_live_wts,
+                anchors=state["anchors"],
+                causal_ctx=alt_causal_ctx,
+                policy=alt_pp,
+                engine_type=alt_engine,
+                static_caps=static_caps,
+                pool_cap=pool_cap,
+            )
+            alt_pcts = {
+                sym: round(float(alt_ov["alloc_weights"].get(sym) or 0.0) * 100.0, 2)
+                for sym in symbols
+            }
+            alt_amts = {
+                sym: round(pool_cap * float(alt_ov["alloc_weights"].get(sym) or 0.0), 2)
+                for sym in symbols
+            }
+            alt_total_pct = round(sum(alt_pcts.values()), 2)
+            alt_total_amt = round(sum(alt_amts.values()), 2)
+            alt_intra_caps: dict[str, float] = {}
+            for sym in symbols:
+                alt_cap_info = self._pool_allocator.compute_symbol_intraday_cap(
+                    symbol=sym,
+                    symbols=symbols,
+                    held_mvs=state["held_mvs"],
+                    pool_equity=state["pool_equity"],
+                    anchors=state["anchors"],
+                    causal_ctx=alt_causal_ctx,
+                    policy=alt_pp,
+                    engine_type=alt_engine,
+                    static_caps=static_caps,
+                )
+                alt_intra_caps[sym] = round(float(alt_cap_info["cap_amount"]), 2)
+
+            if not is_router_enforced:
+                routed_ov = alt_ov
+                routed_pcts = alt_pcts
+                routed_amts = alt_amts
+                routed_total_pct = alt_total_pct
+                routed_total_amt = alt_total_amt
+                routed_intra_caps = alt_intra_caps
+                routed_eff_pol = self._pool_allocator.resolve_effective_policy(alt_pp, alt_causal_ctx)
+                routed_sigma_cap = routed_eff_pol.get("sigma_cap_pct")
+            else:
+                base_ov = alt_ov
+                base_pcts = alt_pcts
+                base_amts = alt_amts
+                base_total_pct = alt_total_pct
+                base_total_amt = alt_total_amt
+                base_intra_caps = alt_intra_caps
+                base_sigma_cap = alt_pp.get("sigma_cap_pct")
+
+            oil_regime_out["comparison"] = {
+                "baseline_policy_id": base_id,
+                "baseline_policy_name": base_name,
+                "routed_policy_id": routed_id,
+                "routed_policy_name": routed_name,
+                "baseline_total_pct": round(base_total_pct, 2),
+                "routed_total_pct": round(routed_total_pct, 2),
+                "delta_total_pct": round(routed_total_pct - base_total_pct, 2),
+                "baseline_total_amount": round(base_total_amt, 2),
+                "routed_total_amount": round(routed_total_amt, 2),
+                "delta_total_amount": round(routed_total_amt - base_total_amt, 2),
+                "baseline_sigma_cap_pct": base_sigma_cap,
+                "routed_sigma_cap_pct": routed_sigma_cap,
+                "baseline_portfolio_sigma_pct": base_ov["portfolio_sigma_pct"],
+                "routed_portfolio_sigma_pct": routed_ov["portfolio_sigma_pct"],
+                "symbols": {
+                    sym: {
+                        "baseline_pct": base_pcts[sym],
+                        "routed_pct": routed_pcts[sym],
+                        "delta_pct": round(routed_pcts[sym] - base_pcts[sym], 2),
+                        "baseline_amount": base_amts[sym],
+                        "routed_amount": routed_amts[sym],
+                        "delta_amount": round(routed_amts[sym] - base_amts[sym], 2),
+                        "baseline_intraday_cap": base_intra_caps[sym],
+                        "routed_intraday_cap": routed_intra_caps[sym],
+                        "delta_intraday_cap": round(routed_intra_caps[sym] - base_intra_caps[sym], 2),
+                    }
+                    for sym in symbols
+                },
+            }
         return {
             "policy_id": active_cap["policy_id"],
             "policy_name": active_cap["name"],

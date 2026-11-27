@@ -1500,7 +1500,20 @@ class RouteDPlusAllocator:
         if symbol in sym_max_map:
             cap_hi = min(cap_hi, float(sym_max_map[symbol]))
         cap_floor = min(float(norm_pol["cap_floor"]), cap_hi)
-        r_max = _clip(eff_in * (m_rec if clean_engine in {"route_d_plus", "shadow_route_d"} else 1.0), cap_floor, cap_hi)
+        if clean_engine in {"route_d_plus", "shadow_route_d"}:
+            mult = float(mult_map.get(symbol, 1.0))
+            r_max = _clip(eff_in * m_rec * (1.0 if mult >= 1.0 else mult), cap_floor, cap_hi)
+        else:
+            r_max = _clip(eff_in, cap_floor, cap_hi)
+        crude_cluster_cap = norm_pol.get("crude_cluster_cap")
+        if is_multi_context and crude_cluster_cap is not None and float(crude_cluster_cap) > 0.0:
+            eq_anchors = {
+                str(x).strip()
+                for x in (norm_pol.get("equity_solo_anchors") or ())
+                if str(x).strip()
+            }
+            if str(anchors.get(symbol) or "brent").strip() not in eq_anchors:
+                r_max = min(r_max, float(crude_cluster_cap))
         cap_amt = round(r_max * eq_base, 2)
         held_mv = max(0.0, float(held_mvs.get(symbol) or 0.0))
         return {

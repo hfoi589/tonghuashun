@@ -856,6 +856,7 @@ class RouteDPlusAllocator:
         override_context: Mapping[str, Any] | None = None,
         live_brn_price: float | None = None,
         live_brn_age_sec: float | None = None,
+        require_fresh_live_brn: bool = True,
     ) -> dict[str, Any]:
         """Load or return cached strictly-causal (< trade_date) Bayesian stats and covariance."""
         norm_pol = normalize_pool_policy(policy)
@@ -947,6 +948,7 @@ class RouteDPlusAllocator:
                         symbol_ma_map=hit.get("symbol_ma_map"),
                         live_brn_price=live_brn_price,
                         live_brn_age_sec=live_brn_age_sec,
+                        require_fresh_live_brn=require_fresh_live_brn,
                         enforced=regime_enabled,
                     )
                 elif isinstance(res_hit.get("oil_regime"), Mapping):
@@ -1027,6 +1029,7 @@ class RouteDPlusAllocator:
                 symbol_ma_map=symbol_ma_map,
                 live_brn_price=live_brn_price,
                 live_brn_age_sec=live_brn_age_sec,
+                require_fresh_live_brn=require_fresh_live_brn,
                 enforced=regime_enabled,
             )
         elif isinstance(out.get("oil_regime"), Mapping):

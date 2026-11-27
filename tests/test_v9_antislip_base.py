@@ -920,3 +920,111 @@ def test_pool_allocation_summary_oil_regime_dual_track_comparison(
     rstore.close()
 
 
+def test_auto_trade_gather_pool_state_wires_live_brn_fast_crash_and_preview(tmp_path: Path) -> None:
+    import json
+    from level2_service.v9_plus_engine import V9MacroDataStore
+
+    auto_store = SQLiteAutoTradeStore(tmp_path / "auto_live_brn.db")
+    rstore = SQLiteResearchStore(tmp_path / "res_live_brn.db")
+
+    # Seed 160 trading days of steady uptrend oil/ho/xop daily bars ending before trade_date
+    dt = datetime(2026, 4, 1)
+    oil_rows: list[list[Any]] = []
+    ho_rows: list[list[Any]] = []
+    xop_rows: list[list[Any]] = []
+    for i in range(160):
+        while dt.weekday() >= 5:
+            dt += timedelta(days=1)
+        d_str = dt.strftime("%Y%m%d")
+        ts = int((dt + timedelta(days=1, hours=6)).timestamp())
+        px = round(70.0 * (1.0035 ** i), 4)
+        oil_rows.append([d_str, ts, px])
+        ho_rows.append([d_str, ts, round(px * 0.04, 4)])
+        xop_rows.append([d_str, ts, round(px * 1.8, 4)])
+        dt += timedelta(days=1)
+
+    while dt.weekday() >= 5:
+        dt += timedelta(days=1)
+    trade_date = dt.strftime("%Y%m%d")
+    ref_close_t1 = float(oil_rows[-1][2])
+    crash_px = round(ref_close_t1 * 0.96, 4)  # -4.0% intraday plunge -> w_crash=0.4125 >= 0.35
+
+    # Ensure quant_macro_cache exists and seed macro daily tables
+    V9MacroDataStore(rstore, allow_network=False)
+    with rstore._lock, rstore._connection:
+        for key, payload in (
+            ("oil_daily_2y", oil_rows),
+            ("ho_daily_2y", ho_rows),
+            ("xop_daily_2y", xop_rows),
+        ):
+            rstore._connection.execute(
+                "INSERT OR REPLACE INTO quant_macro_cache (cache_key, payload_json, updated_at) VALUES (?, ?, ?)",
+                (key, json.dumps(payload), 1_795_750_000.0),
+            )
+
+    in_session_dt = datetime(dt.year, dt.month, dt.day, 10, 30, 0, tzinfo=SHANGHAI_TZ)
+    cap_iso = (in_session_dt - timedelta(seconds=15)).isoformat()
+    with rstore._lock, rstore._connection:
+        rstore._connection.execute(
+            """
+            INSERT OR REPLACE INTO research_points (
+                symbol, trade_date, minute, price, average_price, volume, captured_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            ("BRN0Y", trade_date, "10:30", f"{crash_px:.4f}", f"{crash_px:.4f}", "100.0", cap_iso),
+        )
+
+    cfg = {
+        "symbols": ["160723"],
+        "capital_policy_mode": "route_d_oil_regime",
+        "pool_policy": {"total_pool_cap": 100000.0},
+    }
+
+    # Case 1: In continuous auction with fresh BRN0Y -4.0% plunge -> triggers Fast Crash + next_day_preview
+    engine_live = AutoTradeEngine(
+        auto_store=auto_store,
+        research_store=rstore,
+        broker=None,
+        trade_executor=None,
+        now_fn=lambda: in_session_dt,
+        epoch_fn=lambda: in_session_dt.timestamp(),
+        is_trading_day=lambda _d: True,
+    )
+    state_live = engine_live._gather_pool_state(cfg, trade_date, include_causal=True)
+    oil_regime = (state_live.get("causal_ctx") or {}).get("oil_regime")
+    assert isinstance(oil_regime, dict)
+    assert oil_regime["fast_crash_active"] is True
+    assert oil_regime["effective_regime"] == "下降"
+    assert oil_regime["live_brn_fresh"] is True
+    assert oil_regime["live_brn_price"] == pytest.approx(crash_px)
+    assert oil_regime["live_brn_chg_pct"] == pytest.approx(-4.0, abs=0.05)
+    assert oil_regime["degraded_mode"] is None
+    assert isinstance(oil_regime["next_day_preview"], dict)
+    assert oil_regime["next_day_preview"]["basis_price"] == pytest.approx(crash_px)
+
+    # Case 2: Off-hours (20:00) with stale BRN0Y tick -> no degraded_mode, no Fast Crash, preview still present
+    off_hours_dt = datetime(dt.year, dt.month, dt.day, 20, 0, 0, tzinfo=SHANGHAI_TZ)
+    engine_off = AutoTradeEngine(
+        auto_store=auto_store,
+        research_store=rstore,
+        broker=None,
+        trade_executor=None,
+        now_fn=lambda: off_hours_dt,
+        epoch_fn=lambda: off_hours_dt.timestamp(),
+        is_trading_day=lambda _d: True,
+    )
+    state_off = engine_off._gather_pool_state(cfg, trade_date, include_causal=True)
+    oil_regime_off = (state_off.get("causal_ctx") or {}).get("oil_regime")
+    assert isinstance(oil_regime_off, dict)
+    assert oil_regime_off["fast_crash_active"] is False
+    assert oil_regime_off["live_brn_fresh"] is False
+    assert oil_regime_off["degraded_mode"] is None
+    assert "live_brn" not in oil_regime_off["degraded_sources"]
+    assert oil_regime_off["live_brn_price"] == pytest.approx(crash_px)
+    assert isinstance(oil_regime_off["next_day_preview"], dict)
+    assert oil_regime_off["next_day_preview"]["basis_price"] == pytest.approx(crash_px)
+
+    auto_store.close()
+    rstore.close()
+
+

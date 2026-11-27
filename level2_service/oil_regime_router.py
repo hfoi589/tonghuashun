@@ -505,6 +505,10 @@ class OilRegimeRouter:
                 "taper_501018": float(neutral_tbl["taper_501018"]),
             },
             "fast_crash_active": False,
+            "live_brn_price": None,
+            "live_brn_chg_pct": None,
+            "live_brn_fresh": False,
+            "next_day_preview": None,
             "degraded_mode": degraded_mode,
             "degraded_sources": list(dict.fromkeys(str(s) for s in degraded_sources if str(s))),
         }
@@ -637,6 +641,7 @@ class OilRegimeRouter:
         symbol_ma_map: Mapping[str, tuple[float, float]] | None = None,
         live_brn_price: float | None = None,
         live_brn_age_sec: float | None = None,
+        require_fresh_live_brn: bool = True,
         enforced: bool = False,
     ) -> dict[str, Any]:
         """Evaluate causal oil regime, dual-key parameters, and optional read-only Fast Crash overlay."""
@@ -772,21 +777,32 @@ class OilRegimeRouter:
         # Tier 3: Read-only intraday Fast Crash ramp overlay (never mutates cached daily state)
         display_p = list(base_probs)
         fast_crash_active = False
+        live_brn_price_out: float | None = None
+        live_brn_chg_pct_out: float | None = None
+        live_brn_fresh_out = False
+        next_day_preview: dict[str, Any] | None = None
         if live_brn_price is not None:
             try:
                 live_px = float(live_brn_price)
             except (TypeError, ValueError):
                 live_px = 0.0
+            valid_live_px = math.isfinite(live_px) and live_px > 0.0
             age_ok = True
             if live_brn_age_sec is not None:
                 try:
                     age_ok = float(live_brn_age_sec) <= _MAX_LIVE_BRN_AGE_SEC
                 except (TypeError, ValueError):
                     age_ok = False
+            if valid_live_px:
+                live_brn_price_out = round(live_px, 4)
+                live_brn_chg_pct_out = (
+                    round((live_px / ref_close_t1 - 1.0) * 100.0, 2) if ref_close_t1 > 0.0 else None
+                )
+                live_brn_fresh_out = bool(age_ok)
             if not age_ok:
-                if "live_brn" not in degraded_sources:
+                if require_fresh_live_brn and "live_brn" not in degraded_sources:
                     degraded_sources.append("live_brn")
-            elif math.isfinite(live_px) and live_px > 0.0 and ref_close_t1 > 0.0:
+            elif valid_live_px and ref_close_t1 > 0.0:
                 brn_intra_pct = _clip((live_px / ref_close_t1 - 1.0) * 100.0, -20.0, 20.0)
                 if brn_intra_pct <= -2.5:
                     w_crash = _clip((-brn_intra_pct - 2.5) / 2.0, 0.0, 1.0) * 0.55
@@ -812,6 +828,78 @@ class OilRegimeRouter:
                             effective_regime = "下降"
                             fast_crash_active = True
 
+            # Read-only next-day opening regime preview (zero look-ahead contamination; never writes _base_cache)
+            if valid_live_px and len(oil_closes) >= _MIN_OIL_DAYS:
+                prev_date_sim = clean_td if clean_td > str(oil_last_date) else f"{oil_last_date}N"
+                sim_oil_d = [*oil_dates, prev_date_sim]
+                sim_oil_c = [*oil_closes, float(live_px)]
+                sim_base = self._replay_daily_base(
+                    oil_dates=sim_oil_d,
+                    oil_closes=sim_oil_c,
+                    ho_dates=ho_dates,
+                    ho_closes=ho_closes,
+                    xop_dates=xop_dates,
+                    xop_closes=xop_closes,
+                )
+                sim_oil_ma5 = float(sim_base["oil_ma5"])
+                sim_oil_ma15 = float(sim_base["oil_ma15"])
+                sim_oil_ratio = (sim_oil_ma5 / sim_oil_ma15) if sim_oil_ma15 > 0.0 else 1.0
+                sim_eff_ratio = min(sim_oil_ratio, float(median(crude_ratios))) if crude_ratios else sim_oil_ratio
+                g_sim = _clip((sim_eff_ratio - 0.998) / 0.012, 0.0, 1.0)
+
+                sim_feats = sim_base["last_feats"]
+                sim_crack3 = float(sim_base["last_crack3"])
+                sim_interp_p = list(sim_base["base_probs"])
+                if g_sim > 0.0 and float(sim_feats.get("ret5", 0.0)) > 0.0:
+                    sim_cut = sim_interp_p[3] * 0.70 * g_sim
+                    sim_interp_p[3] = max(0.0, sim_interp_p[3] - sim_cut)
+                    sim_up_sum = sim_interp_p[0] + sim_interp_p[1] + sim_interp_p[2]
+                    if sim_up_sum > 1e-12:
+                        for k in (0, 1, 2):
+                            sim_interp_p[k] += sim_cut * (sim_interp_p[k] / sim_up_sum)
+                    else:
+                        for k in (0, 1, 2):
+                            sim_interp_p[k] += sim_cut / 3.0
+                    sim_interp_p = _normalize_probs(sim_interp_p)
+
+                sim_cluster_bull = sum(
+                    sim_interp_p[k] * float(V5_REGIME_TABLE[OIL_REGIMES[k]]["cluster_bull"]) for k in range(5)
+                )
+                sim_cluster_unconf = sum(
+                    sim_interp_p[k] * float(V5_REGIME_TABLE[OIL_REGIMES[k]]["cluster_unconf"]) for k in range(5)
+                )
+                sim_sig_bull = sum(
+                    sim_interp_p[k] * float(V5_REGIME_TABLE[OIL_REGIMES[k]]["sig_bull"]) for k in range(5)
+                )
+                sim_sig_unconf = sum(
+                    sim_interp_p[k] * float(V5_REGIME_TABLE[OIL_REGIMES[k]]["sig_unconf"]) for k in range(5)
+                )
+                sim_cluster_eff = (1.0 - g_sim) * sim_cluster_unconf + g_sim * sim_cluster_bull
+                sim_sigma_eff = (1.0 - g_sim) * sim_sig_unconf + g_sim * sim_sig_bull
+
+                sim_pos25 = float(sim_feats.get("pos25", 50.0))
+                sim_ret10 = float(sim_feats.get("ret10", 0.0))
+                sim_ret3 = float(sim_feats.get("ret3", 0.0))
+                sim_vol20 = float(sim_feats.get("vol20", 2.0))
+                if sim_pos25 >= 95.0 and sim_ret10 >= 11.0 and (
+                    sim_ret3 <= 1.0 or sim_vol20 >= 3.2 or sim_crack3 <= -2.0
+                ):
+                    sim_sigma_eff = min(sim_sigma_eff, 2.25)
+                    sim_cluster_eff = min(sim_cluster_eff, 0.82)
+
+                next_day_preview = {
+                    "basis_price": round(live_px, 4),
+                    "locked_regime": OIL_REGIMES[int(sim_base["locked_idx"])],
+                    "probs": _format_probs_pct(sim_base["base_probs"]),
+                    "oil_ma5": round(sim_oil_ma5, 2),
+                    "oil_ma15": round(sim_oil_ma15, 2),
+                    "ma_gap_pct": (
+                        round((sim_oil_ma5 / sim_oil_ma15 - 1.0) * 100.0, 2) if sim_oil_ma15 > 0.0 else 0.0
+                    ),
+                    "preview_cluster_cap_pct": round(sim_cluster_eff * 100.0, 2),
+                    "preview_sigma_cap_pct": round(sim_sigma_eff, 4),
+                }
+
         degraded_mode: str | None = None
         if degraded_sources:
             degraded_mode = "auxiliary_degraded"
@@ -836,6 +924,10 @@ class OilRegimeRouter:
                 "taper_501018": round(taper_501018, 4),
             },
             "fast_crash_active": fast_crash_active,
+            "live_brn_price": live_brn_price_out,
+            "live_brn_chg_pct": live_brn_chg_pct_out,
+            "live_brn_fresh": live_brn_fresh_out,
+            "next_day_preview": next_day_preview,
             "degraded_mode": degraded_mode,
             "degraded_sources": list(dict.fromkeys(degraded_sources)),
         }

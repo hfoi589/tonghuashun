@@ -291,3 +291,106 @@ def test_dual_key_ma_confirmation_ignores_162411_and_applies_overbought_taper(tm
     assert res_taper["effective_sigma_cap_pct"] <= 2.25 + 1e-6
     assert set(V5_REGIME_TABLE.keys()) == set(OIL_REGIMES)
     rstore.close()
+
+
+def test_live_brn_fields_next_day_preview_and_off_hours_freshness(tmp_path: Path) -> None:
+    rstore = SQLiteResearchStore(tmp_path / "live_preview.db")
+    oil_closes = _build_steady_uptrend_closes()
+    oil_rows = _make_daily_rows("20260401", oil_closes)
+    ho_rows = _make_daily_rows("20260401", [c * 0.04 for c in oil_closes])
+    xop_rows = _make_daily_rows("20260401", [c * 1.8 for c in oil_closes])
+    last_dt = datetime.strptime(oil_rows[-1][0], "%Y%m%d") + timedelta(days=1)
+    while last_dt.weekday() >= 5:
+        last_dt += timedelta(days=1)
+    trade_date = last_dt.strftime("%Y%m%d")
+    _seed_macro_cache(rstore, oil_rows=oil_rows, ho_rows=ho_rows, xop_rows=xop_rows)
+
+    router = OilRegimeRouter()
+    sym_ma = {"160723": (2.10, 2.00), "161129": (1.90, 1.80), "501018": (1.60, 1.50)}
+
+    # 1. Baseline without live_brn_price has empty live fields & next_day_preview=None
+    res_base = router.evaluate_regime(rstore, trade_date=trade_date, symbol_ma_map=sym_ma)
+    assert res_base["live_brn_price"] is None
+    assert res_base["live_brn_chg_pct"] is None
+    assert res_base["live_brn_fresh"] is False
+    assert res_base["next_day_preview"] is None
+    assert res_base["degraded_mode"] is None
+    assert res_base["degraded_sources"] == []
+
+    # 2. Fresh live_brn_price emits live telemetry + read-only next_day_preview without cache pollution
+    ref_close = float(res_base["oil_close_t1"])
+    live_up_px = round(ref_close * 1.02, 4)
+    res_live = router.evaluate_regime(
+        rstore,
+        trade_date=trade_date,
+        symbol_ma_map=sym_ma,
+        live_brn_price=live_up_px,
+        live_brn_age_sec=20.0,
+    )
+    assert res_live["live_brn_price"] == pytest.approx(live_up_px)
+    assert res_live["live_brn_chg_pct"] == pytest.approx(2.0, abs=0.02)
+    assert res_live["live_brn_fresh"] is True
+    assert res_live["fast_crash_active"] is False
+    assert res_live["degraded_mode"] is None
+    assert res_live["effective_cluster_cap_pct"] == pytest.approx(res_base["effective_cluster_cap_pct"])
+    assert res_live["effective_sigma_cap_pct"] == pytest.approx(res_base["effective_sigma_cap_pct"])
+
+    preview = res_live["next_day_preview"]
+    assert isinstance(preview, dict)
+    assert preview["basis_price"] == pytest.approx(live_up_px)
+    assert preview["locked_regime"] in OIL_REGIMES
+    assert set(preview["probs"].keys()) == set(OIL_REGIMES)
+    assert sum(preview["probs"].values()) == pytest.approx(100.0, abs=0.05)
+    assert preview["oil_ma5"] > 0.0
+    assert preview["oil_ma15"] > 0.0
+    assert preview["ma_gap_pct"] == pytest.approx(
+        round((preview["oil_ma5"] / preview["oil_ma15"] - 1.0) * 100.0, 2), abs=0.05
+    )
+    assert preview["preview_cluster_cap_pct"] > 0.0
+    assert preview["preview_sigma_cap_pct"] > 0.0
+
+    # Zero cache contamination: subsequent clean call matches baseline identically
+    res_clean_again = router.evaluate_regime(rstore, trade_date=trade_date, symbol_ma_map=sym_ma)
+    assert res_clean_again == res_base
+
+    # 3. Off-hours stale live_brn (require_fresh_live_brn=False, age=3600s):
+    #    no degraded_mode, no Fast Crash compression, yet live fields & next_day_preview still populated
+    crash_px = round(ref_close * 0.94, 4)
+    res_off_hours = router.evaluate_regime(
+        rstore,
+        trade_date=trade_date,
+        symbol_ma_map=sym_ma,
+        live_brn_price=crash_px,
+        live_brn_age_sec=3600.0,
+        require_fresh_live_brn=False,
+    )
+    assert res_off_hours["degraded_mode"] is None
+    assert "live_brn" not in res_off_hours["degraded_sources"]
+    assert res_off_hours["fast_crash_active"] is False
+    assert res_off_hours["live_brn_fresh"] is False
+    assert res_off_hours["live_brn_price"] == pytest.approx(crash_px)
+    assert res_off_hours["live_brn_chg_pct"] == pytest.approx(-6.0, abs=0.02)
+    assert res_off_hours["effective_cluster_cap_pct"] == pytest.approx(res_base["effective_cluster_cap_pct"])
+    assert isinstance(res_off_hours["next_day_preview"], dict)
+    assert res_off_hours["next_day_preview"]["basis_price"] == pytest.approx(crash_px)
+
+    # 4. In-session stale live_brn (default require_fresh_live_brn=True, age=3600s) -> auxiliary_degraded
+    res_in_session_stale = router.evaluate_regime(
+        rstore,
+        trade_date=trade_date,
+        symbol_ma_map=sym_ma,
+        live_brn_price=crash_px,
+        live_brn_age_sec=3600.0,
+    )
+    assert res_in_session_stale["degraded_mode"] == "auxiliary_degraded"
+    assert "live_brn" in res_in_session_stale["degraded_sources"]
+    assert res_in_session_stale["fast_crash_active"] is False
+    assert res_in_session_stale["live_brn_fresh"] is False
+
+    # 5. Degraded oil_daily fallback includes consistent default live keys
+    res_degraded = router.evaluate_regime(None, trade_date=trade_date)
+    assert res_degraded["live_brn_price"] is None
+    assert res_degraded["live_brn_chg_pct"] is None
+    assert res_degraded["live_brn_fresh"] is False
+    assert res_degraded["next_day_preview"] is None
+    rstore.close()

@@ -2296,6 +2296,48 @@ class AutoTradeEngine:
             "minute": str(open_leg["minute"]),
         }
 
+    def _resolve_live_brn_telemetry(self) -> tuple[float | None, float | None, bool]:
+        """Read latest local BRN0Y tick from SQLiteResearchStore without blocking network I/O."""
+        in_session = False
+        try:
+            in_session_raw, _ = is_in_continuous_auction(self._local_now(), self.is_trading_day)
+            in_session = bool(in_session_raw)
+        except Exception:
+            in_session = False
+
+        store = getattr(self, "research_store", None)
+        conn = getattr(store, "_connection", None) if store is not None else None
+        if conn is None:
+            return None, None, in_session
+
+        try:
+            lock = getattr(store, "_lock", None)
+            sql = (
+                "SELECT price, captured_at FROM research_points "
+                "WHERE symbol='BRN0Y' ORDER BY trade_date DESC, minute DESC LIMIT 1"
+            )
+            if lock is not None:
+                with lock:
+                    row = conn.execute(sql).fetchone()
+            else:
+                row = conn.execute(sql).fetchone()
+            if not row:
+                return None, None, in_session
+            px = float(row[0])
+            if not (math.isfinite(px) and px > 0.0):
+                return None, None, in_session
+            age_sec: float | None = None
+            raw_cap = str(row[1] or "").strip()
+            if raw_cap:
+                try:
+                    cap_dt = datetime.fromisoformat(raw_cap.replace("Z", "+00:00"))
+                    age_sec = max(0.0, float(self.epoch_fn()) - cap_dt.timestamp())
+                except Exception:
+                    age_sec = None
+            return px, age_sec, in_session
+        except Exception:
+            return None, None, in_session
+
     def _gather_pool_state(
         self,
         root_config: Mapping[str, Any],
@@ -2406,11 +2448,15 @@ class AutoTradeEngine:
 
         causal_ctx: dict[str, Any] | None = None
         if include_causal and symbols:
+            live_brn_px, live_brn_age, in_session = self._resolve_live_brn_telemetry()
             causal_ctx = self._pool_allocator.get_causal_context(
                 self.research_store,
                 rules_by_sym,
                 trade_date,
                 pp,
+                live_brn_price=live_brn_px,
+                live_brn_age_sec=live_brn_age,
+                require_fresh_live_brn=in_session,
             )
             anchors = {sym: str((causal_ctx.get("anchors") or {}).get(sym) or anchors[sym]) for sym in symbols}
 
@@ -2702,11 +2748,15 @@ class AutoTradeEngine:
             )
             if has_nonempty_rules and getattr(self, "research_store", None) is not None:
                 try:
+                    live_brn_px, live_brn_age, in_session = self._resolve_live_brn_telemetry()
                     cand_ctx = self._pool_allocator.get_causal_context(
                         self.research_store,
                         rules_by_sym,
                         trade_date,
                         alt_pp,
+                        live_brn_price=live_brn_px,
+                        live_brn_age_sec=live_brn_age,
+                        require_fresh_live_brn=in_session,
                     )
                     if isinstance(cand_ctx, Mapping):
                         orig_hist = (
@@ -2893,11 +2943,15 @@ class AutoTradeEngine:
         else:
             causal_ctx = state.get("causal_ctx")
             if causal_ctx is None:
+                live_brn_px, live_brn_age, in_session = self._resolve_live_brn_telemetry()
                 causal_ctx = self._pool_allocator.get_causal_context(
                     self.research_store,
                     state["rules_by_sym"],
                     trade_date,
                     state["policy"],
+                    live_brn_price=live_brn_px,
+                    live_brn_age_sec=live_brn_age,
+                    require_fresh_live_brn=in_session,
                 )
             cap_info = self._pool_allocator.compute_symbol_intraday_cap(
                 symbol=symbol,

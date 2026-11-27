@@ -7434,6 +7434,25 @@ def evaluate_v9_plus_live_indicators(
         else raw_tgt_sh
     )
     diff_sh = tgt_sh - int(rolling_shares)
+    tgt_amt = round(float(tgt_sh) * cur_px) if cur_px > 0 else 0
+    bcap_raw = v9_tuning.get("bubble_prem_cap_pct")
+    bcap_disp = float(bcap_raw) if bcap_raw is not None else 2.50
+    ma_rel_txt = "上方" if not below_ma5 else ("守MA15" if cur_px >= ma15 else "下方")
+    dyn_tgt_lbl = (
+        f"保底{tgt_sh:,}股 (0%避险 · 约¥{tgt_amt:,.0f})"
+        if (wt <= 0.0 and min_hold > 0 and tgt_sh == min_hold)
+        else f"{tgt_sh:,}股 ({wt * 100:.0f}% · 约¥{tgt_amt:,.0f})"
+    )
+    buy_close_delta_txt = (
+        f"待补 +{diff_sh:,}股"
+        if diff_sh > 0
+        else (f"超配 {abs(diff_sh):,}股" if diff_sh < 0 else "已对齐0股")
+    )
+    sell_close_delta_txt = (
+        f"需减 {abs(diff_sh):,}股"
+        if diff_sh < 0
+        else (f"低于目标 {diff_sh:,}股" if diff_sh > 0 else "已对齐0股")
+    )
 
     in_win = ("09:32" <= t <= "11:29") or ("13:02" <= t <= "14:30")
     cooldown_ok = (b["i"] - last_exit_idx) >= cooldown
@@ -7575,8 +7594,15 @@ def evaluate_v9_plus_live_indicators(
             "id": "v9-buy-close",
             "label": f"{close_hhmm} 尾盘三态调仓补仓检查",
             "matched": buy_close_ok,
-            "current_value": f"现持 {rolling_shares}股 / 目标 {tgt_sh}股 ({wt * 100:.0f}%)",
-            "target_rule": f"{close_hhmm}-14:55 且 目标仓位高出现持≥100股",
+            "current_value": (
+                f"溢价 {pm:+.2f}% (IOPV {iopv:.4f}), "
+                f"现价{cur_px:.3f}·MA5={ma5:.3f}({ma_rel_txt})/MA15={ma15:.3f}, "
+                f"现持 {int(rolling_shares):,}股 ({buy_close_delta_txt})"
+            ),
+            "target_rule": (
+                f"溢价<{bcap_disp:+.2f}% & 站稳MA5({ma5:.3f})/MA15({ma15:.3f}) & "
+                f"动态目标仓位 {dyn_tgt_lbl} (待补≥100股)"
+            ),
             "detail": wt_reason,
         },
     ]
@@ -7929,8 +7955,15 @@ def evaluate_v9_plus_live_indicators(
             "id": "v9-sell-close",
             "label": f"{close_hhmm} 尾盘三态调仓减仓检查",
             "matched": sell_close_ok,
-            "current_value": f"现持 {rolling_shares}股 / 目标 {tgt_sh}股 ({wt * 100:.0f}%)",
-            "target_rule": f"{close_hhmm}-14:55 且 需减持≥100股避险",
+            "current_value": (
+                f"溢价 {pm:+.2f}% (IOPV {iopv:.4f}), "
+                f"现价{cur_px:.3f}·MA5={ma5:.3f}({ma_rel_txt})/MA15={ma15:.3f}, "
+                f"现持 {int(rolling_shares):,}股 ({sell_close_delta_txt})"
+            ),
+            "target_rule": (
+                f"溢价≥{bcap_disp:+.2f}% 或 跌破MA5({ma5:.3f})/MA15({ma15:.3f}) & "
+                f"动态目标仓位 {dyn_tgt_lbl} (需减≥100股)"
+            ),
             "detail": wt_reason,
         },
     ]
@@ -8087,6 +8120,7 @@ def evaluate_v9_plus_live_indicators(
     sell_hit_cnt = sum(1 for item in sell_conditions if item["matched"])
     diag_out: dict[str, Any] = {
         "price": round(cur_px, 3),
+        "iopv": round(iopv, 4),
         "prem_pct": round(pm, 3),
         "sp_fx_pct": round(sp, 3),
         "brn_price": round(brn, 3),
@@ -8094,6 +8128,8 @@ def evaluate_v9_plus_live_indicators(
         "max_bpos_20d_pct": round(float(day["max_bpos_20d"]) * 100.0, 1),
         "ma5": round(ma5, 3),
         "ma15": round(ma15, 3),
+        "bubble_prem_cap_pct": round(bcap_disp, 2),
+        "strategy_cap_limit": round(float(cap_limit), 2),
         "close_target_weight_pct": round(wt * 100.0, 1),
         "close_target_reason": wt_reason,
         "buy_tier": buy_tier_lbl,

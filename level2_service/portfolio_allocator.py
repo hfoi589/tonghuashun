@@ -76,6 +76,7 @@ VALID_CAPITAL_POLICY_MODES = (
     "route_d_sharpe_shield",
     "route_d_calmar_peak",
     "route_d_plus",
+    "manual_cap",
     "static_cap",
     "route_d_shadow",
 )
@@ -84,6 +85,7 @@ CAPITAL_POLICY_MODE_LABELS: dict[str, str] = {
     "route_d_sharpe_shield": "Route D++ 高夏普控回撤旗舰版 (σ≤2.4% · Sharpe 5.65 / 回撤 6.71%)",
     "route_d_calmar_peak": "Route D++ 卡玛均衡优选版 (σ≤2.6% · Calmar 44.59 / 回撤 7.03%)",
     "route_d_plus": "Route D++ 进取高收益版 (σ≤4.2% · 动态共享池)",
+    "manual_cap": "人工配置（手动设定每股分配金额）",
     "static_cap": "静态分仓上限（各标的独立额度）",
     "route_d_shadow": "Route D++ 影子对照（实盘按静态上限执行，旁路计算动态目标）",
 }
@@ -1548,6 +1550,17 @@ BUILTIN_PORTFOLIO_POLICIES: tuple[dict[str, Any], ...] = (
             "net_return_pct": 195.44,
             "benchmark": "4标的183日实证",
         },
+        "is_builtin": True,
+        "enabled": True,
+    },
+    {
+        "id": "manual_cap",
+        "name": "人工配置（手动设定每股分配金额）",
+        "description": "人工配置模式：仅在此模式下允许在下方「多标的量化资金池与持仓」逐只手动修改每股分配金额；其他选项均为量化资金配比，动态填入资金上限并锁定。",
+        "source": "builtin",
+        "engine_type": "static_cap",
+        "params": {},
+        "metrics_summary": None,
         "is_builtin": True,
         "enabled": True,
     },

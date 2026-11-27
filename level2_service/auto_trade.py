@@ -2074,13 +2074,14 @@ class AutoTradeEngine:
                 "engine_type": engine_type,
                 "is_shared_pool": is_shared,
                 "is_shadow": engine_type == "shadow_route_d",
+                "is_manual": engine_type == "static_cap",
                 "is_builtin": bool(policy_row.get("is_builtin", True)),
                 "enabled": bool(policy_row.get("enabled", True)),
                 "metrics_summary": policy_row.get("metrics_summary"),
                 "params": effective_policy,
             }
 
-        if mode == "static_cap":
+        if mode in {"static_cap", "manual_cap"}:
             engine_type = "static_cap"
         elif mode == "route_d_shadow":
             engine_type = "shadow_route_d"
@@ -2095,6 +2096,7 @@ class AutoTradeEngine:
             "engine_type": engine_type,
             "is_shared_pool": engine_type in SHARED_POOL_EXECUTION_ENGINES,
             "is_shadow": engine_type == "shadow_route_d",
+            "is_manual": engine_type == "static_cap",
             "is_builtin": mode in VALID_CAPITAL_POLICY_MODES,
             "enabled": True,
             "metrics_summary": None,
@@ -2799,8 +2801,22 @@ class AutoTradeEngine:
             sym_dyn_map = (pool_allocation or {}).get("symbols") or {}
             for r in rows:
                 sym_dyn = sym_dyn_map.get(r["symbol"]) or {}
+                dyn_cap = sym_dyn.get("dynamic_intraday_cap")
+                fallback_cap = (
+                    sym_dyn.get("full_signal_capital_amount")
+                    or sym_dyn.get("target_capital_amount")
+                    or 0.0
+                )
+                quant_cap = (
+                    round(float(dyn_cap if dyn_cap is not None else fallback_cap), 2)
+                    if r["enabled"]
+                    else 0.0
+                )
                 r["static_capital_cap"] = r["capital_cap"]
-                r["dynamic_capital_cap"] = sym_dyn.get("dynamic_intraday_cap")
+                r["dynamic_capital_cap"] = dyn_cap
+                r["quant_allocated_cap"] = quant_cap
+                r["capital_cap"] = quant_cap
+                r["capital_cap_locked"] = True
                 r["reserve_short_cash"] = sym_dyn.get("reserve_short_cash", 0.0)
                 r["below_holding_amount"] = 0.0
                 r["over_allocated_amount"] = 0.0
@@ -2816,6 +2832,9 @@ class AutoTradeEngine:
             )
         else:
             for r in rows:
+                r["static_capital_cap"] = r["capital_cap"]
+                r["quant_allocated_cap"] = None
+                r["capital_cap_locked"] = False
                 other_occ = round(max(0.0, total_occ - float(r["occupied_cash"])), 2)
                 r["other_occupied_cash"] = other_occ
                 if available_cash is not None:
@@ -2836,6 +2855,7 @@ class AutoTradeEngine:
             "broker_connected": broker_connected,
             "captured_at": captured_at,
             "capital_policy_mode": cap_mode,
+            "is_manual_cap": bool(active_cap.get("is_manual")),
             "total_assets": round(float(total_assets), 2) if total_assets is not None else None,
             "available_cash": round(float(available_cash), 2) if available_cash is not None else None,
             "total_market_value": round(float(total_market_value), 2) if total_market_value is not None else None,
@@ -3232,6 +3252,21 @@ class AutoTradeEngine:
                 patch["pool_policy"] = synced_pp
 
         candidate = SQLiteAutoTradeStore._build_merged_candidate(current, patch)
+        if isinstance(patch.get("symbol_profiles"), Mapping) and self._is_shared_pool_mode(candidate):
+            # 在量化资金配比模式下锁定已存在标的的底层静态 capital_cap，避免旁路覆盖
+            cur_profiles = current.get("symbol_profiles") if isinstance(current.get("symbol_profiles"), Mapping) else {}
+            cur_syms = {str(s).strip() for s in (current.get("symbols") or []) if str(s).strip()}
+            locked_patch_profiles: dict[str, Any] = {}
+            for sym_key, prof_val in patch["symbol_profiles"].items():
+                sym_clean = str(sym_key).strip()
+                if sym_clean in cur_syms and sym_clean in cur_profiles and isinstance(prof_val, Mapping):
+                    locked_prof = dict(prof_val)
+                    locked_prof["capital_cap"] = cur_profiles[sym_clean].get("capital_cap", locked_prof.get("capital_cap"))
+                    locked_patch_profiles[sym_key] = locked_prof
+                else:
+                    locked_patch_profiles[sym_key] = prof_val
+            patch["symbol_profiles"] = locked_patch_profiles
+            candidate = SQLiteAutoTradeStore._build_merged_candidate(current, patch)
         acct_snapshot: Mapping[str, Any] | None = None
 
         if reconcile_broker:
@@ -3313,13 +3348,18 @@ class AutoTradeEngine:
 
         current = self.auto_store.get_config()
         symbols = list(current.get("symbols") or [])
-        if clean_sym not in symbols:
+        is_existing_symbol = clean_sym in symbols
+        if not is_existing_symbol:
             symbols.append(clean_sym)
 
         existing_profiles = copy.deepcopy(current.get("symbol_profiles") or {})
         base_prof = dict(existing_profiles.get(clean_sym) or _normalize_symbol_profile(clean_sym, None, current))
         base_prof.pop("rule_bindings", None)
-        merged_prof = _normalize_symbol_profile(clean_sym, {**base_prof, **dict(profile_patch)}, current)
+        sanitized_profile_patch = dict(profile_patch)
+        if is_existing_symbol and self._is_shared_pool_mode(current):
+            # 非人工配置模式（量化资金配比模式）不允许手动改写单只标的每股分配上限
+            sanitized_profile_patch.pop("capital_cap", None)
+        merged_prof = _normalize_symbol_profile(clean_sym, {**base_prof, **sanitized_profile_patch}, current)
         existing_profiles[clean_sym] = merged_prof
 
         patch: dict[str, Any] = {

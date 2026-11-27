@@ -3361,6 +3361,32 @@ def test_evaluate_live_snapshot_offhours_falls_back_to_latest_close_and_computes
         round(200000.0 * row200["full_signal_position_pct"] / 100.0, 2)
     )
 
+    # 3) Quant mode locks per-stock capital_cap and exposes dynamic quant_allocated_cap
+    ledger_quant_row = next(r for r in st200["capital_ledger"]["rows"] if r["symbol"] == "160723")
+    assert st200["capital_ledger"]["is_manual_cap"] is False
+    assert ledger_quant_row["capital_cap_locked"] is True
+    assert ledger_quant_row["capital_cap"] == pytest.approx(row200["dynamic_intraday_cap"])
+    assert ledger_quant_row["quant_allocated_cap"] == pytest.approx(row200["dynamic_intraday_cap"])
+    prev_static_cap = float(st200["config"]["symbol_profiles"]["160723"]["capital_cap"])
+    st_locked = engine.upsert_symbol_profile(
+        "160723",
+        {"capital_cap": 12345.0, "order_quantity": 300},
+        reconcile_broker=False,
+    )
+    assert st_locked["config"]["symbol_profiles"]["160723"]["order_quantity"] == 300
+    assert st_locked["config"]["symbol_profiles"]["160723"]["capital_cap"] == pytest.approx(prev_static_cap)
+
+    # 4) Switching to manual_cap unlocks per-stock capital_cap edits
+    avail_ids = {str(p["id"]) for p in st_locked["available_capital_policies"]}
+    assert "manual_cap" in avail_ids
+    engine.reconcile_and_update_config({"capital_policy_mode": "manual_cap"}, reconcile_broker=False)
+    st_manual = engine.upsert_symbol_profile("160723", {"capital_cap": 75000.0}, reconcile_broker=False)
+    assert st_manual["capital_policy_mode"] == "manual_cap"
+    assert st_manual["capital_ledger"]["is_manual_cap"] is True
+    ledger_manual_row = next(r for r in st_manual["capital_ledger"]["rows"] if r["symbol"] == "160723")
+    assert ledger_manual_row["capital_cap_locked"] is False
+    assert ledger_manual_row["capital_cap"] == pytest.approx(75000.0)
+
     rstore.close()
     qstore.close()
     astore.close()

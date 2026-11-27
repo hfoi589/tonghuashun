@@ -301,7 +301,14 @@ def test_sqlite_portfolio_policy_store_crud_and_multi_engine_weights(tmp_path: P
     store = SQLitePortfolioPolicyStore(tmp_path / "policies.db")
     policies = store.list_policies()
     ids = {p["id"] for p in policies}
-    assert {"route_d_sharpe_shield", "route_d_calmar_peak", "route_d_plus", "static_cap", "route_d_shadow"} <= ids
+    assert {
+        "route_d_sharpe_shield",
+        "route_d_calmar_peak",
+        "route_d_plus",
+        "manual_cap",
+        "static_cap",
+        "route_d_shadow",
+    } <= ids
     shield = store.get_policy("route_d_sharpe_shield")
     assert shield is not None
     assert shield["engine_type"] == "route_d_plus"
@@ -368,7 +375,7 @@ def test_sqlite_portfolio_policy_store_crud_and_multi_engine_weights(tmp_path: P
 
     store.delete_policy("custom-inv-vol-v1")
     assert store.get_policy("custom-inv-vol-v1") is None
-    assert len(BUILTIN_PORTFOLIO_POLICIES) == 5
+    assert len(BUILTIN_PORTFOLIO_POLICIES) == 6
     store.close()
 
 

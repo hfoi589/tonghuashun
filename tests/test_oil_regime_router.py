@@ -11,6 +11,8 @@ from level2_service.oil_regime_router import (
     CRUDE_CLUSTER_SYMBOLS,
     OIL_REGIMES,
     V5_REGIME_TABLE,
+    V62_DIMENSION_ORDER,
+    V62_DIMENSION_SHORT_LABELS,
     OilRegimeRouter,
 )
 from level2_service.research_store import SQLiteResearchStore
@@ -393,4 +395,222 @@ def test_live_brn_fields_next_day_preview_and_off_hours_freshness(tmp_path: Path
     assert res_degraded["live_brn_chg_pct"] is None
     assert res_degraded["live_brn_fresh"] is False
     assert res_degraded["next_day_preview"] is None
+    rstore.close()
+
+
+def _seed_v62_all_macro_cache(
+    rstore: SQLiteResearchStore,
+    series_map: dict[str, list[list[Any]]],
+) -> None:
+    macro = V9MacroDataStore(rstore, allow_network=False)
+    now_ts = 1_795_750_000.0
+    with rstore._lock, rstore._connection:
+        for key, data in series_map.items():
+            rstore._connection.execute(
+                """
+                INSERT OR REPLACE INTO quant_macro_cache (cache_key, payload_json, updated_at)
+                VALUES (?, ?, ?)
+                """,
+                (key, json.dumps(data), now_ts),
+            )
+    assert macro is not None
+
+
+def _assert_v62_ci_invariants(res: dict[str, Any]) -> None:
+    ci_map = res["ci_by_regime"]
+    assert isinstance(ci_map, dict)
+    assert set(ci_map.keys()) == set(OIL_REGIMES)
+    for reg in OIL_REGIMES:
+        ci = ci_map[reg]
+        assert ci["mean_pct"] == pytest.approx(res["probs"][reg], abs=1e-6)
+        assert (
+            0.0
+            <= ci["conformal_90_low_pct"]
+            <= ci["ci_low_pct"]
+            <= ci["mean_pct"]
+            <= ci["ci_high_pct"]
+            <= ci["conformal_90_high_pct"]
+            <= 100.0
+        )
+        assert 0.0 <= ci["min_pct"] <= ci["max_pct"] <= 100.0
+
+
+def test_v62_five_dimension_committee_ci_and_guardrails(tmp_path: Path) -> None:
+    rstore = SQLiteResearchStore(tmp_path / "v62_committee.db")
+
+    # --- Scenario 1: Bearish high-consensus resonance -> bear_high_conf_compress ---
+    oil_bear = _build_relay_downtrend_closes()
+    n = len(oil_bear)
+    bear_series: dict[str, list[list[Any]]] = {
+        "oil_daily_2y": _make_daily_rows("20260401", oil_bear),
+        "ho_daily_2y": _make_daily_rows(
+            "20260401", [c * 0.04 * (0.999 ** max(0, i - 130)) for i, c in enumerate(oil_bear)]
+        ),
+        "cl_daily_2y": _make_daily_rows("20260401", [c * 0.94 for c in oil_bear]),
+        "ng_daily_2y": _make_daily_rows("20260401", [3.0 * (0.996 ** i) for i in range(n)]),
+        "uso_daily_2y": _make_daily_rows(
+            "20260401", [c * 0.85 * (0.998 ** max(0, i - 130)) for i, c in enumerate(oil_bear)]
+        ),
+        "bno_daily_2y": _make_daily_rows(
+            "20260401", [c * 0.42 * (0.998 ** max(0, i - 130)) for i, c in enumerate(oil_bear)]
+        ),
+        "dbo_daily_2y": _make_daily_rows("20260401", [c * 0.20 for c in oil_bear]),
+        "sc0_daily_all": _make_daily_rows(
+            "20260401", [c * 6.5 * (0.998 ** max(0, i - 130)) for i, c in enumerate(oil_bear)]
+        ),
+        "xop_daily_2y": _make_daily_rows(
+            "20260401", [c * 1.6 * (0.997 ** max(0, i - 130)) for i, c in enumerate(oil_bear)]
+        ),
+        "xle_daily_2y": _make_daily_rows(
+            "20260401", [c * 1.0 * (0.998 ** max(0, i - 130)) for i, c in enumerate(oil_bear)]
+        ),
+        "spy_daily_2y": _make_daily_rows("20260401", [500.0 * (1.001 ** i) for i in range(n)]),
+        "iwm_daily_2y": _make_daily_rows("20260401", [200.0 * (0.999 ** i) for i in range(n)]),
+    }
+    last_dt = datetime.strptime(bear_series["oil_daily_2y"][-1][0], "%Y%m%d") + timedelta(days=1)
+    while last_dt.weekday() >= 5:
+        last_dt += timedelta(days=1)
+    trade_date = last_dt.strftime("%Y%m%d")
+
+    _seed_v62_all_macro_cache(rstore, bear_series)
+    router = OilRegimeRouter()
+    live_px_bear = round(oil_bear[-1] * 0.995, 4)
+    res_bear = router.evaluate_regime(
+        rstore,
+        trade_date=trade_date,
+        live_brn_price=live_px_bear,
+        live_brn_age_sec=15.0,
+    )
+    res_bear_v5 = router.evaluate_regime(
+        rstore,
+        trade_date=trade_date,
+        profile="oil_v5_legacy",
+    )
+
+    assert res_bear["active_dimensions"] == list(V62_DIMENSION_ORDER)
+    assert res_bear["missing_dimensions"] == []
+    assert len(res_bear["dimension_votes"]) == 5
+    assert res_bear["degraded_mode"] is None
+    assert res_bear["degraded_sources"] == []
+    assert res_bear["locked_regime"] in ("中继下跌", "下降")
+    assert res_bear["consensus_pct"] >= 74.5
+    assert res_bear["consensus_band"] == "高置信共振"
+    assert res_bear["ci_guard_action"] == "bear_high_conf_compress"
+    assert res_bear["effective_cluster_cap_pct"] < res_bear_v5["effective_cluster_cap_pct"]
+    assert res_bear["effective_sigma_cap_pct"] < res_bear_v5["effective_sigma_cap_pct"]
+    _assert_v62_ci_invariants(res_bear)
+
+    for vote in res_bear["dimension_votes"]:
+        assert vote["id"] in V62_DIMENSION_SHORT_LABELS
+        assert vote["label"] == V62_DIMENSION_SHORT_LABELS[vote["id"]]
+        assert vote["vote_regime"] in OIL_REGIMES
+        assert 0.0 < vote["weight_pct"] <= 100.0
+        assert 0.0 <= vote["vote_prob_pct"] <= 100.0
+        assert sum(vote["probs"].values()) == pytest.approx(100.0, abs=0.05)
+
+    preview = res_bear["next_day_preview"]
+    assert isinstance(preview, dict)
+    assert isinstance(preview["consensus_pct"], float)
+    assert preview["consensus_band"] in ("高置信共振", "中等共识", "多空分歧")
+    assert isinstance(preview["ci_guard_action"], str)
+    assert isinstance(preview["locked_ci_pct"], list) and len(preview["locked_ci_pct"]) == 2
+    assert 0.0 <= preview["locked_ci_pct"][0] <= preview["locked_ci_pct"][1] <= 100.0
+
+    # Fast Crash overlay preserves CI ordering invariants without polluting cache
+    res_crash = router.evaluate_regime(
+        rstore,
+        trade_date=trade_date,
+        live_brn_price=round(oil_bear[-1] * 0.93, 4),
+        live_brn_age_sec=10.0,
+    )
+    assert res_crash["fast_crash_active"] is True
+    _assert_v62_ci_invariants(res_crash)
+
+    # --- Scenario 2: Bearish divergence with strong term_physical support -> bear_divergence_support ---
+    div_series = dict(bear_series)
+    div_series["ho_daily_2y"] = _make_daily_rows("20260401", [3.0 * (1.003 ** i) for i in range(n)])
+    div_series["cl_daily_2y"] = _make_daily_rows(
+        "20260401", [c * (0.92 + 0.08 * (max(0, i - 135) / 25.0)) for i, c in enumerate(oil_bear)]
+    )
+    div_series["uso_daily_2y"] = _make_daily_rows("20260401", [60.0 * (1.005 ** i) for i in range(n)])
+    div_series["bno_daily_2y"] = _make_daily_rows("20260401", [30.0 * (1.005 ** i) for i in range(n)])
+    div_series["dbo_daily_2y"] = _make_daily_rows("20260401", [15.0 * (1.0005 ** i) for i in range(n)])
+    div_series["sc0_daily_all"] = _make_daily_rows("20260401", [500.0 * (1.004 ** i) for i in range(n)])
+    div_series["xop_daily_2y"] = _make_daily_rows("20260401", [120.0 * (1.005 ** i) for i in range(n)])
+    div_series["xle_daily_2y"] = _make_daily_rows("20260401", [80.0 * (1.004 ** i) for i in range(n)])
+    div_series["spy_daily_2y"] = _make_daily_rows("20260401", [500.0 * (0.9995 ** i) for i in range(n)])
+    div_series["iwm_daily_2y"] = _make_daily_rows("20260401", [200.0 * (1.002 ** i) for i in range(n)])
+    _seed_v62_all_macro_cache(rstore, div_series)
+    router_div = OilRegimeRouter()
+    res_div = router_div.evaluate_regime(rstore, trade_date=trade_date)
+    res_div_v5 = router_div.evaluate_regime(rstore, trade_date=trade_date, profile="oil_v5_legacy")
+
+    assert len(res_div["active_dimensions"]) == 5
+    assert res_div["missing_dimensions"] == []
+    assert res_div["locked_regime"] in ("中继下跌", "下降")
+    assert res_div["consensus_pct"] < 51.9
+    assert res_div["consensus_band"] == "多空分歧"
+    assert res_div["ci_guard_action"] == "bear_divergence_support"
+    assert res_div["effective_cluster_cap_pct"] > res_div_v5["effective_cluster_cap_pct"]
+    assert res_div["effective_cluster_cap_pct"] <= 56.0 + 1e-6
+    assert res_div["symbol_multipliers"]["160723"] > res_div_v5["symbol_multipliers"]["160723"]
+    assert res_div["symbol_multipliers"]["501018"] > res_div_v5["symbol_multipliers"]["501018"]
+    _assert_v62_ci_invariants(res_div)
+
+    # --- Scenario 3: Bullish high-consensus resonance -> bull_high_conf_unlock ---
+    oil_bull = _build_steady_uptrend_closes()
+    bull_series: dict[str, list[list[Any]]] = {
+        "oil_daily_2y": _make_daily_rows("20260401", oil_bull),
+        "ho_daily_2y": _make_daily_rows(
+            "20260401", [c * 0.04 * (1.001 ** max(0, i - 130)) for i, c in enumerate(oil_bull)]
+        ),
+        "cl_daily_2y": _make_daily_rows(
+            "20260401", [c * (0.93 + 0.03 * (max(0, i - 130) / 30.0)) for i, c in enumerate(oil_bull)]
+        ),
+        "ng_daily_2y": _make_daily_rows("20260401", [2.5 * (1.003 ** i) for i in range(n)]),
+        "uso_daily_2y": _make_daily_rows(
+            "20260401", [c * 0.85 * (1.002 ** max(0, i - 130)) for i, c in enumerate(oil_bull)]
+        ),
+        "bno_daily_2y": _make_daily_rows(
+            "20260401", [c * 0.42 * (1.002 ** max(0, i - 130)) for i, c in enumerate(oil_bull)]
+        ),
+        "dbo_daily_2y": _make_daily_rows("20260401", [c * 0.20 for c in oil_bull]),
+        "sc0_daily_all": _make_daily_rows(
+            "20260401", [c * 6.5 * (1.002 ** max(0, i - 130)) for i, c in enumerate(oil_bull)]
+        ),
+        "xop_daily_2y": _make_daily_rows(
+            "20260401", [c * 1.8 * (1.002 ** max(0, i - 130)) for i, c in enumerate(oil_bull)]
+        ),
+        "xle_daily_2y": _make_daily_rows(
+            "20260401", [c * 1.1 * (1.002 ** max(0, i - 130)) for i, c in enumerate(oil_bull)]
+        ),
+        "spy_daily_2y": _make_daily_rows("20260401", [500.0 * (1.0005 ** i) for i in range(n)]),
+        "iwm_daily_2y": _make_daily_rows("20260401", [200.0 * (1.002 ** i) for i in range(n)]),
+    }
+    _seed_v62_all_macro_cache(rstore, bull_series)
+    router_bull = OilRegimeRouter()
+    sym_ma_bull = {"160723": (2.10, 2.00), "161129": (1.90, 1.80), "501018": (1.60, 1.50)}
+    res_bull = router_bull.evaluate_regime(rstore, trade_date=trade_date, symbol_ma_map=sym_ma_bull)
+    res_bull_v5 = router_bull.evaluate_regime(
+        rstore, trade_date=trade_date, symbol_ma_map=sym_ma_bull, profile="oil_v5_legacy"
+    )
+
+    assert len(res_bull["active_dimensions"]) == 5
+    assert res_bull["missing_dimensions"] == []
+    assert res_bull["consensus_pct"] >= 74.5
+    assert res_bull["consensus_band"] == "高置信共振"
+    assert res_bull["ci_guard_action"] == "bull_high_conf_unlock"
+    assert res_bull["effective_cluster_cap_pct"] >= res_bull_v5["effective_cluster_cap_pct"]
+    assert res_bull["effective_sigma_cap_pct"] >= res_bull_v5["effective_sigma_cap_pct"]
+    _assert_v62_ci_invariants(res_bull)
+
+    # --- Tier-2 degraded result exposes consistent V6.2 fallback keys ---
+    res_deg = router_bull.evaluate_regime(None, trade_date=trade_date)
+    assert res_deg["consensus_pct"] is None
+    assert res_deg["consensus_band"] is None
+    assert res_deg["ci_guard_action"] == "neutral"
+    assert res_deg["active_dimensions"] == []
+    assert res_deg["missing_dimensions"] == list(V62_DIMENSION_ORDER)
+    assert res_deg["ci_by_regime"] is None
+    assert res_deg["dimension_votes"] == []
     rstore.close()
